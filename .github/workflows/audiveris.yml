@@ -19,15 +19,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repo
+    - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Java 11
-      uses: actions/setup-java@v3
-      with:
-        java-version: '11'
-
-    - name: Install Google Cloud CLI
+    - name: Install Google Cloud SDK
       run: |
         sudo apt-get update
         sudo apt-get install -y curl apt-transport-https ca-certificates gnupg
@@ -42,17 +37,24 @@ jobs:
       with:
         credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
 
-    - name: Download PDF from GCS
+    - name: Download input PDF from GCS
       run: |
         echo "Downloading PDF from ${{ github.event.inputs.pdf_gcs_uri }}"
-        gsutil cp "${{ github.event.inputs.pdf_gcs_uri }}" ./input.pdf
+        gsutil cp "${{ github.event.inputs.pdf_gcs_uri }}" input.pdf
 
-    - name: Run Audiveris headless produce MusicXML
+    - name: Convert with Audiveris Docker image
       run: |
-        java -jar audiveris.jar -batch -export input.pdf
+        mkdir -p audiveris/input audiveris/output
+        mv input.pdf audiveris/input/
+        docker pull toprock/audiveris
+        docker run --rm \
+          -v "$(pwd)/audiveris/input":/input \
+          -v "$(pwd)/audiveris/output":/output \
+          toprock/audiveris
+        ls audiveris/output
 
     - name: Upload MusicXML to GCS
       uses: google-github-actions/upload-cloud-storage@v3
       with:
-        path: "*.mxl"
+        path: "audiveris/output/*.mxl"
         destination: "${{ github.event.inputs.output_gcs_prefix }}"
