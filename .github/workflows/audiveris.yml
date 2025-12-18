@@ -1,0 +1,58 @@
+name: Audiveris OMR Processor
+
+on:
+  workflow_dispatch:
+    inputs:
+      pdf_gcs_uri:
+        description: 'GCS URI of the input PDF'
+        required: true
+      output_gcs_prefix:
+        description: 'GCS path prefix for MusicXML output'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  run-audiveris:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Set up Java 11
+      uses: actions/setup-java@v3
+      with:
+        java-version: '11'
+
+    - name: Install Google Cloud CLI
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y curl apt-transport-https ca-certificates gnupg
+        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+          | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+        curl https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+          | sudo apt-key add -
+        sudo apt-get update && sudo apt-get install -y google-cloud-sdk
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v3
+      with:
+        credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+    - name: Download PDF from GCS
+      run: |
+        echo "Downloading PDF from ${{ github.event.inputs.pdf_gcs_uri }}"
+        gsutil cp "${{ github.event.inputs.pdf_gcs_uri }}" ./input.pdf
+
+    - name: Run Audiveris headless produce MusicXML
+      run: |
+        java -jar audiveris.jar -batch -export input.pdf
+
+    - name: Upload MusicXML to GCS
+      uses: google-github-actions/upload-cloud-storage@v3
+      with:
+        path: "*.mxl"
+        destination: "${{ github.event.inputs.output_gcs_prefix }}"
