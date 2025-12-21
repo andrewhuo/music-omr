@@ -19,23 +19,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
     - name: Checkout repository
       uses: actions/checkout@v4
-
-    - name: Install Google Cloud SDK
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y curl apt-transport-https ca-certificates gnupg
-        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
-          | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
-        curl https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-          | sudo apt-key add -
-        sudo apt-get update && sudo apt-get install -y google-cloud-sdk
 
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v3
       with:
         credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+    - name: Set up Google Cloud CLI
+      uses: google-github-actions/setup-gcloud@v3
+      with:
+        version: '>= 416.0.0'
 
     - name: Download input PDF from GCS
       run: |
