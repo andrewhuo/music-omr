@@ -1,13 +1,11 @@
-name: Audiveris OMR Processor
+name: Audiveris OMR + Barline Detection Test
 
 on:
   workflow_dispatch:
     inputs:
       pdf_gcs_uri:
-        description: 'GCS URI of the input PDF'
         required: true
       output_gcs_prefix:
-        description: 'GCS path prefix for MusicXML output'
         required: true
 
 permissions:
@@ -15,12 +13,11 @@ permissions:
   id-token: write
 
 jobs:
-  run-audiveris:
+  run-omr-barline-test:
     runs-on: ubuntu-latest
 
     steps:
-
-    - name: Checkout repository
+    - name: Checkout repo
       uses: actions/checkout@v4
 
     - name: Authenticate to Google Cloud
@@ -34,44 +31,27 @@ jobs:
       with:
         version: '>= 416.0.0'
 
-    - name: Download input PDF from GCS
+    - name: Download input PDF
       run: |
-        echo "Downloading PDF from ${{ github.event.inputs.pdf_gcs_uri }}"
         gsutil cp "${{ github.event.inputs.pdf_gcs_uri }}" input.pdf
 
-    - name: Convert with Audiveris Docker image
+    - name: Run Audiveris
       run: |
         mkdir -p audiveris/input audiveris/output
         mv input.pdf audiveris/input/
         docker pull toprock/audiveris
-        docker run --rm \
-          -v "$(pwd)/audiveris/input":/input \
-          -v "$(pwd)/audiveris/output":/output \
-          toprock/audiveris
-        ls audiveris/output
+        docker run --rm -v "$(pwd)/audiveris/input":/input -v "$(pwd)/audiveris/output":/output toprock/audiveris
 
-    - name: Upload MusicXML to GCS
-      uses: google-github-actions/upload-cloud-storage@v3
-      with:
-        path: "audiveris/output/*.mxl"
-        destination: "${{ github.event.inputs.output_gcs_prefix }}"
-
-    - name: Install Python
+    - name: Install Python for OpenCV test
       uses: actions/setup-python@v6
       with:
         python-version: '3.11'
 
-    - name: Install parser library music21
+    - name: Install OpenCV & PyMuPDF
       run: |
         python -m pip install --upgrade pip
-        python -m pip install music21==9.1
+        python -m pip install opencv-python==4.8.0 pymupdf==1.20.0 numpy
 
-    - name: Test MusicXML parsing
+    - name: Run barline detection test
       run: |
-        python parser-api/parse_musicxml.py audiveris/output/output.musicxml || \
-        python parser-api/parse_musicxml.py audiveris/output/output.mxl
-
-    - name: Extract unique measure list
-      run: |
-        python parser-api/parse_measures_unique.py audiveris/output/output.musicxml || \
-        python parser-api/parse_measures_unique.py audiveris/output/output.mxl
+        python parser-api/detect_barlines_test.py input.pdf
