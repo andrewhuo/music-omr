@@ -26,7 +26,8 @@ jobs:
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v3
       with:
-        credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+        workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
     - name: Set up Google Cloud CLI
       uses: google-github-actions/setup-gcloud@v3
@@ -54,3 +55,19 @@ jobs:
       with:
         path: "audiveris/output/*.mxl"
         destination: "${{ github.event.inputs.output_gcs_prefix }}"
+
+    - name: Install Python and Dependencies
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: Install music21 parser library
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install music21==9.1
+
+    - name: Test MusicXML parsing
+      run: |
+        # Try parsing the output of Audiveris
+        python parser-api/parse_musicxml.py audiveris/output/output.musicxml || \
+        python parser-api/parse_musicxml.py audiveris/output/output.mxl
