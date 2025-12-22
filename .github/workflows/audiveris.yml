@@ -56,18 +56,22 @@ jobs:
         path: "audiveris/output/*.mxl"
         destination: "${{ github.event.inputs.output_gcs_prefix }}"
 
-    - name: Install Python and Dependencies
+    - name: Install Python
       uses: actions/setup-python@v6
       with:
         python-version: '3.11'
 
-    - name: Install music21 parser library
+    - name: Install parser library music21
       run: |
         python -m pip install --upgrade pip
         python -m pip install music21==9.1
 
     - name: Test MusicXML parsing
       run: |
-        # Try parsing the output of Audiveris
         python parser-api/parse_musicxml.py audiveris/output/output.musicxml || \
         python parser-api/parse_musicxml.py audiveris/output/output.mxl
+
+    - name: Extract unique measure list
+      run: |
+        python parser-api/parse_measures_unique.py audiveris/output/output.musicxml || \
+        python parser-api/parse_measures_unique.py audiveris/output/output.mxl
