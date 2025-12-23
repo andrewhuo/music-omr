@@ -95,11 +95,14 @@ jobs:
       #################################################################
       # 6) Annotate measures on PDF
       #################################################################
-      - name: Draw guide test on PDF
+      - name: Draw staff-bounded guides (debug)
         run: |
           set -euo pipefail
-          python -u parser-api/annotate_measures_v0.py \
+          python -u parser-api/annotate_guides_by_staff.py \
             /tmp/work/input.pdf /tmp/work/annotated.pdf
+          echo "Annotated PDF:"
+          ls -lh /tmp/work/annotated.pdf
+
 
 
       #################################################################
