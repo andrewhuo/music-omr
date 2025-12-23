@@ -62,14 +62,14 @@ jobs:
         python -m pip install numpy==1.26.4
         python -m pip install opencv-python==4.8.0.74 pymupdf==1.20.0
 
-    - name: Run barline detection and inspect output
+    - name: Run barline detection and **inspect output**
       run: |
         python parser-api/detect_barlines_test.py audiveris/input/input.pdf \
           --output-dir output
-        echo "Contents of output/ after detection:"
-        ls -l output/
-        echo "If there’s a PDF in a subfolder, list that too:"
-        find output/ -maxdepth 3 -type f -print
+        echo "=== CONTENTS OF output/ ==="
+        ls -R output/
+        echo "=== FIND ALL FILES under output/ ==="
+        find output/ -type f -print
 
     - name: Upload raw Audiveris output
       run: |
@@ -77,8 +77,12 @@ jobs:
 
     - name: Upload annotated PDF
       run: |
+        echo "=== ABOUT TO UPLOAD annotated.pdf ==="
+        ls -l output/
         gsutil cp output/annotated.pdf "${{ github.event.inputs.output_gcs_prefix }}/annotated.pdf"
 
     - name: Upload measures JSON
       run: |
+        echo "=== ABOUT TO UPLOAD measures.json ==="
+        ls -l output/
         gsutil cp output/measures.json "${{ github.event.inputs.output_gcs_prefix }}/measures.json"
