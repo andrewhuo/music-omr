@@ -2,18 +2,9 @@
 """
 Debug step: draw a short RED vertical guide for EACH staff on each page.
 
-Goal:
-- Find staff horizontal lines (top & bottom per staff)
-- For each staff: draw a vertical segment at the "beginning" (left edge of staff)
-- No numbers yet. (Numbers come next step.)
-
-Pipeline:
-1) Render page -> image (PyMuPDF)
-2) Binarize + morphology -> horizontal-line mask (OpenCV)
-3) Detect staff-line rows (peaks in row sums)
-4) Group rows into staves
-5) For each staff: estimate left edge X (robust percentile)
-6) Draw red segment from top staff line to bottom staff line (PDF coords)
+Improvements vs previous:
+- X: use contours of long horizontal staff segments -> true left edge (per staff, supports indents)
+- Y: pick the best 5-line window inside each staff group -> top touches 1st line, bottom touches 5th line
 """
 
 import sys
@@ -21,32 +12,34 @@ import fitz  # PyMuPDF
 import numpy as np
 import cv2
 
+# -----------------------------
+# Tunables (only touch if needed)
+# -----------------------------
+ZOOM = 2.0                   # rendering scale; PDF coords = pixels / ZOOM
+ROW_HIT_THRESHOLD = 200      # row "on" pixels required to count as a staff line row
+MAX_GAP_BETWEEN_LINES = 18   # px gap threshold to group lines into one staff
+MIN_LINES_PER_STAFF = 4      # tolerate missed/broken line: 4+ rows can still be a staff candidate
+X_PAD_LEFT = 0               # per-staff shift (pixels) after detection; keep 0 for now
 
-# -----------------------------
-# Tunables (adjust only if needed)
-# -----------------------------
-ZOOM = 2.0                  # rendering scale; PDF coords = pixels / ZOOM
-ROW_HIT_THRESHOLD = 200     # row "on" pixels required to count as a line row
-MAX_GAP_BETWEEN_LINES = 18  # px gap threshold to group lines into one staff
-MIN_LINES_PER_STAFF = 4     # accept 4+ lines to tolerate missed/broken line
-X_PAD_LEFT = 0              # shift guide right (+) or left (-) in pixels
+# Contour filtering to find "real" staff segments
+MIN_LONG_LINE_FRAC = 0.35    # contour width must be >= this fraction of page width to count as staff line
+MAX_LINE_HEIGHT_PX = 8       # contour bounding-rect height must be <= this to be considered a line
 
 
 def render_page_to_bgr(page: fitz.Page, zoom: float) -> np.ndarray:
     mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)  # usually RGB, no alpha
+    pix = page.get_pixmap(matrix=mat, alpha=False)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
 
     # Normalize to BGR for OpenCV
     if pix.n == 1:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     elif pix.n == 3:
-        # PyMuPDF gives RGB; OpenCV prefers BGR
+        # PyMuPDF yields RGB
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     elif pix.n == 4:
         img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
     else:
-        # Fallback (rare): best-effort
         img = img[:, :, :3]
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
@@ -54,10 +47,10 @@ def render_page_to_bgr(page: fitz.Page, zoom: float) -> np.ndarray:
 
 
 def extract_horizontal_lines_mask(gray: np.ndarray) -> np.ndarray:
-    # Invert threshold so dark staff lines become white in the mask
+    # Dark lines -> white mask
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Extract horizontal lines: erode + dilate with a wide horizontal kernel
+    # Morphology for horizontal line extraction
     kernel_len = max(30, gray.shape[1] // 25)
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
     tmp = cv2.erode(bw, horiz_kernel, iterations=1)
@@ -66,7 +59,6 @@ def extract_horizontal_lines_mask(gray: np.ndarray) -> np.ndarray:
 
 
 def find_staff_line_ys(horiz_mask: np.ndarray) -> list[int]:
-    # staff lines create strong row-wise "on" counts
     row_sums = np.sum(horiz_mask > 0, axis=1)
 
     ys: list[int] = []
@@ -112,18 +104,62 @@ def group_lines_into_staves(line_ys: list[int]) -> list[list[int]]:
     return staves
 
 
+def best_five_line_window(ys: list[int]) -> list[int]:
+    """
+    If we have more than 5 candidate line rows, pick the best group of 5 that looks like a staff:
+    - 5 lines
+    - roughly even spacing
+    """
+    ys = sorted(ys)
+    if len(ys) <= 5:
+        return ys
+
+    best = ys[:5]
+    best_score = float("inf")
+
+    for i in range(0, len(ys) - 4):
+        w = ys[i:i+5]
+        diffs = [w[j+1] - w[j] for j in range(4)]
+        med = float(np.median(diffs))
+        score = sum(abs(d - med) for d in diffs)
+        if score < best_score:
+            best_score = score
+            best = w
+
+    return best
+
+
 def left_edge_x_for_staff(horiz_mask: np.ndarray, top_y: int, bot_y: int) -> int | None:
-    # Look in a thin band around the staff region
+    """
+    Find left edge of staff lines within a band by looking for LONG horizontal contours,
+    then returning the minimum x among those long contours.
+    """
     y0 = max(0, top_y - 2)
     y1 = min(horiz_mask.shape[0], bot_y + 3)
     band = horiz_mask[y0:y1, :]
 
+    # Find contours in the band
+    contours, _ = cv2.findContours(band, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    band_w = band.shape[1]
+    min_x_candidates = []
+
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w >= int(band_w * MIN_LONG_LINE_FRAC) and h <= MAX_LINE_HEIGHT_PX:
+            min_x_candidates.append(x)
+
+    if min_x_candidates:
+        return int(min(min_x_candidates))
+
+    # Fallback: robust low percentile if no long contours matched
     ys, xs = np.where(band > 0)
     if xs.size == 0:
         return None
-
-    # Use a low percentile instead of absolute min to avoid tiny specks
-    return int(np.percentile(xs, 2))
+    return int(np.percentile(xs, 1))
 
 
 def annotate_guides(input_pdf: str, output_pdf: str):
@@ -137,14 +173,18 @@ def annotate_guides(input_pdf: str, output_pdf: str):
         line_ys = find_staff_line_ys(horiz)
         staves = group_lines_into_staves(line_ys)
 
-        # If we detect nothing, mark the page so we know the script ran.
         if not staves:
+            # mark page so we know it ran
             page.draw_rect(fitz.Rect(5, 5, 25, 25), color=(1, 0, 0), width=2)
             continue
 
         for staff_lines in staves:
-            top_y = min(staff_lines)
-            bot_y = max(staff_lines)
+            # Choose the best 5 staff lines (so top/bottom are correct)
+            chosen = best_five_line_window(staff_lines)
+            chosen = sorted(chosen)
+
+            top_y = chosen[0]     # 1st line
+            bot_y = chosen[-1]    # 5th line
 
             x_left = left_edge_x_for_staff(horiz, top_y, bot_y)
             if x_left is None:
@@ -157,7 +197,6 @@ def annotate_guides(input_pdf: str, output_pdf: str):
             y0_pdf = top_y / ZOOM
             y1_pdf = bot_y / ZOOM
 
-            # Draw segmented guide in PDF space
             page.draw_line(
                 (x_pdf, y0_pdf),
                 (x_pdf, y1_pdf),
