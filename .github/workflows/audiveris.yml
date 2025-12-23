@@ -24,6 +24,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # Authenticate to Google Cloud
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
@@ -46,6 +47,7 @@ jobs:
           gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
           ls -lh /tmp/work/input.pdf
 
+      # Optional: run Audiveris OMR
       - name: Run Audiveris OMR (Docker)
         run: |
           set -euo pipefail
@@ -67,6 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
+          # Install a real published OpenCV wheel version
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
       - name: Run barline detection test
@@ -74,7 +77,7 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/work/detect_barlines_out
           python parser-api/detect_barlines_test.py /tmp/work/input.pdf --output-dir /tmp/work/detect_barlines_out
-          echo "Barline detection output:"
+          echo "Barline detection output listing:"
           ls -R /tmp/work/detect_barlines_out
 
       - name: Annotate measures on PDF
@@ -92,9 +95,10 @@ jobs:
       - name: Upload Audiveris outputs to GCS (optional)
         run: |
           set -euo pipefail
-          if [ -d /tmp/work/audiveris_out ]; then
+          if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
+            echo "Uploading Audiveris outputs:"
             gsutil -m cp -r /tmp/work/audiveris_out "${{ inputs.output_gcs_prefix }}/audiveris_out"
             echo "Uploaded Audiveris outputs to: ${{ inputs.output_gcs_prefix }}/audiveris_out"
           else
-            echo "No audiveris_out directory found, skipping."
+            echo "No Audiveris outputs to upload (folder missing or empty), skipping."
           fi
