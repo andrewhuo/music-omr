@@ -93,20 +93,7 @@ jobs:
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
       #################################################################
-      # 6) Run barline detection
-      #################################################################
-      - name: Run barline detection
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/work/detect_barlines_out
-          python -u parser-api/detect_barlines_test.py \
-            /tmp/work/input.pdf \
-            --output-dir /tmp/work/detect_barlines_out
-          echo "Barline detection outputs:"
-          ls -R /tmp/work/detect_barlines_out
-
-      #################################################################
-      # 7) Annotate measures on PDF
+      # 6) Annotate measures on PDF
       #################################################################
       - name: Annotate measures on PDF
         run: |
@@ -117,7 +104,7 @@ jobs:
           ls -lh /tmp/work/annotated.pdf
 
       #################################################################
-      # 8) Render first page of annotated PDF to PNG (debug)
+      # 7) Render first page of annotated PDF to PNG (debug)
       #################################################################
       - name: Render debug PNG preview
         run: |
@@ -135,19 +122,11 @@ jobs:
           ls -lh /tmp/work/debug/annotated_page1.png
 
       #################################################################
-      # 9) Upload ALL outputs to GCS
+      # 8) Upload ALL outputs to GCS
       #################################################################
       - name: Upload outputs to GCS
         run: |
           set -euo pipefail
-
-          # Barline detection data
-          if [ -d /tmp/work/detect_barlines_out ]; then
-            echo "Uploading detect_barlines_out"
-            gsutil -m cp -r /tmp/work/detect_barlines_out "${{ inputs.output_gcs_prefix }}/detect_barlines_out"
-          else
-            echo "No detect_barlines_out folder"
-          fi
 
           # Annotated PDF
           gsutil cp /tmp/work/annotated.pdf "${{ inputs.output_gcs_prefix }}/annotated.pdf"
