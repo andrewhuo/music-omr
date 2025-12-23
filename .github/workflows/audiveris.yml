@@ -4,8 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       pdf_gcs_uri:
+        description: "GCS URI of the input PDF"
         required: true
       output_gcs_prefix:
+        description: "GCS prefix where outputs will be stored (e.g., gs://omr-output/jobs/123/)"
         required: true
 
 permissions:
@@ -31,27 +33,47 @@ jobs:
       with:
         version: '>= 416.0.0'
 
+    - name: Prepare workspace
+      run: |
+        mkdir -p input output audiveris/input audiveris/output
+
     - name: Download input PDF
       run: |
-        gsutil cp "${{ github.event.inputs.pdf_gcs_uri }}" input.pdf
+        echo "Downloading ${{ github.event.inputs.pdf_gcs_uri }}"
+        gsutil cp "${{ github.event.inputs.pdf_gcs_uri }}" input/input.pdf
 
     - name: Run Audiveris
       run: |
-        mkdir -p audiveris/input audiveris/output
-        mv input.pdf audiveris/input/
+        mv input/input.pdf audiveris/input/
         docker pull toprock/audiveris
-        docker run --rm -v "$(pwd)/audiveris/input":/input -v "$(pwd)/audiveris/output":/output toprock/audiveris
+        docker run --rm \
+          -v "$(pwd)/audiveris/input":/input \
+          -v "$(pwd)/audiveris/output":/output \
+          toprock/audiveris
 
-    - name: Install Python for OpenCV test
+    - name: Install Python (for postprocessing)
       uses: actions/setup-python@v6
       with:
         python-version: '3.11'
 
-    - name: Install OpenCV & PyMuPDF
+    - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         python -m pip install opencv-python==4.8.0 pymupdf==1.20.0 numpy
 
-    - name: Run barline detection test
+    - name: Run barline detection and generate annotated PDF
       run: |
-        python parser-api/detect_barlines_test.py input.pdf
+        python parser-api/detect_barlines_test.py audiveris/input/input.pdf \
+          --output-dir output
+
+    - name: Upload raw Audiveris output
+      run: |
+        gsutil -m cp -r audiveris/output "${{ github.event.inputs.output_gcs_prefix }}/audiveris/"
+
+    - name: Upload annotated PDF
+      run: |
+        gsutil cp output/annotated.pdf "${{ github.event.inputs.output_gcs_prefix }}/annotated.pdf"
+
+    - name: Upload measures JSON
+      run: |
+        gsutil cp output/measures.json "${{ github.event.inputs.output_gcs_prefix }}/measures.json"
