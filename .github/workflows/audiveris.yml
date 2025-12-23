@@ -48,7 +48,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "Deleting old outputs under ${{ inputs.output_gcs_prefix }}/"
-          # Remove everything under the output prefix
           gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/*" || echo "No outputs to delete"
 
       #################################################################
@@ -60,7 +59,10 @@ jobs:
           mkdir -p /tmp/work
           echo "Downloading input PDF..."
           gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
+          echo "Downloaded:"
           ls -lh /tmp/work/input.pdf
+          echo "Input SHA256:"
+          sha256sum /tmp/work/input.pdf
 
       #################################################################
       # 4) Run Audiveris OMR (optional; prints output if present)
@@ -89,7 +91,6 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Install known working versions
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
       #################################################################
@@ -99,7 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/work/detect_barlines_out
-          python parser-api/detect_barlines_test.py /tmp/work/input.pdf --output-dir /tmp/work/detect_barlines_out
+          python -u parser-api/detect_barlines_test.py /tmp/work/input.pdf --output-dir /tmp/work/detect_barlines_out
           echo "Barline detection output directory contents:"
           ls -R /tmp/work/detect_barlines_out
 
@@ -109,11 +110,43 @@ jobs:
       - name: Annotate measures on PDF
         run: |
           set -euo pipefail
-          python parser-api/annotate_measures.py /tmp/work/input.pdf /tmp/work/annotated.pdf
+          python -u parser-api/annotate_measures.py /tmp/work/input.pdf /tmp/work/annotated.pdf
+          echo "Annotated PDF written:"
           ls -lh /tmp/work/annotated.pdf
+          echo "Annotated SHA256:"
+          sha256sum /tmp/work/annotated.pdf
 
       #################################################################
-      # 8) Upload annotated PDF to GCS
+      # 8) DEBUG STRATEGY: Render annotated.pdf page 1 to PNG and upload
+      #################################################################
+      - name: Render annotated PDF page 1 to PNG (debug)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/work/debug
+
+          python - << 'PY'
+          import fitz
+
+          in_pdf = "/tmp/work/annotated.pdf"
+          out_png = "/tmp/work/debug/annotated_page1.png"
+
+          doc = fitz.open(in_pdf)
+          page = doc[0]
+          pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x zoom
+          pix.save(out_png)
+          doc.close()
+
+          print(f"Wrote {out_png}")
+          PY
+
+          ls -lh /tmp/work/debug/annotated_page1.png
+
+          echo "Uploading debug PNG preview..."
+          gsutil -m cp /tmp/work/debug/annotated_page1.png "${{ inputs.output_gcs_prefix }}/debug/annotated_page1.png"
+          echo "Uploaded debug PNG to: ${{ inputs.output_gcs_prefix }}/debug/annotated_page1.png"
+
+      #################################################################
+      # 9) Upload annotated PDF to GCS
       #################################################################
       - name: Upload annotated PDF to GCS
         run: |
@@ -122,12 +155,11 @@ jobs:
           echo "Uploaded annotated PDF to: ${{ inputs.output_gcs_prefix }}/annotated.pdf"
 
       #################################################################
-      # 9) Upload Audiveris outputs to GCS (optional)
+      # 10) Upload Audiveris outputs to GCS (optional)
       #################################################################
       - name: Upload Audiveris outputs to GCS (optional)
         run: |
           set -euo pipefail
-          # Only upload if the folder exists and has contents
           if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
             echo "Uploading Audiveris outputs..."
             gsutil -m cp -r /tmp/work/audiveris_out "${{ inputs.output_gcs_prefix }}/audiveris_out"
