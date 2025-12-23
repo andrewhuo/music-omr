@@ -24,7 +24,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Authenticate to Google Cloud
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
@@ -39,6 +38,37 @@ jobs:
           echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
           echo "Output prefix: ${{ inputs.output_gcs_prefix }}"
 
+      - name: Clean previous inputs in bucket
+        run: |
+          set -euo pipefail
+          echo "Deleting old inputs under the input folder..."
+          # Delete all objects in the input folder
+          # Example: gs://bucket/input/*
+          # We parse the bucket and prefix:
+          uri="${{ inputs.pdf_gcs_uri }}"
+          # Extract bucket (after gs:// and before first /)
+          bucket=$(echo "$uri" | sed -E 's#^gs://([^/]+)/.*#\1#')
+          # Extract path prefix of input folder (everything up to last /)
+          prefix=$(echo "$uri" | sed -E 's#^gs://[^/]+/(.*)/[^/]+$#\1#')
+          echo "Bucket: $bucket"
+          echo "Prefix: $prefix"
+          gsutil -m rm -r "gs://$bucket/$prefix/*" || echo "No inputs or already deleted"
+
+      - name: Clean previous outputs in bucket
+        run: |
+          set -euo pipefail
+          echo "Deleting old outputs under ${{ inputs.output_gcs_prefix }}/"
+          gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/*" || echo "No outputs to delete"
+
+      - name: (Re)Upload input PDF
+        run: |
+          set -euo pipefail
+          echo "Re-uploading input PDF so it’s available for processing..."
+          # This assumes you still have the input locally in your runner, or you can replace
+          # this with whatever method you use to re-upload the input file. If not, remove
+          # this step and re-upload your PDF by other means before download.
+          gsutil cp "${{ inputs.pdf_gcs_uri }}" "${{ inputs.pdf_gcs_uri }}"
+
       - name: Download input PDF from GCS
         run: |
           set -euo pipefail
@@ -47,7 +77,6 @@ jobs:
           gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
           ls -lh /tmp/work/input.pdf
 
-      # Optional: run Audiveris OMR
       - name: Run Audiveris OMR (Docker)
         run: |
           set -euo pipefail
@@ -69,7 +98,6 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Install a real published OpenCV wheel version
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
       - name: Run barline detection test
