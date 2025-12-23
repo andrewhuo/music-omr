@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       pdf_gcs_uri:
-        description: "GCS URI to input PDF (example: gs://your-bucket/input/test.pdf)"
+        description: "GCS URI to your input PDF (example: gs://your-bucket/input/test.pdf)"
         required: true
         type: string
       output_gcs_prefix:
-        description: "GCS prefix for outputs (example: gs://your-bucket/output)"
+        description: "GCS prefix where outputs will go (example: gs://your-bucket/output)"
         required: true
         type: string
 
 jobs:
-  audiveris_omr_and_barlines:
+  audiveris_and_barlines:
     runs-on: ubuntu-latest
 
     permissions:
@@ -22,7 +22,7 @@ jobs:
 
     steps:
       #################################################################
-      # 1) Checkout and authenticate to GCP
+      # 1) Checkout and authenticate to Google Cloud
       #################################################################
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,8 +40,8 @@ jobs:
 
       - name: Show inputs
         run: |
-          echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
-          echo "Output prefix: ${{ inputs.output_gcs_prefix }}"
+          echo "PDF GCS URI: ${{ inputs.pdf_gcs_uri }}"
+          echo "Output GCS prefix: ${{ inputs.output_gcs_prefix }}"
 
       #################################################################
       # 2) Delete all previous outputs
@@ -49,18 +49,18 @@ jobs:
       - name: Delete all previous outputs
         run: |
           set -euo pipefail
-          echo "Deleting all objects under: ${{ inputs.output_gcs_prefix }}"
+          echo "Wiping old outputs under: ${{ inputs.output_gcs_prefix }}"
           gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/**" || echo "No files to delete"
 
       #################################################################
       # 3) Download the input PDF
       #################################################################
-      - name: Download input PDF from GCS
+      - name: Download input PDF
         run: |
           set -euo pipefail
           mkdir -p /tmp/work
           gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
-          echo "Downloaded input:"
+          echo "Input PDF downloaded:"
           ls -lh /tmp/work/input.pdf
 
       #################################################################
@@ -102,22 +102,22 @@ jobs:
           python -u parser-api/detect_barlines_test.py \
             /tmp/work/input.pdf \
             --output-dir /tmp/work/detect_barlines_out
-          echo "Barline detection output:"
+          echo "Barline detection outputs:"
           ls -R /tmp/work/detect_barlines_out
 
       #################################################################
-      # 7) Annotate PDF (still debug until we wire measure numbers)
+      # 7) Annotate measures on PDF
       #################################################################
-      - name: Annotate measures on PDF
+      - name: Annotate measures
         run: |
           set -euo pipefail
           python -u parser-api/annotate_measures.py \
             /tmp/work/input.pdf /tmp/work/annotated.pdf
-          echo "Annotated PDF:"
+          echo "Annotated PDF ready:"
           ls -lh /tmp/work/annotated.pdf
 
       #################################################################
-      # 8) Render first page to PNG for debug
+      # 8) Render debug PNG of first page
       #################################################################
       - name: Render annotated PDF to PNG (debug)
         run: |
@@ -126,27 +126,31 @@ jobs:
           python - << 'PYCODE'
           import fitz
           doc = fitz.open("/tmp/work/annotated.pdf")
-          page = doc[0]
-          pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+          pix = doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
           pix.save("/tmp/work/debug/annotated_page1.png")
           doc.close()
           PYCODE
           ls -lh /tmp/work/debug/annotated_page1.png
 
       #################################################################
-      # 9) Upload ALL outputs
+      # 9) Upload ALL outputs to GCS
       #################################################################
       - name: Upload outputs to GCS
         run: |
           set -euo pipefail
-          # Barline detection data
+
+          # Upload barline detection outputs
           gsutil -m cp -r /tmp/work/detect_barlines_out "${{ inputs.output_gcs_prefix }}/detect_barlines_out"
-          # Annotated PDF
+
+          # Upload the annotated PDF
           gsutil cp /tmp/work/annotated.pdf "${{ inputs.output_gcs_prefix }}/annotated.pdf"
-          # Debug PNG
+
+          # Upload debug PNG
           gsutil -m cp -r /tmp/work/debug "${{ inputs.output_gcs_prefix }}/debug"
-          # Optional Audiveris outputs
+
+          # Upload Audiveris outputs if any
           if [ -d /tmp/work/audiveris_out ]; then
             gsutil -m cp -r /tmp/work/audiveris_out "${{ inputs.output_gcs_prefix }}/audiveris_out"
           fi
+
           echo "Upload complete"
