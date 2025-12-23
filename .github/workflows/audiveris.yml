@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       pdf_gcs_uri:
-        description: "GCS URI to input PDF"
+        description: "GCS URI to input PDF (example: gs://your-bucket/input/test.pdf)"
         required: true
         type: string
       output_gcs_prefix:
-        description: "GCS prefix for outputs"
+        description: "GCS prefix for outputs (example: gs://your-bucket/output)"
         required: true
         type: string
 
 jobs:
-  run_pipeline:
+  audiveris_omr_and_barlines:
     runs-on: ubuntu-latest
 
     permissions:
@@ -21,79 +21,132 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout
+      #################################################################
+      # 1) Checkout and authenticate to GCP
+      #################################################################
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v3
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
-      - name: Setup gcloud
-        uses: google-gcloud/setup-gcloud@v2
+      - name: Set up gcloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: ">= 363.0.0"
 
       - name: Show inputs
         run: |
-          echo "PDF: ${{ inputs.pdf_gcs_uri }}"
-          echo "Output: ${{ inputs.output_gcs_prefix }}"
+          echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
+          echo "Output prefix: ${{ inputs.output_gcs_prefix }}"
 
-      - name: Clean output prefix
+      #################################################################
+      # 2) Delete all previous outputs
+      #################################################################
+      - name: Delete all previous outputs
         run: |
           set -euo pipefail
-          gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/**" || echo "Nothing to delete"
+          echo "Deleting all objects under: ${{ inputs.output_gcs_prefix }}"
+          gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/**" || echo "No files to delete"
 
-      - name: Download PDF
+      #################################################################
+      # 3) Download the input PDF
+      #################################################################
+      - name: Download input PDF from GCS
         run: |
+          set -euo pipefail
           mkdir -p /tmp/work
           gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
+          echo "Downloaded input:"
+          ls -lh /tmp/work/input.pdf
 
-      - name: Run Audiveris
+      #################################################################
+      # 4) Run Audiveris OMR (optional)
+      #################################################################
+      - name: Run Audiveris OMR
         run: |
+          set -euo pipefail
           mkdir -p /tmp/work/audiveris_out
           docker pull toprock/audiveris:latest
-          docker run --rm -v /tmp/work:/work toprock/audiveris:latest \
+          docker run --rm \
+            -v /tmp/work:/work \
+            toprock/audiveris:latest \
             audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
+          echo "Audiveris output contents:"
+          ls -R /tmp/work/audiveris_out || true
 
-      - name: Setup Python
+      #################################################################
+      # 5) Set up Python & install dependencies
+      #################################################################
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install Python deps
+      - name: Install Python dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
+      #################################################################
+      # 6) Run barline detection
+      #################################################################
       - name: Run barline detection
         run: |
+          set -euo pipefail
           mkdir -p /tmp/work/detect_barlines_out
           python -u parser-api/detect_barlines_test.py \
             /tmp/work/input.pdf \
             --output-dir /tmp/work/detect_barlines_out
+          echo "Barline detection output:"
           ls -R /tmp/work/detect_barlines_out
 
-      - name: Annotate PDF
+      #################################################################
+      # 7) Annotate PDF (still debug until we wire measure numbers)
+      #################################################################
+      - name: Annotate measures on PDF
         run: |
+          set -euo pipefail
           python -u parser-api/annotate_measures.py \
             /tmp/work/input.pdf /tmp/work/annotated.pdf
+          echo "Annotated PDF:"
+          ls -lh /tmp/work/annotated.pdf
 
-      - name: Render debug PNG
+      #################################################################
+      # 8) Render first page to PNG for debug
+      #################################################################
+      - name: Render annotated PDF to PNG (debug)
         run: |
+          set -euo pipefail
           mkdir -p /tmp/work/debug
           python - << 'PYCODE'
           import fitz
           doc = fitz.open("/tmp/work/annotated.pdf")
-          pix = doc[0].get_pixmap(2,2)
+          page = doc[0]
+          pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
           pix.save("/tmp/work/debug/annotated_page1.png")
           doc.close()
           PYCODE
+          ls -lh /tmp/work/debug/annotated_page1.png
 
-      - name: Upload outputs
+      #################################################################
+      # 9) Upload ALL outputs
+      #################################################################
+      - name: Upload outputs to GCS
         run: |
+          set -euo pipefail
+          # Barline detection data
           gsutil -m cp -r /tmp/work/detect_barlines_out "${{ inputs.output_gcs_prefix }}/detect_barlines_out"
+          # Annotated PDF
           gsutil cp /tmp/work/annotated.pdf "${{ inputs.output_gcs_prefix }}/annotated.pdf"
+          # Debug PNG
           gsutil -m cp -r /tmp/work/debug "${{ inputs.output_gcs_prefix }}/debug"
+          # Optional Audiveris outputs
           if [ -d /tmp/work/audiveris_out ]; then
             gsutil -m cp -r /tmp/work/audiveris_out "${{ inputs.output_gcs_prefix }}/audiveris_out"
           fi
+          echo "Upload complete"
