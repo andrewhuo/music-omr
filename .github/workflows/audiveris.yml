@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       pdf_gcs_uri:
-        description: "GCS URI to your input PDF (example: gs://your-bucket/input/test.pdf)"
+        description: "GCS URI to your input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
         required: true
         type: string
       output_gcs_prefix:
-        description: "GCS prefix to upload output (example: gs://your-bucket/output)"
+        description: "GCS prefix to upload output (gs://music-omr-bucket-777135743132/output)"
         required: true
         type: string
 
