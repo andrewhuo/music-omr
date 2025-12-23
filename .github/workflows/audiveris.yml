@@ -95,13 +95,12 @@ jobs:
       #################################################################
       # 6) Annotate measures on PDF
       #################################################################
-      - name: Annotate measures on PDF
+      - name: Draw guide test on PDF
         run: |
           set -euo pipefail
-          python -u parser-api/annotate_measures.py \
+          python -u parser-api/annotate_measures_v0.py \
             /tmp/work/input.pdf /tmp/work/annotated.pdf
-          echo "Annotated PDF:"
-          ls -lh /tmp/work/annotated.pdf
+
 
       #################################################################
       # 7) Render first page of annotated PDF to PNG (debug)
