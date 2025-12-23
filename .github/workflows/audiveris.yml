@@ -8,12 +8,12 @@ on:
         required: true
         type: string
       output_gcs_prefix:
-        description: "GCS prefix where outputs will go (example: gs://your-bucket/output)"
+        description: "GCS prefix to upload output (example: gs://your-bucket/output)"
         required: true
         type: string
 
 jobs:
-  audiveris_and_barlines:
+  pipeline:
     runs-on: ubuntu-latest
 
     permissions:
@@ -22,9 +22,9 @@ jobs:
 
     steps:
       #################################################################
-      # 1) Checkout and authenticate to Google Cloud
+      # 1) Checkout and authenticate
       #################################################################
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Authenticate to Google Cloud
@@ -33,24 +33,24 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
-      - name: Set up gcloud SDK
+      - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v3
         with:
           version: ">= 363.0.0"
 
       - name: Show inputs
         run: |
-          echo "PDF GCS URI: ${{ inputs.pdf_gcs_uri }}"
-          echo "Output GCS prefix: ${{ inputs.output_gcs_prefix }}"
+          echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
+          echo "Output prefix: ${{ inputs.output_gcs_prefix }}"
 
       #################################################################
-      # 2) Delete all previous outputs
+      # 2) Clean output prefix (delete all previous outputs)
       #################################################################
-      - name: Delete all previous outputs
+      - name: Wipe old outputs
         run: |
           set -euo pipefail
-          echo "Wiping old outputs under: ${{ inputs.output_gcs_prefix }}"
-          gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/**" || echo "No files to delete"
+          echo "Deleting all objects under: ${{ inputs.output_gcs_prefix }}"
+          gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/**" || echo "No objects to delete"
 
       #################################################################
       # 3) Download the input PDF
@@ -60,7 +60,7 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/work
           gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
-          echo "Input PDF downloaded:"
+          echo "Input PDF:"
           ls -lh /tmp/work/input.pdf
 
       #################################################################
@@ -76,10 +76,10 @@ jobs:
             toprock/audiveris:latest \
             audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
           echo "Audiveris output contents:"
-          ls -R /tmp/work/audiveris_out || true
+          ls -R /tmp/work/audiveris_out || echo "(none)"
 
       #################################################################
-      # 5) Set up Python & install dependencies
+      # 5) Python setup & dependencies
       #################################################################
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -108,28 +108,30 @@ jobs:
       #################################################################
       # 7) Annotate measures on PDF
       #################################################################
-      - name: Annotate measures
+      - name: Annotate measures on PDF
         run: |
           set -euo pipefail
           python -u parser-api/annotate_measures.py \
             /tmp/work/input.pdf /tmp/work/annotated.pdf
-          echo "Annotated PDF ready:"
+          echo "Annotated PDF:"
           ls -lh /tmp/work/annotated.pdf
 
       #################################################################
-      # 8) Render debug PNG of first page
+      # 8) Render first page of annotated PDF to PNG (debug)
       #################################################################
-      - name: Render annotated PDF to PNG (debug)
+      - name: Render debug PNG preview
         run: |
           set -euo pipefail
           mkdir -p /tmp/work/debug
           python - << 'PYCODE'
           import fitz
           doc = fitz.open("/tmp/work/annotated.pdf")
-          pix = doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+          page = doc[0]
+          pix = page.get_pixmap(matrix=fitz.Matrix(2,2))
           pix.save("/tmp/work/debug/annotated_page1.png")
           doc.close()
           PYCODE
+          echo "Debug PNG:"
           ls -lh /tmp/work/debug/annotated_page1.png
 
       #################################################################
@@ -139,18 +141,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Upload barline detection outputs
-          gsutil -m cp -r /tmp/work/detect_barlines_out "${{ inputs.output_gcs_prefix }}/detect_barlines_out"
-
-          # Upload the annotated PDF
-          gsutil cp /tmp/work/annotated.pdf "${{ inputs.output_gcs_prefix }}/annotated.pdf"
-
-          # Upload debug PNG
-          gsutil -m cp -r /tmp/work/debug "${{ inputs.output_gcs_prefix }}/debug"
-
-          # Upload Audiveris outputs if any
-          if [ -d /tmp/work/audiveris_out ]; then
-            gsutil -m cp -r /tmp/work/audiveris_out "${{ inputs.output_gcs_prefix }}/audiveris_out"
+          # Barline detection data
+          if [ -d /tmp/work/detect_barlines_out ]; then
+            echo "Uploading detect_barlines_out"
+            gsutil -m cp -r /tmp/work/detect_barlines_out "${{ inputs.output_gcs_prefix }}/detect_barlines_out"
+          else
+            echo "No detect_barlines_out folder"
           fi
 
-          echo "Upload complete"
+          # Annotated PDF
+          gsutil cp /tmp/work/annotated.pdf "${{ inputs.output_gcs_prefix }}/annotated.pdf"
+
+          # Debug PNG
+          gsutil -m cp -r /tmp/work/debug "${{ inputs.output_gcs_prefix }}/debug"
+
+          # Audiveris outputs (only if present)
+          if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
+            echo "Uploading Audiveris outputs"
+            gsutil -m cp -r /tmp/work/audiveris_out "${{ inputs.output_gcs_prefix }}/audiveris_out"
+          else
+            echo "No Audiveris outputs to upload"
+          fi
+
+          echo "All uploads complete"
