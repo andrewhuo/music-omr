@@ -54,7 +54,7 @@ jobs:
     - name: Install Python (for postprocessing)
       uses: actions/setup-python@v6
       with:
-        python-version: '3.11'
+        python-version: '3.10'
 
     - name: Install dependencies
       run: |
@@ -76,4 +76,4 @@ jobs:
 
     - name: Upload measures JSON
       run: |
-        gsutil cp output/measures.json "${{ github.event.inputs.output_gcs_prefix }}/measures.json"
+        gsutil cp output/measures.json
