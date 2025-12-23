@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       pdf_gcs_uri:
-        description: "GCS URI to input PDF (example: gs://YOUR_BUCKET/input/job123.pdf)"
+        description: "GCS URI to input PDF (example: gs://music-omr-bucket-777135743132/input/test.pdf)"
         required: true
         type: string
       output_gcs_prefix:
-        description: "GCS prefix for outputs (example: gs://YOUR_BUCKET/output/job123)"
+        description: "GCS prefix for outputs (example: gs://music-omr-bucket-777135743132/output/job123)"
         required: true
         type: string
 
@@ -21,6 +21,9 @@ jobs:
       id-token: write
 
     steps:
+      #################################################################
+      # 1) Checkout source and authenticate to Google Cloud
+      #################################################################
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -35,48 +38,33 @@ jobs:
 
       - name: Show inputs
         run: |
-          echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
+          echo "Input PDF URI: ${{ inputs.pdf_gcs_uri }}"
           echo "Output prefix: ${{ inputs.output_gcs_prefix }}"
 
-      - name: Clean previous inputs in bucket
-        run: |
-          set -euo pipefail
-          echo "Deleting old inputs under the input folder..."
-          # Delete all objects in the input folder
-          # Example: gs://bucket/input/*
-          # We parse the bucket and prefix:
-          uri="${{ inputs.pdf_gcs_uri }}"
-          # Extract bucket (after gs:// and before first /)
-          bucket=$(echo "$uri" | sed -E 's#^gs://([^/]+)/.*#\1#')
-          # Extract path prefix of input folder (everything up to last /)
-          prefix=$(echo "$uri" | sed -E 's#^gs://[^/]+/(.*)/[^/]+$#\1#')
-          echo "Bucket: $bucket"
-          echo "Prefix: $prefix"
-          gsutil -m rm -r "gs://$bucket/$prefix/*" || echo "No inputs or already deleted"
-
+      #################################################################
+      # 2) Clean previous outputs ONLY
+      #################################################################
       - name: Clean previous outputs in bucket
         run: |
           set -euo pipefail
           echo "Deleting old outputs under ${{ inputs.output_gcs_prefix }}/"
+          # Remove everything under the output prefix
           gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/*" || echo "No outputs to delete"
 
-      - name: (Re)Upload input PDF
-        run: |
-          set -euo pipefail
-          echo "Re-uploading input PDF so it’s available for processing..."
-          # This assumes you still have the input locally in your runner, or you can replace
-          # this with whatever method you use to re-upload the input file. If not, remove
-          # this step and re-upload your PDF by other means before download.
-          gsutil cp "${{ inputs.pdf_gcs_uri }}" "${{ inputs.pdf_gcs_uri }}"
-
+      #################################################################
+      # 3) Download the input PDF
+      #################################################################
       - name: Download input PDF from GCS
         run: |
           set -euo pipefail
           mkdir -p /tmp/work
-          echo "Downloading ${{ inputs.pdf_gcs_uri }}"
+          echo "Downloading input PDF..."
           gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
           ls -lh /tmp/work/input.pdf
 
+      #################################################################
+      # 4) Run Audiveris OMR (optional; prints output if present)
+      #################################################################
       - name: Run Audiveris OMR (Docker)
         run: |
           set -euo pipefail
@@ -86,9 +74,12 @@ jobs:
             -v /tmp/work:/work \
             toprock/audiveris:latest \
             audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
-          echo "Audiveris output listing:"
+          echo "Audiveris output directory contents:"
           ls -R /tmp/work/audiveris_out || true
 
+      #################################################################
+      # 5) Set up Python and install dependencies
+      #################################################################
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -98,35 +89,49 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
+          # Install known working versions
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
+      #################################################################
+      # 6) Run barline detection test with required output-dir
+      #################################################################
       - name: Run barline detection test
         run: |
           set -euo pipefail
           mkdir -p /tmp/work/detect_barlines_out
           python parser-api/detect_barlines_test.py /tmp/work/input.pdf --output-dir /tmp/work/detect_barlines_out
-          echo "Barline detection output listing:"
+          echo "Barline detection output directory contents:"
           ls -R /tmp/work/detect_barlines_out
 
+      #################################################################
+      # 7) Annotate measures on PDF
+      #################################################################
       - name: Annotate measures on PDF
         run: |
           set -euo pipefail
           python parser-api/annotate_measures.py /tmp/work/input.pdf /tmp/work/annotated.pdf
           ls -lh /tmp/work/annotated.pdf
 
+      #################################################################
+      # 8) Upload annotated PDF to GCS
+      #################################################################
       - name: Upload annotated PDF to GCS
         run: |
           set -euo pipefail
           gsutil -m cp /tmp/work/annotated.pdf "${{ inputs.output_gcs_prefix }}/annotated.pdf"
-          echo "Uploaded: ${{ inputs.output_gcs_prefix }}/annotated.pdf"
+          echo "Uploaded annotated PDF to: ${{ inputs.output_gcs_prefix }}/annotated.pdf"
 
+      #################################################################
+      # 9) Upload Audiveris outputs to GCS (optional)
+      #################################################################
       - name: Upload Audiveris outputs to GCS (optional)
         run: |
           set -euo pipefail
+          # Only upload if the folder exists and has contents
           if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
-            echo "Uploading Audiveris outputs:"
+            echo "Uploading Audiveris outputs..."
             gsutil -m cp -r /tmp/work/audiveris_out "${{ inputs.output_gcs_prefix }}/audiveris_out"
             echo "Uploaded Audiveris outputs to: ${{ inputs.output_gcs_prefix }}/audiveris_out"
           else
-            echo "No Audiveris outputs to upload (folder missing or empty), skipping."
+            echo "No Audiveris outputs to upload (folder empty or missing), skipping."
           fi
