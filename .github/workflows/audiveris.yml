@@ -46,7 +46,6 @@ jobs:
           gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
           ls -lh /tmp/work/input.pdf
 
-      # OMR step (Audiveris), adjust if needed
       - name: Run Audiveris OMR (Docker)
         run: |
           set -euo pipefail
@@ -68,13 +67,15 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Install a real available wheel version of opencv-python
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
       - name: Run barline detection test
         run: |
           set -euo pipefail
-          python parser-api/detect_barlines_test.py /tmp/work/input.pdf
+          mkdir -p /tmp/work/detect_barlines_out
+          python parser-api/detect_barlines_test.py /tmp/work/input.pdf --output-dir /tmp/work/detect_barlines_out
+          echo "Barline detection output:"
+          ls -R /tmp/work/detect_barlines_out
 
       - name: Annotate measures on PDF
         run: |
