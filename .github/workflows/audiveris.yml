@@ -43,6 +43,45 @@ jobs:
           echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
           echo "Output prefix: ${{ inputs.output_gcs_prefix }}"
 
+      - name: Validate GCS inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IN="${{ inputs.pdf_gcs_uri }}"
+          OUT="${{ inputs.output_gcs_prefix }}"
+
+          echo "Validating:"
+          echo "  pdf_gcs_uri=$IN"
+          echo "  output_gcs_prefix=$OUT"
+
+          # Must be gs:// URIs
+          [[ "$IN"  == gs://* ]] || { echo "ERROR: pdf_gcs_uri must start with gs://"; exit 1; }
+          [[ "$OUT" == gs://* ]] || { echo "ERROR: output_gcs_prefix must start with gs://"; exit 1; }
+
+          # After gs://, do NOT allow ':' or '://'
+          # This prevents weird object names like outputgs:// (GCS object names allow odd characters).
+          REST="${OUT#gs://}"
+          if [[ "$REST" == *:* ]]; then
+            echo "ERROR: output_gcs_prefix must NOT contain ':' after gs:// (this can create names like outputgs://)."
+            exit 1
+          fi
+          if [[ "$REST" == *"://"* ]]; then
+            echo "ERROR: output_gcs_prefix contains '://'. It should be like gs://<bucket>/<prefix>."
+            exit 1
+          fi
+
+          # Avoid double slashes and trailing slash (which can lead to accidental prefixes)
+          if [[ "$REST" == *"//"* ]]; then
+            echo "ERROR: output_gcs_prefix contains '//' after gs://. Remove extra slashes."
+            exit 1
+          fi
+          if [[ "$OUT" == */ ]]; then
+            echo "ERROR: output_gcs_prefix must not end with '/'. Use .../output not .../output/"
+            exit 1
+          fi
+
+
       #################################################################
       # 2) Clean output prefix (delete all previous outputs)
       #################################################################
