@@ -43,47 +43,62 @@ jobs:
           echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
           echo "Output prefix: ${{ inputs.output_gcs_prefix }}"
 
-      - name: Validate GCS inputs
+      #################################################################
+      # 2) Wipe everything except input/ and output/ in the main bucket
+      #################################################################
+      - name: Wipe non-input/output prefixes in main bucket
         shell: bash
         run: |
           set -euo pipefail
 
-          IN="${{ inputs.pdf_gcs_uri }}"
-          OUT="${{ inputs.output_gcs_prefix }}"
+          BUCKET="gs://music-omr-bucket-777135743132"
+          KEEP_INPUT="${BUCKET}/input/"
+          KEEP_OUTPUT="${BUCKET}/output/"
 
-          echo "Validating:"
-          echo "  pdf_gcs_uri=$IN"
-          echo "  output_gcs_prefix=$OUT"
+          echo "Bucket: ${BUCKET}"
+          echo "Keeping: ${KEEP_INPUT}"
+          echo "Keeping: ${KEEP_OUTPUT}"
+          echo "Listing top-level entries..."
 
-          # Must be gs:// URIs
-          [[ "$IN"  == gs://* ]] || { echo "ERROR: pdf_gcs_uri must start with gs://"; exit 1; }
-          [[ "$OUT" == gs://* ]] || { echo "ERROR: output_gcs_prefix must start with gs://"; exit 1; }
+          # Top-level listing (prefixes and any root objects)
+          mapfile -t ITEMS < <(gsutil ls -d "${BUCKET}/*" 2>/dev/null || true)
 
-          # After gs://, do NOT allow ':' or '://'
-          # This prevents weird object names like outputgs:// (GCS object names allow odd characters).
-          REST="${OUT#gs://}"
-          if [[ "$REST" == *:* ]]; then
-            echo "ERROR: output_gcs_prefix must NOT contain ':' after gs:// (this can create names like outputgs://)."
-            exit 1
-          fi
-          if [[ "$REST" == *"://"* ]]; then
-            echo "ERROR: output_gcs_prefix contains '://'. It should be like gs://<bucket>/<prefix>."
-            exit 1
+          if [[ ${#ITEMS[@]} -eq 0 ]]; then
+            echo "No top-level entries found (or none visible)."
+            exit 0
           fi
 
-          # Avoid double slashes and trailing slash (which can lead to accidental prefixes)
-          if [[ "$REST" == *"//"* ]]; then
-            echo "ERROR: output_gcs_prefix contains '//' after gs://. Remove extra slashes."
-            exit 1
-          fi
-          if [[ "$OUT" == */ ]]; then
-            echo "ERROR: output_gcs_prefix must not end with '/'. Use .../output not .../output/"
-            exit 1
-          fi
+          echo "Top-level entries:"
+          printf '  %s\n' "${ITEMS[@]}"
+
+          for ITEM in "${ITEMS[@]}"; do
+            # Keep only input/ and output/
+            if [[ "$ITEM" == "$KEEP_INPUT" || "$ITEM" == "$KEEP_OUTPUT" ]]; then
+              echo "KEEP   $ITEM"
+              continue
+            fi
+
+            echo "DELETE $ITEM"
+
+            # If it's a "prefix" (ends with /), delete everything under it.
+            # The ** pattern matches all objects under that prefix.
+            if [[ "$ITEM" == */ ]]; then
+              gsutil -m rm -r "${ITEM}**" || true
+
+              # Also try to remove any legacy "folder placeholder" object names, if they exist.
+              gsutil rm "${ITEM}" 2>/dev/null || true
+              gsutil rm "${ITEM%/}_$folder$" 2>/dev/null || true
+            else
+              # It's a root-level object (like the weird outputgs:// object)
+              gsutil rm "$ITEM" || true
+            fi
+          done
+
+          echo "Cleanup complete."
 
 
       #################################################################
-      # 2) Clean output prefix (delete all previous outputs)
+      # 3) Clean output prefix (delete all previous outputs)
       #################################################################
       - name: Wipe old outputs
         run: |
@@ -92,7 +107,7 @@ jobs:
           gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/**" || echo "No objects to delete"
 
       #################################################################
-      # 3) Download the input PDF
+      # 4) Download the input PDF
       #################################################################
       - name: Download input PDF
         run: |
@@ -103,7 +118,7 @@ jobs:
           ls -lh /tmp/work/input.pdf
 
       #################################################################
-      # 4) Run Audiveris OMR (optional)
+      # 5) Run Audiveris OMR (optional)
       #################################################################
       - name: Run Audiveris OMR
         run: |
@@ -118,7 +133,7 @@ jobs:
           ls -R /tmp/work/audiveris_out || echo "(none)"
 
       #################################################################
-      # 5) Python setup & dependencies
+      # 6) Python setup & dependencies
       #################################################################
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -132,7 +147,7 @@ jobs:
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
       #################################################################
-      # 6) Annotate measures on PDF
+      # 7) Annotate measures on PDF
       #################################################################
       - name: Draw staff-bounded guides (debug)
         run: |
@@ -145,7 +160,7 @@ jobs:
 
 
       #################################################################
-      # 7) Render first page of annotated PDF to PNG (debug)
+      # 8) Render first page of annotated PDF to PNG (debug)
       #################################################################
       - name: Render debug PNG preview
         run: |
@@ -163,7 +178,7 @@ jobs:
           ls -lh /tmp/work/debug/annotated_page1.png
 
       #################################################################
-      # 8) Upload ALL outputs to GCS
+      # 9) Upload ALL outputs to GCS
       #################################################################
       - name: Upload outputs to GCS
         run: |
