@@ -87,20 +87,17 @@ def render_page_to_bgr(page: fitz.Page, zoom: float) -> np.ndarray:
 
 def binarize_ink(gray: np.ndarray) -> np.ndarray:
     # ink -> 255, background -> 0
-    # (Otsu + inverse binary is standard for scanned docs)
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     return ink
 
 
 def extract_horizontal_lines_mask(ink: np.ndarray) -> np.ndarray:
-    # Morphological line extraction (erode/dilate with wide horizontal kernel)
     w = ink.shape[1]
     kernel_len = max(30, w // HORIZ_KERNEL_DIV)
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
     tmp = cv2.erode(ink, horiz_kernel, iterations=1)
     horiz = cv2.dilate(tmp, horiz_kernel, iterations=1)
 
-    # reconnect small breaks
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (HORIZ_CLOSE_LEN, 1))
     horiz = cv2.morphologyEx(horiz, cv2.MORPH_CLOSE, close_kernel, iterations=1)
     return horiz
@@ -207,10 +204,6 @@ def _spacing_ok(lines5: list[int]) -> bool:
 
 
 def _fit_5_line_pattern(cands: list[int], approx5: list[int]) -> list[int] | None:
-    """
-    Given candidate line centers in absolute coords, try to fit a 5-line pattern
-    anchored near approx5 (to avoid jumping to adjacent staff).
-    """
     if len(cands) < 5:
         return None
     approx5 = sorted(approx5)
@@ -231,7 +224,6 @@ def _fit_5_line_pattern(cands: list[int], approx5: list[int]) -> list[int] | Non
         ok = True
         for k in range(1, 5):
             target = top + k * spacing
-            # nearest candidate to target
             idx = int(np.argmin([abs(y - target) for y in cands]))
             yk = cands[idx]
             err = abs(yk - target)
@@ -248,7 +240,6 @@ def _fit_5_line_pattern(cands: list[int], approx5: list[int]) -> list[int] | Non
         if not _spacing_ok(chosen):
             continue
 
-        # anchor penalty: stay near original staff window
         anchor_pen = abs(chosen[0] - approx_top) + abs(chosen[-1] - approx_bot)
         total = score + 0.15 * anchor_pen
 
@@ -260,10 +251,6 @@ def _fit_5_line_pattern(cands: list[int], approx5: list[int]) -> list[int] | Non
 
 
 def refine_staff_5_lines(horiz_mask: np.ndarray, approx5: list[int]) -> list[int] | None:
-    """
-    Robustly return refined 5 staff lines (absolute y coords).
-    Retries with different thresholds and band sizes if needed.
-    """
     approx5 = sorted(approx5)
     approx_top, approx_bot = approx5[0], approx5[-1]
     H, W = horiz_mask.shape[:2]
@@ -290,10 +277,8 @@ def refine_staff_5_lines(horiz_mask: np.ndarray, approx5: list[int]) -> list[int
             if fitted is not None:
                 return fitted
 
-            # fallback attempt: best 5-line window among candidates, then validate
             win = sorted(best_five_line_window(cands_abs))
             if len(win) == 5 and _spacing_ok(win):
-                # ensure it doesn't jump far away from approx staff
                 if abs(win[0] - approx_top) <= staff_h and abs(win[-1] - approx_bot) <= staff_h:
                     return win
 
@@ -311,7 +296,6 @@ def _first_continuous_run_x(mask_1d: np.ndarray, win: int, min_on: int) -> int |
 
 def fallback_staffline_start_x(horiz_mask: np.ndarray, staff5: list[int]) -> int | None:
     H, W = horiz_mask.shape[:2]
-    # Dilate a bit to bridge gaps
     dil_k = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1))
     hm = cv2.dilate(horiz_mask, dil_k, iterations=1)
 
@@ -336,11 +320,12 @@ def fallback_staffline_start_x(horiz_mask: np.ndarray, staff5: list[int]) -> int
     return None
 
 
-def clef_blob_anchor_x(ink_mask: np.ndarray, horiz_mask: np.ndarray, top_y: int, bot_y: int) -> tuple[int | None, tuple[int, int, int, int] | None]:
-    """
-    Find x for guide as "just left of the leftmost large symbol blob" in the staff band,
-    after subtracting staff lines. Returns (x_guide, bbox) where bbox=(x,y,w,h) in pixel coords.
-    """
+def clef_blob_anchor_x(
+    ink_mask: np.ndarray,
+    horiz_mask: np.ndarray,
+    top_y: int,
+    bot_y: int
+) -> tuple[int | None, tuple[int, int, int, int] | None]:
     H, W = ink_mask.shape[:2]
     staff_h = max(1, bot_y - top_y)
     margin = int(staff_h * STAFF_BAND_MARGIN_FRAC)
@@ -349,29 +334,26 @@ def clef_blob_anchor_x(ink_mask: np.ndarray, horiz_mask: np.ndarray, top_y: int,
 
     band_ink = ink_mask[y0:y1, :].copy()
 
-    # Subtract staff lines (dilate first so we remove the thickened line area)
     dil = cv2.getStructuringElement(cv2.MORPH_RECT, (STAFFLINE_SUBTRACT_DILATE, 1))
     staff_d = cv2.dilate(horiz_mask[y0:y1, :], dil, iterations=1)
     band_ink[staff_d > 0] = 0
 
-    # Clean speckles
     if INK_OPEN_K >= 2:
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (INK_OPEN_K, INK_OPEN_K))
         band_ink = cv2.morphologyEx(band_ink, cv2.MORPH_OPEN, k, iterations=1)
 
-    # Connected components on binary image
     bin_img = (band_ink > 0).astype(np.uint8)
     if np.count_nonzero(bin_img) == 0:
         return None, None
 
     num, labels, stats, _ = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
-    # stats rows: [x, y, w, h, area]
+
     band_area = float(bin_img.shape[0] * bin_img.shape[1])
     min_area = int(max(30, band_area * CLEF_MIN_AREA_FRAC))
     max_x = int(W * CLEF_MAX_X_FRAC)
 
     best = None  # (x, -area, bbox)
-    for i in range(1, num):  # skip background
+    for i in range(1, num):
         x, y, w, h, area = stats[i]
         if area < min_area:
             continue
@@ -380,7 +362,6 @@ def clef_blob_anchor_x(ink_mask: np.ndarray, horiz_mask: np.ndarray, top_y: int,
         if h < int(staff_h * CLEF_MIN_H_FRAC):
             continue
 
-        # vertical overlap with staff region
         comp_top = y0 + y
         comp_bot = y0 + y + h
         overlap = max(0, min(comp_bot, bot_y) - max(comp_top, top_y))
@@ -425,32 +406,30 @@ def annotate_guides(input_pdf: str, output_pdf: str):
             refined = refine_staff_5_lines(horiz, approx)
             if refined is None or len(refined) != 5:
                 if DEBUG_MARK_BAD_STAFF:
-                    # mark near the approx top-left area
                     x_pdf = 8 / ZOOM
                     y_pdf = approx[0] / ZOOM
-                    page.draw_rect(fitz.Rect(x_pdf, y_pdf, x_pdf + 6/ZOOM, y_pdf + 6/ZOOM), color=(1, 0, 1), width=1)
+                    page.draw_rect(
+                        fitz.Rect(x_pdf, y_pdf, x_pdf + 6/ZOOM, y_pdf + 6/ZOOM),
+                        color=(1, 0, 1),
+                        width=1
+                    )
                 continue
 
             staff5 = sorted(refined)
             top_y, bot_y = staff5[0], staff5[-1]
 
-            # Primary X: clef/key ink blob anchor
             x_left, bbox = clef_blob_anchor_x(ink, horiz, top_y, bot_y)
-
-            # Fallback X: staffline-start heuristic
             if x_left is None:
                 x_left = fallback_staffline_start_x(horiz, staff5)
 
             if x_left is None:
                 continue
 
-            # Optional debug box around chosen blob (helps tuning)
             if DEBUG_DRAW_CLEF_BOX and bbox is not None:
                 bx, by, bw, bh = bbox
                 r = fitz.Rect(bx/ZOOM, by/ZOOM, (bx+bw)/ZOOM, (by+bh)/ZOOM)
                 page.draw_rect(r, color=(0, 1, 1), width=0.8)
 
-            # Draw guide: line between staff line 1 and 5
             x_pdf = x_left / ZOOM
             y0_pdf = top_y / ZOOM
             y1_pdf = bot_y / ZOOM
