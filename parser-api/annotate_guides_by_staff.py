@@ -2,14 +2,18 @@
 """
 Draw a short RED vertical guide for EACH staff on each page.
 
-Goals:
-- Each guide spans from the 1st staff line to the 5th staff line (robustly).
-- X position is the left start of the staff lines for that staff (handles indents).
-- Each staff is processed independently (no shared/global X).
+What we want:
+- Vertical span: exactly from staff line 1 to staff line 5.
+- Horizontal position: just LEFT of the clef/key-signature ink (pre-measure marker).
+- Each staff independent: different indents handled naturally.
 
-Fixes:
-- Prevent "short outliers" by refining staff lines using an expected 5-line pattern.
-- Prevent "too far right" by scanning for the first continuous staff-line run.
+Approach (image-only):
+1) Binarize (Otsu) for ink mask.
+2) Extract horizontal staff lines with morphology (erode/dilate).
+3) Detect staff-line rows via projection profile and group into staves.
+4) Refine each staff to an accurate 5-line pattern (guarded; retries if suspicious).
+5) For X: remove staff lines from ink mask, then use connected components inside the staff band
+   to find the leftmost "big" symbol blob (clef/key). Place guide slightly left of that.
 """
 
 import sys
@@ -17,33 +21,50 @@ import fitz  # PyMuPDF
 import numpy as np
 import cv2
 
+
 # -----------------------------
-# Tunables
+# Tunables (start here when tuning)
 # -----------------------------
 ZOOM = 2.0
 
 # Staff line row detection (adaptive)
-ROW_HIT_FRAC = 0.07
-ROW_HIT_MIN = 120
+ROW_HIT_FRAC = 0.07     # row must have at least this fraction of width "on" to count as staff line
+ROW_HIT_MIN = 120       # absolute floor
+
 MAX_GAP_BETWEEN_LINES = 18
 MIN_LINES_PER_STAFF = 4
 
-# Horizontal morphology
-HORIZ_KERNEL_DIV = 25          # kernel_len = max(30, width // HORIZ_KERNEL_DIV)
-HORIZ_CLOSE_LEN = 7            # reconnect small breaks
+# Horizontal morphology for staff lines (from OpenCV line extraction style)
+HORIZ_KERNEL_DIV = 25   # kernel_len = max(30, width // HORIZ_KERNEL_DIV)
+HORIZ_CLOSE_LEN = 9     # reconnect small breaks in staff lines
 
-# Refinement
-REFINE_PAD_PX = 28
-REFINE_LOCAL_THRESH_FRAC = 0.38
+# Refinement retries
+REFINE_PAD_BASE = 28
+REFINE_PAD_MULTS = (0.6, 1.0, 1.5)                 # try increasing local search bands
+REFINE_THRESH_FRACS = (0.42, 0.35, 0.28, 0.22)     # try progressively gentler thresholds
 
-# Pattern matching tolerance (relative to staff spacing)
-SPACING_TOL_FRAC = 0.35
+SPACING_TOL_FRAC = 0.30   # allowed deviation relative to staff spacing
+MIN_STAFF_SPACING = 5.0
+MAX_STAFF_SPACING = 22.0
 
-# Left-edge scan settings
-X_RUN_WINDOW = 25              # pixels
-X_RUN_MIN_FRAC = 0.60          # window must be at least this "on"
-X_NUDGE_LEFT_PX = 4            # tiny nudge left to counter residual right bias
-X_MIN = 0
+# X anchor via ink blobs (clef/key)
+STAFF_BAND_MARGIN_FRAC = 0.25    # band extends beyond staff by this fraction of staff height
+STAFFLINE_SUBTRACT_DILATE = 17   # dilate staffline mask before subtracting from ink
+INK_OPEN_K = 3                   # cleanup speckles in ink mask
+
+CLEF_MIN_AREA_FRAC = 0.010       # min component area relative to staff band area
+CLEF_MIN_H_FRAC = 0.55           # component height relative to staff height
+CLEF_MIN_OVERLAP_FRAC = 0.60     # vertical overlap with staff region
+CLEF_MAX_X_FRAC = 0.55           # only consider blobs in left portion of page
+PAD_LEFT_OF_CLEF_PX = 6          # place guide this many px left of the clef/key blob
+
+# Fallback X (only if blob method fails)
+X_RUN_WINDOW = 27
+X_RUN_MIN_FRAC = 0.65
+
+# Debug toggles
+DEBUG_DRAW_CLEF_BOX = False      # draws a thin cyan box around chosen blob (useful when tuning)
+DEBUG_MARK_BAD_STAFF = False     # draws a small magenta square if staff refinement fails
 
 
 def render_page_to_bgr(page: fitz.Page, zoom: float) -> np.ndarray:
@@ -51,6 +72,7 @@ def render_page_to_bgr(page: fitz.Page, zoom: float) -> np.ndarray:
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
 
+    # PyMuPDF gives RGB for alpha=False; OpenCV expects BGR
     if pix.n == 1:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     elif pix.n == 3:
@@ -60,41 +82,44 @@ def render_page_to_bgr(page: fitz.Page, zoom: float) -> np.ndarray:
     else:
         img = img[:, :, :3]
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
     return img
 
 
-def extract_horizontal_lines_mask(gray: np.ndarray) -> np.ndarray:
-    # Dark lines -> white mask
-    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+def binarize_ink(gray: np.ndarray) -> np.ndarray:
+    # ink -> 255, background -> 0
+    # (Otsu + inverse binary is standard for scanned docs)
+    _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return ink
 
-    # Extract horizontal lines
-    kernel_len = max(30, gray.shape[1] // HORIZ_KERNEL_DIV)
+
+def extract_horizontal_lines_mask(ink: np.ndarray) -> np.ndarray:
+    # Morphological line extraction (erode/dilate with wide horizontal kernel)
+    w = ink.shape[1]
+    kernel_len = max(30, w // HORIZ_KERNEL_DIV)
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
-    tmp = cv2.erode(bw, horiz_kernel, iterations=1)
+    tmp = cv2.erode(ink, horiz_kernel, iterations=1)
     horiz = cv2.dilate(tmp, horiz_kernel, iterations=1)
 
-    # Reconnect small breaks (important for left-edge detection)
+    # reconnect small breaks
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (HORIZ_CLOSE_LEN, 1))
     horiz = cv2.morphologyEx(horiz, cv2.MORPH_CLOSE, close_kernel, iterations=1)
-
     return horiz
 
 
 def find_staff_line_ys(horiz_mask: np.ndarray) -> list[int]:
     row_sums = np.sum(horiz_mask > 0, axis=1)
     W = horiz_mask.shape[1]
-    row_hit_threshold = max(ROW_HIT_MIN, int(W * ROW_HIT_FRAC))
+    threshold = max(ROW_HIT_MIN, int(W * ROW_HIT_FRAC))
 
     ys: list[int] = []
     in_run = False
     run_start = 0
 
-    for y, count in enumerate(row_sums):
-        if count >= row_hit_threshold and not in_run:
+    for y, cnt in enumerate(row_sums):
+        if cnt >= threshold and not in_run:
             in_run = True
             run_start = y
-        elif count < row_hit_threshold and in_run:
+        elif cnt < threshold and in_run:
             in_run = False
             run_end = y - 1
             ys.append((run_start + run_end) // 2)
@@ -115,7 +140,6 @@ def group_lines_into_staves(line_ys: list[int]) -> list[list[int]]:
         if not cur:
             cur = [y]
             continue
-
         if y - cur[-1] <= MAX_GAP_BETWEEN_LINES:
             cur.append(y)
         else:
@@ -136,19 +160,15 @@ def best_five_line_window(ys: list[int]) -> list[int]:
 
     best = ys[:5]
     best_score = float("inf")
-
     for i in range(0, len(ys) - 4):
         w = ys[i:i + 5]
-        diffs = [w[j + 1] - w[j] for j in range(4)]
+        diffs = np.diff(w)
         med = float(np.median(diffs))
-        var = sum(abs(d - med) for d in diffs)
-
-        # Slight preference lower on page
+        var = float(np.sum(np.abs(diffs - med)))
         score = var - 0.002 * w[-1]
         if score < best_score:
             best_score = score
             best = w
-
     return best
 
 
@@ -173,54 +193,47 @@ def _run_centers_from_row_sums(row_sums: np.ndarray, threshold: int) -> list[int
     return centers
 
 
-def refine_staff_5_lines(horiz_mask: np.ndarray, approx5: list[int]) -> list[int]:
+def _spacing_ok(lines5: list[int]) -> bool:
+    if len(lines5) != 5:
+        return False
+    diffs = np.diff(sorted(lines5)).astype(np.float32)
+    spacing = float(np.median(diffs))
+    if spacing < MIN_STAFF_SPACING or spacing > MAX_STAFF_SPACING:
+        return False
+    tol = max(2.0, spacing * SPACING_TOL_FRAC)
+    if float(np.max(np.abs(diffs - spacing))) > tol:
+        return False
+    return True
+
+
+def _fit_5_line_pattern(cands: list[int], approx5: list[int]) -> list[int] | None:
     """
-    Refine to the true 1st..5th staff line set.
-    Uses a local band and fits a 5-line pattern based on the approx spacing.
+    Given candidate line centers in absolute coords, try to fit a 5-line pattern
+    anchored near approx5 (to avoid jumping to adjacent staff).
     """
+    if len(cands) < 5:
+        return None
     approx5 = sorted(approx5)
-    approx_top, approx_bot = approx5[0], approx5[-1]
-    H, W = horiz_mask.shape[:2]
-
-    diffs = np.diff(approx5) if len(approx5) >= 2 else np.array([10])
+    diffs = np.diff(approx5) if len(approx5) >= 2 else np.array([10.0])
     spacing = float(np.median(diffs)) if diffs.size else 10.0
-    spacing = max(6.0, spacing)
-
-    staff_h = max(1, approx_bot - approx_top)
-    pad = max(REFINE_PAD_PX, int(staff_h * 0.6))
-
-    y0 = max(0, approx_top - pad)
-    y1 = min(H, approx_bot + pad)
-    band = horiz_mask[y0:y1, :]
-
-    row_sums = np.sum(band > 0, axis=1)
-    mx = int(row_sums.max()) if row_sums.size else 0
-    if mx <= 0:
-        return approx5
-
-    local_thresh = max(20, int(mx * REFINE_LOCAL_THRESH_FRAC))
-    centers = _run_centers_from_row_sums(row_sums, local_thresh)
-    if len(centers) < 5:
-        return approx5
-
-    centers_abs = sorted([c + y0 for c in centers])
-
-    # Fit 5-line pattern: pick a top, then seek 4 more lines near top + k*spacing
+    spacing = float(np.clip(spacing, MIN_STAFF_SPACING, MAX_STAFF_SPACING))
     tol = max(2.0, spacing * SPACING_TOL_FRAC)
 
     best = None
     best_score = float("inf")
 
-    for top in centers_abs:
+    cands = sorted(cands)
+    approx_top, approx_bot = approx5[0], approx5[-1]
+
+    for top in cands:
         chosen = [top]
         score = 0.0
         ok = True
-
         for k in range(1, 5):
             target = top + k * spacing
             # nearest candidate to target
-            idx = int(np.argmin([abs(y - target) for y in centers_abs]))
-            yk = centers_abs[idx]
+            idx = int(np.argmin([abs(y - target) for y in cands]))
+            yk = cands[idx]
             err = abs(yk - target)
             if err > tol:
                 ok = False
@@ -228,77 +241,163 @@ def refine_staff_5_lines(horiz_mask: np.ndarray, approx5: list[int]) -> list[int
             chosen.append(yk)
             score += err
 
-        if ok:
-            chosen = sorted(chosen)
-            # Keep it anchored near our original approx window (prevents snapping to wrong staff)
-            anchor_penalty = abs(chosen[0] - approx_top) + abs(chosen[-1] - approx_bot)
-            total = score + 0.15 * anchor_penalty
-            if total < best_score:
-                best_score = total
-                best = chosen
+        if not ok:
+            continue
 
-    if best is not None:
-        return best
+        chosen = sorted(chosen)
+        if not _spacing_ok(chosen):
+            continue
 
-    # Fallback: best 5-line window among candidates
-    return sorted(best_five_line_window(centers_abs))
+        # anchor penalty: stay near original staff window
+        anchor_pen = abs(chosen[0] - approx_top) + abs(chosen[-1] - approx_bot)
+        total = score + 0.15 * anchor_pen
+
+        if total < best_score:
+            best_score = total
+            best = chosen
+
+    return best
+
+
+def refine_staff_5_lines(horiz_mask: np.ndarray, approx5: list[int]) -> list[int] | None:
+    """
+    Robustly return refined 5 staff lines (absolute y coords).
+    Retries with different thresholds and band sizes if needed.
+    """
+    approx5 = sorted(approx5)
+    approx_top, approx_bot = approx5[0], approx5[-1]
+    H, W = horiz_mask.shape[:2]
+    staff_h = max(1, approx_bot - approx_top)
+
+    for pad_mult in REFINE_PAD_MULTS:
+        pad = max(REFINE_PAD_BASE, int(staff_h * pad_mult))
+        y0 = max(0, approx_top - pad)
+        y1 = min(H, approx_bot + pad)
+        band = horiz_mask[y0:y1, :]
+        row_sums = np.sum(band > 0, axis=1)
+        mx = int(row_sums.max()) if row_sums.size else 0
+        if mx <= 0:
+            continue
+
+        for frac in REFINE_THRESH_FRACS:
+            thr = max(20, int(mx * frac))
+            centers = _run_centers_from_row_sums(row_sums, thr)
+            if len(centers) < 5:
+                continue
+            cands_abs = [c + y0 for c in centers]
+
+            fitted = _fit_5_line_pattern(cands_abs, approx5)
+            if fitted is not None:
+                return fitted
+
+            # fallback attempt: best 5-line window among candidates, then validate
+            win = sorted(best_five_line_window(cands_abs))
+            if len(win) == 5 and _spacing_ok(win):
+                # ensure it doesn't jump far away from approx staff
+                if abs(win[0] - approx_top) <= staff_h and abs(win[-1] - approx_bot) <= staff_h:
+                    return win
+
+    return None
 
 
 def _first_continuous_run_x(mask_1d: np.ndarray, win: int, min_on: int) -> int | None:
-    """
-    Find the first x where a window of length win has at least min_on "on" pixels.
-    mask_1d: uint8 0/1
-    """
     if mask_1d.size < win:
         return None
     kernel = np.ones(win, dtype=np.int32)
     run = np.convolve(mask_1d.astype(np.int32), kernel, mode="same")
     hits = np.where(run >= min_on)[0]
-    if hits.size == 0:
-        return None
-    return int(hits[0])
+    return int(hits[0]) if hits.size else None
 
 
-def left_edge_x_for_staff(horiz_mask: np.ndarray, staff5: list[int]) -> int | None:
-    """
-    Determine where the staff lines *start* for this staff (handles indents).
-    Uses an early "continuous run" detector per staff line, then aggregates.
-    """
+def fallback_staffline_start_x(horiz_mask: np.ndarray, staff5: list[int]) -> int | None:
     H, W = horiz_mask.shape[:2]
-    if len(staff5) < 5:
-        return None
-
-    # Light dilation to bridge tiny gaps (especially under clef)
-    dil_k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1))
+    # Dilate a bit to bridge gaps
+    dil_k = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1))
     hm = cv2.dilate(horiz_mask, dil_k, iterations=1)
 
     win = X_RUN_WINDOW
     min_on = int(win * X_RUN_MIN_FRAC)
 
     xs = []
-    for y in staff5[:5]:
+    for y in staff5:
         a = max(0, y - 1)
         b = min(H, y + 2)
         strip = hm[a:b, :]
         col_any = (np.any(strip > 0, axis=0)).astype(np.uint8)
-
         x0 = _first_continuous_run_x(col_any, win=win, min_on=min_on)
         if x0 is not None:
             xs.append(x0)
 
     if len(xs) >= 3:
-        # Use the median of the 3 smallest to lean left but stay stable
         xs = sorted(xs)[:3]
-        x_left = int(np.median(xs))
-        x_left = max(X_MIN, x_left - X_NUDGE_LEFT_PX)
-        return x_left
-
-    if len(xs) > 0:
-        x_left = int(np.median(xs))
-        x_left = max(X_MIN, x_left - X_NUDGE_LEFT_PX)
-        return x_left
-
+        return int(np.median(xs))
+    if xs:
+        return int(np.median(xs))
     return None
+
+
+def clef_blob_anchor_x(ink_mask: np.ndarray, horiz_mask: np.ndarray, top_y: int, bot_y: int) -> tuple[int | None, tuple[int, int, int, int] | None]:
+    """
+    Find x for guide as "just left of the leftmost large symbol blob" in the staff band,
+    after subtracting staff lines. Returns (x_guide, bbox) where bbox=(x,y,w,h) in pixel coords.
+    """
+    H, W = ink_mask.shape[:2]
+    staff_h = max(1, bot_y - top_y)
+    margin = int(staff_h * STAFF_BAND_MARGIN_FRAC)
+    y0 = max(0, top_y - margin)
+    y1 = min(H, bot_y + margin)
+
+    band_ink = ink_mask[y0:y1, :].copy()
+
+    # Subtract staff lines (dilate first so we remove the thickened line area)
+    dil = cv2.getStructuringElement(cv2.MORPH_RECT, (STAFFLINE_SUBTRACT_DILATE, 1))
+    staff_d = cv2.dilate(horiz_mask[y0:y1, :], dil, iterations=1)
+    band_ink[staff_d > 0] = 0
+
+    # Clean speckles
+    if INK_OPEN_K >= 2:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (INK_OPEN_K, INK_OPEN_K))
+        band_ink = cv2.morphologyEx(band_ink, cv2.MORPH_OPEN, k, iterations=1)
+
+    # Connected components on binary image
+    bin_img = (band_ink > 0).astype(np.uint8)
+    if np.count_nonzero(bin_img) == 0:
+        return None, None
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
+    # stats rows: [x, y, w, h, area]
+    band_area = float(bin_img.shape[0] * bin_img.shape[1])
+    min_area = int(max(30, band_area * CLEF_MIN_AREA_FRAC))
+    max_x = int(W * CLEF_MAX_X_FRAC)
+
+    best = None  # (x, -area, bbox)
+    for i in range(1, num):  # skip background
+        x, y, w, h, area = stats[i]
+        if area < min_area:
+            continue
+        if x > max_x:
+            continue
+        if h < int(staff_h * CLEF_MIN_H_FRAC):
+            continue
+
+        # vertical overlap with staff region
+        comp_top = y0 + y
+        comp_bot = y0 + y + h
+        overlap = max(0, min(comp_bot, bot_y) - max(comp_top, top_y))
+        if overlap < int(staff_h * CLEF_MIN_OVERLAP_FRAC):
+            continue
+
+        bbox = (x, y0 + y, w, h)
+        cand = (x, -area, bbox)
+        if best is None or cand < best:
+            best = cand
+
+    if best is None:
+        return None, None
+
+    x_blob, _, bbox = best
+    x_guide = max(0, int(x_blob - PAD_LEFT_OF_CLEF_PX))
+    return x_guide, bbox
 
 
 def annotate_guides(input_pdf: str, output_pdf: str):
@@ -308,7 +407,9 @@ def annotate_guides(input_pdf: str, output_pdf: str):
         img = render_page_to_bgr(page, ZOOM)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        horiz = extract_horizontal_lines_mask(gray)
+        ink = binarize_ink(gray)
+        horiz = extract_horizontal_lines_mask(ink)
+
         line_ys = find_staff_line_ys(horiz)
         staves = group_lines_into_staves(line_ys)
 
@@ -317,29 +418,42 @@ def annotate_guides(input_pdf: str, output_pdf: str):
             continue
 
         for staff_lines in staves:
-            approx5 = sorted(best_five_line_window(staff_lines))
-            if len(approx5) < 2:
+            approx = sorted(best_five_line_window(staff_lines))
+            if len(approx) < 2:
                 continue
 
-            # Refine to true 1st and 5th staff lines
-            staff5 = refine_staff_5_lines(horiz, approx5)
-            staff5 = sorted(staff5)
-            if len(staff5) < 5:
+            refined = refine_staff_5_lines(horiz, approx)
+            if refined is None or len(refined) != 5:
+                if DEBUG_MARK_BAD_STAFF:
+                    # mark near the approx top-left area
+                    x_pdf = 8 / ZOOM
+                    y_pdf = approx[0] / ZOOM
+                    page.draw_rect(fitz.Rect(x_pdf, y_pdf, x_pdf + 6/ZOOM, y_pdf + 6/ZOOM), color=(1, 0, 1), width=1)
                 continue
 
+            staff5 = sorted(refined)
             top_y, bot_y = staff5[0], staff5[-1]
 
-            # Detect where this staff's lines start (independent per staff)
-            x_left = left_edge_x_for_staff(horiz, staff5)
+            # Primary X: clef/key ink blob anchor
+            x_left, bbox = clef_blob_anchor_x(ink, horiz, top_y, bot_y)
+
+            # Fallback X: staffline-start heuristic
+            if x_left is None:
+                x_left = fallback_staffline_start_x(horiz, staff5)
+
             if x_left is None:
                 continue
 
-            # Pixel -> PDF coords
+            # Optional debug box around chosen blob (helps tuning)
+            if DEBUG_DRAW_CLEF_BOX and bbox is not None:
+                bx, by, bw, bh = bbox
+                r = fitz.Rect(bx/ZOOM, by/ZOOM, (bx+bw)/ZOOM, (by+bh)/ZOOM)
+                page.draw_rect(r, color=(0, 1, 1), width=0.8)
+
+            # Draw guide: line between staff line 1 and 5
             x_pdf = x_left / ZOOM
             y0_pdf = top_y / ZOOM
             y1_pdf = bot_y / ZOOM
-
-            # Draw the guide (line between 1st and 5th staff line)
             page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=(1, 0, 0), width=1.0)
 
     doc.save(output_pdf)
