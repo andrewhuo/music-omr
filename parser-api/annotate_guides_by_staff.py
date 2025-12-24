@@ -2,12 +2,16 @@
 """
 Debug step: draw a short RED vertical guide for EACH staff on each page.
 
-Fix in this version:
-- X stays as-is (already good)
-- Y endpoints are refined per staff:
-  snap top to the strongest line near the top
-  snap bottom to the strongest line near the bottom
-This makes the segment touch the 1st and 5th staff lines much more reliably.
+Improvements in this version:
+- More robust staff-line detection across different PDFs:
+  * row hit threshold scales with page width (instead of fixed 200)
+  * horizontal mask gets a light "close" to reconnect broken staff lines
+- More precise X at the true left edge of the staff:
+  * estimate left edge from the 5 staff-line pixels (percentile-based)
+  * fall back to contour method if needed
+- More reliable Y endpoints:
+  * refinement pad scales with staff height
+  * slightly gentler local threshold for faint lines
 """
 
 import sys
@@ -21,7 +25,8 @@ import cv2
 ZOOM = 2.0
 
 # Detect staff-line rows (global scan)
-ROW_HIT_THRESHOLD = 200
+ROW_HIT_FRAC = 0.07      # fraction of page width that must be "ink" to count as staff line
+ROW_HIT_MIN = 120        # minimum pixels, prevents too-low threshold on narrow pages
 MAX_GAP_BETWEEN_LINES = 18
 MIN_LINES_PER_STAFF = 4
 
@@ -31,8 +36,8 @@ MIN_LONG_LINE_FRAC = 0.35
 MAX_LINE_HEIGHT_PX = 8
 
 # Y refinement (per staff)
-REFINE_PAD_PX = 28          # how far above/below the detected staff to search
-REFINE_LOCAL_THRESH_FRAC = 0.45  # local threshold relative to max row-sum in the band
+REFINE_PAD_PX = 28               # baseline pad; actual pad scales with staff height
+REFINE_LOCAL_THRESH_FRAC = 0.38  # gentler for faint lines (was 0.45)
 
 
 def render_page_to_bgr(page: fitz.Page, zoom: float) -> np.ndarray:
@@ -40,7 +45,6 @@ def render_page_to_bgr(page: fitz.Page, zoom: float) -> np.ndarray:
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
 
-    # PyMuPDF gives RGB for alpha=False; OpenCV likes BGR
     if pix.n == 1:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     elif pix.n == 3:
@@ -63,21 +67,30 @@ def extract_horizontal_lines_mask(gray: np.ndarray) -> np.ndarray:
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
     tmp = cv2.erode(bw, horiz_kernel, iterations=1)
     horiz = cv2.dilate(tmp, horiz_kernel, iterations=1)
+
+    # Light close to reconnect small breaks in staff lines
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1))
+    horiz = cv2.morphologyEx(horiz, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
     return horiz
 
 
 def find_staff_line_ys(horiz_mask: np.ndarray) -> list[int]:
     row_sums = np.sum(horiz_mask > 0, axis=1)
 
+    # Adaptive threshold based on page width
+    W = horiz_mask.shape[1]
+    row_hit_threshold = max(ROW_HIT_MIN, int(W * ROW_HIT_FRAC))
+
     ys: list[int] = []
     in_run = False
     run_start = 0
 
     for y, count in enumerate(row_sums):
-        if count >= ROW_HIT_THRESHOLD and not in_run:
+        if count >= row_hit_threshold and not in_run:
             in_run = True
             run_start = y
-        elif count < ROW_HIT_THRESHOLD and in_run:
+        elif count < row_hit_threshold and in_run:
             in_run = False
             run_end = y - 1
             ys.append((run_start + run_end) // 2)
@@ -126,8 +139,7 @@ def best_five_line_window(ys: list[int]) -> list[int]:
         med = float(np.median(diffs))
         var = sum(abs(d - med) for d in diffs)
 
-        # Prefer windows that are lower on the page (helps include the true 5th line)
-        # Smaller score is better.
+        # Prefer windows lower on the page a tiny bit (helps avoid header junk)
         score = var - 0.002 * w[-1]
         if score < best_score:
             best_score = score
@@ -136,35 +148,7 @@ def best_five_line_window(ys: list[int]) -> list[int]:
     return best
 
 
-def left_edge_x_for_staff(horiz_mask: np.ndarray, top_y: int, bot_y: int) -> int | None:
-    y0 = max(0, top_y - 2)
-    y1 = min(horiz_mask.shape[0], bot_y + 3)
-    band = horiz_mask[y0:y1, :]
-
-    contours, _ = cv2.findContours(band, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    band_w = band.shape[1]
-    min_x_candidates = []
-
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        if w >= int(band_w * MIN_LONG_LINE_FRAC) and h <= MAX_LINE_HEIGHT_PX:
-            min_x_candidates.append(x)
-
-    if min_x_candidates:
-        return int(min(min_x_candidates))
-
-    # Fallback
-    ys, xs = np.where(band > 0)
-    if xs.size == 0:
-        return None
-    return int(np.percentile(xs, 1))
-
-
 def _run_centers_from_row_sums(row_sums: np.ndarray, threshold: int) -> list[int]:
-    """Return run-centers of rows where row_sum >= threshold."""
     centers: list[int] = []
     in_run = False
     start = 0
@@ -185,47 +169,93 @@ def _run_centers_from_row_sums(row_sums: np.ndarray, threshold: int) -> list[int
     return centers
 
 
-def refine_staff_endpoints(horiz_mask: np.ndarray, approx_top: int, approx_bot: int) -> tuple[int, int]:
+def refine_staff_lines(horiz_mask: np.ndarray, approx_lines: list[int]) -> list[int] | None:
     """
-    Snap approx endpoints to the best local line rows inside a small band.
-    Strategy:
-    - Look in [approx_top-pad, approx_bot+pad]
-    - Compute row_sums in that band
-    - Find candidate line rows using a local threshold
-    - Choose the best 5-line window; return its top and bottom
+    Given approximate staff lines (ideally 5), search a local band and return a refined 5-line set if possible.
     """
+    if not approx_lines:
+        return None
+    approx_lines = sorted(approx_lines)
+    approx_top, approx_bot = approx_lines[0], approx_lines[-1]
+
     H, W = horiz_mask.shape[:2]
-    y0 = max(0, approx_top - REFINE_PAD_PX)
-    y1 = min(H, approx_bot + REFINE_PAD_PX)
+    staff_h = max(1, approx_bot - approx_top)
+    pad = max(REFINE_PAD_PX, int(staff_h * 0.6))
+
+    y0 = max(0, approx_top - pad)
+    y1 = min(H, approx_bot + pad)
     band = horiz_mask[y0:y1, :]
 
     row_sums = np.sum(band > 0, axis=1)
     mx = int(row_sums.max()) if row_sums.size else 0
     if mx <= 0:
-        return approx_top, approx_bot
+        return None
 
     local_thresh = max(20, int(mx * REFINE_LOCAL_THRESH_FRAC))
     centers = _run_centers_from_row_sums(row_sums, local_thresh)
+    if len(centers) < 5:
+        return None
 
-    # If we found decent candidates, pick a 5-line staff and use its endpoints
-    if len(centers) >= 5:
-        centers_abs = [c + y0 for c in centers]
-        chosen = best_five_line_window(centers_abs)
-        chosen = sorted(chosen)
-        return chosen[0], chosen[-1]
+    centers_abs = [c + y0 for c in centers]
+    chosen = best_five_line_window(centers_abs)
+    return sorted(chosen) if len(chosen) >= 5 else None
 
-    # Fallback: snap to strongest rows near approx_top/bot
-    # (helps when only a few lines are detected in the band)
-    def snap_near(y_target: int, radius: int = 10) -> int:
-        a = max(y0, y_target - radius)
-        b = min(y1, y_target + radius + 1)
-        sub = horiz_mask[a:b, :]
-        rs = np.sum(sub > 0, axis=1)
-        if rs.size == 0:
-            return y_target
-        return int(a + int(np.argmax(rs)))
 
-    return snap_near(approx_top), snap_near(approx_bot)
+def left_edge_x_from_staff_lines(horiz_mask: np.ndarray, staff_lines: list[int]) -> int | None:
+    """
+    Estimate the staff's true left edge by looking at pixels on the staff lines themselves.
+    This is usually more accurate than contours when the left edge is faint/broken.
+    """
+    H, W = horiz_mask.shape[:2]
+    if not staff_lines:
+        return None
+
+    per_line_x = []
+    for y in staff_lines[:5]:
+        a = max(0, y - 1)
+        b = min(H, y + 2)
+        strip = horiz_mask[a:b, :]
+        ys, xs = np.where(strip > 0)
+        if xs.size == 0:
+            continue
+        # Use a low percentile to lean left but avoid a single stray pixel
+        per_line_x.append(int(np.percentile(xs, 2)))
+
+    if len(per_line_x) >= 3:
+        # Take median of the 3 smallest values: "left-leaning but stable"
+        vals = sorted(per_line_x)[:3]
+        return int(np.median(vals))
+
+    if len(per_line_x) > 0:
+        return int(np.median(per_line_x))
+
+    return None
+
+
+def left_edge_x_from_contours(horiz_mask: np.ndarray, top_y: int, bot_y: int) -> int | None:
+    y0 = max(0, top_y - 2)
+    y1 = min(horiz_mask.shape[0], bot_y + 3)
+    band = horiz_mask[y0:y1, :]
+
+    contours, _ = cv2.findContours(band, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    band_w = band.shape[1]
+    min_x_candidates = []
+
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w >= int(band_w * MIN_LONG_LINE_FRAC) and h <= MAX_LINE_HEIGHT_PX:
+            min_x_candidates.append(x)
+
+    if min_x_candidates:
+        return int(min(min_x_candidates))
+
+    ys, xs = np.where(band > 0)
+    if xs.size == 0:
+        return None
+    return int(np.percentile(xs, 1))
 
 
 def annotate_guides(input_pdf: str, output_pdf: str):
@@ -245,14 +275,18 @@ def annotate_guides(input_pdf: str, output_pdf: str):
 
         for staff_lines in staves:
             # Initial pick of 5 lines
-            chosen = best_five_line_window(staff_lines)
-            chosen = sorted(chosen)
-            approx_top, approx_bot = chosen[0], chosen[-1]
+            approx5 = sorted(best_five_line_window(staff_lines))
+            approx_top, approx_bot = approx5[0], approx5[-1]
 
-            # Refine to true 1st/5th lines
-            top_y, bot_y = refine_staff_endpoints(horiz, approx_top, approx_bot)
+            # Refine to true 5-line staff if possible
+            refined5 = refine_staff_lines(horiz, approx5)
+            use_lines = refined5 if refined5 is not None else approx5
+            top_y, bot_y = use_lines[0], use_lines[-1]
 
-            x_left = left_edge_x_for_staff(horiz, top_y, bot_y)
+            # Better X: try line-pixel based left edge first, fall back to contours
+            x_left = left_edge_x_from_staff_lines(horiz, use_lines)
+            if x_left is None:
+                x_left = left_edge_x_from_contours(horiz, top_y, bot_y)
             if x_left is None:
                 continue
 
