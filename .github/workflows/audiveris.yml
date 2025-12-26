@@ -130,7 +130,7 @@ jobs:
           docker run --rm \
             -v /tmp/work:/work \
             toprock/audiveris:latest \
-            /audiveris-extract/bin/Audiveris -batch -save -output /work/audiveris_out /work/input.pdf || true
+            /audiveris-extract/bin/Audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
 
           echo "Audiveris output contents:"
           find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
@@ -142,18 +142,35 @@ jobs:
       - name: Inspect OMR contents (debug)
         run: |
           set -euo pipefail
-          OMR=/tmp/work/audiveris_out/input/input.omr
+          OMR="/tmp/work/audiveris_out/input/input.omr"
 
           echo "== List .omr archive =="
           unzip -l "$OMR" | sed -n '1,200p'
 
-          echo "== Show first ~200 lines of sheet#1.xml =="
-          unzip -p "$OMR" sheet#1/sheet#1.xml | sed -n '1,200p'
+          SHEET_XML="$(unzip -l "$OMR" | awk '{print $4}' | grep -E '^sheet#.+/sheet#.+\.xml$' | head -n 1 || true)"
+          if [ -z "$SHEET_XML" ]; then
+            echo
+            echo "No sheet XML found inside .omr (only book.xml was saved)."
+            echo "Showing Audiveris log tail to diagnose:"
+            LOG="$(ls -1 /tmp/work/audiveris_out/input/*.log 2>/dev/null | head -n 1 || true)"
+            if [ -n "$LOG" ]; then
+              echo "Log: $LOG"
+              tail -n 200 "$LOG" || true
+            else
+              echo "No log file found in /tmp/work/audiveris_out/input/"
+            fi
+            exit 0
+          fi
 
+          echo
+          echo "== Found sheet XML: $SHEET_XML =="
+          unzip -p "$OMR" "$SHEET_XML" | sed -n '1,200p'
+
+          echo
           echo "== Grep likely geometry keywords =="
-          unzip -p "$OMR" sheet#1/sheet#1.xml | egrep -n "System|Staff|bounds|rect|x|y|top|bottom" | head -n 200 || true
+          unzip -p "$OMR" "$SHEET_XML" | egrep -n "System|Staff|bounds|rect|x|y|top|bottom|left|right" | head -n 200 || true
 
-
+      
       #################################################################
       # 7) Python setup & dependencies
       #################################################################
