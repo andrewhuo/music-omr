@@ -118,19 +118,24 @@ jobs:
           ls -lh /tmp/work/input.pdf
 
       #################################################################
-      # 5) Run Audiveris OMR (optional)
+      # 5) Run Audiveris OMR 
       #################################################################
       - name: Run Audiveris OMR
         run: |
           set -euo pipefail
           mkdir -p /tmp/work/audiveris_out
           docker pull toprock/audiveris:latest
+
+          # IMPORTANT: the Audiveris executable in this image is:
+          # /audiveris-extract/bin/Audiveris  (capital A)
           docker run --rm \
             -v /tmp/work:/work \
             toprock/audiveris:latest \
-            audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
+            /audiveris-extract/bin/Audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
+
           echo "Audiveris output contents:"
-          ls -R /tmp/work/audiveris_out || echo "(none)"
+          find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
+
 
       #################################################################
       # 6) Python setup & dependencies
