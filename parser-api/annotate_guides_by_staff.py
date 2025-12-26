@@ -2,20 +2,20 @@
 """
 Draw a RED vertical guide for EACH staff on each page.
 
-Goal:
-- Y: span from staff line 1 to staff line 5 (best effort).
-- X: at the true staff origin, just left of clef (never at internal barlines).
+Current state:
+- X anchoring is working well (baseline + blob, with vertical-line suppression).
+- Remaining issues are mostly Y:
+  - Some staves get skipped when only 4 staff lines are detected.
+  - Some guides are too short because the "5 lines" set is missing outer lines.
 
-Key X fixes:
-1) Staff-left baseline = 1st percentile of staffline pixels in staff band.
-2) Suppress vertical lines (barlines/stems) via morphology before connected-components.
-3) Clamp: blob candidates are limited to near the baseline so they can't jump a measure deep.
-4) If staff refinement fails, fall back to approximate 5 lines (so no "missing red line" cases).
+Fixes:
+1) If a staff has only 3–4 detected lines, synthesize missing lines by snapping to
+   the strongest horizontal-line rows near expected positions.
+2) Post-check any 5-line set: if its vertical span is too small vs staff spacing,
+   "repair" top/bottom by snapping near expected outer lines.
 
-Uses:
-- OpenCV morphology for horizontal/vertical line extraction. :contentReference[oaicite:4]{index=4}
-- connectedComponentsWithStats for blob picking. :contentReference[oaicite:5]{index=5}
-- PyMuPDF Page.draw_line for PDF annotation. :contentReference[oaicite:6]{index=6}
+Uses OpenCV morphology for line extraction. :contentReference[oaicite:1]{index=1}
+Uses connectedComponentsWithStats for blob picking. :contentReference[oaicite:2]{index=2}
 """
 
 import sys
@@ -32,7 +32,9 @@ ZOOM = 2.0
 ROW_HIT_FRAC = 0.07
 ROW_HIT_MIN = 120
 MAX_GAP_BETWEEN_LINES = 18
-MIN_LINES_PER_STAFF = 4
+
+# Allow smaller groups so we can synthesize missing lines (we still validate later)
+MIN_LINES_PER_STAFF = 3
 
 # Horizontal staffline morphology
 HORIZ_KERNEL_DIV = 25
@@ -46,37 +48,36 @@ VERT_CLOSE_LEN = 9
 REFINE_PAD_BASE = 28
 REFINE_PAD_MULTS = (0.6, 1.0, 1.5)
 REFINE_THRESH_FRACS = (0.42, 0.35, 0.28, 0.22)
+
 SPACING_TOL_FRAC = 0.30
 MIN_STAFF_SPACING = 5.0
 MAX_STAFF_SPACING = 22.0
 
 # X anchoring
 STAFF_BAND_MARGIN_FRAC = 0.18
-
-# Keep staffline subtraction gentle (don’t erase clef)
 STAFFLINE_SUBTRACT_DILATE = 7
-
-# Remove barlines strongly (vertical lines)
 VERTLINE_SUBTRACT_DILATE = 9
 
 # Reconnect clef/key fragments after subtraction (small)
 RECONNECT_DILATE = 2
 RECONNECT_CLOSE = 3
-
 INK_OPEN_K = 3
 
 # Blob filters
 CLEF_MIN_AREA_FRAC = 0.008
 CLEF_MIN_H_FRAC = 0.50
-CLEF_MAX_X_FRAC = 0.55  # only consider blobs in left part of page
+CLEF_MAX_X_FRAC = 0.55
 PAD_LEFT_OF_BLOB_PX = 6
 
 # Reject barline-like components even if they survive
 BARLINE_THIN_PX = 3
 BARLINE_TALL_FRAC = 0.90
 
-# Clamp: never allow chosen X far right of staff-left baseline
-CLAMP_RIGHT_SPACES = 2.5   # in staff-spaces
+# Clamp blob search region near baseline
+CLAMP_RIGHT_SPACES = 2.5
+
+# Y repair threshold: if staff span is too short, fix outer lines
+SPAN_MIN_SPACES = 3.6  # ideal is ~4 staff-spaces between line1 and line5
 
 # Debug toggles
 DEBUG_MARK_FALLBACK = False
@@ -202,23 +203,25 @@ def _run_centers_from_row_sums(row_sums: np.ndarray, threshold: int) -> list[int
     return centers
 
 
+def staff_spacing(lines: list[int]) -> float:
+    lines = sorted(lines)
+    if len(lines) < 2:
+        return 10.0
+    diffs = np.diff(lines).astype(np.float32)
+    s = float(np.median(diffs))
+    return float(np.clip(s, MIN_STAFF_SPACING, MAX_STAFF_SPACING))
+
+
 def _spacing_ok(lines5: list[int]) -> bool:
     if len(lines5) != 5:
         return False
-    diffs = np.diff(sorted(lines5)).astype(np.float32)
+    lines5 = sorted(lines5)
+    diffs = np.diff(lines5).astype(np.float32)
     spacing = float(np.median(diffs))
     if spacing < MIN_STAFF_SPACING or spacing > MAX_STAFF_SPACING:
         return False
     tol = max(2.0, spacing * SPACING_TOL_FRAC)
     return float(np.max(np.abs(diffs - spacing))) <= tol
-
-
-def staff_spacing(lines5: list[int]) -> float:
-    if len(lines5) != 5:
-        return 10.0
-    diffs = np.diff(sorted(lines5)).astype(np.float32)
-    s = float(np.median(diffs))
-    return float(np.clip(s, MIN_STAFF_SPACING, MAX_STAFF_SPACING))
 
 
 def _fit_5_line_pattern(cands: list[int], approx5: list[int]) -> list[int] | None:
@@ -298,14 +301,105 @@ def refine_staff_5_lines(horiz_mask: np.ndarray, approx5: list[int]) -> list[int
     return None
 
 
+def _snap_to_strongest_row(row_sums: np.ndarray, y_target: float, radius: int) -> tuple[int, int]:
+    """Return (best_y, best_strength) near y_target."""
+    H = row_sums.shape[0]
+    yt = int(round(y_target))
+    a = max(0, yt - radius)
+    b = min(H, yt + radius + 1)
+    if a >= b:
+        return yt, int(row_sums[min(max(yt, 0), H - 1)])
+    window = row_sums[a:b]
+    idx = int(np.argmax(window))
+    best_y = a + idx
+    return best_y, int(window[idx])
+
+
+def synthesize_or_repair_staff5(
+    staff_lines: list[int],
+    page_row_sums: np.ndarray,
+) -> tuple[list[int] | None, bool]:
+    """
+    Return (staff5, used_fallback_like).
+    - If we already have 5 but it's too short, repair outer lines.
+    - If we have 3–4, synthesize missing lines by snapping near expected positions.
+    """
+    ys = sorted(staff_lines)
+    used = False
+
+    if len(ys) >= 5:
+        staff5 = ys[:5] if len(ys) == 5 else best_five_line_window(ys)
+    elif len(ys) in (3, 4):
+        used = True
+        s = staff_spacing(ys)
+        # Build hypotheses by extending above/below, snapping to strongest rows
+        radius = int(max(3, 0.9 * s))
+
+        # Start from current ys as "core"
+        core = ys.copy()
+
+        # We will try to add missing lines until we reach 5
+        # Prefer adding to both ends (outer lines) first.
+        while len(core) < 5:
+            core = sorted(core)
+            s = staff_spacing(core)
+            radius = int(max(3, 0.9 * s))
+
+            top_expect = core[0] - s
+            bot_expect = core[-1] + s
+
+            top_y, top_strength = _snap_to_strongest_row(page_row_sums, top_expect, radius)
+            bot_y, bot_strength = _snap_to_strongest_row(page_row_sums, bot_expect, radius)
+
+            # Choose the stronger addition first (more likely a real staff line)
+            if top_strength >= bot_strength:
+                core = [top_y] + core
+            else:
+                core = core + [bot_y]
+
+            # Prevent duplicates collapsing
+            core = sorted(list(dict.fromkeys(core)))
+
+            # If snapping created duplicates and we still can't grow, break
+            if len(core) < 5 and (top_strength == 0 and bot_strength == 0):
+                break
+
+        if len(core) != 5 or not _spacing_ok(core):
+            return None, True
+        staff5 = core
+    else:
+        return None, True
+
+    # Repair step: if span too small, outer lines are likely missing/wrong
+    staff5 = sorted(staff5)
+    s = staff_spacing(staff5)
+    span = staff5[-1] - staff5[0]
+
+    if span < SPAN_MIN_SPACES * s:
+        used = True
+        radius = int(max(3, 0.9 * s))
+        # Keep middle three, re-snap outer expectations
+        mid3 = staff5[1:4]
+        top_expect = mid3[0] - s
+        bot_expect = mid3[-1] + s
+        top_y, _ = _snap_to_strongest_row(page_row_sums, top_expect, radius)
+        bot_y, _ = _snap_to_strongest_row(page_row_sums, bot_expect, radius)
+        candidate = sorted([top_y] + mid3 + [bot_y])
+        if _spacing_ok(candidate):
+            staff5 = candidate
+
+    if len(staff5) != 5:
+        return None, used
+    return staff5, used
+
+
 def staff_left_baseline_x(horiz_mask: np.ndarray, top_y: int, bot_y: int, spacing_px: float) -> int | None:
-    """Stable staff-left x from staffline pixels (not continuity)."""
     H, W = horiz_mask.shape[:2]
     margin = int(max(2, spacing_px * 0.8))
     y0 = max(0, top_y - margin)
     y1 = min(H, bot_y + margin)
     band = horiz_mask[y0:y1, :]
-    ys, xs = np.where(band > 0)
+    _, xs = np.where(band > 0)
     if xs.size == 0:
         return None
     return int(np.percentile(xs, 1))
@@ -320,7 +414,6 @@ def clef_like_blob_x(
     spacing_px: float,
     baseline_x: int | None
 ) -> int | None:
-    """Find a clef/key blob x near the staff origin; returns guide x (left of blob) or None."""
     H, W = ink.shape[:2]
     staff_h = max(1, bot_y - top_y)
     margin = int(staff_h * STAFF_BAND_MARGIN_FRAC)
@@ -329,17 +422,17 @@ def clef_like_blob_x(
 
     band = ink[y0:y1, :].copy()
 
-    # Remove vertical lines (barlines/stems) so they cannot become the "best blob".
+    # Remove vertical lines (barlines/stems) so they can't win. :contentReference[oaicite:3]{index=3}
     vd = cv2.getStructuringElement(cv2.MORPH_RECT, (1, VERTLINE_SUBTRACT_DILATE))
     vband = cv2.dilate(vert_mask[y0:y1, :], vd, iterations=1)
     band[vband > 0] = 0
 
-    # Gently remove staff lines (avoid erasing clef/key).
+    # Gently remove staff lines
     hd = cv2.getStructuringElement(cv2.MORPH_RECT, (STAFFLINE_SUBTRACT_DILATE, 1))
     hband = cv2.dilate(horiz_mask[y0:y1, :], hd, iterations=1)
     band[hband > 0] = 0
 
-    # Reconnect fragments (clef + sharps can get broken up).
+    # Reconnect fragments (helps key signatures)
     if RECONNECT_DILATE > 0:
         kd = cv2.getStructuringElement(cv2.MORPH_RECT, (RECONNECT_DILATE, RECONNECT_DILATE))
         band = cv2.dilate(band, kd, iterations=1)
@@ -347,7 +440,6 @@ def clef_like_blob_x(
         kc = cv2.getStructuringElement(cv2.MORPH_RECT, (RECONNECT_CLOSE, RECONNECT_CLOSE))
         band = cv2.morphologyEx(band, cv2.MORPH_CLOSE, kc, iterations=1)
 
-    # Speckle cleanup
     if INK_OPEN_K >= 2:
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (INK_OPEN_K, INK_OPEN_K))
         band = cv2.morphologyEx(band, cv2.MORPH_OPEN, k, iterations=1)
@@ -356,7 +448,7 @@ def clef_like_blob_x(
     if np.count_nonzero(bin_img) == 0:
         return None
 
-    num, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_img, connectivity=8) :contentReference[oaicite:4]{index=4}
 
     band_area = float(bin_img.shape[0] * bin_img.shape[1])
     min_area = int(max(25, band_area * CLEF_MIN_AREA_FRAC))
@@ -374,18 +466,14 @@ def clef_like_blob_x(
 
         if area < min_area:
             continue
-        if x > max_x:
-            continue
-        if x > max_near:
+        if x > max_x or x > max_near:
             continue
         if h < int(staff_h * CLEF_MIN_H_FRAC):
             continue
 
-        # reject barline-like survivors: very thin and very tall
         if w <= BARLINE_THIN_PX and h >= int(staff_h * BARLINE_TALL_FRAC):
             continue
 
-        # prefer blobs whose centroid is within the staff (not header text)
         cy_abs = y0 + cy
         if not (top_y <= cy_abs <= bot_y):
             continue
@@ -412,6 +500,9 @@ def annotate_guides(input_pdf: str, output_pdf: str):
         horiz = extract_horizontal_lines_mask(ink)
         vert = extract_vertical_lines_mask(ink)
 
+        # Precompute per-page row sums for snapping (cheap + stable)
+        page_row_sums = np.sum(horiz > 0, axis=1).astype(np.int32)
+
         line_ys = find_staff_line_ys(horiz)
         staves = group_lines_into_staves(line_ys)
 
@@ -420,20 +511,26 @@ def annotate_guides(input_pdf: str, output_pdf: str):
             continue
 
         for staff_lines in staves:
-            approx5 = sorted(best_five_line_window(staff_lines))
-            refined = None
-            if len(approx5) >= 5:
-                refined = refine_staff_5_lines(horiz, approx5)
+            # Step 1: try normal path if we already have >=5 line candidates
+            staff5 = None
+            used_fallback = False
 
-            # Never skip: if refine fails, fall back to approx window.
-            if refined is None or len(refined) != 5:
-                if len(approx5) < 5:
-                    continue
-                staff5 = approx5
-                used_fallback = True
-            else:
-                staff5 = sorted(refined)
-                used_fallback = False
+            if len(staff_lines) >= 5:
+                approx5 = sorted(best_five_line_window(staff_lines))
+                refined = refine_staff_5_lines(horiz, approx5)
+                if refined is not None and len(refined) == 5 and _spacing_ok(refined):
+                    staff5 = sorted(refined)
+                else:
+                    # fallback to approx and then repair if needed
+                    staff5, used_fallback = synthesize_or_repair_staff5(approx5, page_row_sums)
+
+            # Step 2: if fewer than 5, synthesize/repair from what we have
+            if staff5 is None:
+                staff5, used_fallback2 = synthesize_or_repair_staff5(staff_lines, page_row_sums)
+                used_fallback = used_fallback or used_fallback2
+
+            if staff5 is None or len(staff5) != 5:
+                continue
 
             top_y, bot_y = staff5[0], staff5[-1]
             s_px = staff_spacing(staff5)
@@ -445,7 +542,6 @@ def annotate_guides(input_pdf: str, output_pdf: str):
             if x_left is None:
                 continue
 
-            # Optional marker if fallback used (off by default)
             if DEBUG_MARK_FALLBACK and used_fallback:
                 r = fitz.Rect(x_left/ZOOM, (top_y-6)/ZOOM, (x_left+6)/ZOOM, top_y/ZOOM)
                 page.draw_rect(r, color=(1, 0.5, 0), width=1)
