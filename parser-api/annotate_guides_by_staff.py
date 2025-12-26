@@ -81,11 +81,29 @@ def binarize_ink(gray: np.ndarray) -> np.ndarray:
 
 
 def extract_horizontal_lines_mask(ink: np.ndarray) -> np.ndarray:
+    """
+    Multi-scale horizontal line extraction:
+    - Long kernel catches full staff lines
+    - Short kernel rescues indented/fragmented staff lines
+    """
     w = ink.shape[1]
-    kernel_len = max(30, w // HORIZ_KERNEL_DIV)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
-    tmp = cv2.erode(ink, k, iterations=1)
-    horiz = cv2.dilate(tmp, k, iterations=1)
+
+    def one_pass(kernel_len: int) -> np.ndarray:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+        tmp = cv2.erode(ink, k, iterations=1)
+        out = cv2.dilate(tmp, k, iterations=1)
+        return out
+
+    # Two scales
+    k_long = max(25, w // 25)
+    k_short = max(15, w // 45)
+
+    horiz_long = one_pass(k_long)
+    horiz_short = one_pass(k_short)
+
+    horiz = cv2.bitwise_or(horiz_long, horiz_short)
+
+    # Close small breaks along the lines
     ck = cv2.getStructuringElement(cv2.MORPH_RECT, (HORIZ_CLOSE_LEN, 1))
     horiz = cv2.morphologyEx(horiz, cv2.MORPH_CLOSE, ck, iterations=1)
     return horiz
@@ -101,27 +119,34 @@ def extract_vertical_lines_mask(ink: np.ndarray) -> np.ndarray:
     vert = cv2.morphologyEx(vert, cv2.MORPH_CLOSE, ck, iterations=1)
     return vert
 
+def extract_horizontal_lines_mask(ink: np.ndarray) -> np.ndarray:
+    """
+    Multi-scale horizontal line extraction:
+    - Long kernel catches full staff lines
+    - Short kernel rescues indented/fragmented staff lines
+    """
+    w = ink.shape[1]
 
-def find_staff_line_ys(horiz_mask: np.ndarray) -> list[int]:
-    row_sums = np.sum(horiz_mask > 0, axis=1)
-    W = horiz_mask.shape[1]
-    threshold = max(ROW_HIT_MIN, int(W * ROW_HIT_FRAC))
+    def one_pass(kernel_len: int) -> np.ndarray:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+        tmp = cv2.erode(ink, k, iterations=1)
+        out = cv2.dilate(tmp, k, iterations=1)
+        return out
 
-    ys: list[int] = []
-    in_run = False
-    start = 0
-    for y, cnt in enumerate(row_sums):
-        if cnt >= threshold and not in_run:
-            in_run = True
-            start = y
-        elif cnt < threshold and in_run:
-            in_run = False
-            end = y - 1
-            ys.append((start + end) // 2)
-    if in_run:
-        end = len(row_sums) - 1
-        ys.append((start + end) // 2)
-    return ys
+    # Two scales
+    k_long = max(25, w // 25)
+    k_short = max(15, w // 45)
+
+    horiz_long = one_pass(k_long)
+    horiz_short = one_pass(k_short)
+
+    horiz = cv2.bitwise_or(horiz_long, horiz_short)
+
+    # Close small breaks along the lines
+    ck = cv2.getStructuringElement(cv2.MORPH_RECT, (HORIZ_CLOSE_LEN, 1))
+    horiz = cv2.morphologyEx(horiz, cv2.MORPH_CLOSE, ck, iterations=1)
+    return horiz
+
 
 
 def group_lines_into_staves(line_ys: list[int]) -> list[list[int]]:
