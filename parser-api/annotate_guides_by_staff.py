@@ -108,6 +108,38 @@ def extract_horizontal_lines_mask(ink: np.ndarray) -> np.ndarray:
     horiz = cv2.morphologyEx(horiz, cv2.MORPH_CLOSE, ck, iterations=1)
     return horiz
 
+def find_staff_line_ys(horiz_mask: np.ndarray) -> list[int]:
+    """
+    Adaptive threshold based on projection peaks so indented/fragmented staves
+    still get detected.
+    """
+    row_sums = np.sum(horiz_mask > 0, axis=1).astype(np.int32)
+    mx = int(row_sums.max()) if row_sums.size else 0
+    if mx <= 0:
+        return []
+
+    # Threshold relative to the strongest line row on the page (more robust than width-based).
+    threshold = max(ROW_HIT_MIN, int(mx * 0.35))
+
+    ys: list[int] = []
+    in_run = False
+    start = 0
+
+    for y, cnt in enumerate(row_sums):
+        if cnt >= threshold and not in_run:
+            in_run = True
+            start = y
+        elif cnt < threshold and in_run:
+            in_run = False
+            end = y - 1
+            ys.append((start + end) // 2)
+
+    if in_run:
+        end = len(row_sums) - 1
+        ys.append((start + end) // 2)
+
+    return ys
+
 
 def extract_vertical_lines_mask(ink: np.ndarray) -> np.ndarray:
     h = ink.shape[0]
@@ -119,19 +151,12 @@ def extract_vertical_lines_mask(ink: np.ndarray) -> np.ndarray:
     vert = cv2.morphologyEx(vert, cv2.MORPH_CLOSE, ck, iterations=1)
     return vert
 
-def extract_horizontal_lines_mask(ink: np.ndarray) -> np.ndarray:
-    """
-    Multi-scale horizontal line extraction:
-    - Long kernel catches full staff lines
-    - Short kernel rescues indented/fragmented staff lines
-    """
-    w = ink.shape[1]
 
-    def one_pass(kernel_len: int) -> np.ndarray:
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
-        tmp = cv2.erode(ink, k, iterations=1)
-        out = cv2.dilate(tmp, k, iterations=1)
-        return out
+def one_pass(kernel_len: int) -> np.ndarray:
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+    tmp = cv2.erode(ink, k, iterations=1)
+    out = cv2.dilate(tmp, k, iterations=1)
+    return out
 
     # Two scales
     k_long = max(25, w // 25)
