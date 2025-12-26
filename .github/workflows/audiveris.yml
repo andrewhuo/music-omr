@@ -126,19 +126,36 @@ jobs:
           mkdir -p /tmp/work/audiveris_out
           docker pull toprock/audiveris:latest
 
-          # IMPORTANT: the Audiveris executable in this image is:
-          # /audiveris-extract/bin/Audiveris  (capital A)
+          # Use the actual executable inside the image
           docker run --rm \
             -v /tmp/work:/work \
             toprock/audiveris:latest \
-            /audiveris-extract/bin/Audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
+            /audiveris-extract/bin/Audiveris -batch -save -output /work/audiveris_out /work/input.pdf || true
 
           echo "Audiveris output contents:"
           find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
+          
+
+      #################################################################
+      # 6) Inspect OMR contents (debug)
+      #################################################################
+      - name: Inspect OMR contents (debug)
+        run: |
+          set -euo pipefail
+          OMR=/tmp/work/audiveris_out/input/input.omr
+
+          echo "== List .omr archive =="
+          unzip -l "$OMR" | sed -n '1,200p'
+
+          echo "== Show first ~200 lines of sheet#1.xml =="
+          unzip -p "$OMR" sheet#1/sheet#1.xml | sed -n '1,200p'
+
+          echo "== Grep likely geometry keywords =="
+          unzip -p "$OMR" sheet#1/sheet#1.xml | egrep -n "System|Staff|bounds|rect|x|y|top|bottom" | head -n 200 || true
 
 
       #################################################################
-      # 6) Python setup & dependencies
+      # 7) Python setup & dependencies
       #################################################################
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -152,7 +169,7 @@ jobs:
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
       #################################################################
-      # 7) Annotate measures on PDF
+      # 8) Annotate measures on PDF
       #################################################################
       - name: Draw staff-bounded guides (debug)
         run: |
@@ -165,7 +182,7 @@ jobs:
 
 
       #################################################################
-      # 8) Render first page of annotated PDF to PNG (debug)
+      # 9) Render first page of annotated PDF to PNG (debug)
       #################################################################
       - name: Render debug PNG preview
         run: |
@@ -183,7 +200,7 @@ jobs:
           ls -lh /tmp/work/debug/annotated_page1.png
 
       #################################################################
-      # 9) Upload ALL outputs to GCS
+      # 10) Upload ALL outputs to GCS
       #################################################################
       - name: Upload outputs to GCS
         run: |
