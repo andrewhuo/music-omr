@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import math
 import sys
 import re
 import zipfile
@@ -7,16 +6,16 @@ import xml.etree.ElementTree as ET
 
 import fitz  # PyMuPDF
 
-
 GUIDE_COLOR = (1, 0, 0)  # red
 GUIDE_WIDTH = 1.0
 
+# Small left shift so line sits just left of the staff start / clef
+PAD_LEFT_PX = 6.0
 
 _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 
 
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
-    """Return sheet#N/sheet#N.xml paths sorted by N."""
     found = []
     for name in z.namelist():
         m = _SHEET_XML_RE.match(name)
@@ -25,8 +24,8 @@ def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
     found.sort(key=lambda t: t[0])
     return [p for _, p in found]
 
+
 def _pct(values: list[float], p: float) -> float:
-    """Simple percentile without numpy. p in [0,1]."""
     if not values:
         raise ValueError("empty")
     xs = sorted(values)
@@ -35,22 +34,18 @@ def _pct(values: list[float], p: float) -> float:
     i = int(round(p * (len(xs) - 1)))
     return xs[max(0, min(len(xs) - 1, i))]
 
+
 def _best_five_by_spacing(yxs: list[tuple[float, float]], expected_spacing: float) -> list[tuple[float, float]]:
-    """
-    Pick best 5 lines from candidates by minimizing spacing variance.
-    yxs: list of (y, x_min_for_that_line), sorted by y.
-    """
     if len(yxs) <= 5:
         return yxs
     best = None
     best_score = float("inf")
     for i in range(0, len(yxs) - 4):
-        win = yxs[i:i+5]
+        win = yxs[i:i + 5]
         ys = [t[0] for t in win]
-        diffs = [ys[j+1] - ys[j] for j in range(4)]
+        diffs = [ys[j + 1] - ys[j] for j in range(4)]
         med = sorted(diffs)[2]
         var = sum(abs(d - med) for d in diffs)
-        # prefer windows close to expected spacing when available
         if expected_spacing > 0:
             var += 0.35 * sum(abs(d - expected_spacing) for d in diffs)
         if var < best_score:
@@ -58,11 +53,8 @@ def _best_five_by_spacing(yxs: list[tuple[float, float]], expected_spacing: floa
             best = win
     return best if best is not None else yxs[:5]
 
+
 def _synthesize_five_lines(ys: list[float], expected_spacing: float) -> list[float] | None:
-    """
-    Given 3-4 observed line y's, build 5 y's using expected_spacing.
-    Tries different alignment (which observed line corresponds to which index 0..4).
-    """
     ys = sorted(ys)
     if expected_spacing <= 0:
         return None
@@ -73,7 +65,6 @@ def _synthesize_five_lines(ys: list[float], expected_spacing: float) -> list[flo
     best_hits = -1
     best_err = float("inf")
 
-    # try mapping each observed y to each line index k
     for anchor_y in ys:
         for k in range(5):
             y0 = anchor_y - k * expected_spacing
@@ -88,7 +79,7 @@ def _synthesize_five_lines(ys: list[float], expected_spacing: float) -> list[flo
                     hits += 1
                     err += d
                 else:
-                    err += 2 * tol + d  # penalize outliers hard
+                    err += 2 * tol + d
 
             if hits > best_hits or (hits == best_hits and err < best_err):
                 best_hits = hits
@@ -98,7 +89,6 @@ def _synthesize_five_lines(ys: list[float], expected_spacing: float) -> list[flo
     if best is None or best_hits < 2:
         return None
 
-    # snap predicted lines to nearby observed lines when close
     snapped = []
     for y_pred in best:
         nearest_obs = min(ys, key=lambda t: abs(t - y_pred))
@@ -108,10 +98,111 @@ def _synthesize_five_lines(ys: list[float], expected_spacing: float) -> list[flo
             snapped.append(y_pred)
 
     snapped = sorted(snapped)
-    # sanity: must be increasing and reasonably tall
     if snapped[-1] - snapped[0] < 3.2 * expected_spacing:
         return None
     return snapped
+
+
+def _safe_float(s: str | None) -> float | None:
+    if s is None:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _index_inters(page: ET.Element) -> dict[int, ET.Element]:
+    """
+    Build a mapping id -> inter element from <sig><inters>.
+    Useful to lookup clef bounds and (optionally) barline medians.
+    """
+    out: dict[int, ET.Element] = {}
+    inters = page.find(".//sig/inters")
+    if inters is None:
+        return out
+    for el in list(inters):
+        sid = el.get("id")
+        if not sid:
+            continue
+        try:
+            out[int(sid)] = el
+        except Exception:
+            continue
+    return out
+
+
+def _barline_y_span_for_staff(page: ET.Element, staff_id: str) -> tuple[float, float] | None:
+    """
+    If staff lines are missing/partial, barline medians often still provide
+    perfect staff-height vertical span. We use any barline for that staff.
+    """
+    inters = page.find(".//sig/inters")
+    if inters is None:
+        return None
+
+    # pick a "reasonable" barline: smallest bounds.x tends to be earliest in the system
+    best = None  # (x, y0, y1)
+    for el in inters.findall("barline"):
+        if el.get("staff") != staff_id:
+            continue
+        b = el.find("bounds")
+        med = el.find("median")
+        if b is None or med is None:
+            continue
+
+        bx = _safe_float(b.get("x"))
+        if bx is None:
+            continue
+
+        p1 = med.find("p1")
+        p2 = med.find("p2")
+        if p1 is None or p2 is None:
+            continue
+
+        y1 = _safe_float(p1.get("y"))
+        y2 = _safe_float(p2.get("y"))
+        if y1 is None or y2 is None:
+            continue
+
+        y_top = float(min(y1, y2))
+        y_bot = float(max(y1, y2))
+        if y_bot <= y_top:
+            continue
+
+        cand = (bx, y_top, y_bot)
+        if best is None or cand[0] < best[0]:
+            best = cand
+
+    if best is None:
+        return None
+    return (best[1], best[2])
+
+
+def _clef_left_x(page: ET.Element, inter_by_id: dict[int, ET.Element], staff: ET.Element) -> float | None:
+    """
+    Use staff/header/clef-id -> <clef> inter -> <bounds x=...>
+    """
+    header = staff.find("header")
+    if header is None:
+        return None
+    clef_id_txt = header.findtext("clef")
+    if not clef_id_txt:
+        return None
+    try:
+        clef_id = int(clef_id_txt.strip())
+    except Exception:
+        return None
+
+    clef_el = inter_by_id.get(clef_id)
+    if clef_el is None:
+        return None
+
+    b = clef_el.find("bounds")
+    if b is None:
+        return None
+    return _safe_float(b.get("x"))
+
 
 def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     data = z.read(sheet_xml_path)
@@ -126,94 +217,112 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     if pic_w <= 0 or pic_h <= 0:
         raise ValueError(f"Bad picture size in {sheet_xml_path}: {pic_w}x{pic_h}")
 
-    # Expected staff line spacing from Audiveris scale (very helpful for partial lines)
     expected_spacing = 0.0
     scale = root.find("scale")
     if scale is not None:
         inter = scale.find("interline")
         if inter is not None:
-            try:
-                expected_spacing = float(inter.get("main") or 0.0)
-            except Exception:
-                expected_spacing = 0.0
+            expected_spacing = _safe_float(inter.get("main")) or 0.0
 
-    guides = []
+    guides: list[tuple[float, float, float]] = []
     page = root.find("page")
     if page is None:
         return pic_w, pic_h, guides
 
+    inter_by_id = _index_inters(page)
+
     for staff in page.findall(".//system//staff"):
+        staff_id = staff.get("id") or ""
+
         lines_node = staff.find("lines")
-        if lines_node is None:
-            continue
+        line_nodes = [] if lines_node is None else lines_node.findall("line")
 
-        # Prefer staff@left; else header/@start; else later fallback from line points
-        x_left_attr = staff.get("left")
-        x_anchor = float(x_left_attr) if x_left_attr is not None else None
+        # ---- Collect line-derived (y_at_left, x_min_for_that_line) pairs ----
+        yxs: list[tuple[float, float]] = []
+        all_line_xmins: list[float] = []
 
-        header = staff.find("header")
-        if x_anchor is None and header is not None:
-            hs = header.get("start")
-            if hs is not None:
-                try:
-                    x_anchor = float(hs)
-                except Exception:
-                    pass
-
-        line_nodes = lines_node.findall("line")
-        if not line_nodes:
-            continue
-
-        # For each line, compute (y_at_left, min_x_of_that_line)
-        yxs = []
         for ln in line_nodes:
             pts = ln.findall("point")
             if not pts:
                 continue
-            best = None  # (x, y)
+            best = None  # (x, y) for smallest x
             for p in pts:
-                x = float(p.get("x"))
-                y = float(p.get("y"))
+                x = _safe_float(p.get("x"))
+                y = _safe_float(p.get("y"))
+                if x is None or y is None:
+                    continue
                 if best is None or x < best[0]:
                     best = (x, y)
             if best is None:
                 continue
             yxs.append((best[1], best[0]))
+            all_line_xmins.append(best[0])
 
-        if len(yxs) < 3:
-            continue
-
-        # Sort by y and pick best 5 (or synthesize if only 3-4)
         yxs.sort(key=lambda t: t[0])
 
+        # ---- Derive Y span (top/bottom) ----
+        ys5: list[float] | None = None
         if len(yxs) >= 5:
             chosen = _best_five_by_spacing(yxs, expected_spacing)
             chosen = sorted(chosen, key=lambda t: t[0])
             ys5 = [t[0] for t in chosen]
-            xmins = [t[1] for t in chosen]
-        else:
+        elif len(yxs) in (3, 4):
             ys_partial = [t[0] for t in yxs]
             ys5 = _synthesize_five_lines(ys_partial, expected_spacing)
-            if ys5 is None:
-                continue
-            # xmins: use what we have (for fallback x computation)
-            xmins = [t[1] for t in yxs]
 
-        y_top = float(min(ys5))
-        y_bot = float(max(ys5))
+        if ys5 is not None:
+            y_top = float(min(ys5))
+            y_bot = float(max(ys5))
+        else:
+            # Fallback: barline median span for this staff
+            if staff_id:
+                span = _barline_y_span_for_staff(page, staff_id)
+            else:
+                span = None
+            if span is None:
+                continue
+            y_top, y_bot = span
+
         if y_bot <= y_top or (y_bot - y_top) < 10:
             continue
 
-        # X choice: anchor if present; else a stable percentile of per-line min-x
-        if x_anchor is not None:
-            x_left = x_anchor
-        else:
-            # Avoid extreme min/max outliers
-            x_left = _pct(xmins, 0.30)
+        # ---- Derive X anchor (left edge) ----
+        # Priority:
+        # 1) staff@left
+        # 2) min x from staff line points
+        # 3) clef bounds x
+        # 4) header@start
+        # 5) percentile fallback
+        x_left = _safe_float(staff.get("left"))
+
+        if x_left is None and all_line_xmins:
+            x_left = float(min(all_line_xmins))
+
+        if x_left is None:
+            clef_x = _clef_left_x(page, inter_by_id, staff)
+            if clef_x is not None:
+                x_left = float(clef_x)
+
+        if x_left is None:
+            header = staff.find("header")
+            if header is not None:
+                hs = _safe_float(header.get("start"))
+                if hs is not None:
+                    x_left = float(hs)
+
+        if x_left is None and all_line_xmins:
+            # very last resort: tiny percentile, not 0.30 (0.30 is what caused "inside" drift)
+            x_left = float(_pct(all_line_xmins, 0.05))
+
+        if x_left is None:
+            continue
+
+        x_left = max(0.0, x_left - PAD_LEFT_PX)
 
         guides.append((x_left, y_top, y_bot))
 
     return pic_w, pic_h, guides
+
 
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
     doc = fitz.open(input_pdf)
@@ -223,24 +332,18 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         if not sheet_paths:
             raise RuntimeError("No sheet#N/sheet#N.xml found inside .omr")
 
-        # We expect one sheet per PDF page. If mismatch, we still do min() safely.
         for page_index in range(doc.page_count):
-            page = doc[page_index]
-
-            # Choose matching sheet; if fewer sheets than pages, reuse last.
             if page_index >= len(sheet_paths):
-                # No matching sheet for this PDF page. Skip rather than reuse last sheet.
+                # safer: skip pages we don't have a matching sheet for
                 continue
-            sheet_i = page_index
 
-            sheet_xml_path = sheet_paths[sheet_i]
+            page = doc[page_index]
+            sheet_xml_path = sheet_paths[page_index]
 
             pic_w, pic_h, guides = _parse_sheet(z, sheet_xml_path)
             if not guides:
                 continue
 
-            # Map Audiveris pixel coords -> PDF coords for THIS page
-            # (PyMuPDF page coords use page.rect; origin at top-left in MuPDF space). :contentReference[oaicite:1]{index=1}
             rect = page.rect
             scale_x = rect.width / pic_w
             scale_y = rect.height / pic_h
@@ -249,7 +352,12 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 x_pdf = x_px * scale_x
                 y0_pdf = y0_px * scale_y
                 y1_pdf = y1_px * scale_y
-                page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
+                page.draw_line(
+                    (x_pdf, y0_pdf),
+                    (x_pdf, y1_pdf),
+                    color=GUIDE_COLOR,
+                    width=GUIDE_WIDTH,
+                )
 
     doc.save(output_pdf)
     doc.close()
