@@ -188,15 +188,15 @@ jobs:
       #################################################################
       # 8) Annotate measures on PDF
       #################################################################
-      - name: Draw staff-bounded guides (debug)
+      - name: Draw staff guides from Audiveris OMR
         run: |
           set -euo pipefail
-          python -u parser-api/annotate_guides_by_staff.py \
-            /tmp/work/input.pdf /tmp/work/annotated.pdf
+          python -u parser-api/annotate_guides_from_omr.py \
+            /tmp/work/input.pdf \
+            /tmp/work/audiveris_out/input/input.omr \
+            /tmp/work/annotated.pdf
           echo "Annotated PDF:"
           ls -lh /tmp/work/annotated.pdf
-
-
 
       #################################################################
       # 9) Render first page of annotated PDF to PNG (debug)
