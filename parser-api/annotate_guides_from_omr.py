@@ -1,153 +1,103 @@
 #!/usr/bin/env python3
-"""
-Draw staff-bounded vertical guide lines using Audiveris .omr (XML) geometry.
-
-Inputs:
-  1) input.pdf
-  2) input.omr  (zip containing sheet#N/sheet#N.xml)
-  3) output.pdf
-
-What it does:
-- Reads the Audiveris sheet XML from the .omr archive
-- For each PDF page, finds the matching <page id="...">
-- For each <staff>, uses:
-    x_draw = staff@left (optionally minus a tiny pad)
-    y_top  = y at x_draw on staff line #1 (top line)
-    y_bot  = y at x_draw on staff line #5 (bottom line)
-- Converts from Audiveris pixel coords to PDF coords by scaling with page.rect
-- Draws a red vertical line at that location
-
-This should be robust to:
-- indentation
-- missing OpenCV detections
-- clutter (text/slurs) near staves
-"""
-
 import sys
+import re
 import zipfile
 import xml.etree.ElementTree as ET
 
 import fitz  # PyMuPDF
 
+# How many pixels (in Audiveris image coords) to shift LEFT of the staff start
+PAD_LEFT_PX = 6
 
-GUIDE_COLOR = (1, 0, 0)  # red
-GUIDE_WIDTH = 1.0
-X_PAD_PX = 0.0  # set to e.g. 2.0 if you want a tiny nudge left; keep 0 for now
+RED = (1, 0, 0)
+LINE_WIDTH = 1.0
+
+SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 
 
-def _find_first_sheet_xml_in_omr(omr_path: str) -> str:
+def list_sheet_xml_paths(omr_path: str) -> list[str]:
     with zipfile.ZipFile(omr_path, "r") as z:
-        names = z.namelist()
-    # Prefer sheet#1/sheet#1.xml but support any sheet numbering
-    sheet_xmls = [n for n in names if n.startswith("sheet#") and n.endswith(".xml") and "/sheet#" in n]
-    if not sheet_xmls:
-        raise RuntimeError("No sheet XML found inside .omr archive.")
-    sheet_xmls.sort()
-    return sheet_xmls[0]
+        matches = []
+        for name in z.namelist():
+            m = SHEET_XML_RE.match(name)
+            if m:
+                matches.append((int(m.group(1)), name))
+    matches.sort(key=lambda t: t[0])
+    return [p for _, p in matches]
 
 
-def _load_sheet_root(omr_path: str) -> ET.Element:
-    sheet_xml = _find_first_sheet_xml_in_omr(omr_path)
+def load_sheet_xml(omr_path: str, sheet_xml_path: str) -> ET.Element:
     with zipfile.ZipFile(omr_path, "r") as z:
-        data = z.read(sheet_xml)
+        data = z.read(sheet_xml_path)
     return ET.fromstring(data)
 
 
-def _interp_y_at_x(points, xq: float) -> float:
+def draw_guides_for_sheet(page: fitz.Page, sheet_root: ET.Element) -> None:
     """
-    points: list of (x,y) along the staff line polyline
-    Returns y at xq using linear interpolation along x.
+    Uses Audiveris staff lines geometry:
+    <staff left="..." ...>
+      <lines>
+        <line> <point x="..." y="..."/> ... </line>  (5 of these)
+      </lines>
     """
-    if not points:
-        raise ValueError("Empty point list")
-    if len(points) == 1:
-        return float(points[0][1])
+    # Get the staff entries anywhere under the sheet
+    for staff in sheet_root.findall(".//staff"):
+        left_attr = staff.get("left")
+        if left_attr is None:
+            continue
+        try:
+            staff_left_x = float(left_attr)
+        except ValueError:
+            continue
 
-    # If outside range, clamp to nearest endpoint
-    xs = [p[0] for p in points]
-    if xq <= xs[0]:
-        return float(points[0][1])
-    if xq >= xs[-1]:
-        return float(points[-1][1])
+        # Collect 5 staff line y-values at the LEFT edge (use the point with min x for each line)
+        line_ys = []
+        for line in staff.findall(".//lines/line"):
+            pts = []
+            for pt in line.findall("./point"):
+                x = pt.get("x")
+                y = pt.get("y")
+                if x is None or y is None:
+                    continue
+                try:
+                    pts.append((float(x), float(y)))
+                except ValueError:
+                    pass
+            if not pts:
+                continue
+            x_min, y_at_left = min(pts, key=lambda t: t[0])
+            line_ys.append(y_at_left)
 
-    # Find segment containing xq
-    for (x0, y0), (x1, y1) in zip(points, points[1:]):
-        if x0 <= xq <= x1 or x1 <= xq <= x0:
-            if x1 == x0:
-                return float(y0)
-            t = (xq - x0) / (x1 - x0)
-            return float(y0 + t * (y1 - y0))
+        if len(line_ys) < 5:
+            # If Audiveris didn’t give 5, skip this staff (rare, but safe)
+            continue
 
-    # Fallback
-    return float(points[-1][1])
+        line_ys.sort()
+        top_y = line_ys[0]
+        bot_y = line_ys[-1]
+
+        x = max(0.0, staff_left_x - PAD_LEFT_PX)
+
+        # Audiveris coords are in the raster image space used for the sheet.
+        # If your PDF rendering matches that scale 1:1 you can draw directly.
+        # In practice: your earlier logs show Audiveris picture width/height match the rasterized PDF page size,
+        # so this should align.
+        page.draw_line((x, top_y), (x, bot_y), color=RED, width=LINE_WIDTH)
 
 
-def annotate_guides_from_omr(input_pdf: str, input_omr: str, output_pdf: str) -> None:
-    root = _load_sheet_root(input_omr)
-
-    picture = root.find("./picture")
-    if picture is None:
-        raise RuntimeError("No <picture> node found in sheet XML.")
-
-    pic_w = float(picture.attrib["width"])
-    pic_h = float(picture.attrib["height"])
+def annotate_pdf_from_omr(input_pdf: str, input_omr: str, output_pdf: str) -> None:
+    sheet_paths = list_sheet_xml_paths(input_omr)
+    if not sheet_paths:
+        raise RuntimeError("No sheet#N/sheet#N.xml found inside .omr")
 
     doc = fitz.open(input_pdf)
 
-    for page_index, page in enumerate(doc):
-        # Audiveris uses 1-based page ids in the XML snippet you posted
-        page_id = str(page_index + 1)
-        page_node = root.find(f".//page[@id='{page_id}']")
-        if page_node is None:
-            # If missing, just skip this page
-            continue
-
-        pdf_w = float(page.rect.width)
-        pdf_h = float(page.rect.height)
-
-        sx = pdf_w / pic_w
-        sy = pdf_h / pic_h
-
-        for system in page_node.findall("./system"):
-            for part in system.findall("./part"):
-                for staff in part.findall("./staff"):
-                    left = staff.attrib.get("left")
-                    if left is None:
-                        continue
-                    x_draw = float(left) - float(X_PAD_PX)
-                    if x_draw < 0:
-                        x_draw = 0.0
-
-                    lines_node = staff.find("./lines")
-                    if lines_node is None:
-                        continue
-                    line_nodes = lines_node.findall("./line")
-                    if len(line_nodes) < 5:
-                        continue  # skip malformed staves
-
-                    def parse_line_points(line_elem):
-                        pts = []
-                        for p in line_elem.findall("./point"):
-                            pts.append((float(p.attrib["x"]), float(p.attrib["y"])))
-                        # Sort by x so interpolation works reliably
-                        pts.sort(key=lambda t: t[0])
-                        return pts
-
-                    top_pts = parse_line_points(line_nodes[0])
-                    bot_pts = parse_line_points(line_nodes[4])
-
-                    if not top_pts or not bot_pts:
-                        continue
-
-                    y_top = _interp_y_at_x(top_pts, x_draw)
-                    y_bot = _interp_y_at_x(bot_pts, x_draw)
-
-                    # Convert to PDF coords
-                    x_pdf = x_draw * sx
-                    y0_pdf = y_top * sy
-                    y1_pdf = y_bot * sy
-
-                    page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
+    # Map page i -> sheet i (1-indexed in Audiveris naming)
+    for i in range(doc.page_count):
+        sheet_idx = min(i, len(sheet_paths) - 1)  # safety if mismatch
+        sheet_root = load_sheet_xml(input_omr, sheet_paths[sheet_idx])
+        page = doc.load_page(i)
+        draw_guides_for_sheet(page, sheet_root)
 
     doc.save(output_pdf)
     doc.close()
@@ -158,4 +108,4 @@ if __name__ == "__main__":
         print("Usage: annotate_guides_from_omr.py <input.pdf> <input.omr> <output.pdf>")
         sys.exit(1)
 
-    annotate_guides_from_omr(sys.argv[1], sys.argv[2], sys.argv[3])
+    annotate_pdf_from_omr(sys.argv[1], sys.argv[2], sys.argv[3])
