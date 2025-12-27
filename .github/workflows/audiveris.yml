@@ -1,20 +1,21 @@
 name: Audiveris OMR + Barline Detection Test
 
 on:
-  workflow_dispatch:
-    inputs:
-      pdf_gcs_uri:
-        description: "GCS URI to your input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
-        required: true
-        type: string
-      output_gcs_prefix:
-        description: "GCS prefix to upload output (gs://music-omr-bucket-777135743132/output)"
-        required: true
-        type: string
+    workflow_dispatch:
+      inputs:
+        pdf_gcs_uri:
+          description: "GCS URI to your input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
+          required: true
+          type: string
+
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
+    env:
+      BUCKET: "gs://music-omr-bucket-777135743132"
+      OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
+
 
     permissions:
       contents: read
@@ -41,7 +42,7 @@ jobs:
       - name: Show inputs
         run: |
           echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
-          echo "Output prefix: ${{ inputs.output_gcs_prefix }}"
+          echo "Output prefix (fixed): ${OUTPUT_PREFIX}"
 
       #################################################################
       # 2) Wipe everything except input/ and output/ in the main bucket
@@ -103,8 +104,8 @@ jobs:
       - name: Wipe old outputs
         run: |
           set -euo pipefail
-          echo "Deleting all objects under: ${{ inputs.output_gcs_prefix }}"
-          gsutil -m rm -r "${{ inputs.output_gcs_prefix }}/**" || echo "No objects to delete"
+          echo "Deleting all objects under: ${OUTPUT_PREFIX}"
+          gsutil -m rm -r "${OUTPUT_PREFIX}/**" || echo "No objects to delete"
 
       #################################################################
       # 4) Download the input PDF
@@ -198,43 +199,37 @@ jobs:
           echo "Annotated PDF:"
           ls -lh /tmp/work/annotated.pdf
 
-      #################################################################
-      # 9) Render first page of annotated PDF to PNG (debug)
-      #################################################################
-      - name: Render debug PNG preview
+      - name: Sanity check annotated PDF page count
         run: |
           set -euo pipefail
-          mkdir -p /tmp/work/debug
-          python - << 'PYCODE'
+          python - << 'PY'
           import fitz
-          doc = fitz.open("/tmp/work/annotated.pdf")
-          page = doc[0]
-          pix = page.get_pixmap(matrix=fitz.Matrix(2,2))
-          pix.save("/tmp/work/debug/annotated_page1.png")
-          doc.close()
-          PYCODE
-          echo "Debug PNG:"
-          ls -lh /tmp/work/debug/annotated_page1.png
+          in_doc = fitz.open("/tmp/work/input.pdf")
+          out_doc = fitz.open("/tmp/work/annotated.pdf")
+          print("input pages:", in_doc.page_count)
+          print("output pages:", out_doc.page_count)
+          if in_doc.page_count != out_doc.page_count:
+              raise SystemExit("ERROR: annotated.pdf page count does not match input.pdf")
+          PY
+
 
       #################################################################
-      # 10) Upload ALL outputs to GCS
+      # 9) Upload ALL outputs to GCS
       #################################################################
       - name: Upload outputs to GCS
         run: |
           set -euo pipefail
 
           # Annotated PDF
-          gsutil cp /tmp/work/annotated.pdf "${{ inputs.output_gcs_prefix }}/annotated.pdf"
-
-          # Debug PNG
-          gsutil -m cp -r /tmp/work/debug "${{ inputs.output_gcs_prefix }}/debug"
+          gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
 
           # Audiveris outputs (only if present)
           if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
             echo "Uploading Audiveris outputs"
-            gsutil -m cp -r /tmp/work/audiveris_out "${{ inputs.output_gcs_prefix }}/audiveris_out"
+            gsutil -m cp -r /tmp/work/audiveris_out "${OUTPUT_PREFIX}/audiveris_out"
           else
             echo "No Audiveris outputs to upload"
           fi
 
           echo "All uploads complete"
+
