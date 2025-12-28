@@ -250,6 +250,193 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     inter_by_id = _index_inters(page)
     inters = page.find(".//sig/inters")
 
+    def _parse_int_list(txt: str | None) -> list[int]:
+        if not txt:
+            return []
+        out: list[int] = []
+        for m in re.findall(r"\d+", txt):
+            try:
+                out.append(int(m))
+            except Exception:
+                pass
+        return out
+
+    def _barline_span_from_el(el: ET.Element) -> tuple[float, float, float] | None:
+        b = el.find("bounds")
+        med = el.find("median")
+        if b is None or med is None:
+            return None
+
+        bx = _safe_float(b.get("x"))
+        if bx is None:
+            return None
+
+        p1 = med.find("p1")
+        p2 = med.find("p2")
+        if p1 is None or p2 is None:
+            return None
+
+        y1 = _safe_float(p1.get("y"))
+        y2 = _safe_float(p2.get("y"))
+        if y1 is None or y2 is None:
+            return None
+
+        y_top = float(min(y1, y2))
+        y_bot = float(max(y1, y2))
+        if y_bot <= y_top:
+            return None
+
+        return (float(bx), y_top, y_bot)
+
+    def _choose_span(cands: list[tuple[float, float, float]], y_hint: float | None) -> tuple[float, float] | None:
+        if not cands:
+            return None
+
+        if y_hint is not None:
+            covering = [c for c in cands if (c[1] - 2.0) <= y_hint <= (c[2] + 2.0)]
+            if covering:
+                covering.sort(key=lambda t: t[0])  # smallest bx
+                return (covering[0][1], covering[0][2])
+
+            def score(c: tuple[float, float, float]) -> tuple[float, float]:
+                mid = 0.5 * (c[1] + c[2])
+                return (abs(mid - y_hint), c[0])
+
+            best = min(cands, key=score)
+            return (best[1], best[2])
+
+        cands.sort(key=lambda t: t[0])  # smallest bx
+        return (cands[0][1], cands[0][2])
+
+    def _barline_span_for_staff_global(staff_id: str, y_hint: float | None) -> tuple[float, float] | None:
+        if inters is None or not staff_id:
+            return None
+
+        cands: list[tuple[float, float, float]] = []
+        for el in inters.findall("barline"):
+            if el.get("staff") != staff_id:
+                continue
+            span = _barline_span_from_el(el)
+            if span is not None:
+                cands.append(span)
+
+        return _choose_span(cands, y_hint)
+
+    # Iterate systems robustly (handles different nesting layouts)
+    for system in page.findall(".//system"):
+        for staff in system.findall(".//staff"):
+            staff_id = staff.get("id") or ""
+
+            header = staff.find("header")
+            header_start = _safe_float(header.get("start")) if header is not None else None
+
+            clef_b = _clef_bounds(page, inter_by_id, staff)
+            clef_x = clef_b[0] if clef_b is not None else None
+            clef_y_hint = (clef_b[1] + 0.5 * clef_b[3]) if clef_b is not None else None
+
+            lines_node = staff.find("lines")
+            line_nodes = [] if lines_node is None else lines_node.findall("line")
+
+            yxs: list[tuple[float, float]] = []
+            all_line_xmins: list[float] = []
+
+            for ln in line_nodes:
+                pts = ln.findall("point")
+                if not pts:
+                    continue
+
+                min_x = None
+                y_at_min_x = None
+
+                for p in pts:
+                    x = _safe_float(p.get("x"))
+                    y = _safe_float(p.get("y"))
+                    if x is None or y is None:
+                        continue
+                    if min_x is None or x < min_x:
+                        min_x = x
+                        y_at_min_x = y
+
+                if min_x is None or y_at_min_x is None:
+                    continue
+
+                yxs.append((float(y_at_min_x), float(min_x)))
+                all_line_xmins.append(float(min_x))
+
+            yxs.sort(key=lambda t: t[0])
+
+            # ---- Y span ----
+            ys5: list[float] | None = None
+
+            if len(yxs) >= 5:
+                chosen = _best_five_by_spacing(yxs, expected_spacing)
+                chosen = sorted(chosen, key=lambda t: t[0])
+                ys5 = [t[0] for t in chosen]
+            elif len(yxs) >= 2:
+                ys_partial = [t[0] for t in yxs]
+                ys5 = _synthesize_five_lines(ys_partial, expected_spacing)
+
+            if ys5 is not None:
+                y_top = float(min(ys5))
+                y_bot = float(max(ys5))
+            else:
+                # BEST FIX: use THIS staff's own <barlines> list (IDs) to pick a barline span
+                y_hint = yxs[0][0] if len(yxs) >= 1 else clef_y_hint
+
+                staff_barline_ids = _parse_int_list(staff.findtext("barlines"))
+                cands: list[tuple[float, float, float]] = []
+                for bid in staff_barline_ids:
+                    el = inter_by_id.get(bid)
+                    if el is None:
+                        continue
+                    if el.tag != "barline":
+                        continue
+                    span = _barline_span_from_el(el)
+                    if span is not None:
+                        cands.append(span)
+
+                span2 = _choose_span(cands, y_hint)
+                if span2 is None:
+                    # last resort: global search by staff_id
+                    span2 = _barline_span_for_staff_global(staff_id, y_hint)
+
+                if span2 is None:
+                    continue
+
+                y_top, y_bot = span2
+
+            if y_bot <= y_top or (y_bot - y_top) < 10.0:
+                continue
+
+            # ---- X anchor ----
+            x_left = _safe_float(staff.get("left"))
+            line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
+
+            if x_left is None and line_min_x is not None:
+                x_left = line_min_x
+
+            if x_left is None and header_start is not None:
+                x_left = float(header_start)
+
+            if x_left is None and clef_x is not None:
+                shift = (0.90 * expected_spacing) if expected_spacing > 0.0 else 20.0
+                x_left = float(clef_x) - float(shift)
+
+            if x_left is None and all_line_xmins:
+                x_left = float(_pct(all_line_xmins, 0.05))
+
+            if x_left is None:
+                continue
+
+            if line_min_x is not None and expected_spacing > 0.0:
+                if x_left > (line_min_x + 0.60 * expected_spacing):
+                    x_left = line_min_x
+
+            x_left = max(0.0, float(x_left) - PAD_LEFT_PX)
+            guides.append((x_left, y_top, y_bot))
+
+    return pic_w, pic_h, guides
+
     def barline_span_for_staff(staff_id: str, y_hint: float | None) -> tuple[float, float] | None:
         """
         Choose a barline span for this staff. If y_hint is provided, prefer:
