@@ -171,7 +171,83 @@ jobs:
           echo "== Grep likely geometry keywords =="
           unzip -p "$OMR" "$SHEET_XML" | egrep -n "System|Staff|bounds|rect|x|y|top|bottom|left|right" | head -n 200 || true
 
-      
+      - name: OMR structure debug (systems/staves)
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import os, json, re, zipfile
+          import xml.etree.ElementTree as ET
+
+          omr = "/tmp/work/audiveris_out/input/input.omr"
+          sheet_re = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
+
+          with zipfile.ZipFile(omr, "r") as z:
+            sheets = []
+            for name in z.namelist():
+              m = sheet_re.match(name)
+              if m:
+                sheets.append((int(m.group(1)), name))
+            sheets.sort()
+
+            out = []
+            for n, path in sheets:
+              root = ET.fromstring(z.read(path))
+              page = root.find("page")
+              if page is None:
+                out.append({"sheet": path, "page": None})
+                continue
+
+              systems_direct = page.findall("system")
+              systems_all = page.findall(".//system")
+
+              rec = {
+                "sheet": path,
+                "systems_direct": len(systems_direct),
+                "systems_all": len(systems_all),
+                "systems": [],
+              }
+
+              for sys_el in systems_all:
+                sys_id = sys_el.get("id")
+                indented = sys_el.get("indented")
+                staves = sys_el.findall(".//staff")
+
+                staff_recs = []
+                for st in staves:
+                  header = st.find("header")
+                  header_start = header.get("start") if header is not None else None
+                  lines = st.find("lines")
+                  line_count = len(lines.findall("line")) if lines is not None else 0
+                  staff_recs.append({
+                    "staff_id": st.get("id"),
+                    "staff_left": st.get("left"),
+                    "header_start": header_start,
+                    "line_count": line_count,
+                  })
+
+                rec["systems"].append({
+                  "system_id": sys_id,
+                  "indented": indented,
+                  "staff_count": len(staves),
+                  "staves": staff_recs,
+                })
+
+              out.append(rec)
+
+          os.makedirs("/tmp/work/debug", exist_ok=True)
+          p = "/tmp/work/debug/omr_structure.json"
+          with open(p, "w") as f:
+            json.dump(out, f, indent=2)
+
+          print("Wrote", p)
+          print("Preview:")
+          with open(p, "r") as f:
+            for i, line in enumerate(f):
+              if i >= 200:
+                break
+              print(line.rstrip("\n"))
+          PY
+
       #################################################################
       # 7) Python setup & dependencies
       #################################################################
