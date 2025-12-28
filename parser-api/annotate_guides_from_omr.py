@@ -355,11 +355,19 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             if x_left is None:
                 continue
 
-            # Safety clamp: if we have staff edge, never drift right of it
+           # Safety clamp: if we have staff edge, never drift right of it
             if line_min_x is not None and expected_spacing > 0.0:
                 if x_left > (line_min_x + 0.60 * expected_spacing):
                     x_left = line_min_x
-
+            
+            # Hard clamp against clef: never place the guide inside the clef box
+            if clef_b is not None:
+                clef_x, _, clef_w, _ = clef_b
+                guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
+                max_x = float(clef_x) - guard
+                if x_left > max_x:
+                    x_left = max_x
+            
             x_left = max(0.0, float(x_left) - PAD_LEFT_PX)
             guides_px.append((x_left, y_top, y_bot))
 
@@ -389,7 +397,7 @@ def _fallback_missing_staff_guides(page: fitz.Page, existing_guides_pdf: list[tu
     )
 
     # Extract horizontal lines
-    kernel_w = max(40, w // 20)
+    kernel_w = max(30, w // 25)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
     horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
 
@@ -398,7 +406,7 @@ def _fallback_missing_staff_guides(page: fitz.Page, existing_guides_pdf: list[tu
     lines = []
     for c in contours:
         x, y, ww, hh = cv2.boundingRect(c)
-        if ww < 0.35 * w:
+        if ww < 0.20 * w:
             continue
         if hh > 6:
             continue
