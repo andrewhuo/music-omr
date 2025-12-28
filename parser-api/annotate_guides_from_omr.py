@@ -6,6 +6,11 @@ import xml.etree.ElementTree as ET
 
 import fitz  # PyMuPDF
 
+# Fallback needs these; your workflow already installs them.
+import numpy as np
+import cv2
+
+
 GUIDE_COLOR = (1, 0, 0)  # red
 GUIDE_WIDTH = 1.0
 
@@ -113,10 +118,6 @@ def _safe_float(s: str | None) -> float | None:
 
 
 def _index_inters(page: ET.Element) -> dict[int, ET.Element]:
-    """
-    Build a mapping id -> inter element from <sig><inters>.
-    Useful to lookup clef bounds and (optionally) barline medians.
-    """
     out: dict[int, ET.Element] = {}
     inters = page.find(".//sig/inters")
     if inters is None:
@@ -132,56 +133,7 @@ def _index_inters(page: ET.Element) -> dict[int, ET.Element]:
     return out
 
 
-def _barline_y_span_for_staff(page: ET.Element, staff_id: str) -> tuple[float, float] | None:
-    """
-    If staff lines are missing/partial, barline medians often still provide
-    perfect staff-height vertical span. We use any barline for that staff.
-    """
-    inters = page.find(".//sig/inters")
-    if inters is None:
-        return None
-
-    # pick a "reasonable" barline: smallest bounds.x tends to be earliest in the system
-    best = None  # (x, y0, y1)
-    for el in inters.findall("barline"):
-        if el.get("staff") != staff_id:
-            continue
-        b = el.find("bounds")
-        med = el.find("median")
-        if b is None or med is None:
-            continue
-
-        bx = _safe_float(b.get("x"))
-        if bx is None:
-            continue
-
-        p1 = med.find("p1")
-        p2 = med.find("p2")
-        if p1 is None or p2 is None:
-            continue
-
-        y1 = _safe_float(p1.get("y"))
-        y2 = _safe_float(p2.get("y"))
-        if y1 is None or y2 is None:
-            continue
-
-        y_top = float(min(y1, y2))
-        y_bot = float(max(y1, y2))
-        if y_bot <= y_top:
-            continue
-
-        cand = (bx, y_top, y_bot)
-        if best is None or cand[0] < best[0]:
-            best = cand
-
-    if best is None:
-        return None
-    return (best[1], best[2])
-
-def _clef_bounds(page: ET.Element, inter_by_id: dict[int, ET.Element], staff: ET.Element) -> tuple[float, float, float, float] | None:
-    """
-    Return clef bounds (x, y, w, h) if available for this staff via header/clef id.
-    """
+def _clef_bounds(inter_by_id: dict[int, ET.Element], staff: ET.Element) -> tuple[float, float, float, float] | None:
     header = staff.find("header")
     if header is None:
         return None
@@ -212,16 +164,14 @@ def _clef_bounds(page: ET.Element, inter_by_id: dict[int, ET.Element], staff: ET
 
     return (float(x), float(y), float(w), float(h))
 
-def _clef_left_x(page: ET.Element, inter_by_id: dict[int, ET.Element], staff: ET.Element) -> float | None:
-    """
-    Use staff/header/clef-id -> <clef> inter -> <bounds x=...>
-    """
-    b = _clef_bounds(page, inter_by_id, staff)
-    if b is None:
-        return None
-    return b[0]
 
 def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
+    """
+    Returns:
+      pic_w, pic_h: Audiveris picture size
+      guides_px: list of (x_left_px, y_top_px, y_bot_px) in picture pixels
+      staff_total: how many <staff> nodes exist (target guide count)
+    """
     data = z.read(sheet_xml_path)
     root = ET.fromstring(data)
 
@@ -241,209 +191,16 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         if inter is not None:
             expected_spacing = _safe_float(inter.get("main")) or 0.0
 
-    guides: list[tuple[float, float, float]] = []
+    guides_px: list[tuple[float, float, float]] = []
 
     page = root.find("page")
     if page is None:
-        return pic_w, pic_h, guides
+        return pic_w, pic_h, guides_px, 0
 
     inter_by_id = _index_inters(page)
     inters = page.find(".//sig/inters")
 
-    def _parse_int_list(txt: str | None) -> list[int]:
-        if not txt:
-            return []
-        out: list[int] = []
-        for m in re.findall(r"\d+", txt):
-            try:
-                out.append(int(m))
-            except Exception:
-                pass
-        return out
-
-    def _barline_span_from_el(el: ET.Element) -> tuple[float, float, float] | None:
-        b = el.find("bounds")
-        med = el.find("median")
-        if b is None or med is None:
-            return None
-
-        bx = _safe_float(b.get("x"))
-        if bx is None:
-            return None
-
-        p1 = med.find("p1")
-        p2 = med.find("p2")
-        if p1 is None or p2 is None:
-            return None
-
-        y1 = _safe_float(p1.get("y"))
-        y2 = _safe_float(p2.get("y"))
-        if y1 is None or y2 is None:
-            return None
-
-        y_top = float(min(y1, y2))
-        y_bot = float(max(y1, y2))
-        if y_bot <= y_top:
-            return None
-
-        return (float(bx), y_top, y_bot)
-
-    def _choose_span(cands: list[tuple[float, float, float]], y_hint: float | None) -> tuple[float, float] | None:
-        if not cands:
-            return None
-
-        if y_hint is not None:
-            covering = [c for c in cands if (c[1] - 2.0) <= y_hint <= (c[2] + 2.0)]
-            if covering:
-                covering.sort(key=lambda t: t[0])  # smallest bx
-                return (covering[0][1], covering[0][2])
-
-            def score(c: tuple[float, float, float]) -> tuple[float, float]:
-                mid = 0.5 * (c[1] + c[2])
-                return (abs(mid - y_hint), c[0])
-
-            best = min(cands, key=score)
-            return (best[1], best[2])
-
-        cands.sort(key=lambda t: t[0])  # smallest bx
-        return (cands[0][1], cands[0][2])
-
-    def _barline_span_for_staff_global(staff_id: str, y_hint: float | None) -> tuple[float, float] | None:
-        if inters is None or not staff_id:
-            return None
-
-        cands: list[tuple[float, float, float]] = []
-        for el in inters.findall("barline"):
-            if el.get("staff") != staff_id:
-                continue
-            span = _barline_span_from_el(el)
-            if span is not None:
-                cands.append(span)
-
-        return _choose_span(cands, y_hint)
-
-    # Iterate systems robustly (handles different nesting layouts)
-    for system in page.findall(".//system"):
-        for staff in system.findall(".//staff"):
-            staff_id = staff.get("id") or ""
-
-            header = staff.find("header")
-            header_start = _safe_float(header.get("start")) if header is not None else None
-
-            clef_b = _clef_bounds(page, inter_by_id, staff)
-            clef_x = clef_b[0] if clef_b is not None else None
-            clef_y_hint = (clef_b[1] + 0.5 * clef_b[3]) if clef_b is not None else None
-
-            lines_node = staff.find("lines")
-            line_nodes = [] if lines_node is None else lines_node.findall("line")
-
-            yxs: list[tuple[float, float]] = []
-            all_line_xmins: list[float] = []
-
-            for ln in line_nodes:
-                pts = ln.findall("point")
-                if not pts:
-                    continue
-
-                min_x = None
-                y_at_min_x = None
-
-                for p in pts:
-                    x = _safe_float(p.get("x"))
-                    y = _safe_float(p.get("y"))
-                    if x is None or y is None:
-                        continue
-                    if min_x is None or x < min_x:
-                        min_x = x
-                        y_at_min_x = y
-
-                if min_x is None or y_at_min_x is None:
-                    continue
-
-                yxs.append((float(y_at_min_x), float(min_x)))
-                all_line_xmins.append(float(min_x))
-
-            yxs.sort(key=lambda t: t[0])
-
-            # ---- Y span ----
-            ys5: list[float] | None = None
-
-            if len(yxs) >= 5:
-                chosen = _best_five_by_spacing(yxs, expected_spacing)
-                chosen = sorted(chosen, key=lambda t: t[0])
-                ys5 = [t[0] for t in chosen]
-            elif len(yxs) >= 2:
-                ys_partial = [t[0] for t in yxs]
-                ys5 = _synthesize_five_lines(ys_partial, expected_spacing)
-
-            if ys5 is not None:
-                y_top = float(min(ys5))
-                y_bot = float(max(ys5))
-            else:
-                # BEST FIX: use THIS staff's own <barlines> list (IDs) to pick a barline span
-                y_hint = yxs[0][0] if len(yxs) >= 1 else clef_y_hint
-
-                staff_barline_ids = _parse_int_list(staff.findtext("barlines"))
-                cands: list[tuple[float, float, float]] = []
-                for bid in staff_barline_ids:
-                    el = inter_by_id.get(bid)
-                    if el is None:
-                        continue
-                    if el.tag != "barline":
-                        continue
-                    span = _barline_span_from_el(el)
-                    if span is not None:
-                        cands.append(span)
-
-                span2 = _choose_span(cands, y_hint)
-                if span2 is None:
-                    # last resort: global search by staff_id
-                    span2 = _barline_span_for_staff_global(staff_id, y_hint)
-
-                if span2 is None:
-                    continue
-
-                y_top, y_bot = span2
-
-            if y_bot <= y_top or (y_bot - y_top) < 10.0:
-                continue
-
-            # ---- X anchor ----
-            x_left = _safe_float(staff.get("left"))
-            line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
-
-            if x_left is None and line_min_x is not None:
-                x_left = line_min_x
-
-            if x_left is None and header_start is not None:
-                x_left = float(header_start)
-
-            if x_left is None and clef_x is not None:
-                shift = (0.90 * expected_spacing) if expected_spacing > 0.0 else 20.0
-                x_left = float(clef_x) - float(shift)
-
-            if x_left is None and all_line_xmins:
-                x_left = float(_pct(all_line_xmins, 0.05))
-
-            if x_left is None:
-                continue
-
-            if line_min_x is not None and expected_spacing > 0.0:
-                if x_left > (line_min_x + 0.60 * expected_spacing):
-                    x_left = line_min_x
-
-            x_left = max(0.0, float(x_left) - PAD_LEFT_PX)
-            guides.append((x_left, y_top, y_bot))
-
-    return pic_w, pic_h, guides
-
     def barline_span_for_staff(staff_id: str, y_hint: float | None) -> tuple[float, float] | None:
-        """
-        Choose a barline span for this staff. If y_hint is provided, prefer:
-          1) barlines whose median span covers y_hint
-          2) else barline whose median midpoint is closest to y_hint
-        Tie-breaker: smallest bounds.x (earliest in system).
-        """
         if inters is None or not staff_id:
             return None
 
@@ -496,25 +253,28 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
         if best_covering is not None:
             return (best_covering[1], best_covering[2])
-
         if y_hint is not None and best_closest is not None:
             return (best_closest[2], best_closest[3])
-
         if best_any is not None:
             return (best_any[1], best_any[2])
-
         return None
 
-    # Iterate systems in order
-    for system in page.findall("system"):
+    # IMPORTANT: use ".//system" so we don't miss later/indented systems on some sheets
+    systems = page.findall(".//system")
+    if not systems:
+        systems = page.findall("system")
+
+    staff_total = 0
+
+    for system in systems:
         for staff in system.findall(".//staff"):
+            staff_total += 1
             staff_id = staff.get("id") or ""
 
             header = staff.find("header")
             header_start = _safe_float(header.get("start")) if header is not None else None
 
-            clef_b = _clef_bounds(page, inter_by_id, staff)
-            clef_x = clef_b[0] if clef_b is not None else None
+            clef_b = _clef_bounds(inter_by_id, staff)
             clef_y_hint = (clef_b[1] + 0.5 * clef_b[3]) if clef_b is not None else None
 
             lines_node = staff.find("lines")
@@ -550,7 +310,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
             # ---- Y span ----
             ys5: list[float] | None = None
-
             if len(yxs) >= 5:
                 chosen = _best_five_by_spacing(yxs, expected_spacing)
                 chosen = sorted(chosen, key=lambda t: t[0])
@@ -563,7 +322,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 y_top = float(min(ys5))
                 y_bot = float(max(ys5))
             else:
-                # Key fix: use clef-based vertical hint when staff lines are missing
                 y_hint = yxs[0][0] if len(yxs) >= 1 else clef_y_hint
                 span = barline_span_for_staff(staff_id, y_hint)
                 if span is None:
@@ -577,18 +335,19 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             x_left = _safe_float(staff.get("left"))
             line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
 
-            # Prefer real staff geometry first
+            # Prefer real staff geometry
             if x_left is None and line_min_x is not None:
                 x_left = line_min_x
 
-            # If no staff line x, header_start is usually the staff left edge (better than clef.x)
+            # Next best: header_start is usually the staff left edge
             if x_left is None and header_start is not None:
                 x_left = float(header_start)
 
-            # Last resort: place it to the LEFT of the clef, not on the clef
-            if x_left is None and clef_x is not None:
-                shift = (0.90 * expected_spacing) if expected_spacing > 0.0 else 20.0
-                x_left = float(clef_x) - float(shift)
+            # Last resort: left of clef by (clef width + a bit)
+            if x_left is None and clef_b is not None:
+                clef_x, _, clef_w, _ = clef_b
+                extra = (expected_spacing if expected_spacing > 0 else 20.0)
+                x_left = float(clef_x) - float(clef_w) - float(extra)
 
             if x_left is None and all_line_xmins:
                 x_left = float(_pct(all_line_xmins, 0.05))
@@ -596,178 +355,123 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             if x_left is None:
                 continue
 
-            # Safety clamp: if we have staff-line edge, never drift into the clef
+            # Safety clamp: if we have staff edge, never drift right of it
             if line_min_x is not None and expected_spacing > 0.0:
                 if x_left > (line_min_x + 0.60 * expected_spacing):
                     x_left = line_min_x
 
             x_left = max(0.0, float(x_left) - PAD_LEFT_PX)
-            guides.append((x_left, y_top, y_bot))
+            guides_px.append((x_left, y_top, y_bot))
 
-    return pic_w, pic_h, guides
+    return pic_w, pic_h, guides_px, staff_total
 
-    def barline_span_for_staff(staff_id: str, y_hint: float | None) -> tuple[float, float] | None:
-        """
-        Choose a barline span for this staff, preferably one whose median span covers y_hint.
-        Among candidates, pick smallest bounds.x (earliest in the system).
-        """
-        if inters is None or not staff_id:
-            return None
 
-        best_any = None          # (bx, y_top, y_bot)
-        best_covering = None     # (bx, y_top, y_bot)
+def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return gray
 
-        for el in inters.findall("barline"):
-            if el.get("staff") != staff_id:
-                continue
 
-            b = el.find("bounds")
-            med = el.find("median")
-            if b is None or med is None:
-                continue
+def _fallback_missing_staff_guides(page: fitz.Page, existing_guides_pdf: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    """
+    Detect staff lines directly from the rendered page image.
+    Return ONLY guides that don't overlap existing ones (by y-span).
+    """
+    gray = _render_page_gray(page, zoom=2.0)
+    h, w = gray.shape[:2]
 
-            bx = _safe_float(b.get("x"))
-            if bx is None:
-                continue
+    # Binarize (music tends to be dark)
+    thr = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 10
+    )
 
-            p1 = med.find("p1")
-            p2 = med.find("p2")
-            if p1 is None or p2 is None:
-                continue
+    # Extract horizontal lines
+    kernel_w = max(40, w // 20)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
+    horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
 
-            y1 = _safe_float(p1.get("y"))
-            y2 = _safe_float(p2.get("y"))
-            if y1 is None or y2 is None:
-                continue
+    contours, _ = cv2.findContours(horiz, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            y_top = float(min(y1, y2))
-            y_bot = float(max(y1, y2))
-            if y_bot <= y_top:
-                continue
+    lines = []
+    for c in contours:
+        x, y, ww, hh = cv2.boundingRect(c)
+        if ww < 0.35 * w:
+            continue
+        if hh > 6:
+            continue
+        y_mid = y + 0.5 * hh
+        lines.append((y_mid, x, ww))
 
-            cand = (bx, y_top, y_bot)
+    if len(lines) < 8:
+        return []
 
-            if best_any is None or cand[0] < best_any[0]:
-                best_any = cand
+    lines.sort(key=lambda t: t[0])
+    ys = [t[0] for t in lines]
 
-            if y_hint is not None:
-                # small slack
-                if (y_top - 2.0) <= y_hint <= (y_bot + 2.0):
-                    if best_covering is None or cand[0] < best_covering[0]:
-                        best_covering = cand
+    # Estimate typical interline spacing from small gaps
+    gaps = []
+    for i in range(len(ys) - 1):
+        d = ys[i + 1] - ys[i]
+        if 3 <= d <= 40:
+            gaps.append(d)
+    if not gaps:
+        return []
 
-        chosen = best_covering if best_covering is not None else best_any
-        if chosen is None:
-            return None
-        return (chosen[1], chosen[2])
+    gaps.sort()
+    gap = gaps[len(gaps) // 2]
+    tol = max(2.0, 0.35 * gap)
 
-    # Iterate systems in order (more stable than ".//system//staff" in some XMLs)
-    for system in page.findall("system"):
-        # staff nodes live under system/part/staff
-        for staff in system.findall(".//staff"):
-            staff_id = staff.get("id") or ""
+    # Find 5-line windows matching spacing
+    staff_candidates = []
+    for i in range(0, len(lines) - 4):
+        win = lines[i:i + 5]
+        wy = [t[0] for t in win]
+        diffs = [wy[j + 1] - wy[j] for j in range(4)]
+        if all(abs(d - gap) <= tol for d in diffs):
+            x_left = min(t[1] for t in win)
+            y_top = wy[0]
+            y_bot = wy[4]
+            staff_candidates.append((x_left, y_top, y_bot))
 
-            lines_node = staff.find("lines")
-            line_nodes = [] if lines_node is None else lines_node.findall("line")
+    if not staff_candidates:
+        return []
 
-            # Collect (y_at_left, x_min_for_that_line) for each detected staff line
-            yxs: list[tuple[float, float]] = []
-            all_line_xmins: list[float] = []
+    # Deduplicate by y (many overlapping windows)
+    staff_candidates.sort(key=lambda t: (t[1], t[0]))
+    staves = []
+    for x_left, y_top, y_bot in staff_candidates:
+        cy = 0.5 * (y_top + y_bot)
+        if staves and abs(cy - 0.5 * (staves[-1][1] + staves[-1][2])) < 0.6 * (y_bot - y_top):
+            continue
+        staves.append((x_left, y_top, y_bot))
 
-            for ln in line_nodes:
-                pts = ln.findall("point")
-                if not pts:
-                    continue
+    rect = page.rect
+    pad_pdf = (PAD_LEFT_PX / float(w)) * rect.width
 
-                min_x = None
-                y_at_min_x = None
+    extras = []
+    for x_left_i, y_top_i, y_bot_i in staves:
+        x_pdf = (x_left_i / float(w)) * rect.width - pad_pdf
+        y0_pdf = (y_top_i / float(h)) * rect.height
+        y1_pdf = (y_bot_i / float(h)) * rect.height
+        if y1_pdf <= y0_pdf:
+            continue
 
-                for p in pts:
-                    x = _safe_float(p.get("x"))
-                    y = _safe_float(p.get("y"))
-                    if x is None or y is None:
-                        continue
-                    if min_x is None or x < min_x:
-                        min_x = x
-                        y_at_min_x = y
+        cy = 0.5 * (y0_pdf + y1_pdf)
+        h_staff = (y1_pdf - y0_pdf)
 
-                if min_x is None or y_at_min_x is None:
-                    continue
+        overlaps = False
+        for (_, ey0, ey1) in existing_guides_pdf:
+            if (ey0 - 0.25 * h_staff) <= cy <= (ey1 + 0.25 * h_staff):
+                overlaps = True
+                break
 
-                yxs.append((float(y_at_min_x), float(min_x)))
-                all_line_xmins.append(float(min_x))
+        if not overlaps:
+            extras.append((max(0.0, x_pdf), y0_pdf, y1_pdf))
 
-            yxs.sort(key=lambda t: t[0])
-
-            # ---- Y span ----
-            ys5: list[float] | None = None
-
-            if len(yxs) >= 5:
-                chosen = _best_five_by_spacing(yxs, expected_spacing)
-                chosen = sorted(chosen, key=lambda t: t[0])
-                ys5 = [t[0] for t in chosen]
-            elif len(yxs) >= 2:
-                # IMPORTANT: allow 2–4 lines (this is the main missing-staff fix)
-                ys_partial = [t[0] for t in yxs]
-                ys5 = _synthesize_five_lines(ys_partial, expected_spacing)
-
-            if ys5 is not None:
-                y_top = float(min(ys5))
-                y_bot = float(max(ys5))
-            else:
-                # Fallback: barline median span (prefer one covering a y hint if we have any)
-                y_hint = yxs[0][0] if len(yxs) >= 1 else None
-                span = barline_span_for_staff(staff_id, y_hint)
-                if span is None:
-                    continue
-                y_top, y_bot = span
-
-            if y_bot <= y_top or (y_bot - y_top) < 10.0:
-                continue
-
-            # ---- X anchor ----
-            # Priority:
-            # 1) staff@left
-            # 2) min x from staff line points
-            # 3) clef bounds x
-            # 4) header@start
-            # 5) percentile fallback
-            x_left = _safe_float(staff.get("left"))
-
-            line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
-
-            if x_left is None and line_min_x is not None:
-                x_left = line_min_x
-
-            if x_left is None:
-                clef_x = _clef_left_x(page, inter_by_id, staff)
-                if clef_x is not None:
-                    x_left = float(clef_x)
-
-            if x_left is None:
-                header = staff.find("header")
-                if header is not None:
-                    hs = _safe_float(header.get("start"))
-                    if hs is not None:
-                        x_left = float(hs)
-
-            if x_left is None and all_line_xmins:
-                x_left = float(_pct(all_line_xmins, 0.05))
-
-            if x_left is None:
-                continue
-
-            # Clamp: if chosen x is too far right compared to the staff-line edge,
-            # force it back to the staff edge (fixes "line inside clef" safely).
-            if line_min_x is not None and expected_spacing > 0.0:
-                if x_left > (line_min_x + 0.60 * expected_spacing):
-                    x_left = line_min_x
-
-            x_left = max(0.0, float(x_left) - PAD_LEFT_PX)
-
-            guides.append((x_left, y_top, y_bot))
-
-    return pic_w, pic_h, guides
+    return extras
 
 
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
@@ -780,30 +484,32 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
         for page_index in range(doc.page_count):
             if page_index >= len(sheet_paths):
-                # safer: skip pages we don't have a matching sheet for
                 continue
 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
 
-            pic_w, pic_h, guides = _parse_sheet(z, sheet_xml_path)
-            if not guides:
+            pic_w, pic_h, guides_px, staff_total = _parse_sheet(z, sheet_xml_path)
+            if pic_w <= 0 or pic_h <= 0:
                 continue
 
             rect = page.rect
             scale_x = rect.width / pic_w
             scale_y = rect.height / pic_h
 
-            for (x_px, y0_px, y1_px) in guides:
+            guides_pdf = []
+            for (x_px, y0_px, y1_px) in guides_px:
                 x_pdf = x_px * scale_x
                 y0_pdf = y0_px * scale_y
                 y1_pdf = y1_px * scale_y
-                page.draw_line(
-                    (x_pdf, y0_pdf),
-                    (x_pdf, y1_pdf),
-                    color=GUIDE_COLOR,
-                    width=GUIDE_WIDTH,
-                )
+                guides_pdf.append((x_pdf, y0_pdf, y1_pdf))
+                page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
+
+            # Fallback: ONLY if OMR missed staves
+            if staff_total > 0 and len(guides_pdf) < staff_total:
+                extras = _fallback_missing_staff_guides(page, guides_pdf)
+                for (x_pdf, y0_pdf, y1_pdf) in extras:
+                    page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
 
     doc.save(output_pdf)
     doc.close()
