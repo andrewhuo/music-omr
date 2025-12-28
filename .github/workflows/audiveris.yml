@@ -248,6 +248,54 @@ jobs:
               print(line.rstrip("\n"))
           PY
 
+      - name: OMR anomaly summary (print only problem systems)
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json
+
+          p = "/tmp/work/debug/omr_structure.json"
+          with open(p, "r") as f:
+              data = json.load(f)
+
+          def staff_bad(st):
+              lc = st.get("line_count", 0)
+              left = st.get("staff_left")
+              hs = st.get("header_start")
+              return (lc is None) or (lc < 5) or (left is None) or (hs is None)
+
+          any_printed = False
+          for sheet in data:
+              bad_systems = []
+              for sys in sheet.get("systems", []):
+                  staves = sys.get("staves", [])
+                  if not staves:
+                      continue
+                  bad_staves = [s for s in staves if staff_bad(s)]
+                  if bad_staves:
+                      bad_systems.append({
+                          "system_id": sys.get("system_id"),
+                          "indented": sys.get("indented"),
+                          "staff_count": sys.get("staff_count"),
+                          "bad_staves": bad_staves,
+                      })
+
+              if bad_systems:
+                  any_printed = True
+                  print("\nSHEET:", sheet.get("sheet"))
+                  print("systems_direct:", sheet.get("systems_direct"), "systems_all:", sheet.get("systems_all"))
+                  for bs in bad_systems:
+                      print("  SYSTEM id=", bs["system_id"], "indented=", bs["indented"], "staff_count=", bs["staff_count"])
+                      for s in bs["bad_staves"]:
+                          print("    staff_id=", s.get("staff_id"),
+                                "line_count=", s.get("line_count"),
+                                "staff_left=", s.get("staff_left"),
+                                "header_start=", s.get("header_start"))
+
+          if not any_printed:
+              print("\nNo anomalies found: all staves had line_count>=5 and left/header_start present.")
+          PY
+
       #################################################################
       # 7) Python setup & dependencies
       #################################################################
