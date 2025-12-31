@@ -171,6 +171,31 @@ jobs:
           echo "== Grep likely geometry keywords =="
           unzip -p "$OMR" "$SHEET_XML" | egrep -n "System|Staff|bounds|rect|x|y|top|bottom|left|right" | head -n 200 || true
 
+      - name: Check if any sheet XML contains multiple <page> blocks
+        run: |
+          set -euo pipefail
+          OMR="/tmp/work/audiveris_out/input/input.omr"
+          python - << 'PY'
+          import re, zipfile, xml.etree.ElementTree as ET
+
+          sheet_re = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
+          omr = "/tmp/work/audiveris_out/input/input.omr"
+
+          with zipfile.ZipFile(omr, "r") as z:
+            sheets = sorted([n for n in z.namelist() if sheet_re.match(n)])
+            for path in sheets:
+              root = ET.fromstring(z.read(path))
+              pages = root.findall("page")
+              if len(pages) != 1:
+                print("\nMULTI-PAGE SHEET:", path, "page_count=", len(pages))
+              for p in pages:
+                pid = p.get("id")
+                systems = p.findall(".//system")
+                ind = [s.get("indented") for s in systems if s.get("indented") is not None]
+                print(f"  sheet={path} page_id={pid} systems={len(systems)} indented_flags={ind[:5]}")
+          PY
+
+
       - name: OMR structure debug (systems/staves)
         run: |
           set -euo pipefail
