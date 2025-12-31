@@ -3,19 +3,19 @@ import sys
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-
+import os
 import fitz  # PyMuPDF
 
 # Fallback needs these; your workflow already installs them.
 import numpy as np
 import cv2
 
-
 GUIDE_COLOR = (1, 0, 0)  # red
 GUIDE_WIDTH = 1.0
 
 # Small left shift so line sits just left of the staff start / clef
 PAD_LEFT_PX = 6.0
+DEBUG_GUIDES = os.getenv("DEBUG_GUIDES", "").strip() == "1"
 
 _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 
@@ -275,6 +275,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 header_start = _safe_float(header.get("start")) if header is not None else None
 
                 clef_b = _clef_bounds(inter_by_id, staff)
+                if DEBUG_GUIDES and clef_b is None:
+                    print(f"[DEBUG] clef_b=None sheet={sheet_xml_path} staff_id={staff_id}")
+
                 clef_y_hint = (clef_b[1] + 0.5 * clef_b[3]) if clef_b is not None else None
 
                 lines_node = staff.find("lines")
@@ -362,6 +365,18 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     max_x = float(clef_x) - guard
                     if x_left > max_x:
                         x_left = max_x
+                if DEBUG_GUIDES and clef_b is not None:
+                    clef_x, _, clef_w, _ = clef_b
+                    x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
+                    if clef_x <= x_postpad <= (clef_x + clef_w):
+                        print(
+                            "[DEBUG] GUIDE_IN_CLEF "
+                            f"sheet={sheet_xml_path} staff_id={staff_id} "
+                            f"x_left_raw={float(x_left):.2f} x_postpad={x_postpad:.2f} "
+                            f"clef_x={clef_x:.2f} clef_w={clef_w:.2f} "
+                            f"staff_left={staff.get('left')} header_start={header_start} "
+                            f"line_min_x={line_min_x}"
+                            )
 
                 x_left = max(0.0, float(x_left) - PAD_LEFT_PX)
                 guides_px.append((x_left, y_top, y_bot))
@@ -511,6 +526,12 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             # Fallback: ONLY if OMR missed staves
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
+                if DEBUG_GUIDES:
+                    print(
+                        f"[DEBUG] page={page_index+1} sheet={sheet_xml_path} "
+                        f"staff_total={staff_total} omr_guides={len(guides_pdf)} fallback_extras={len(extras)}"
+                    )
+
                 for (x_pdf, y0_pdf, y1_pdf) in extras:
                     page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
 
