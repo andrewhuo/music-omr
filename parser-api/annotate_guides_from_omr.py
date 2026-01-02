@@ -275,6 +275,26 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 header_start = _safe_float(header.get("start")) if header is not None else None
 
                 clef_b = _clef_bounds(inter_by_id, staff)
+                # Fallback: if header doesn't point to the clef, find clef directly in inters by staff id
+                if clef_b is None and inters is not None and staff_id:
+                    best = None  # choose leftmost clef if multiple
+                    for el in inters.findall("clef"):
+                        if el.get("staff") != staff_id:
+                            continue
+                        b = el.find("bounds")
+                        if b is None:
+                            continue
+                        x = _safe_float(b.get("x"))
+                        y = _safe_float(b.get("y"))
+                        w = _safe_float(b.get("w"))
+                        h = _safe_float(b.get("h"))
+                        if x is None or y is None or w is None or h is None:
+                            continue
+                        cand = (float(x), float(y), float(w), float(h))
+                        if best is None or cand[0] < best[0]:
+                            best = cand
+                    clef_b = best
+
                 if DEBUG_GUIDES and clef_b is None:
                     print(f"[DEBUG] clef_b=None sheet={sheet_xml_path} staff_id={staff_id}")
 
