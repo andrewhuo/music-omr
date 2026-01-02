@@ -362,6 +362,13 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     x_left = line_min_x
 
                 if x_left is None and header_start is not None:
+                                # Hard clamp against header start: never put guide inside the header (clef/key/time area)
+                    guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
+                    if header_start is not None:
+                        max_x = float(header_start) - guard
+                        if x_left is not None and x_left > max_x:
+                            x_left = max_x
+
                     x_left = float(header_start)
 
                 if x_left is None and clef_b is not None:
