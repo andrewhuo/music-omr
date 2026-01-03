@@ -1,23 +1,43 @@
 #!/usr/bin/env python3
-import sys
+import os
 import re
+import sys
 import zipfile
 import xml.etree.ElementTree as ET
-import os
-import fitz  # PyMuPDF
 
-# Fallback needs these; your workflow already installs them.
+import fitz  # PyMuPDF
 import numpy as np
 import cv2
+
 
 GUIDE_COLOR = (1, 0, 0)  # red
 GUIDE_WIDTH = 1.0
 
 # Small left shift so line sits just left of the staff start / clef
 PAD_LEFT_PX = 6.0
-DEBUG_GUIDES = os.getenv("DEBUG_GUIDES", "").strip() == "1"
 
 _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
+
+
+def _debug_enabled() -> bool:
+    v = os.getenv("DEBUG_GUIDES", "").strip()
+    return v in ("1", "true", "True", "yes", "YES")
+
+
+def _debug_match(sheet_xml_path: str, staff_id: str) -> bool:
+    # Optional filters to avoid log spam
+    want_sheet = os.getenv("DEBUG_GUIDES_SHEET", "").strip()
+    want_staff = os.getenv("DEBUG_GUIDES_STAFF_ID", "").strip()
+    if want_sheet and want_sheet not in sheet_xml_path:
+        return False
+    if want_staff and want_staff != str(staff_id):
+        return False
+    return True
+
+
+def _dbg(sheet_xml_path: str, staff_id: str, msg: str) -> None:
+    if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
+        print(msg, flush=True)
 
 
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
@@ -40,13 +60,15 @@ def _pct(values: list[float], p: float) -> float:
     return xs[max(0, min(len(xs) - 1, i))]
 
 
-def _best_five_by_spacing(yxs: list[tuple[float, float]], expected_spacing: float) -> list[tuple[float, float]]:
+def _best_five_by_spacing(
+    yxs: list[tuple[float, float]], expected_spacing: float
+) -> list[tuple[float, float]]:
     if len(yxs) <= 5:
         return yxs
     best = None
     best_score = float("inf")
     for i in range(0, len(yxs) - 4):
-        win = yxs[i:i + 5]
+        win = yxs[i : i + 5]
         ys = [t[0] for t in win]
         diffs = [ys[j + 1] - ys[j] for j in range(4)]
         med = sorted(diffs)[2]
@@ -133,7 +155,9 @@ def _index_inters(page: ET.Element) -> dict[int, ET.Element]:
     return out
 
 
-def _clef_bounds(inter_by_id: dict[int, ET.Element], staff: ET.Element) -> tuple[float, float, float, float] | None:
+def _clef_bounds_from_header(
+    inter_by_id: dict[int, ET.Element], staff: ET.Element
+) -> tuple[float, float, float, float] | None:
     header = staff.find("header")
     if header is None:
         return None
@@ -163,6 +187,88 @@ def _clef_bounds(inter_by_id: dict[int, ET.Element], staff: ET.Element) -> tuple
         return None
 
     return (float(x), float(y), float(w), float(h))
+
+
+def _clef_bounds_fallback(
+    inters: ET.Element | None,
+    staff_id: str,
+    y_top: float,
+    y_bot: float,
+    header_start: float | None,
+) -> tuple[float, float, float, float] | None:
+    """
+    If header doesn't link the clef (or staff attribute mismatches),
+    try to find a clef inter by:
+      1) matching clef@staff == staff_id (leftmost)
+      2) otherwise, any clef whose bounds overlap the staff y-span (leftmost,
+         optionally preferring ones near header_start)
+    """
+    if inters is None:
+        return None
+
+    best = None
+
+    # 1) clef elements that explicitly match staff id
+    if staff_id:
+        for el in inters.findall("clef"):
+            if el.get("staff") != staff_id:
+                continue
+            b = el.find("bounds")
+            if b is None:
+                continue
+            x = _safe_float(b.get("x"))
+            y = _safe_float(b.get("y"))
+            w = _safe_float(b.get("w"))
+            h = _safe_float(b.get("h"))
+            if x is None or y is None or w is None or h is None:
+                continue
+            cand = (float(x), float(y), float(w), float(h))
+            if best is None or cand[0] < best[0]:
+                best = cand
+
+    if best is not None:
+        return best
+
+    # 2) clef elements overlapping staff y-span
+    #    Prefer ones near header_start if available.
+    y_pad = 0.20 * (y_bot - y_top)
+    want_y0 = y_top - y_pad
+    want_y1 = y_bot + y_pad
+
+    best_score = None
+    for el in inters.findall("clef"):
+        b = el.find("bounds")
+        if b is None:
+            continue
+        x = _safe_float(b.get("x"))
+        y = _safe_float(b.get("y"))
+        w = _safe_float(b.get("w"))
+        h = _safe_float(b.get("h"))
+        if x is None or y is None or w is None or h is None:
+            continue
+
+        x, y, w, h = float(x), float(y), float(w), float(h)
+        if h <= 0 or w <= 0:
+            continue
+
+        by0 = y
+        by1 = y + h
+        # overlap check
+        if by1 < want_y0 or by0 > want_y1:
+            continue
+
+        # score: leftmost wins; add small penalty if far to the right of header_start
+        penalty = 0.0
+        if header_start is not None:
+            # if clef is way to the right of header_start, it's probably not the header clef
+            penalty = max(0.0, x - header_start) * 0.05
+        score = x + penalty
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best = (x, y, w, h)
+
+    return best
 
 
 def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
@@ -274,32 +380,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 header = staff.find("header")
                 header_start = _safe_float(header.get("start")) if header is not None else None
 
-                clef_b = _clef_bounds(inter_by_id, staff)
-                # Fallback: if header doesn't point to the clef, find clef directly in inters by staff id
-                if clef_b is None and inters is not None and staff_id:
-                    best = None  # choose leftmost clef if multiple
-                    for el in inters.findall("clef"):
-                        if el.get("staff") != staff_id:
-                            continue
-                        b = el.find("bounds")
-                        if b is None:
-                            continue
-                        x = _safe_float(b.get("x"))
-                        y = _safe_float(b.get("y"))
-                        w = _safe_float(b.get("w"))
-                        h = _safe_float(b.get("h"))
-                        if x is None or y is None or w is None or h is None:
-                            continue
-                        cand = (float(x), float(y), float(w), float(h))
-                        if best is None or cand[0] < best[0]:
-                            best = cand
-                    clef_b = best
-
-                if DEBUG_GUIDES and clef_b is None:
-                    print(f"[DEBUG] clef_b=None sheet={sheet_xml_path} staff_id={staff_id}")
-
-                clef_y_hint = (clef_b[1] + 0.5 * clef_b[3]) if clef_b is not None else None
-
                 lines_node = staff.find("lines")
                 line_nodes = [] if lines_node is None else lines_node.findall("line")
 
@@ -341,36 +421,56 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     ys_partial = [t[0] for t in yxs]
                     ys5 = _synthesize_five_lines(ys_partial, expected_spacing)
 
+                clef_y_hint = None
+                clef_b = None  # we’ll compute after y span, so we can do y-overlap fallback
+
                 if ys5 is not None:
                     y_top = float(min(ys5))
                     y_bot = float(max(ys5))
                 else:
-                    y_hint = yxs[0][0] if len(yxs) >= 1 else clef_y_hint
-                    span = barline_span_for_staff(staff_id, y_hint)
+                    span = barline_span_for_staff(staff_id, yxs[0][0] if len(yxs) >= 1 else None)
                     if span is None:
+                        # try clef y-hint if available from header-linked clef
+                        clef_b0 = _clef_bounds_from_header(inter_by_id, staff)
+                        if clef_b0 is not None:
+                            clef_y_hint = clef_b0[1] + 0.5 * clef_b0[3]
+                            span = barline_span_for_staff(staff_id, clef_y_hint)
+                    if span is None:
+                        _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP no_y_span sheet={sheet_xml_path} staff={staff_id}")
                         continue
                     y_top, y_bot = span
 
                 if y_bot <= y_top or (y_bot - y_top) < 10.0:
+                    _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP bad_y_span sheet={sheet_xml_path} staff={staff_id} y_top={y_top} y_bot={y_bot}")
                     continue
+
+                # ---- Clef bounds (after y span so we can do y-overlap fallback) ----
+                clef_b = _clef_bounds_from_header(inter_by_id, staff)
+                if clef_b is None:
+                    clef_b = _clef_bounds_fallback(inters, staff_id, y_top, y_bot, header_start)
+
+                if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
+                    _dbg(
+                        sheet_xml_path,
+                        staff_id,
+                        f"[DBG] sheet={sheet_xml_path} sys={system.get('id')} staff={staff_id} indented={system.get('indented')} "
+                        f"lines={len(line_nodes)} header_start={header_start} line_min_x={(min(all_line_xmins) if all_line_xmins else None)} "
+                        f"clef_b={'present' if clef_b is not None else None} y_top={y_top:.1f} y_bot={y_bot:.1f}",
+                    )
 
                 # ---- X anchor ----
                 x_left = _safe_float(staff.get("left"))
                 line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
 
+                # Prefer real staff geometry if present
                 if x_left is None and line_min_x is not None:
                     x_left = line_min_x
 
+                # Next best: header_start is usually the staff left edge
                 if x_left is None and header_start is not None:
-                                # Hard clamp against header start: never put guide inside the header (clef/key/time area)
-                    guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
-                    if header_start is not None:
-                        max_x = float(header_start) - guard
-                        if x_left is not None and x_left > max_x:
-                            x_left = max_x
-
                     x_left = float(header_start)
 
+                # Last resort: left of clef by (clef width + a bit)
                 if x_left is None and clef_b is not None:
                     clef_x, _, clef_w, _ = clef_b
                     extra = (expected_spacing if expected_spacing > 0 else 20.0)
@@ -380,33 +480,48 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     x_left = float(_pct(all_line_xmins, 0.05))
 
                 if x_left is None:
+                    _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP no_x sheet={sheet_xml_path} staff={staff_id}")
                     continue
 
+                x_before = float(x_left)
+
+                # 1) Don’t drift right of staff line start (if available)
                 if line_min_x is not None and expected_spacing > 0.0:
                     if x_left > (line_min_x + 0.60 * expected_spacing):
                         x_left = line_min_x
 
+                # 2) Never put guide inside header area (clef/key/time)
+                if header_start is not None:
+                    guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
+                    max_x = float(header_start) - guard
+                    if x_left > max_x:
+                        x_left = max_x
+
+                # 3) Never put guide inside clef box (strongest clamp)
                 if clef_b is not None:
                     clef_x, _, _, _ = clef_b
                     guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
                     max_x = float(clef_x) - guard
                     if x_left > max_x:
                         x_left = max_x
-                if DEBUG_GUIDES and clef_b is not None:
-                    clef_x, _, clef_w, _ = clef_b
-                    x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
-                    if clef_x <= x_postpad <= (clef_x + clef_w):
-                        print(
-                            "[DEBUG] GUIDE_IN_CLEF "
-                            f"sheet={sheet_xml_path} staff_id={staff_id} "
-                            f"x_left_raw={float(x_left):.2f} x_postpad={x_postpad:.2f} "
-                            f"clef_x={clef_x:.2f} clef_w={clef_w:.2f} "
-                            f"staff_left={staff.get('left')} header_start={header_start} "
-                            f"line_min_x={line_min_x}"
-                            )
 
-                x_left = max(0.0, float(x_left) - PAD_LEFT_PX)
-                guides_px.append((x_left, y_top, y_bot))
+                # Apply pad last
+                x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
+
+                # Debug: detect if final guide still lands inside clef (should be rare now)
+                if _debug_enabled() and _debug_match(sheet_xml_path, staff_id) and clef_b is not None:
+                    clef_x, _, clef_w, _ = clef_b
+                    if clef_x <= x_postpad <= (clef_x + clef_w):
+                        _dbg(
+                            sheet_xml_path,
+                            staff_id,
+                            "[DBG] GUIDE_IN_CLEF "
+                            f"sheet={sheet_xml_path} staff={staff_id} "
+                            f"x_before={x_before:.2f} x_after={float(x_left):.2f} x_postpad={x_postpad:.2f} "
+                            f"clef_x={clef_x:.2f} clef_w={clef_w:.2f} staff_left={staff.get('left')} header_start={header_start} line_min_x={line_min_x}",
+                        )
+
+                guides_px.append((x_postpad, y_top, y_bot))
 
     return pic_w, pic_h, guides_px, staff_total
 
@@ -420,7 +535,10 @@ def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
     return gray
 
 
-def _fallback_missing_staff_guides(page: fitz.Page, existing_guides_pdf: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+def _fallback_missing_staff_guides(
+    page: fitz.Page,
+    existing_guides_pdf: list[tuple[float, float, float]],
+) -> list[tuple[float, float, float]]:
     """
     Detect staff lines directly from the rendered page image.
     Return ONLY guides that don't overlap existing ones (by y-span).
@@ -428,12 +546,10 @@ def _fallback_missing_staff_guides(page: fitz.Page, existing_guides_pdf: list[tu
     gray = _render_page_gray(page, zoom=2.0)
     h, w = gray.shape[:2]
 
-    # Binarize (music tends to be dark)
     thr = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 10
     )
 
-    # Extract horizontal lines
     kernel_w = max(30, w // 25)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
     horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -456,7 +572,6 @@ def _fallback_missing_staff_guides(page: fitz.Page, existing_guides_pdf: list[tu
     lines.sort(key=lambda t: t[0])
     ys = [t[0] for t in lines]
 
-    # Estimate typical interline spacing from small gaps
     gaps = []
     for i in range(len(ys) - 1):
         d = ys[i + 1] - ys[i]
@@ -469,10 +584,9 @@ def _fallback_missing_staff_guides(page: fitz.Page, existing_guides_pdf: list[tu
     gap = gaps[len(gaps) // 2]
     tol = max(2.0, 0.35 * gap)
 
-    # Find 5-line windows matching spacing
     staff_candidates = []
     for i in range(0, len(lines) - 4):
-        win = lines[i:i + 5]
+        win = lines[i : i + 5]
         wy = [t[0] for t in win]
         diffs = [wy[j + 1] - wy[j] for j in range(4)]
         if all(abs(d - gap) <= tol for d in diffs):
@@ -484,7 +598,6 @@ def _fallback_missing_staff_guides(page: fitz.Page, existing_guides_pdf: list[tu
     if not staff_candidates:
         return []
 
-    # Deduplicate by y (many overlapping windows)
     staff_candidates.sort(key=lambda t: (t[1], t[0]))
     staves = []
     for x_left, y_top, y_bot in staff_candidates:
@@ -548,19 +661,28 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 y0_pdf = y0_px * scale_y
                 y1_pdf = y1_px * scale_y
                 guides_pdf.append((x_pdf, y0_pdf, y1_pdf))
-                page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
+                page.draw_line(
+                    (x_pdf, y0_pdf),
+                    (x_pdf, y1_pdf),
+                    color=GUIDE_COLOR,
+                    width=GUIDE_WIDTH,
+                )
 
-            # Fallback: ONLY if OMR missed staves
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
-                if DEBUG_GUIDES:
+                if _debug_enabled():
                     print(
-                        f"[DEBUG] page={page_index+1} sheet={sheet_xml_path} "
-                        f"staff_total={staff_total} omr_guides={len(guides_pdf)} fallback_extras={len(extras)}"
+                        f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
+                        f"staff_total={staff_total} omr_guides={len(guides_pdf)} fallback_extras={len(extras)}",
+                        flush=True,
                     )
-
                 for (x_pdf, y0_pdf, y1_pdf) in extras:
-                    page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
+                    page.draw_line(
+                        (x_pdf, y0_pdf),
+                        (x_pdf, y1_pdf),
+                        color=GUIDE_COLOR,
+                        width=GUIDE_WIDTH,
+                    )
 
     doc.save(output_pdf)
     doc.close()
