@@ -230,7 +230,6 @@ def _clef_bounds_fallback(
         return best
 
     # 2) clef elements overlapping staff y-span
-    #    Prefer ones near header_start if available.
     y_pad = 0.20 * (y_bot - y_top)
     want_y0 = y_top - y_pad
     want_y1 = y_bot + y_pad
@@ -253,14 +252,11 @@ def _clef_bounds_fallback(
 
         by0 = y
         by1 = y + h
-        # overlap check
         if by1 < want_y0 or by0 > want_y1:
             continue
 
-        # score: leftmost wins; add small penalty if far to the right of header_start
         penalty = 0.0
         if header_start is not None:
-            # if clef is way to the right of header_start, it's probably not the header clef
             penalty = max(0.0, x - header_start) * 0.05
         score = x + penalty
 
@@ -269,6 +265,115 @@ def _clef_bounds_fallback(
             best = (x, y, w, h)
 
     return best
+
+
+def _bounds_overlap_1d(a0: float, a1: float, b0: float, b1: float) -> bool:
+    return not (a1 < b0 or b1 < a0)
+
+
+def _push_left_if_inside_any_symbol(
+    inters: ET.Element | None,
+    staff_id: str,
+    y_top: float,
+    y_bot: float,
+    x_left: float,
+    line_min_x: float | None,
+    header_start: float | None,
+    expected_spacing: float,
+    sheet_xml_path: str,
+) -> float:
+    """
+    Generic collision-avoidance:
+    If the guide (after PAD_LEFT_PX) lands inside ANY inter bounds overlapping this staff,
+    push it left of that symbol.
+
+    This is the key fix for cases where clef_b=None but the clef (or key/time) still occupies
+    the x-region visually.
+    """
+    if inters is None:
+        return x_left
+
+    # Strong, stable guard even if expected_spacing is tiny.
+    guard = max(10.0, (0.35 * expected_spacing) if expected_spacing > 0 else 10.0)
+
+    # Reference x for "header-ish" area
+    ref = None
+    for v in (line_min_x, header_start, x_left):
+        if v is not None:
+            ref = float(v)
+            break
+    if ref is None:
+        ref = float(x_left)
+
+    # How far right we consider "header area" for collision checks.
+    # Default ~1.25 staff-spacings; fallback ~60px.
+    header_span = 1.25 * (expected_spacing if expected_spacing > 0 else 60.0)
+
+    # Try a few times in case pushing left hits another symbol.
+    for _ in range(4):
+        x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
+
+        hits: list[tuple[float, float, str]] = []  # (x0, x1, tag)
+        for el in list(inters):
+            b = el.find("bounds")
+            if b is None:
+                continue
+
+            x = _safe_float(b.get("x"))
+            y = _safe_float(b.get("y"))
+            w = _safe_float(b.get("w"))
+            h = _safe_float(b.get("h"))
+            if x is None or y is None or w is None or h is None:
+                continue
+            if w <= 0 or h <= 0:
+                continue
+
+            x0 = float(x)
+            x1 = x0 + float(w)
+            y0 = float(y)
+            y1 = y0 + float(h)
+
+            # If element has staff attribute, prefer matching
+            el_staff = el.get("staff")
+            if el_staff and staff_id and el_staff != staff_id:
+                continue
+
+            # Only consider symbols near the left/header region (avoid "notes" further right)
+            if x0 > (ref + header_span):
+                continue
+
+            if not _bounds_overlap_1d(y0, y1, y_top, y_bot):
+                continue
+
+            if x0 <= x_postpad <= x1:
+                hits.append((x0, x1, el.tag))
+
+        if not hits:
+            return x_left
+
+        # Push left of the leftmost offending symbol edge
+        hits.sort(key=lambda t: t[0])
+        hit_x0, hit_x1, hit_tag = hits[0]
+
+        new_x_postpad = max(0.0, hit_x0 - guard)
+        new_x_left = new_x_postpad + PAD_LEFT_PX
+
+        _dbg(
+            sheet_xml_path,
+            staff_id,
+            "[DBG] PUSH_LEFT "
+            f"staff={staff_id} x_postpad={x_postpad:.2f} -> {new_x_postpad:.2f} "
+            f"hit_tag={hit_tag} hit_x0={hit_x0:.2f} hit_x1={hit_x1:.2f} "
+            f"guard={guard:.2f} ref={ref:.2f} header_span={header_span:.2f}",
+        )
+
+        # If we're not moving anymore, stop
+        if abs(new_x_left - x_left) < 0.01:
+            return new_x_left
+
+        x_left = new_x_left
+
+    return x_left
 
 
 def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
@@ -422,7 +527,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     ys5 = _synthesize_five_lines(ys_partial, expected_spacing)
 
                 clef_y_hint = None
-                clef_b = None  # we’ll compute after y span, so we can do y-overlap fallback
+                clef_b = None  # compute after y span so we can do y-overlap fallback
 
                 if ys5 is not None:
                     y_top = float(min(ys5))
@@ -430,7 +535,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 else:
                     span = barline_span_for_staff(staff_id, yxs[0][0] if len(yxs) >= 1 else None)
                     if span is None:
-                        # try clef y-hint if available from header-linked clef
                         clef_b0 = _clef_bounds_from_header(inter_by_id, staff)
                         if clef_b0 is not None:
                             clef_y_hint = clef_b0[1] + 0.5 * clef_b0[3]
@@ -444,33 +548,21 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP bad_y_span sheet={sheet_xml_path} staff={staff_id} y_top={y_top} y_bot={y_bot}")
                     continue
 
-                # ---- Clef bounds (after y span so we can do y-overlap fallback) ----
+                # ---- Clef bounds ----
                 clef_b = _clef_bounds_from_header(inter_by_id, staff)
                 if clef_b is None:
                     clef_b = _clef_bounds_fallback(inters, staff_id, y_top, y_bot, header_start)
-
-                if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
-                    _dbg(
-                        sheet_xml_path,
-                        staff_id,
-                        f"[DBG] sheet={sheet_xml_path} sys={system.get('id')} staff={staff_id} indented={system.get('indented')} "
-                        f"lines={len(line_nodes)} header_start={header_start} line_min_x={(min(all_line_xmins) if all_line_xmins else None)} "
-                        f"clef_b={'present' if clef_b is not None else None} y_top={y_top:.1f} y_bot={y_bot:.1f}",
-                    )
 
                 # ---- X anchor ----
                 x_left = _safe_float(staff.get("left"))
                 line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
 
-                # Prefer real staff geometry if present
                 if x_left is None and line_min_x is not None:
                     x_left = line_min_x
 
-                # Next best: header_start is usually the staff left edge
                 if x_left is None and header_start is not None:
                     x_left = float(header_start)
 
-                # Last resort: left of clef by (clef width + a bit)
                 if x_left is None and clef_b is not None:
                     clef_x, _, clef_w, _ = clef_b
                     extra = (expected_spacing if expected_spacing > 0 else 20.0)
@@ -497,7 +589,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > max_x:
                         x_left = max_x
 
-                # 3) Never put guide inside clef box (strongest clamp)
+                # 3) Never put guide inside clef box (strongest clamp when clef_b exists)
                 if clef_b is not None:
                     clef_x, _, _, _ = clef_b
                     guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
@@ -505,8 +597,33 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > max_x:
                         x_left = max_x
 
+                # 4) NEW: even if clef_b is missing, avoid ANY header symbol bounds
+                x_left = _push_left_if_inside_any_symbol(
+                    inters=inters,
+                    staff_id=staff_id,
+                    y_top=y_top,
+                    y_bot=y_bot,
+                    x_left=float(x_left),
+                    line_min_x=line_min_x,
+                    header_start=header_start,
+                    expected_spacing=expected_spacing,
+                    sheet_xml_path=sheet_xml_path,
+                )
+
                 # Apply pad last
                 x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
+
+                # One-line staff debug summary (filtered)
+                if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
+                    _dbg(
+                        sheet_xml_path,
+                        staff_id,
+                        f"[DBG] sheet={sheet_xml_path} sys={system.get('id')} staff={staff_id} indented={system.get('indented')} "
+                        f"lines={len(line_nodes)} header_start={header_start} line_min_x={line_min_x} "
+                        f"clef_b={'present' if clef_b is not None else None} "
+                        f"x_before={x_before:.2f} x_after={float(x_left):.2f} x_postpad={x_postpad:.2f} "
+                        f"y_top={y_top:.1f} y_bot={y_bot:.1f}",
+                    )
 
                 # Debug: detect if final guide still lands inside clef (should be rare now)
                 if _debug_enabled() and _debug_match(sheet_xml_path, staff_id) and clef_b is not None:
