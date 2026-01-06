@@ -1,13 +1,12 @@
 name: Audiveris OMR + Barline Detection Test
 
 on:
-    workflow_dispatch:
-      inputs:
-        pdf_gcs_uri:
-          description: "GCS URI to your input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
-          required: true
-          type: string
-
+  workflow_dispatch:
+    inputs:
+      pdf_gcs_uri:
+        description: "GCS URI to your input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
+        required: true
+        type: string
 
 jobs:
   pipeline:
@@ -16,6 +15,11 @@ jobs:
       BUCKET: "gs://music-omr-bucket-777135743132"
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
 
+      # ====== Debug targeting knobs (EDIT THESE) ======
+      # Based on your earlier description: "5th one down on the 3rd page"
+      # Start with sheet#3 and staff id 5. If it’s not the right one, change STAFF.
+      DEBUG_SHEET: "sheet#3/sheet#3.xml"
+      DEBUG_STAFF: "5"
 
     permissions:
       contents: read
@@ -43,6 +47,8 @@ jobs:
         run: |
           echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
           echo "Output prefix (fixed): ${OUTPUT_PREFIX}"
+          echo "DEBUG_SHEET: ${DEBUG_SHEET}"
+          echo "DEBUG_STAFF: ${DEBUG_STAFF}"
 
       #################################################################
       # 2) Wipe everything except input/ and output/ in the main bucket
@@ -61,7 +67,6 @@ jobs:
           echo "Keeping: ${KEEP_OUTPUT}"
           echo "Listing top-level entries..."
 
-          # Top-level listing (prefixes and any root objects)
           mapfile -t ITEMS < <(gsutil ls -d "${BUCKET}/*" 2>/dev/null || true)
 
           if [[ ${#ITEMS[@]} -eq 0 ]]; then
@@ -73,30 +78,22 @@ jobs:
           printf '  %s\n' "${ITEMS[@]}"
 
           for ITEM in "${ITEMS[@]}"; do
-            # Keep only input/ and output/
             if [[ "$ITEM" == "$KEEP_INPUT" || "$ITEM" == "$KEEP_OUTPUT" ]]; then
               echo "KEEP   $ITEM"
               continue
             fi
 
             echo "DELETE $ITEM"
-
-            # If it's a "prefix" (ends with /), delete everything under it.
-            # The ** pattern matches all objects under that prefix.
             if [[ "$ITEM" == */ ]]; then
               gsutil -m rm -r "${ITEM}**" || true
-
-              # Also try to remove any legacy "folder placeholder" object names, if they exist.
               gsutil rm "${ITEM}" 2>/dev/null || true
               gsutil rm "${ITEM%/}_$folder$" 2>/dev/null || true
             else
-              # It's a root-level object (like the weird outputgs:// object)
               gsutil rm "$ITEM" || true
             fi
           done
 
           echo "Cleanup complete."
-
 
       #################################################################
       # 3) Clean output prefix (delete all previous outputs)
@@ -119,7 +116,7 @@ jobs:
           ls -lh /tmp/work/input.pdf
 
       #################################################################
-      # 5) Run Audiveris OMR 
+      # 5) Run Audiveris OMR
       #################################################################
       - name: Run Audiveris OMR
         run: |
@@ -127,7 +124,6 @@ jobs:
           mkdir -p /tmp/work/audiveris_out
           docker pull toprock/audiveris:latest
 
-          # Use the actual executable inside the image
           docker run --rm \
             -v /tmp/work:/work \
             toprock/audiveris:latest \
@@ -135,10 +131,9 @@ jobs:
 
           echo "Audiveris output contents:"
           find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
-          
 
       #################################################################
-      # 6) Inspect OMR contents (debug)
+      # 6) Inspect OMR contents (quick sanity)
       #################################################################
       - name: Inspect OMR contents (debug)
         run: |
@@ -160,17 +155,15 @@ jobs:
             else
               echo "No log file found in /tmp/work/audiveris_out/input/"
             fi
-            exit 0
+            exit 1
           fi
 
           echo
-          echo "== Found sheet XML: $SHEET_XML =="
-          unzip -p "$OMR" "$SHEET_XML" | sed -n '1,200p'
+          echo "== Found sheet XML (first one): $SHEET_XML =="
 
-          echo
-          echo "== Grep likely geometry keywords =="
-          unzip -p "$OMR" "$SHEET_XML" | egrep -n "System|Staff|bounds|rect|x|y|top|bottom|left|right" | head -n 200 || true
-
+      #################################################################
+      # 7) Multi-page sheet check (kept)
+      #################################################################
       - name: Check if any sheet XML contains multiple <page> blocks
         run: |
           set -euo pipefail
@@ -195,8 +188,10 @@ jobs:
                 print(f"  sheet={path} page_id={pid} systems={len(systems)} indented_flags={ind[:5]}")
           PY
 
-
-      - name: OMR structure debug (systems/staves)
+      #################################################################
+      # 8) OMR structure debug (FIXED: handles multiple <page>)
+      #################################################################
+      - name: OMR structure debug (systems/staves) - all pages
         run: |
           set -euo pipefail
           python - << 'PY'
@@ -215,47 +210,52 @@ jobs:
             sheets.sort()
 
             out = []
-            for n, path in sheets:
+            for _, path in sheets:
               root = ET.fromstring(z.read(path))
-              page = root.find("page")
-              if page is None:
-                out.append({"sheet": path, "page": None})
-                continue
-
-              systems_direct = page.findall("system")
-              systems_all = page.findall(".//system")
+              pages = root.findall("page")
 
               rec = {
                 "sheet": path,
-                "systems_direct": len(systems_direct),
-                "systems_all": len(systems_all),
-                "systems": [],
+                "page_count": len(pages),
+                "pages": [],
               }
 
-              for sys_el in systems_all:
-                sys_id = sys_el.get("id")
-                indented = sys_el.get("indented")
-                staves = sys_el.findall(".//staff")
+              for page in pages:
+                pid = page.get("id")
+                systems_all = page.findall(".//system")
 
-                staff_recs = []
-                for st in staves:
-                  header = st.find("header")
-                  header_start = header.get("start") if header is not None else None
-                  lines = st.find("lines")
-                  line_count = len(lines.findall("line")) if lines is not None else 0
-                  staff_recs.append({
-                    "staff_id": st.get("id"),
-                    "staff_left": st.get("left"),
-                    "header_start": header_start,
-                    "line_count": line_count,
+                page_rec = {
+                  "page_id": pid,
+                  "systems_all": len(systems_all),
+                  "systems": [],
+                }
+
+                for sys_el in systems_all:
+                  sys_id = sys_el.get("id")
+                  indented = sys_el.get("indented")
+                  staves = sys_el.findall(".//staff")
+
+                  staff_recs = []
+                  for st in staves:
+                    header = st.find("header")
+                    header_start = header.get("start") if header is not None else None
+                    lines = st.find("lines")
+                    line_count = len(lines.findall("line")) if lines is not None else 0
+                    staff_recs.append({
+                      "staff_id": st.get("id"),
+                      "staff_left": st.get("left"),
+                      "header_start": header_start,
+                      "line_count": line_count,
+                    })
+
+                  page_rec["systems"].append({
+                    "system_id": sys_id,
+                    "indented": indented,
+                    "staff_count": len(staves),
+                    "staves": staff_recs,
                   })
 
-                rec["systems"].append({
-                  "system_id": sys_id,
-                  "indented": indented,
-                  "staff_count": len(staves),
-                  "staves": staff_recs,
-                })
+                rec["pages"].append(page_rec)
 
               out.append(rec)
 
@@ -268,61 +268,55 @@ jobs:
           print("Preview:")
           with open(p, "r") as f:
             for i, line in enumerate(f):
-              if i >= 200:
+              if i >= 120:
                 break
               print(line.rstrip("\n"))
           PY
 
-      - name: OMR anomaly summary (print only problem systems)
+      #################################################################
+      # 9) Dump target staff XML (so we see header/clef/lines raw)
+      #################################################################
+      - name: Dump target staff XML (for DEBUG_SHEET/DEBUG_STAFF)
         run: |
           set -euo pipefail
           python - << 'PY'
-          import json
+          import os, zipfile, xml.etree.ElementTree as ET
 
-          p = "/tmp/work/debug/omr_structure.json"
-          with open(p, "r") as f:
-              data = json.load(f)
+          omr = "/tmp/work/audiveris_out/input/input.omr"
+          target_sheet = os.environ["DEBUG_SHEET"]
+          target_staff = os.environ["DEBUG_STAFF"]
 
-          def staff_bad(st):
-              lc = st.get("line_count", 0)
-              left = st.get("staff_left")
-              hs = st.get("header_start")
-              return (lc is None) or (lc < 5) or (left is None) or (hs is None)
+          out_dir = "/tmp/work/debug"
+          os.makedirs(out_dir, exist_ok=True)
+          out_path = os.path.join(out_dir, f"staff_dump_{target_sheet.replace('/','_')}_staff{target_staff}.xml.txt")
 
-          any_printed = False
-          for sheet in data:
-              bad_systems = []
-              for sys in sheet.get("systems", []):
-                  staves = sys.get("staves", [])
-                  if not staves:
-                      continue
-                  bad_staves = [s for s in staves if staff_bad(s)]
-                  if bad_staves:
-                      bad_systems.append({
-                          "system_id": sys.get("system_id"),
-                          "indented": sys.get("indented"),
-                          "staff_count": sys.get("staff_count"),
-                          "bad_staves": bad_staves,
-                      })
+          with zipfile.ZipFile(omr, "r") as z:
+            root = ET.fromstring(z.read(target_sheet))
+            pages = root.findall("page")
+            found = False
+            with open(out_path, "w") as f:
+              for page in pages:
+                for sys_el in page.findall(".//system"):
+                  for st in sys_el.findall(".//staff"):
+                    if (st.get("id") or "") == target_staff:
+                      f.write(f"FOUND staff id={target_staff} system_id={sys_el.get('id')} page_id={page.get('id')}\n\n")
+                      f.write(ET.tostring(st, encoding="unicode"))
+                      f.write("\n")
+                      found = True
+                      break
+                  if found:
+                    break
+                if found:
+                  break
 
-              if bad_systems:
-                  any_printed = True
-                  print("\nSHEET:", sheet.get("sheet"))
-                  print("systems_direct:", sheet.get("systems_direct"), "systems_all:", sheet.get("systems_all"))
-                  for bs in bad_systems:
-                      print("  SYSTEM id=", bs["system_id"], "indented=", bs["indented"], "staff_count=", bs["staff_count"])
-                      for s in bs["bad_staves"]:
-                          print("    staff_id=", s.get("staff_id"),
-                                "line_count=", s.get("line_count"),
-                                "staff_left=", s.get("staff_left"),
-                                "header_start=", s.get("header_start"))
+              if not found:
+                f.write(f"Did not find staff id={target_staff} in {target_sheet}\n")
 
-          if not any_printed:
-              print("\nNo anomalies found: all staves had line_count>=5 and left/header_start present.")
+          print("Wrote", out_path)
           PY
 
       #################################################################
-      # 7) Python setup & dependencies
+      # 10) Python setup & dependencies
       #################################################################
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -336,11 +330,14 @@ jobs:
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
       #################################################################
-      # 8) Annotate measures on PDF
+      # 11) Draw staff guides (targeted debug only)
       #################################################################
       - name: Draw staff guides from Audiveris OMR
         env:
           DEBUG_GUIDES: "1"
+          DEBUG_GUIDES_SHEET: "${{ env.DEBUG_SHEET }}"
+          DEBUG_GUIDES_STAFF_ID: "${{ env.DEBUG_STAFF }}"
+          DEBUG_GUIDES_DUMP_INTERS: "1"
         run: |
           set -euo pipefail
           python -u parser-api/annotate_guides_from_omr.py \
@@ -363,18 +360,21 @@ jobs:
               raise SystemExit("ERROR: annotated.pdf page count does not match input.pdf")
           PY
 
-
       #################################################################
-      # 9) Upload ALL outputs to GCS
+      # 12) Upload outputs + debug artifacts to GCS
       #################################################################
       - name: Upload outputs to GCS
         run: |
           set -euo pipefail
 
-          # Annotated PDF
           gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
 
-          # Audiveris outputs (only if present)
+          # Upload debug artifacts
+          if [ -d /tmp/work/debug ]; then
+            gsutil -m cp -r /tmp/work/debug "${OUTPUT_PREFIX}/debug"
+          fi
+
+          # Upload Audiveris outputs
           if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
             echo "Uploading Audiveris outputs"
             gsutil -m cp -r /tmp/work/audiveris_out "${OUTPUT_PREFIX}/audiveris_out"
@@ -383,4 +383,3 @@ jobs:
           fi
 
           echo "All uploads complete"
-
