@@ -25,7 +25,6 @@ def _debug_enabled() -> bool:
 
 
 def _debug_match(sheet_xml_path: str, staff_id: str) -> bool:
-    # Optional filters to avoid log spam
     want_sheet = os.getenv("DEBUG_GUIDES_SHEET", "").strip()
     want_staff = os.getenv("DEBUG_GUIDES_STAFF_ID", "").strip()
     if want_sheet and want_sheet not in sheet_xml_path:
@@ -50,6 +49,11 @@ def _debug_dump_sigs_enabled() -> bool:
     return v in ("1", "true", "True", "yes", "YES")
 
 
+def _outlier_fix_enabled() -> bool:
+    v = os.getenv("GUIDE_OUTLIER_FIX", "1").strip()
+    return v not in ("0", "false", "False", "no", "NO")
+
+
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
     found = []
     for name in z.namelist():
@@ -68,6 +72,22 @@ def _pct(values: list[float], p: float) -> float:
         return xs[0]
     i = int(round(p * (len(xs) - 1)))
     return xs[max(0, min(len(xs) - 1, i))]
+
+
+def _median(xs: list[float]) -> float:
+    ys = sorted(xs)
+    n = len(ys)
+    if n == 0:
+        raise ValueError("empty")
+    mid = n // 2
+    if n % 2 == 1:
+        return float(ys[mid])
+    return 0.5 * (float(ys[mid - 1]) + float(ys[mid]))
+
+
+def _mad(xs: list[float], med: float) -> float:
+    dev = [abs(x - med) for x in xs]
+    return _median(dev)
 
 
 def _best_five_by_spacing(
@@ -193,9 +213,6 @@ def _clef_id_from_header(staff: ET.Element) -> int | None:
 
 
 def _index_inters(inters: ET.Element | None) -> dict[int, ET.Element]:
-    """
-    Index inter elements by id, scanning descendants.
-    """
     out: dict[int, ET.Element] = {}
     if inters is None:
         return out
@@ -451,6 +468,84 @@ def _push_left_if_inside_any_symbol(
     return x_left
 
 
+def _fix_system_x_outliers(
+    sheet_xml_path: str,
+    system_id: str,
+    guides: list[dict],
+    expected_spacing: float,
+) -> None:
+    """
+    Conservative outlier clamp:
+      - per system
+      - only clamp RIGHT-side outliers (x too large)
+      - use modified z-score threshold 3.5
+      - only if enough samples (>=3) and MAD>0
+      - optional gating: only if clef missing OR looks close to header_start
+    """
+    if not _outlier_fix_enabled():
+        return
+
+    xs = [float(g["x_postpad"]) for g in guides if g.get("x_postpad") is not None]
+    if len(xs) < 3:
+        return
+
+    med = _median(xs)
+    mad = _mad(xs, med)
+    if mad <= 1e-6:
+        return
+
+    # Modified z-score: 0.6745 * (x - median) / MAD
+    # We'll only treat positive (right-side) scores as candidates.
+    mzs = []
+    for x in xs:
+        mzs.append(0.6745 * (x - med) / mad)
+
+    # Inliers define the consensus x
+    inliers = [x for x, mz in zip(xs, mzs) if mz <= 3.5]
+    if len(inliers) < 2:
+        return
+
+    consensus = _median(inliers)
+
+    # A tiny nudge left of consensus helps avoid landing on a boundary
+    nudge = max(0.0, 0.10 * expected_spacing) if expected_spacing > 0 else 0.0
+    target = max(0.0, consensus - nudge)
+
+    for g in guides:
+        x = float(g["x_postpad"])
+        mz = 0.6745 * (x - med) / mad
+
+        if mz <= 3.5:
+            continue  # not an outlier to the right
+
+        # Gate: only fix if this staff is likely to be "missing clef context"
+        clef_missing = bool(g.get("clef_missing"))
+        header_start = g.get("header_start")
+        near_header = False
+        if header_start is not None:
+            # If x is very near or to the right of header_start, it's suspicious
+            thresh = max(6.0, 0.25 * expected_spacing) if expected_spacing > 0 else 6.0
+            near_header = (x >= float(header_start) - thresh)
+
+        if not (clef_missing or near_header):
+            continue
+
+        if x <= target + 0.01:
+            continue
+
+        old = g["x_postpad"]
+        g["x_postpad"] = target
+
+        if _debug_enabled() and _debug_match(sheet_xml_path, str(g.get("staff_id", ""))):
+            _dbg(
+                sheet_xml_path,
+                str(g.get("staff_id", "")),
+                f"[DBG] OUTLIER_X sys={system_id} staff={g.get('staff_id')} "
+                f"x={old:.2f} -> {target:.2f} "
+                f"median={med:.2f} mad={mad:.2f} mz={mz:.2f} consensus={consensus:.2f}",
+            )
+
+
 def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     data = z.read(sheet_xml_path)
     root = ET.fromstring(data)
@@ -485,7 +580,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             systems = page.findall("system")
 
         for system in systems:
-            # FIX: SIG is per-system; prefer system-local inters
+            system_id = system.get("id") or "?"
+
+            # SIG is per-system; prefer system-local inters
             system_inters = system.find(".//sig/inters")
             if system_inters is None:
                 system_inters = page.find(".//sig/inters")
@@ -507,16 +604,16 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         continue
 
                     b = el.find("bounds")
-                    med = el.find("median")
-                    if b is None or med is None:
+                    medn = el.find("median")
+                    if b is None or medn is None:
                         continue
 
                     bx = _safe_float(b.get("x"))
                     if bx is None:
                         continue
 
-                    p1 = med.find("p1")
-                    p2 = med.find("p2")
+                    p1 = medn.find("p1")
+                    p2 = medn.find("p2")
                     if p1 is None or p2 is None:
                         continue
 
@@ -552,6 +649,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 if best_any is not None:
                     return (best_any[1], best_any[2])
                 return None
+
+            system_guides: list[dict] = []
 
             for staff in system.findall(".//staff"):
                 staff_total += 1
@@ -601,9 +700,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     ys_partial = [t[0] for t in yxs]
                     ys5 = _synthesize_five_lines(ys_partial, expected_spacing)
 
-                clef_y_hint = None
-                clef_b = None
-
                 if ys5 is not None:
                     y_top = float(min(ys5))
                     y_bot = float(max(ys5))
@@ -627,19 +723,18 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     )
                     continue
 
-                # DEBUG A+B: SIG inventory + which SIG has clef id
-                _dump_sigs_for_staff(
-                    sheet_xml_path=sheet_xml_path,
-                    staff_id=staff_id,
-                    page=page,
-                    system=system,
-                    chosen_inters=system_inters,
-                    y_top=y_top,
-                    y_bot=y_bot,
-                    clef_id=clef_id,
-                )
+                if _debug_dump_sigs_enabled():
+                    _dump_sigs_for_staff(
+                        sheet_xml_path=sheet_xml_path,
+                        staff_id=staff_id,
+                        page=page,
+                        system=system,
+                        chosen_inters=system_inters,
+                        y_top=y_top,
+                        y_bot=y_bot,
+                        clef_id=clef_id,
+                    )
 
-                # Clef bounds now use system-scoped inters
                 clef_b = _clef_bounds_from_header(inter_by_id, staff)
                 if clef_b is None:
                     clef_b = _clef_bounds_fallback(system_inters, staff_id, y_top, y_bot, header_start)
@@ -668,7 +763,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > (line_min_x + 0.60 * expected_spacing):
                         x_left = line_min_x
 
-                # 2) Header clamp (small, always safe)
+                # 2) Header clamp (small)
                 if header_start is not None:
                     base_guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
                     max_x = float(header_start) - base_guard
@@ -683,7 +778,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > max_x:
                         x_left = max_x
 
-                # 4) Collision clamp (system-scoped inters)
+                # 4) Collision clamp (system-scoped)
                 x_left = _push_left_if_inside_any_symbol(
                     inters=system_inters,
                     staff_id=staff_id,
@@ -698,15 +793,16 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
 
-                _dump_inters_near_staff(
-                    sheet_xml_path=sheet_xml_path,
-                    staff_id=staff_id,
-                    inters=system_inters,
-                    y_top=y_top,
-                    y_bot=y_bot,
-                    x_center=x_postpad,
-                    x_window=140.0,
-                )
+                if _debug_dump_enabled():
+                    _dump_inters_near_staff(
+                        sheet_xml_path=sheet_xml_path,
+                        staff_id=staff_id,
+                        inters=system_inters,
+                        y_top=y_top,
+                        y_bot=y_bot,
+                        x_center=x_postpad,
+                        x_window=140.0,
+                    )
 
                 if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
                     _dbg(
@@ -720,7 +816,27 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         f"y_top={y_top:.1f} y_bot={y_bot:.1f}",
                     )
 
-                guides_px.append((x_postpad, y_top, y_bot))
+                system_guides.append(
+                    {
+                        "staff_id": staff_id,
+                        "x_postpad": x_postpad,
+                        "y_top": y_top,
+                        "y_bot": y_bot,
+                        "clef_missing": (clef_b is None),
+                        "header_start": header_start,
+                    }
+                )
+
+            # NEW: after we have all staff guides in the system, clamp x outliers
+            _fix_system_x_outliers(
+                sheet_xml_path=sheet_xml_path,
+                system_id=str(system.get("id") or "?"),
+                guides=system_guides,
+                expected_spacing=expected_spacing,
+            )
+
+            for g in system_guides:
+                guides_px.append((float(g["x_postpad"]), float(g["y_top"]), float(g["y_bot"])))
 
     return pic_w, pic_h, guides_px, staff_total
 
