@@ -161,6 +161,21 @@ jobs:
           echo
           echo "== Found sheet XML (first one): $SHEET_XML =="
 
+      - name: Auto-pick DEBUG_SHEET if missing
+        run: |
+          set -euo pipefail
+          OMR="/tmp/work/audiveris_out/input/input.omr"
+
+          # If DEBUG_SHEET is empty or not present in the archive, choose the first sheet
+          if [[ -z "${DEBUG_SHEET:-}" ]] || ! unzip -l "$OMR" | awk '{print $4}' | grep -qx "${DEBUG_SHEET}"; then
+            SHEET="$(unzip -l "$OMR" | awk '{print $4}' | grep -E '^sheet#[0-9]+/sheet#[0-9]+\.xml$' | sort -V | head -n 1)"
+            echo "Auto DEBUG_SHEET=${SHEET}"
+            echo "DEBUG_SHEET=${SHEET}" >> "${GITHUB_ENV}"
+          else
+            echo "Using provided DEBUG_SHEET=${DEBUG_SHEET}"
+          fi
+
+
       #################################################################
       # 7) Multi-page sheet check (kept)
       #################################################################
