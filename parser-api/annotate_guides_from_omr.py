@@ -190,6 +190,23 @@ def _tag_looks_like_clef(el: ET.Element) -> bool:
     return False
 
 
+def _header_declares_clef(staff: ET.Element) -> bool:
+    """
+    True if <staff><header><clef>...</clef></header> is present (even if we can't resolve the inter).
+    """
+    header = staff.find("header")
+    if header is None:
+        return False
+    clef_id_txt = header.findtext("clef")
+    if not clef_id_txt:
+        return False
+    clef_id_txt = clef_id_txt.strip()
+    if not clef_id_txt:
+        return False
+    # Sometimes it's numeric id, sometimes could be malformed; either way it's a "declared clef"
+    return True
+
+
 def _clef_bounds_from_header(
     inter_by_id: dict[int, ET.Element], staff: ET.Element
 ) -> tuple[float, float, float, float] | None:
@@ -330,71 +347,6 @@ def _dump_inters_near_staff(
         )
 
 
-def _looks_headerish_symbol(el: ET.Element) -> bool:
-    tag = (el.tag or "").lower()
-    if any(k in tag for k in ("clef", "keysig", "timesig", "brace", "bracket")):
-        return True
-
-    shape_blob = []
-    for k in ("shape", "type", "kind", "name", "family"):
-        v = el.get(k)
-        if v:
-            shape_blob.append(v.lower())
-    s = " ".join(shape_blob)
-    if not s:
-        return False
-
-    return any(k in s for k in ("clef", "key", "time", "brace", "bracket", "keysig", "timesig"))
-
-
-def _has_headerish_symbol_near_header(
-    inters: ET.Element | None,
-    staff_id: str,
-    y_top: float,
-    y_bot: float,
-    header_start: float | None,
-    expected_spacing: float,
-) -> bool:
-    """
-    When clef linkage is missing, only apply aggressive 'header guarding' if we can
-    actually find header-ish symbols near the header_start region for this staff.
-    """
-    if inters is None or header_start is None:
-        return False
-
-    header_span = max(60.0, (4.0 * expected_spacing) if expected_spacing > 0 else 60.0)
-
-    y_pad = 0.25 * (y_bot - y_top)
-    want_y0 = y_top - y_pad
-    want_y1 = y_bot + y_pad
-
-    x0 = float(header_start) - header_span
-    x1 = float(header_start) + header_span
-
-    for el in inters.iter():
-        b = _bounds_of(el)
-        if b is None:
-            continue
-
-        bx, by, bw, bh = b
-        bx0, bx1 = bx, bx + bw
-        by0, by1 = by, by + bh
-
-        if by1 < want_y0 or by0 > want_y1:
-            continue
-        if bx1 < x0 or bx0 > x1:
-            continue
-
-        el_staff = el.get("staff")
-        if el_staff and staff_id and el_staff != staff_id:
-            continue
-
-        if _looks_headerish_symbol(el):
-            return True
-
-    return False
-
-
 def _push_left_if_inside_any_symbol(
     inters: ET.Element | None,
     staff_id: str,
@@ -417,7 +369,7 @@ def _push_left_if_inside_any_symbol(
 
     guard = max(10.0, (0.35 * expected_spacing) if expected_spacing > 0 else 10.0)
 
-    # Prefer header_start as the reference window anchor (safer than line_min_x).
+    # Prefer header_start as reference anchor (safer than line_min_x).
     ref = None
     for v in (header_start, line_min_x, x_left):
         if v is not None:
@@ -588,6 +540,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 header = staff.find("header")
                 header_start = _safe_float(header.get("start")) if header is not None else None
+                header_declares_clef = _header_declares_clef(staff)
 
                 lines_node = staff.find("lines")
                 line_nodes = [] if lines_node is None else lines_node.findall("line")
@@ -693,26 +646,19 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > max_x:
                         x_left = max_x
 
-                    # BIG guard only when clef is missing *and* we actually detect header-ish symbols nearby
-                    if clef_b is None:
-                        if _has_headerish_symbol_near_header(
-                            inters=inters,
-                            staff_id=staff_id,
-                            y_top=y_top,
-                            y_bot=y_bot,
-                            header_start=header_start,
-                            expected_spacing=expected_spacing,
-                        ):
-                            big_guard = max(18.0, (1.6 * expected_spacing) if expected_spacing > 0 else 18.0)
-                            max_x2 = float(header_start) - big_guard
-                            if x_left > max_x2:
-                                _dbg(
-                                    sheet_xml_path,
-                                    staff_id,
-                                    f"[DBG] BIG_HEADER_GUARD staff={staff_id} header_start={header_start:.2f} "
-                                    f"expected_spacing={expected_spacing:.2f} x={x_left:.2f} -> {max_x2:.2f}",
-                                )
-                                x_left = max_x2
+                    # If clef bounds are missing but the staff header *declares* a clef,
+                    # use a medium guard to avoid drawing through the (real) clef glyph.
+                    if clef_b is None and header_declares_clef:
+                        med_guard = max(18.0, (1.6 * expected_spacing) if expected_spacing > 0 else 18.0)
+                        max_x2 = float(header_start) - med_guard
+                        if x_left > max_x2:
+                            _dbg(
+                                sheet_xml_path,
+                                staff_id,
+                                f"[DBG] MED_HEADER_GUARD staff={staff_id} header_start={header_start:.2f} "
+                                f"expected_spacing={expected_spacing:.2f} x={x_left:.2f} -> {max_x2:.2f}",
+                            )
+                            x_left = max_x2
 
                 # 3) Clef clamp (when clef bounds exist)
                 if clef_b is not None:
