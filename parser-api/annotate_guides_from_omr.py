@@ -45,6 +45,11 @@ def _debug_dump_enabled() -> bool:
     return v in ("1", "true", "True", "yes", "YES")
 
 
+def _debug_dump_sigs_enabled() -> bool:
+    v = os.getenv("DEBUG_GUIDES_DUMP_SIGS", "").strip()
+    return v in ("1", "true", "True", "yes", "YES")
+
+
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
     found = []
     for name in z.namelist():
@@ -144,25 +149,6 @@ def _safe_float(s: str | None) -> float | None:
         return None
 
 
-def _index_inters(page: ET.Element) -> dict[int, ET.Element]:
-    """
-    IMPORTANT: Audiveris sometimes nests inter elements; don't only look at direct children.
-    """
-    out: dict[int, ET.Element] = {}
-    inters = page.find(".//sig/inters")
-    if inters is None:
-        return out
-    for el in inters.iter():
-        sid = el.get("id")
-        if not sid:
-            continue
-        try:
-            out[int(sid)] = el
-        except Exception:
-            continue
-    return out
-
-
 def _bounds_of(el: ET.Element) -> tuple[float, float, float, float] | None:
     b = el.find("bounds")
     if b is None:
@@ -178,11 +164,14 @@ def _bounds_of(el: ET.Element) -> tuple[float, float, float, float] | None:
     return (float(x), float(y), float(w), float(h))
 
 
+def _bounds_overlap_1d(a0: float, a1: float, b0: float, b1: float) -> bool:
+    return not (a1 < b0 or b1 < a0)
+
+
 def _tag_looks_like_clef(el: ET.Element) -> bool:
     t = (el.tag or "").lower()
     if t == "clef" or t.endswith("clef"):
         return True
-    # Some Audiveris builds store as generic nodes with shape/type
     for k in ("shape", "type", "kind", "name", "family"):
         v = el.get(k)
         if v and "clef" in v.lower():
@@ -190,47 +179,47 @@ def _tag_looks_like_clef(el: ET.Element) -> bool:
     return False
 
 
-def _header_declares_clef(staff: ET.Element) -> bool:
-    """
-    True if <staff><header><clef>...</clef></header> is present (even if we can't resolve the inter).
-    """
+def _clef_id_from_header(staff: ET.Element) -> int | None:
     header = staff.find("header")
     if header is None:
-        return False
-    clef_id_txt = header.findtext("clef")
-    if not clef_id_txt:
-        return False
-    clef_id_txt = clef_id_txt.strip()
-    if not clef_id_txt:
-        return False
-    # Sometimes it's numeric id, sometimes could be malformed; either way it's a "declared clef"
-    return True
+        return None
+    txt = header.findtext("clef")
+    if not txt:
+        return None
+    try:
+        return int(txt.strip())
+    except Exception:
+        return None
+
+
+def _index_inters(inters: ET.Element | None) -> dict[int, ET.Element]:
+    """
+    Index inter elements by id, scanning descendants.
+    """
+    out: dict[int, ET.Element] = {}
+    if inters is None:
+        return out
+    for el in inters.iter():
+        sid = el.get("id")
+        if not sid:
+            continue
+        try:
+            out[int(sid)] = el
+        except Exception:
+            continue
+    return out
 
 
 def _clef_bounds_from_header(
     inter_by_id: dict[int, ET.Element], staff: ET.Element
 ) -> tuple[float, float, float, float] | None:
-    header = staff.find("header")
-    if header is None:
+    clef_id = _clef_id_from_header(staff)
+    if clef_id is None:
         return None
-
-    clef_id_txt = header.findtext("clef")
-    if not clef_id_txt:
-        return None
-
-    try:
-        clef_id = int(clef_id_txt.strip())
-    except Exception:
-        return None
-
     clef_el = inter_by_id.get(clef_id)
     if clef_el is None:
         return None
-
-    b = _bounds_of(clef_el)
-    if b is None:
-        return None
-    return b
+    return _bounds_of(clef_el)
 
 
 def _clef_bounds_fallback(
@@ -240,14 +229,6 @@ def _clef_bounds_fallback(
     y_bot: float,
     header_start: float | None,
 ) -> tuple[float, float, float, float] | None:
-    """
-    Fallback when header doesn't link a clef.
-    Robustly search *all descendants* under inters for clef-ish nodes with bounds.
-    Prefer:
-      - staff match when available
-      - y overlap with staff
-      - leftmost, with slight preference near header_start
-    """
     if inters is None:
         return None
 
@@ -287,8 +268,56 @@ def _clef_bounds_fallback(
     return best
 
 
-def _bounds_overlap_1d(a0: float, a1: float, b0: float, b1: float) -> bool:
-    return not (a1 < b0 or b1 < a0)
+def _dump_sigs_for_staff(
+    sheet_xml_path: str,
+    staff_id: str,
+    page: ET.Element,
+    system: ET.Element,
+    chosen_inters: ET.Element | None,
+    y_top: float,
+    y_bot: float,
+    clef_id: int | None,
+) -> None:
+    if not (_debug_enabled() and _debug_dump_sigs_enabled() and _debug_match(sheet_xml_path, staff_id)):
+        return
+
+    sig_inters_list = page.findall(".//sig/inters")
+    _dbg(
+        sheet_xml_path,
+        staff_id,
+        f"[DBG] SIGS sheet={sheet_xml_path} sys={system.get('id')} staff={staff_id} sig_count={len(sig_inters_list)} "
+        f"chosen={'yes' if chosen_inters is not None else 'no'} clef_id={clef_id}",
+    )
+
+    chosen_key = id(chosen_inters) if chosen_inters is not None else None
+
+    for idx, inters in enumerate(sig_inters_list):
+        inter_by_id = _index_inters(inters)
+        has_clef = (clef_id in inter_by_id) if clef_id is not None else False
+
+        overlap_cnt = 0
+        leftmost = None  # (x0, x1, tag, iid)
+        for el in inters.iter():
+            b = _bounds_of(el)
+            if b is None:
+                continue
+            x, y, w, h = b
+            x0, x1 = x, x + w
+            y0, y1 = y, y + h
+            if not _bounds_overlap_1d(y0, y1, y_top, y_bot):
+                continue
+            overlap_cnt += 1
+            iid = el.get("id")
+            if leftmost is None or x0 < leftmost[0]:
+                leftmost = (x0, x1, el.tag, iid)
+
+        is_chosen = (chosen_key is not None and id(inters) == chosen_key)
+        _dbg(
+            sheet_xml_path,
+            staff_id,
+            f"  [DBG] SIG idx={idx} chosen={is_chosen} overlap_bounds={overlap_cnt} has_clef_id={has_clef} "
+            f"leftmost={None if leftmost is None else f'{leftmost[2]} id={leftmost[3]} x=[{leftmost[0]:.1f},{leftmost[1]:.1f}]'}",
+        )
 
 
 def _dump_inters_near_staff(
@@ -358,18 +387,11 @@ def _push_left_if_inside_any_symbol(
     expected_spacing: float,
     sheet_xml_path: str,
 ) -> float:
-    """
-    If the guide (after PAD_LEFT_PX) lands inside ANY inter bounds overlapping this staff,
-    push it left of that symbol.
-
-    NOTE: scan inters.iter() (descendants), not just direct children.
-    """
     if inters is None:
         return x_left
 
     guard = max(10.0, (0.35 * expected_spacing) if expected_spacing > 0 else 10.0)
 
-    # Prefer header_start as reference anchor (safer than line_min_x).
     ref = None
     for v in (header_start, line_min_x, x_left):
         if v is not None:
@@ -430,12 +452,6 @@ def _push_left_if_inside_any_symbol(
 
 
 def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
-    """
-    Returns:
-      pic_w, pic_h: Audiveris picture size
-      guides_px: list of (x_left_px, y_top_px, y_bot_px) in picture pixels
-      staff_total: how many <staff> nodes exist (target guide count)
-    """
     data = z.read(sheet_xml_path)
     root = ET.fromstring(data)
 
@@ -464,83 +480,86 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     staff_total = 0
 
     for page in pages:
-        inter_by_id = _index_inters(page)
-        inters = page.find(".//sig/inters")
-
-        def barline_span_for_staff(staff_id: str, y_hint: float | None) -> tuple[float, float] | None:
-            if inters is None or not staff_id:
-                return None
-
-            best_covering = None   # (bx, y_top, y_bot)
-            best_closest = None    # (dist, bx, y_top, y_bot)
-            best_any = None        # (bx, y_top, y_bot)
-
-            # barline tags tend to be direct children, but use iter() for safety
-            for el in inters.iter():
-                if (el.tag or "").lower() != "barline":
-                    continue
-                if el.get("staff") != staff_id:
-                    continue
-
-                b = el.find("bounds")
-                med = el.find("median")
-                if b is None or med is None:
-                    continue
-
-                bx = _safe_float(b.get("x"))
-                if bx is None:
-                    continue
-
-                p1 = med.find("p1")
-                p2 = med.find("p2")
-                if p1 is None or p2 is None:
-                    continue
-
-                y1 = _safe_float(p1.get("y"))
-                y2 = _safe_float(p2.get("y"))
-                if y1 is None or y2 is None:
-                    continue
-
-                y_top = float(min(y1, y2))
-                y_bot = float(max(y1, y2))
-                if y_bot <= y_top:
-                    continue
-
-                cand_any = (float(bx), y_top, y_bot)
-                if best_any is None or cand_any[0] < best_any[0]:
-                    best_any = cand_any
-
-                if y_hint is not None:
-                    if (y_top - 2.0) <= y_hint <= (y_bot + 2.0):
-                        if best_covering is None or cand_any[0] < best_covering[0]:
-                            best_covering = cand_any
-
-                    mid = 0.5 * (y_top + y_bot)
-                    dist = abs(mid - y_hint)
-                    cand_closest = (dist, float(bx), y_top, y_bot)
-                    if best_closest is None or cand_closest < best_closest:
-                        best_closest = cand_closest
-
-            if best_covering is not None:
-                return (best_covering[1], best_covering[2])
-            if y_hint is not None and best_closest is not None:
-                return (best_closest[2], best_closest[3])
-            if best_any is not None:
-                return (best_any[1], best_any[2])
-            return None
-
         systems = page.findall(".//system")
         if not systems:
             systems = page.findall("system")
 
         for system in systems:
+            # FIX: SIG is per-system; prefer system-local inters
+            system_inters = system.find(".//sig/inters")
+            if system_inters is None:
+                system_inters = page.find(".//sig/inters")
+
+            inter_by_id = _index_inters(system_inters)
+
+            def barline_span_for_staff(staff_id: str, y_hint: float | None) -> tuple[float, float] | None:
+                if system_inters is None or not staff_id:
+                    return None
+
+                best_covering = None   # (bx, y_top, y_bot)
+                best_closest = None    # (dist, bx, y_top, y_bot)
+                best_any = None        # (bx, y_top, y_bot)
+
+                for el in system_inters.iter():
+                    if (el.tag or "").lower() != "barline":
+                        continue
+                    if el.get("staff") != staff_id:
+                        continue
+
+                    b = el.find("bounds")
+                    med = el.find("median")
+                    if b is None or med is None:
+                        continue
+
+                    bx = _safe_float(b.get("x"))
+                    if bx is None:
+                        continue
+
+                    p1 = med.find("p1")
+                    p2 = med.find("p2")
+                    if p1 is None or p2 is None:
+                        continue
+
+                    y1 = _safe_float(p1.get("y"))
+                    y2 = _safe_float(p2.get("y"))
+                    if y1 is None or y2 is None:
+                        continue
+
+                    y_top = float(min(y1, y2))
+                    y_bot = float(max(y1, y2))
+                    if y_bot <= y_top:
+                        continue
+
+                    cand_any = (float(bx), y_top, y_bot)
+                    if best_any is None or cand_any[0] < best_any[0]:
+                        best_any = cand_any
+
+                    if y_hint is not None:
+                        if (y_top - 2.0) <= y_hint <= (y_bot + 2.0):
+                            if best_covering is None or cand_any[0] < best_covering[0]:
+                                best_covering = cand_any
+
+                        mid = 0.5 * (y_top + y_bot)
+                        dist = abs(mid - y_hint)
+                        cand_closest = (dist, float(bx), y_top, y_bot)
+                        if best_closest is None or cand_closest < best_closest:
+                            best_closest = cand_closest
+
+                if best_covering is not None:
+                    return (best_covering[1], best_covering[2])
+                if y_hint is not None and best_closest is not None:
+                    return (best_closest[2], best_closest[3])
+                if best_any is not None:
+                    return (best_any[1], best_any[2])
+                return None
+
             for staff in system.findall(".//staff"):
                 staff_total += 1
                 staff_id = staff.get("id") or ""
 
                 header = staff.find("header")
                 header_start = _safe_float(header.get("start")) if header is not None else None
-                header_declares_clef = _header_declares_clef(staff)
+                clef_id = _clef_id_from_header(staff)
 
                 lines_node = staff.find("lines")
                 line_nodes = [] if lines_node is None else lines_node.findall("line")
@@ -573,7 +592,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 yxs.sort(key=lambda t: t[0])
 
-                # ---- Y span ----
                 ys5: list[float] | None = None
                 if len(yxs) >= 5:
                     chosen = _best_five_by_spacing(yxs, expected_spacing)
@@ -609,12 +627,23 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     )
                     continue
 
-                # ---- Clef bounds (robust) ----
+                # DEBUG A+B: SIG inventory + which SIG has clef id
+                _dump_sigs_for_staff(
+                    sheet_xml_path=sheet_xml_path,
+                    staff_id=staff_id,
+                    page=page,
+                    system=system,
+                    chosen_inters=system_inters,
+                    y_top=y_top,
+                    y_bot=y_bot,
+                    clef_id=clef_id,
+                )
+
+                # Clef bounds now use system-scoped inters
                 clef_b = _clef_bounds_from_header(inter_by_id, staff)
                 if clef_b is None:
-                    clef_b = _clef_bounds_fallback(inters, staff_id, y_top, y_bot, header_start)
+                    clef_b = _clef_bounds_fallback(system_inters, staff_id, y_top, y_bot, header_start)
 
-                # ---- X anchor ----
                 x_left = _safe_float(staff.get("left"))
                 line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
 
@@ -639,26 +668,12 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > (line_min_x + 0.60 * expected_spacing):
                         x_left = line_min_x
 
-                # 2) Header clamp
+                # 2) Header clamp (small, always safe)
                 if header_start is not None:
                     base_guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
                     max_x = float(header_start) - base_guard
                     if x_left > max_x:
                         x_left = max_x
-
-                    # If clef bounds are missing but the staff header *declares* a clef,
-                    # use a medium guard to avoid drawing through the (real) clef glyph.
-                    if clef_b is None and header_declares_clef:
-                        med_guard = max(18.0, (1.6 * expected_spacing) if expected_spacing > 0 else 18.0)
-                        max_x2 = float(header_start) - med_guard
-                        if x_left > max_x2:
-                            _dbg(
-                                sheet_xml_path,
-                                staff_id,
-                                f"[DBG] MED_HEADER_GUARD staff={staff_id} header_start={header_start:.2f} "
-                                f"expected_spacing={expected_spacing:.2f} x={x_left:.2f} -> {max_x2:.2f}",
-                            )
-                            x_left = max_x2
 
                 # 3) Clef clamp (when clef bounds exist)
                 if clef_b is not None:
@@ -668,9 +683,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > max_x:
                         x_left = max_x
 
-                # 4) Generic collision clamp: scan ALL descendant inter bounds
+                # 4) Collision clamp (system-scoped inters)
                 x_left = _push_left_if_inside_any_symbol(
-                    inters=inters,
+                    inters=system_inters,
                     staff_id=staff_id,
                     y_top=y_top,
                     y_bot=y_bot,
@@ -681,21 +696,18 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     sheet_xml_path=sheet_xml_path,
                 )
 
-                # Apply pad last
                 x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
 
-                # Optional inter dump around where we ended up
                 _dump_inters_near_staff(
                     sheet_xml_path=sheet_xml_path,
                     staff_id=staff_id,
-                    inters=inters,
+                    inters=system_inters,
                     y_top=y_top,
                     y_bot=y_bot,
                     x_center=x_postpad,
                     x_window=140.0,
                 )
 
-                # Summary debug line (always useful)
                 if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
                     _dbg(
                         sheet_xml_path,
