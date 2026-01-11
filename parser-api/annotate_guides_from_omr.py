@@ -316,10 +316,83 @@ def _dump_inters_near_staff(
         rows.append((x0, x1, el.tag, el.get("staff"), el.get("id"), shape, y0, y1))
 
     rows.sort(key=lambda r: r[0])
-    _dbg(sheet_xml_path, staff_id, f"[DBG] DUMP_INTERS staff={staff_id} y=[{y_top:.1f},{y_bot:.1f}] x_center={x_center:.1f} found={len(rows)}")
+    _dbg(
+        sheet_xml_path,
+        staff_id,
+        f"[DBG] DUMP_INTERS staff={staff_id} y=[{y_top:.1f},{y_bot:.1f}] x_center={x_center:.1f} found={len(rows)}",
+    )
     for r in rows[:25]:
         x0, x1, tag, st, iid, shape, y0, y1 = r
-        _dbg(sheet_xml_path, staff_id, f"  [DBG] inter tag={tag} staff={st} id={iid} {shape or ''} x=[{x0:.1f},{x1:.1f}] y=[{y0:.1f},{y1:.1f}]")
+        _dbg(
+            sheet_xml_path,
+            staff_id,
+            f"  [DBG] inter tag={tag} staff={st} id={iid} {shape or ''} x=[{x0:.1f},{x1:.1f}] y=[{y0:.1f},{y1:.1f}]",
+        )
+
+
+def _looks_headerish_symbol(el: ET.Element) -> bool:
+    tag = (el.tag or "").lower()
+    if any(k in tag for k in ("clef", "keysig", "timesig", "brace", "bracket")):
+        return True
+
+    shape_blob = []
+    for k in ("shape", "type", "kind", "name", "family"):
+        v = el.get(k)
+        if v:
+            shape_blob.append(v.lower())
+    s = " ".join(shape_blob)
+    if not s:
+        return False
+
+    return any(k in s for k in ("clef", "key", "time", "brace", "bracket", "keysig", "timesig"))
+
+
+def _has_headerish_symbol_near_header(
+    inters: ET.Element | None,
+    staff_id: str,
+    y_top: float,
+    y_bot: float,
+    header_start: float | None,
+    expected_spacing: float,
+) -> bool:
+    """
+    When clef linkage is missing, only apply aggressive 'header guarding' if we can
+    actually find header-ish symbols near the header_start region for this staff.
+    """
+    if inters is None or header_start is None:
+        return False
+
+    header_span = max(60.0, (4.0 * expected_spacing) if expected_spacing > 0 else 60.0)
+
+    y_pad = 0.25 * (y_bot - y_top)
+    want_y0 = y_top - y_pad
+    want_y1 = y_bot + y_pad
+
+    x0 = float(header_start) - header_span
+    x1 = float(header_start) + header_span
+
+    for el in inters.iter():
+        b = _bounds_of(el)
+        if b is None:
+            continue
+
+        bx, by, bw, bh = b
+        bx0, bx1 = bx, bx + bw
+        by0, by1 = by, by + bh
+
+        if by1 < want_y0 or by0 > want_y1:
+            continue
+        if bx1 < x0 or bx0 > x1:
+            continue
+
+        el_staff = el.get("staff")
+        if el_staff and staff_id and el_staff != staff_id:
+            continue
+
+        if _looks_headerish_symbol(el):
+            return True
+
+    return False
 
 
 def _push_left_if_inside_any_symbol(
@@ -344,8 +417,9 @@ def _push_left_if_inside_any_symbol(
 
     guard = max(10.0, (0.35 * expected_spacing) if expected_spacing > 0 else 10.0)
 
+    # Prefer header_start as the reference window anchor (safer than line_min_x).
     ref = None
-    for v in (line_min_x, header_start, x_left):
+    for v in (header_start, line_min_x, x_left):
         if v is not None:
             ref = float(v)
             break
@@ -575,7 +649,11 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     y_top, y_bot = span
 
                 if y_bot <= y_top or (y_bot - y_top) < 10.0:
-                    _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP bad_y_span sheet={sheet_xml_path} staff={staff_id} y_top={y_top} y_bot={y_bot}")
+                    _dbg(
+                        sheet_xml_path,
+                        staff_id,
+                        f"[DBG] SKIP bad_y_span sheet={sheet_xml_path} staff={staff_id} y_top={y_top} y_bot={y_bot}",
+                    )
                     continue
 
                 # ---- Clef bounds (robust) ----
@@ -615,18 +693,26 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > max_x:
                         x_left = max_x
 
-                    # BIG guard only when clef is missing:
+                    # BIG guard only when clef is missing *and* we actually detect header-ish symbols nearby
                     if clef_b is None:
-                        big_guard = max(28.0, (2.5 * expected_spacing) if expected_spacing > 0 else 28.0)
-                        max_x2 = float(header_start) - big_guard
-                        if x_left > max_x2:
-                            _dbg(
-                                sheet_xml_path,
-                                staff_id,
-                                f"[DBG] BIG_HEADER_GUARD staff={staff_id} header_start={header_start:.2f} "
-                                f"expected_spacing={expected_spacing:.2f} x={x_left:.2f} -> {max_x2:.2f}",
-                            )
-                            x_left = max_x2
+                        if _has_headerish_symbol_near_header(
+                            inters=inters,
+                            staff_id=staff_id,
+                            y_top=y_top,
+                            y_bot=y_bot,
+                            header_start=header_start,
+                            expected_spacing=expected_spacing,
+                        ):
+                            big_guard = max(18.0, (1.6 * expected_spacing) if expected_spacing > 0 else 18.0)
+                            max_x2 = float(header_start) - big_guard
+                            if x_left > max_x2:
+                                _dbg(
+                                    sheet_xml_path,
+                                    staff_id,
+                                    f"[DBG] BIG_HEADER_GUARD staff={staff_id} header_start={header_start:.2f} "
+                                    f"expected_spacing={expected_spacing:.2f} x={x_left:.2f} -> {max_x2:.2f}",
+                                )
+                                x_left = max_x2
 
                 # 3) Clef clamp (when clef bounds exist)
                 if clef_b is not None:
