@@ -16,11 +16,14 @@ jobs:
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
 
       # ====== Debug knobs (OFF by default) ======
-      # Turn these on only when you need logs for one specific staff.
+      # Turn these on only when you need [DBG] logs from annotate_guides_from_omr.py
       DEBUG_GUIDES: "0"
       DEBUG_GUIDES_DUMP_INTERS: "0"
-      DEBUG_SHEET: ""     # e.g. sheet#3/sheet#3.xml
-      DEBUG_STAFF: ""     # e.g. 5
+
+      # Leave blank to auto-pick a valid sheet from the .omr (avoids sheet#3 missing errors)
+      DEBUG_SHEET: ""
+      # Optional: set to one staff id to keep logs small
+      DEBUG_STAFF: ""
 
     permissions:
       contents: read
@@ -28,7 +31,7 @@ jobs:
 
     steps:
       #################################################################
-      # 1) Checkout + auth
+      # 1) Checkout + Auth
       #################################################################
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -99,7 +102,6 @@ jobs:
           set -euo pipefail
           OMR="/tmp/work/audiveris_out/input/input.omr"
 
-          # If DEBUG_SHEET is empty or not present in archive, choose the first sheet.
           if [[ -z "${DEBUG_SHEET:-}" ]] || ! unzip -l "$OMR" | awk '{print $4}' | grep -qx "${DEBUG_SHEET}"; then
             SHEET="$(unzip -l "$OMR" | awk '{print $4}' | grep -E '^sheet#[0-9]+/sheet#[0-9]+\.xml$' | sort -V | head -n 1)"
             echo "Auto DEBUG_SHEET=${SHEET}"
@@ -160,7 +162,7 @@ jobs:
           set -euo pipefail
           gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
 
-          # Upload Audiveris outputs (useful for debugging)
+          # Upload Audiveris outputs (useful for later debugging)
           if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
             gsutil -m cp -r /tmp/work/audiveris_out "${OUTPUT_PREFIX}/audiveris_out"
           fi
