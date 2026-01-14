@@ -403,8 +403,11 @@ def _push_left_if_inside_any_symbol(
             x0, x1 = x, x + w
             y0, y1 = y, y + h
 
+            # FIX: Only consider staff-owned symbols as collisions.
+            # System-level elements (like left grouped barlines / braces / brackets) can overlap every staff in Y,
+            # and will incorrectly shove guidelines to the page margin.
             el_staff = el.get("staff")
-            if el_staff and staff_id and el_staff != staff_id:
+            if not el_staff or el_staff != staff_id:
                 continue
 
             if x0 > (ref + header_span):
@@ -677,7 +680,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                     if x_left > max_x:
                         x_left = max_x
 
-                # 4) Generic collision clamp: scan ALL descendant inter bounds
+                # 4) Generic collision clamp: scan ALL descendant inter bounds (staff-owned only after fix)
                 x_left = _push_left_if_inside_any_symbol(
                     inters=inters,
                     staff_id=staff_id,
@@ -778,7 +781,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
     guides_px: list[tuple[float, float, float]] = [(r["x_postpad"], r["y_top"], r["y_bot"]) for r in staff_recs]
 
     # ---------------------------
-    # Measure numbers (system start + barlines on top staff)
+    # Measure numbers (ONE per system start; advance by barline count)
     # ---------------------------
     measures_px: list[tuple[float, float, str]] = []
     measure_no = int(start_measure)
@@ -786,12 +789,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
     eps = max(6.0, 0.45 * expected_spacing) if expected_spacing > 0 else 10.0
     v_off = max(10.0, 0.90 * expected_spacing) if expected_spacing > 0 else 14.0
 
-    # We need access to inters for barlines: re-read per-page inters and compute per-system top staff
-    # We'll build a quick map of staff spans by system already in system_recs, but we must re-open inters per page.
-    # Simpler: use root pages again and for each system compute barlines using the first page's <sig/inters>.
-    # In practice, systems and inters live under the same page element; so we iterate pages and systems again,
-    # but use the finalized x_postpad from staff_recs (post forcing).
-    staff_x_by_sys_staff: dict[tuple[str, str], float] = {(r["sys_id"], r["staff_id"]): r["x_postpad"] for r in staff_recs}
+    staff_x_by_sys_staff: dict[tuple[str, str], float] = {
+        (r["sys_id"], r["staff_id"]): r["x_postpad"] for r in staff_recs
+    }
 
     for page in pages:
         inters = page.find(".//sig/inters")
@@ -820,26 +820,29 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
             # ignore barlines that are left of (or basically at) system start
             bar_xs = [x for x in bar_xs if x > (sys_start_x + eps)]
 
-            boundaries = [float(sys_start_x)] + [float(x) for x in bar_xs]
-
             _meas_dbg(
                 sheet_xml_path,
                 sys_id,
                 f"[DBG] MEAS_SYS sheet={sheet_xml_path} sys={sys_id} top_staff={top_staff_id} "
-                f"start_x={sys_start_x:.2f} bars={len(bar_xs)} xs={[round(x,1) for x in bar_xs[:20]]}",
+                f"start_x={sys_start_x:.2f} bar_count={len(bar_xs)} xs={[round(x,1) for x in bar_xs[:20]]}",
             )
 
-            for bx in boundaries:
-                x_text = bx + max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else (bx + 8.0)
-                y_text = max(0.0, float(top_y_top) - v_off)
+            # Draw exactly ONE label at system start (above guideline)
+            x_text = float(sys_start_x) + (max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else 8.0)
+            y_text = max(0.0, float(top_y_top) - v_off)
+            measures_px.append((float(x_text), float(y_text), str(measure_no)))
 
-                measures_px.append((float(x_text), float(y_text), str(measure_no)))
-                _meas_dbg(
-                    sheet_xml_path,
-                    sys_id,
-                    f"[DBG] MEAS_DRAW sheet={sheet_xml_path} sys={sys_id} measure={measure_no} x={x_text:.2f} y={y_text:.2f}",
-                )
-                measure_no += 1
+            _meas_dbg(
+                sheet_xml_path,
+                sys_id,
+                f"[DBG] MEAS_DRAW_SYS_START sheet={sheet_xml_path} sys={sys_id} measure={measure_no} "
+                f"x={x_text:.2f} y={y_text:.2f}",
+            )
+
+            # Advance by number of barlines within this system.
+            # If a system ends mid-measure (no barline at the break), bar_count won't include it,
+            # so the next system will correctly reuse the same measure number.
+            measure_no += int(len(bar_xs))
 
     return pic_w, pic_h, guides_px, staff_total, measures_px, measure_no
 
@@ -990,14 +993,10 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     width=GUIDE_WIDTH,
                 )
 
-            # Draw measure numbers
-            # Fontsize scaled from interline (in PDF units), with clamps
+            # Draw measure numbers (already filtered to one per system start)
             if measures_px:
-                # approximate interline in PDF space (y scaling)
-                # use median staff height from guides if available as a fallback
                 interline_pdf = None
                 if len(guides_pdf) >= 1:
-                    # staff height ~ 4 * interline
                     staff_h = abs(guides_pdf[0][2] - guides_pdf[0][1])
                     interline_pdf = staff_h / 4.0 if staff_h > 0 else None
 
