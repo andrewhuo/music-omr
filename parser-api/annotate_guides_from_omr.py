@@ -16,12 +16,18 @@ GUIDE_WIDTH = 1.0
 # Small left shift so line sits just left of the staff start / clef
 PAD_LEFT_PX = 6.0
 
+# Measure number rendering
+MEASURE_TEXT_COLOR = (0, 0, 0)  # black
+MEASURE_MIN_FONTSIZE = 7.0
+MEASURE_MAX_FONTSIZE = 12.0
+
+# Outlier forcing
+OUTLIER_MZ_THRESHOLD = 3.5  # modified z-score threshold
+OUTLIER_ABS_FLOOR_PX = 10.0  # minimum MAD floor to avoid divide-by-near-zero
+
 _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 
 
-# ----------------------------
-# Debug toggles
-# ----------------------------
 def _debug_enabled() -> bool:
     v = os.getenv("DEBUG_GUIDES", "").strip()
     return v in ("1", "true", "True", "yes", "YES")
@@ -48,22 +54,26 @@ def _debug_dump_enabled() -> bool:
     return v in ("1", "true", "True", "yes", "YES")
 
 
-def _debug_dump_xs_enabled() -> bool:
-    v = os.getenv("DEBUG_GUIDES_DUMP_XS", "").strip()
+def _meas_debug_enabled() -> bool:
+    v = os.getenv("DEBUG_MEASURES", "").strip()
     return v in ("1", "true", "True", "yes", "YES")
 
 
-def _outlier_fix_enabled() -> bool:
-    # Default ON (you asked to try it). Set to 0/false to disable.
-    v = os.getenv("DEBUG_GUIDES_OUTLIER_FIX", "").strip()
-    if v == "":
-        return True
-    return v in ("1", "true", "True", "yes", "YES")
+def _meas_debug_match(sheet_xml_path: str, system_id: str) -> bool:
+    want_sheet = os.getenv("DEBUG_MEASURES_SHEET", "").strip()
+    want_sys = os.getenv("DEBUG_MEASURES_SYS_ID", "").strip()
+    if want_sheet and want_sheet not in sheet_xml_path:
+        return False
+    if want_sys and want_sys != str(system_id):
+        return False
+    return True
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
+def _meas_dbg(sheet_xml_path: str, system_id: str, msg: str) -> None:
+    if _meas_debug_enabled() and _meas_debug_match(sheet_xml_path, system_id):
+        print(msg, flush=True)
+
+
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
     found = []
     for name in z.namelist():
@@ -85,14 +95,18 @@ def _pct(values: list[float], p: float) -> float:
 
 
 def _median(xs: list[float]) -> float:
-    if not xs:
-        raise ValueError("empty")
     ys = sorted(xs)
     n = len(ys)
+    if n == 0:
+        raise ValueError("median of empty")
     mid = n // 2
     if n % 2 == 1:
-        return float(ys[mid])
-    return 0.5 * (float(ys[mid - 1]) + float(ys[mid]))
+        return ys[mid]
+    return 0.5 * (ys[mid - 1] + ys[mid])
+
+
+def _mad(xs: list[float], med: float) -> float:
+    return _median([abs(x - med) for x in xs])
 
 
 def _best_five_by_spacing(
@@ -212,7 +226,6 @@ def _tag_looks_like_clef(el: ET.Element) -> bool:
     t = (el.tag or "").lower()
     if t == "clef" or t.endswith("clef"):
         return True
-    # Some Audiveris builds store as generic nodes with shape/type
     for k in ("shape", "type", "kind", "name", "family"):
         v = el.get(k)
         if v and "clef" in v.lower():
@@ -253,14 +266,6 @@ def _clef_bounds_fallback(
     y_bot: float,
     header_start: float | None,
 ) -> tuple[float, float, float, float] | None:
-    """
-    Fallback when header doesn't link a clef.
-    Robustly search *all descendants* under inters for clef-ish nodes with bounds.
-    Prefer:
-      - staff match when available
-      - y overlap with staff
-      - leftmost, with slight preference near header_start
-    """
     if inters is None:
         return None
 
@@ -353,7 +358,11 @@ def _dump_inters_near_staff(
     )
     for r in rows[:25]:
         x0, x1, tag, st, iid, shape, y0, y1 = r
-        _dbg(sheet_xml_path, staff_id, f"  [DBG] inter tag={tag} staff={st} id={iid} {shape or ''} x=[{x0:.1f},{x1:.1f}] y=[{y0:.1f},{y1:.1f}]")
+        _dbg(
+            sheet_xml_path,
+            staff_id,
+            f"  [DBG] inter tag={tag} staff={st} id={iid} {shape or ''} x=[{x0:.1f},{x1:.1f}] y=[{y0:.1f},{y1:.1f}]",
+        )
 
 
 def _push_left_if_inside_any_symbol(
@@ -367,12 +376,6 @@ def _push_left_if_inside_any_symbol(
     expected_spacing: float,
     sheet_xml_path: str,
 ) -> float:
-    """
-    If the guide (after PAD_LEFT_PX) lands inside ANY inter bounds overlapping this staff,
-    push it left of that symbol.
-
-    NOTE: scan inters.iter() (descendants), not just direct children.
-    """
     if inters is None:
         return x_left
 
@@ -437,148 +440,73 @@ def _push_left_if_inside_any_symbol(
     return x_left
 
 
-# ----------------------------
-# Outlier fix (page-level)
-# ----------------------------
-def _is_indented_flag(v: str | None) -> bool:
-    if v is None:
-        return False
-    s = str(v).strip().lower()
-    return s in ("1", "true", "yes", "y")
+def _barline_xs_for_staff(
+    inters: ET.Element | None,
+    staff_id: str,
+    y_top: float,
+    y_bot: float,
+) -> list[float]:
+    if inters is None or not staff_id:
+        return []
 
-
-def _page_outlier_fix(
-    sheet_xml_path: str,
-    page_guides: list[dict],
-    mz_threshold: float = 3.5,
-) -> list[dict]:
-    """
-    Force rare x outliers to mean(inliers) per page, but split into two groups:
-      - indented systems
-      - non-indented systems
-    This avoids clobbering legitimate indented layouts.
-    """
-    if not _outlier_fix_enabled():
-        return page_guides
-    if len(page_guides) < 4:
-        return page_guides
-
-    want_staff = os.getenv("DEBUG_GUIDES_STAFF_ID", "").strip()
-
-    def should_print(outlier_staff_ids: set[str]) -> bool:
-        if not _debug_enabled():
-            return False
-        if not want_staff:
-            return True
-        return want_staff in outlier_staff_ids
-
-    # group by indentation flag
-    grouped: dict[bool, list[dict]] = {False: [], True: []}
-    for g in page_guides:
-        grouped[bool(g.get("indented", False))].append(g)
-
-    out: list[dict] = []
-    for indented_flag, items in grouped.items():
-        if len(items) < 4:
-            out.extend(items)
+    xs: list[float] = []
+    for el in inters.iter():
+        if (el.tag or "").lower() != "barline":
+            continue
+        if el.get("staff") != staff_id:
             continue
 
-        xs = [float(it["x_postpad"]) for it in items]
-        try:
-            med = _median(xs)
-        except Exception:
-            out.extend(items)
+        b = el.find("bounds")
+        med = el.find("median")
+        if b is None or med is None:
             continue
 
-        abs_devs = [abs(x - med) for x in xs]
-        try:
-            mad = _median(abs_devs)
-        except Exception:
-            out.extend(items)
+        bx = _safe_float(b.get("x"))
+        if bx is None:
             continue
 
-        if mad <= 1e-6:
-            out.extend(items)
+        p1 = med.find("p1")
+        p2 = med.find("p2")
+        if p1 is None or p2 is None:
             continue
 
-        # Modified z-score: 0.6745*(x - median)/MAD
-        mzs: list[float] = [(0.6745 * (x - med) / mad) for x in xs]
+        y1 = _safe_float(p1.get("y"))
+        y2 = _safe_float(p2.get("y"))
+        if y1 is None or y2 is None:
+            continue
 
-        outlier_idx = [i for i, mz in enumerate(mzs) if abs(mz) > mz_threshold]
-        outlier_staff_ids = {str(items[i].get("staff_id", "")) for i in outlier_idx}
+        by0 = float(min(y1, y2))
+        by1 = float(max(y1, y2))
+        if not _bounds_overlap_1d(by0, by1, y_top, y_bot):
+            continue
 
-        n = len(items)
-        max_outliers = max(2, int(0.20 * n))  # only "rare" fixes
-        applied = False
-        reason = "ok"
-        if not outlier_idx:
-            reason = "no_outliers"
-        elif len(outlier_idx) > max_outliers:
-            reason = f"too_many_outliers({len(outlier_idx)}/{n})"
-        elif (n - len(outlier_idx)) < 3:
-            reason = "not_enough_inliers"
+        xs.append(float(bx))
+
+    xs.sort()
+    return xs
+
+
+def _dedupe_sorted_xs(xs: list[float], eps: float) -> list[float]:
+    if not xs:
+        return []
+    out = [xs[0]]
+    for x in xs[1:]:
+        if abs(x - out[-1]) <= eps:
+            # merge by averaging
+            out[-1] = 0.5 * (out[-1] + x)
         else:
-            # compute mean over inliers
-            inlier_xs = [xs[i] for i in range(n) if i not in outlier_idx]
-            mean_inlier = float(sum(inlier_xs) / len(inlier_xs))
-
-            # apply forcing
-            for i in outlier_idx:
-                old = float(items[i]["x_postpad"])
-                items[i]["x_postpad"] = max(0.0, mean_inlier)
-                items[i]["_outlier_forced"] = True
-                items[i]["_outlier_mz"] = float(mzs[i])
-                items[i]["_outlier_old_x"] = float(old)
-                items[i]["_outlier_new_x"] = float(items[i]["x_postpad"])
-            applied = True
-
-        if should_print(outlier_staff_ids):
-            label = "indented" if indented_flag else "normal"
-            _xs_preview = ""
-            if _debug_dump_xs_enabled():
-                xs_sorted = sorted(xs)
-                _xs_preview = f" xs_sorted={','.join([f'{v:.1f}' for v in xs_sorted[:24]])}"
-
-            if outlier_idx and reason == "ok":
-                inlier_xs = [xs[i] for i in range(n) if i not in outlier_idx]
-                mean_inlier = float(sum(inlier_xs) / len(inlier_xs))
-                print(
-                    f"[DBG] OUTLIER_X sheet={sheet_xml_path} group={label} "
-                    f"n={n} median={med:.2f} mad={mad:.2f} thr={mz_threshold:.2f} "
-                    f"inliers={len(inlier_xs)} outliers={len(outlier_idx)} mean_inlier={mean_inlier:.2f} "
-                    f"applied={applied}{_xs_preview}",
-                    flush=True,
-                )
-                for i in outlier_idx:
-                    it = items[i]
-                    print(
-                        f"[DBG] OUTLIER_X_FIX sheet={sheet_xml_path} group={label} "
-                        f"sys={it.get('system_id')} staff={it.get('staff_id')} "
-                        f"x={xs[i]:.2f} mz={mzs[i]:.2f} -> {float(it['x_postpad']):.2f}",
-                        flush=True,
-                    )
-            else:
-                print(
-                    f"[DBG] OUTLIER_X sheet={sheet_xml_path} group={label} "
-                    f"n={n} median={med:.2f} mad={mad:.2f} thr={mz_threshold:.2f} "
-                    f"outliers={len(outlier_idx)} applied={applied} reason={reason}{_xs_preview}",
-                    flush=True,
-                )
-
-        out.extend(items)
-
+            out.append(x)
     return out
 
 
-# ----------------------------
-# Main parsing
-# ----------------------------
-def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
+def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
     """
     Returns:
       pic_w, pic_h: Audiveris picture size
       guides_px: list of (x_left_px, y_top_px, y_bot_px) in picture pixels
       staff_total: how many <staff> nodes exist (target guide count)
+      measures_px: list of (x_px, y_px, label_text) in picture pixels
+      next_measure: next measure number after this sheet
     """
     data = z.read(sheet_xml_path)
     root = ET.fromstring(data)
@@ -599,91 +527,34 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         if inter is not None:
             expected_spacing = _safe_float(inter.get("main")) or 0.0
 
-    guides_px: list[tuple[float, float, float]] = []
-
     pages = root.findall("page")
     if not pages:
-        return pic_w, pic_h, guides_px, 0
+        return pic_w, pic_h, [], 0, [], start_measure
 
     staff_total = 0
+
+    # We'll stage staff guide candidates first, then apply outlier forcing.
+    staff_recs: list[dict] = []
+    system_recs: dict[str, dict] = {}  # key=system_id
 
     for page in pages:
         inter_by_id = _index_inters(page)
         inters = page.find(".//sig/inters")
 
-        def barline_span_for_staff(staff_id: str, y_hint: float | None) -> tuple[float, float] | None:
-            if inters is None or not staff_id:
-                return None
-
-            best_covering = None   # (bx, y_top, y_bot)
-            best_closest = None    # (dist, bx, y_top, y_bot)
-            best_any = None        # (bx, y_top, y_bot)
-
-            # barline tags tend to be direct children, but use iter() for safety
-            for el in inters.iter():
-                if (el.tag or "").lower() != "barline":
-                    continue
-                if el.get("staff") != staff_id:
-                    continue
-
-                b = el.find("bounds")
-                med = el.find("median")
-                if b is None or med is None:
-                    continue
-
-                bx = _safe_float(b.get("x"))
-                if bx is None:
-                    continue
-
-                p1 = med.find("p1")
-                p2 = med.find("p2")
-                if p1 is None or p2 is None:
-                    continue
-
-                y1 = _safe_float(p1.get("y"))
-                y2 = _safe_float(p2.get("y"))
-                if y1 is None or y2 is None:
-                    continue
-
-                y_top = float(min(y1, y2))
-                y_bot = float(max(y1, y2))
-                if y_bot <= y_top:
-                    continue
-
-                cand_any = (float(bx), y_top, y_bot)
-                if best_any is None or cand_any[0] < best_any[0]:
-                    best_any = cand_any
-
-                if y_hint is not None:
-                    if (y_top - 2.0) <= y_hint <= (y_bot + 2.0):
-                        if best_covering is None or cand_any[0] < best_covering[0]:
-                            best_covering = cand_any
-
-                    mid = 0.5 * (y_top + y_bot)
-                    dist = abs(mid - y_hint)
-                    cand_closest = (dist, float(bx), y_top, y_bot)
-                    if best_closest is None or cand_closest < best_closest:
-                        best_closest = cand_closest
-
-            if best_covering is not None:
-                return (best_covering[1], best_covering[2])
-            if y_hint is not None and best_closest is not None:
-                return (best_closest[2], best_closest[3])
-            if best_any is not None:
-                return (best_any[1], best_any[2])
-            return None
-
         systems = page.findall(".//system")
         if not systems:
             systems = page.findall("system")
 
-        # collect first, then apply page-level outlier fix
-        page_guides: list[dict] = []
-
         for system in systems:
-            sys_id = system.get("id")
-            indented_attr = system.get("indented")
-            indented_flag = _is_indented_flag(indented_attr)
+            sys_id = system.get("id") or ""
+            sys_indented = system.get("indented")
+
+            if sys_id not in system_recs:
+                system_recs[sys_id] = {
+                    "sys_id": sys_id,
+                    "indented": sys_indented,
+                    "staff_spans": [],  # list of (y_top, y_bot, staff_id)
+                }
 
             for staff in system.findall(".//staff"):
                 staff_total += 1
@@ -733,23 +604,12 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     ys_partial = [t[0] for t in yxs]
                     ys5 = _synthesize_five_lines(ys_partial, expected_spacing)
 
-                clef_y_hint = None
-                clef_b = None
-
                 if ys5 is not None:
                     y_top = float(min(ys5))
                     y_bot = float(max(ys5))
                 else:
-                    span = barline_span_for_staff(staff_id, yxs[0][0] if len(yxs) >= 1 else None)
-                    if span is None:
-                        clef_b0 = _clef_bounds_from_header(inter_by_id, staff)
-                        if clef_b0 is not None:
-                            clef_y_hint = clef_b0[1] + 0.5 * clef_b0[3]
-                            span = barline_span_for_staff(staff_id, clef_y_hint)
-                    if span is None:
-                        _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP no_y_span sheet={sheet_xml_path} staff={staff_id}")
-                        continue
-                    y_top, y_bot = span
+                    _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP no_y_span sheet={sheet_xml_path} staff={staff_id}")
+                    continue
 
                 if y_bot <= y_top or (y_bot - y_top) < 10.0:
                     _dbg(
@@ -789,12 +649,25 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > (line_min_x + 0.60 * expected_spacing):
                         x_left = line_min_x
 
-                # 2) Header clamp (small, always)
+                # 2) Header clamp
                 if header_start is not None:
                     base_guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
                     max_x = float(header_start) - base_guard
                     if x_left > max_x:
                         x_left = max_x
+
+                    # BIG guard only when clef is missing:
+                    if clef_b is None:
+                        big_guard = max(28.0, (2.5 * expected_spacing) if expected_spacing > 0 else 28.0)
+                        max_x2 = float(header_start) - big_guard
+                        if x_left > max_x2:
+                            _dbg(
+                                sheet_xml_path,
+                                staff_id,
+                                f"[DBG] BIG_HEADER_GUARD staff={staff_id} header_start={header_start:.2f} "
+                                f"expected_spacing={expected_spacing:.2f} x={x_left:.2f} -> {max_x2:.2f}",
+                            )
+                            x_left = max_x2
 
                 # 3) Clef clamp (when clef bounds exist)
                 if clef_b is not None:
@@ -804,7 +677,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if x_left > max_x:
                         x_left = max_x
 
-                # 4) Generic collision clamp (kept)
+                # 4) Generic collision clamp: scan ALL descendant inter bounds
                 x_left = _push_left_if_inside_any_symbol(
                     inters=inters,
                     staff_id=staff_id,
@@ -831,12 +704,12 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     x_window=140.0,
                 )
 
-                # Summary debug line (always useful)
+                # Summary debug line
                 if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
                     _dbg(
                         sheet_xml_path,
                         staff_id,
-                        f"[DBG] sheet={sheet_xml_path} sys={sys_id} staff={staff_id} indented={indented_attr} "
+                        f"[DBG] sheet={sheet_xml_path} sys={sys_id} staff={staff_id} indented={system.get('indented')} "
                         f"lines={len(line_nodes)} header_start={header_start} line_min_x={line_min_x} "
                         f"expected_spacing={expected_spacing:.2f} "
                         f"clef_b={'present' if clef_b is not None else None} "
@@ -844,40 +717,133 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         f"y_top={y_top:.1f} y_bot={y_bot:.1f}",
                     )
 
-                page_guides.append(
+                staff_recs.append(
                     {
-                        "system_id": sys_id,
+                        "sys_id": sys_id,
                         "staff_id": staff_id,
-                        "indented": indented_flag,
+                        "indented": system.get("indented"),
                         "x_postpad": float(x_postpad),
                         "y_top": float(y_top),
                         "y_bot": float(y_bot),
                     }
                 )
+                system_recs[sys_id]["staff_spans"].append((float(y_top), float(y_bot), staff_id))
 
-        # Apply outlier fix per page (after we have all x values)
-        page_guides = _page_outlier_fix(sheet_xml_path, page_guides, mz_threshold=3.5)
+    # ---------------------------
+    # Outlier forcing (exclude indented)
+    # ---------------------------
+    non_indented_xs = [
+        r["x_postpad"] for r in staff_recs if not (r["indented"] not in (None, "", "false", "False", "0"))
+    ]
 
-        # If a specific staff is being debugged and got forced, print a clear line
-        for g in page_guides:
-            sid = str(g.get("staff_id", ""))
-            if g.get("_outlier_forced") and _debug_enabled() and _debug_match(sheet_xml_path, sid):
-                _dbg(
-                    sheet_xml_path,
-                    sid,
-                    f"[DBG] OUTLIER_FORCED staff={sid} old_x={g.get('_outlier_old_x'):.2f} "
-                    f"new_x={g.get('_outlier_new_x'):.2f} mz={g.get('_outlier_mz'):.2f}",
+    forced_avg = None
+    outlier_ids: set[tuple[str, str]] = set()
+
+    if len(non_indented_xs) >= 6:
+        med = _median(non_indented_xs)
+        mad = _mad(non_indented_xs, med)
+        mad = max(mad, OUTLIER_ABS_FLOOR_PX)
+
+        def mz(x: float) -> float:
+            return abs(0.6745 * (x - med) / mad)
+
+        inliers = [x for x in non_indented_xs if mz(x) <= OUTLIER_MZ_THRESHOLD]
+        if len(inliers) >= 4:
+            forced_avg = sum(inliers) / float(len(inliers))
+
+            for r in staff_recs:
+                if r["indented"] not in (None, "", "false", "False", "0"):
+                    continue  # never force indented
+                score = mz(r["x_postpad"])
+                if score > OUTLIER_MZ_THRESHOLD:
+                    outlier_ids.add((r["sys_id"], r["staff_id"]))
+                    old = r["x_postpad"]
+                    r["x_postpad"] = float(forced_avg)
+                    if _debug_enabled() and _debug_match(sheet_xml_path, r["staff_id"]):
+                        _dbg(
+                            sheet_xml_path,
+                            r["staff_id"],
+                            f"[DBG] FORCE_OUTLIER staff={r['staff_id']} sys={r['sys_id']} "
+                            f"x={old:.2f} -> {forced_avg:.2f} mz={score:.2f} med={med:.2f} mad={mad:.2f} n_inliers={len(inliers)}",
+                        )
+
+            if _debug_enabled():
+                print(
+                    f"[DBG] OUTLIER_SUMMARY sheet={sheet_xml_path} forced_avg={forced_avg:.2f} "
+                    f"non_indented={len(non_indented_xs)} outliers_forced={len(outlier_ids)}",
+                    flush=True,
                 )
 
-        for g in page_guides:
-            guides_px.append((float(g["x_postpad"]), float(g["y_top"]), float(g["y_bot"])))
+    # Final guides list
+    guides_px: list[tuple[float, float, float]] = [(r["x_postpad"], r["y_top"], r["y_bot"]) for r in staff_recs]
 
-    return pic_w, pic_h, guides_px, staff_total
+    # ---------------------------
+    # Measure numbers (system start + barlines on top staff)
+    # ---------------------------
+    measures_px: list[tuple[float, float, str]] = []
+    measure_no = int(start_measure)
+
+    eps = max(6.0, 0.45 * expected_spacing) if expected_spacing > 0 else 10.0
+    v_off = max(10.0, 0.90 * expected_spacing) if expected_spacing > 0 else 14.0
+
+    # We need access to inters for barlines: re-read per-page inters and compute per-system top staff
+    # We'll build a quick map of staff spans by system already in system_recs, but we must re-open inters per page.
+    # Simpler: use root pages again and for each system compute barlines using the first page's <sig/inters>.
+    # In practice, systems and inters live under the same page element; so we iterate pages and systems again,
+    # but use the finalized x_postpad from staff_recs (post forcing).
+    staff_x_by_sys_staff: dict[tuple[str, str], float] = {(r["sys_id"], r["staff_id"]): r["x_postpad"] for r in staff_recs}
+
+    for page in pages:
+        inters = page.find(".//sig/inters")
+        systems = page.findall(".//system")
+        if not systems:
+            systems = page.findall("system")
+
+        for system in systems:
+            sys_id = system.get("id") or ""
+            spans = system_recs.get(sys_id, {}).get("staff_spans", [])
+            if not spans:
+                continue
+
+            # pick top staff by smallest y_top
+            spans_sorted = sorted(spans, key=lambda t: t[0])
+            top_y_top, top_y_bot, top_staff_id = spans_sorted[0]
+
+            # system start x = guide x (post forcing) for that staff
+            sys_start_x = staff_x_by_sys_staff.get((sys_id, top_staff_id))
+            if sys_start_x is None:
+                continue
+
+            bar_xs = _barline_xs_for_staff(inters, top_staff_id, top_y_top, top_y_bot)
+            bar_xs = _dedupe_sorted_xs(bar_xs, eps=eps)
+
+            # ignore barlines that are left of (or basically at) system start
+            bar_xs = [x for x in bar_xs if x > (sys_start_x + eps)]
+
+            boundaries = [float(sys_start_x)] + [float(x) for x in bar_xs]
+
+            _meas_dbg(
+                sheet_xml_path,
+                sys_id,
+                f"[DBG] MEAS_SYS sheet={sheet_xml_path} sys={sys_id} top_staff={top_staff_id} "
+                f"start_x={sys_start_x:.2f} bars={len(bar_xs)} xs={[round(x,1) for x in bar_xs[:20]]}",
+            )
+
+            for bx in boundaries:
+                x_text = bx + max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else (bx + 8.0)
+                y_text = max(0.0, float(top_y_top) - v_off)
+
+                measures_px.append((float(x_text), float(y_text), str(measure_no)))
+                _meas_dbg(
+                    sheet_xml_path,
+                    sys_id,
+                    f"[DBG] MEAS_DRAW sheet={sheet_xml_path} sys={sys_id} measure={measure_no} x={x_text:.2f} y={y_text:.2f}",
+                )
+                measure_no += 1
+
+    return pic_w, pic_h, guides_px, staff_total, measures_px, measure_no
 
 
-# ----------------------------
-# PDF fallback (unchanged)
-# ----------------------------
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -980,8 +946,14 @@ def _fallback_missing_staff_guides(
     return extras
 
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
     doc = fitz.open(input_pdf)
+
+    measure_no = 1
 
     with zipfile.ZipFile(omr_path, "r") as z:
         sheet_paths = _sorted_sheet_xml_paths(z)
@@ -995,7 +967,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
 
-            pic_w, pic_h, guides_px, staff_total = _parse_sheet(z, sheet_xml_path)
+            pic_w, pic_h, guides_px, staff_total, measures_px, measure_no = _parse_sheet(
+                z, sheet_xml_path, start_measure=measure_no
+            )
             if pic_w <= 0 or pic_h <= 0:
                 continue
 
@@ -1015,6 +989,32 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     color=GUIDE_COLOR,
                     width=GUIDE_WIDTH,
                 )
+
+            # Draw measure numbers
+            # Fontsize scaled from interline (in PDF units), with clamps
+            if measures_px:
+                # approximate interline in PDF space (y scaling)
+                # use median staff height from guides if available as a fallback
+                interline_pdf = None
+                if len(guides_pdf) >= 1:
+                    # staff height ~ 4 * interline
+                    staff_h = abs(guides_pdf[0][2] - guides_pdf[0][1])
+                    interline_pdf = staff_h / 4.0 if staff_h > 0 else None
+
+                if interline_pdf is None:
+                    interline_pdf = 16.0
+
+                fontsize = _clamp(0.55 * interline_pdf, MEASURE_MIN_FONTSIZE, MEASURE_MAX_FONTSIZE)
+
+                for (x_px, y_px, label) in measures_px:
+                    x_pdf = x_px * scale_x
+                    y_pdf = y_px * scale_y
+                    page.insert_text(
+                        (x_pdf, y_pdf),
+                        label,
+                        fontsize=fontsize,
+                        color=MEASURE_TEXT_COLOR,
+                    )
 
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
