@@ -11,22 +11,22 @@ on:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-
     env:
       BUCKET: "gs://music-omr-bucket-777135743132"
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
 
-      # ===== Debug knobs (NO UI inputs; controlled via repo variables) =====
-      # Set these in: Repo Settings -> Secrets and variables -> Actions -> Variables
-      # (see instructions below)
-      DEBUG_GUIDES: "${{ vars.DEBUG_GUIDES || '0' }}"
-      DEBUG_MEASURES: "${{ vars.DEBUG_MEASURES || '0' }}"
-      DEBUG_GUIDES_DUMP_INTERS: "${{ vars.DEBUG_GUIDES_DUMP_INTERS || '0' }}"
+      # ====== Debug knobs (OFF by default) ======
+      # Flip these to "1" only when you want [DBG] logs in the GitHub Actions step output.
+      DEBUG_GUIDES: "0"
+      DEBUG_MEASURES: "0"
+      DEBUG_GUIDES_DUMP_INTERS: "0"
 
-      # Optional targeting to keep logs small
-      DEBUG_SHEET: "${{ vars.DEBUG_SHEET || '' }}"
-      DEBUG_STAFF: "${{ vars.DEBUG_STAFF || '' }}"
-      DEBUG_MEASURES_SYS: "${{ vars.DEBUG_MEASURES_SYS || '' }}"
+      # Leave blank to auto-pick a valid sheet from the .omr (avoids sheet#3 missing errors)
+      DEBUG_SHEET: ""
+      # Optional: set to one staff id to keep logs small
+      DEBUG_STAFF: ""
+      # Optional: set to one system id to keep logs small (measures debug)
+      DEBUG_MEASURES_SYS: ""
 
     permissions:
       contents: read
@@ -50,17 +50,17 @@ jobs:
         with:
           version: ">= 363.0.0"
 
-      - name: Show inputs and debug vars
+      - name: Show inputs
         run: |
           set -euo pipefail
           echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
           echo "Output prefix: ${OUTPUT_PREFIX}"
           echo "DEBUG_GUIDES=${DEBUG_GUIDES}"
           echo "DEBUG_MEASURES=${DEBUG_MEASURES}"
-          echo "DEBUG_GUIDES_DUMP_INTERS=${DEBUG_GUIDES_DUMP_INTERS}"
           echo "DEBUG_SHEET=${DEBUG_SHEET}"
           echo "DEBUG_STAFF=${DEBUG_STAFF}"
           echo "DEBUG_MEASURES_SYS=${DEBUG_MEASURES_SYS}"
+          echo "DEBUG_GUIDES_DUMP_INTERS=${DEBUG_GUIDES_DUMP_INTERS}"
 
       #################################################################
       # 2) Clean output prefix (safe)
@@ -99,7 +99,7 @@ jobs:
           test -f /tmp/work/audiveris_out/input/input.omr
 
       #################################################################
-      # 5) Auto-pick DEBUG_SHEET (only when debug is enabled)
+      # 5) Auto-pick DEBUG_SHEET (only when debug is ON)
       #################################################################
       - name: Auto-pick DEBUG_SHEET (only when debug enabled)
         if: ${{ env.DEBUG_GUIDES == '1' || env.DEBUG_MEASURES == '1' }}
@@ -144,14 +144,11 @@ jobs:
           DEBUG_MEASURES_SYS_ID: "${{ env.DEBUG_MEASURES_SYS }}"
         run: |
           set -euo pipefail
-
-          # Tee so logs are visible in the Actions UI and also uploaded to GCS
           python -u parser-api/annotate_guides_from_omr.py \
             /tmp/work/input.pdf \
             /tmp/work/audiveris_out/input/input.omr \
-            /tmp/work/annotated.pdf | tee /tmp/work/annotate.log
-
-          ls -lh /tmp/work/annotated.pdf /tmp/work/annotate.log
+            /tmp/work/annotated.pdf
+          ls -lh /tmp/work/annotated.pdf
 
       - name: Sanity check annotated PDF page count
         run: |
@@ -167,15 +164,14 @@ jobs:
           PY
 
       #################################################################
-      # 8) Upload outputs
+      # 8) Upload outputs (NO annotate.log)
       #################################################################
       - name: Upload outputs to GCS
         run: |
           set -euo pipefail
           gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
-          gsutil cp /tmp/work/annotate.log "${OUTPUT_PREFIX}/annotate.log"
 
-          # Upload Audiveris outputs (useful for debugging)
+          # Upload Audiveris outputs (useful for later debugging)
           if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
             gsutil -m cp -r /tmp/work/audiveris_out "${OUTPUT_PREFIX}/audiveris_out"
           fi
