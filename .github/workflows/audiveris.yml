@@ -8,68 +8,25 @@ on:
         required: true
         type: string
 
-      # Optional: override output prefix (defaults to gs://.../output)
-      output_gcs_prefix:
-        description: "GCS prefix to upload outputs (gs://.../output)"
-        required: false
-        type: string
-        default: "gs://music-omr-bucket-777135743132/output"
-
-      # ===== Debug toggles =====
-      debug_guides:
-        description: "Emit [DBG] guide placement logs"
-        required: false
-        type: boolean
-        default: false
-
-      debug_measures:
-        description: "Emit [DBG] measure/system logs"
-        required: false
-        type: boolean
-        default: false
-
-      debug_dump_inters:
-        description: "When DEBUG_GUIDES is on, dump nearby symbol boxes (can be noisy)"
-        required: false
-        type: boolean
-        default: false
-
-      # Optional targeting to keep logs small
-      debug_sheet:
-        description: "Filter debug to one sheet xml path substring (ex: sheet#1/sheet#1.xml). Leave blank to auto-pick."
-        required: false
-        type: string
-        default: ""
-
-      debug_staff:
-        description: "Filter guide debug to one staff id (string). Leave blank for all."
-        required: false
-        type: string
-        default: ""
-
-      debug_measures_sys:
-        description: "Filter measure debug to one system id. Leave blank for all."
-        required: false
-        type: string
-        default: ""
-
 jobs:
   pipeline:
     runs-on: ubuntu-latest
 
     env:
       BUCKET: "gs://music-omr-bucket-777135743132"
-      OUTPUT_PREFIX: "${{ inputs.output_gcs_prefix }}"
+      OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
 
-      # ====== Debug knobs passed into annotate_guides_from_omr.py ======
-      DEBUG_GUIDES: "${{ inputs.debug_guides && '1' || '0' }}"
-      DEBUG_MEASURES: "${{ inputs.debug_measures && '1' || '0' }}"
-      DEBUG_GUIDES_DUMP_INTERS: "${{ inputs.debug_dump_inters && '1' || '0' }}"
+      # ===== Debug knobs (NO UI inputs; controlled via repo variables) =====
+      # Set these in: Repo Settings -> Secrets and variables -> Actions -> Variables
+      # (see instructions below)
+      DEBUG_GUIDES: "${{ vars.DEBUG_GUIDES || '0' }}"
+      DEBUG_MEASURES: "${{ vars.DEBUG_MEASURES || '0' }}"
+      DEBUG_GUIDES_DUMP_INTERS: "${{ vars.DEBUG_GUIDES_DUMP_INTERS || '0' }}"
 
-      # Optional filters (blank means no filter; sheet can be auto-picked below)
-      DEBUG_SHEET: "${{ inputs.debug_sheet }}"
-      DEBUG_STAFF: "${{ inputs.debug_staff }}"
-      DEBUG_MEASURES_SYS: "${{ inputs.debug_measures_sys }}"
+      # Optional targeting to keep logs small
+      DEBUG_SHEET: "${{ vars.DEBUG_SHEET || '' }}"
+      DEBUG_STAFF: "${{ vars.DEBUG_STAFF || '' }}"
+      DEBUG_MEASURES_SYS: "${{ vars.DEBUG_MEASURES_SYS || '' }}"
 
     permissions:
       contents: read
@@ -93,7 +50,7 @@ jobs:
         with:
           version: ">= 363.0.0"
 
-      - name: Show inputs
+      - name: Show inputs and debug vars
         run: |
           set -euo pipefail
           echo "Input PDF: ${{ inputs.pdf_gcs_uri }}"
@@ -142,7 +99,7 @@ jobs:
           test -f /tmp/work/audiveris_out/input/input.omr
 
       #################################################################
-      # 5) Auto-pick DEBUG_SHEET if debugging is enabled and sheet is blank/invalid
+      # 5) Auto-pick DEBUG_SHEET (only when debug is enabled)
       #################################################################
       - name: Auto-pick DEBUG_SHEET (only when debug enabled)
         if: ${{ env.DEBUG_GUIDES == '1' || env.DEBUG_MEASURES == '1' }}
@@ -188,7 +145,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Tee output so you get logs both in Actions UI and as a file we upload to GCS
+          # Tee so logs are visible in the Actions UI and also uploaded to GCS
           python -u parser-api/annotate_guides_from_omr.py \
             /tmp/work/input.pdf \
             /tmp/work/audiveris_out/input/input.omr \
@@ -218,7 +175,7 @@ jobs:
           gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
           gsutil cp /tmp/work/annotate.log "${OUTPUT_PREFIX}/annotate.log"
 
-          # Upload Audiveris outputs (useful for later debugging)
+          # Upload Audiveris outputs (useful for debugging)
           if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
             gsutil -m cp -r /tmp/work/audiveris_out "${OUTPUT_PREFIX}/audiveris_out"
           fi
