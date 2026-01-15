@@ -34,7 +34,6 @@ def _debug_enabled() -> bool:
 
 
 def _debug_match(sheet_xml_path: str, staff_id: str) -> bool:
-    # Optional filters to avoid log spam
     want_sheet = os.getenv("DEBUG_GUIDES_SHEET", "").strip()
     want_staff = os.getenv("DEBUG_GUIDES_STAFF_ID", "").strip()
     if want_sheet and want_sheet not in sheet_xml_path:
@@ -59,18 +58,18 @@ def _meas_debug_enabled() -> bool:
     return v in ("1", "true", "True", "yes", "YES")
 
 
-def _meas_debug_match(sheet_xml_path: str, system_id: str) -> bool:
+def _meas_debug_match(sheet_xml_path: str, system_key: str) -> bool:
     want_sheet = os.getenv("DEBUG_MEASURES_SHEET", "").strip()
     want_sys = os.getenv("DEBUG_MEASURES_SYS_ID", "").strip()
     if want_sheet and want_sheet not in sheet_xml_path:
         return False
-    if want_sys and want_sys != str(system_id):
+    if want_sys and want_sys != str(system_key):
         return False
     return True
 
 
-def _meas_dbg(sheet_xml_path: str, system_id: str, msg: str) -> None:
-    if _meas_debug_enabled() and _meas_debug_match(sheet_xml_path, system_id):
+def _meas_dbg(sheet_xml_path: str, system_key: str, msg: str) -> None:
+    if _meas_debug_enabled() and _meas_debug_match(sheet_xml_path, system_key):
         print(msg, flush=True)
 
 
@@ -109,9 +108,7 @@ def _mad(xs: list[float], med: float) -> float:
     return _median([abs(x - med) for x in xs])
 
 
-def _best_five_by_spacing(
-    yxs: list[tuple[float, float]], expected_spacing: float
-) -> list[tuple[float, float]]:
+def _best_five_by_spacing(yxs: list[tuple[float, float]], expected_spacing: float) -> list[tuple[float, float]]:
     if len(yxs) <= 5:
         return yxs
     best = None
@@ -189,9 +186,6 @@ def _safe_float(s: str | None) -> float | None:
 
 
 def _index_inters(page: ET.Element) -> dict[int, ET.Element]:
-    """
-    IMPORTANT: Audiveris sometimes nests inter elements; don't only look at direct children.
-    """
     out: dict[int, ET.Element] = {}
     inters = page.find(".//sig/inters")
     if inters is None:
@@ -233,9 +227,7 @@ def _tag_looks_like_clef(el: ET.Element) -> bool:
     return False
 
 
-def _clef_bounds_from_header(
-    inter_by_id: dict[int, ET.Element], staff: ET.Element
-) -> tuple[float, float, float, float] | None:
+def _clef_bounds_from_header(inter_by_id: dict[int, ET.Element], staff: ET.Element) -> tuple[float, float, float, float] | None:
     header = staff.find("header")
     if header is None:
         return None
@@ -253,10 +245,7 @@ def _clef_bounds_from_header(
     if clef_el is None:
         return None
 
-    b = _bounds_of(clef_el)
-    if b is None:
-        return None
-    return b
+    return _bounds_of(clef_el)
 
 
 def _clef_bounds_fallback(
@@ -403,7 +392,6 @@ def _push_left_if_inside_any_symbol(
             x0, x1 = x, x + w
             y0, y1 = y, y + h
 
-            # Only consider staff-owned symbols as collisions.
             el_staff = el.get("staff")
             if not el_staff or el_staff != staff_id:
                 continue
@@ -441,22 +429,44 @@ def _push_left_if_inside_any_symbol(
     return x_left
 
 
-def _barline_xs_for_system(
-    inters: ET.Element | None,
-    staff_ids_in_system: set[str],
-    y_top: float,
-    y_bot: float,
-) -> list[float]:
-    """
-    Collect barlines for the whole system, not just one staff.
+def _dedupe_sorted_xs(xs: list[float], eps: float) -> list[float]:
+    if not xs:
+        return []
+    out = [xs[0]]
+    for x in xs[1:]:
+        if abs(x - out[-1]) <= eps:
+            out[-1] = 0.5 * (out[-1] + x)
+        else:
+            out.append(x)
+    return out
 
-    Audiveris barline inters can be:
-      - attached to a particular staff (staff="..."), but not necessarily the top staff
-      - or sometimes not reliably staff-attached for system-wide constructs
-    So we:
-      - accept barlines with staff in this system
-      - also accept barlines with no staff attribute
-      - filter by vertical overlap with the system span
+
+def _count_measures_in_system(system: ET.Element) -> int:
+    ms = system.findall("./measures/measure")
+    if not ms:
+        ms = system.findall("./measure")
+    if not ms:
+        ms = system.findall(".//measure")
+
+    if not ms:
+        return 0
+
+    ids: list[str] = []
+    for m in ms:
+        mid = (m.get("id") or m.get("number") or "").strip()
+        if mid:
+            ids.append(mid)
+
+    if ids:
+        return len(set(ids))
+
+    return len(ms)
+
+
+def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> list[float]:
+    """
+    Collect barline x positions purely by y-overlap, not staff linkage.
+    This is the key fix for the "later systems advance=0 -> repeated label" bug.
     """
     if inters is None:
         return []
@@ -465,11 +475,6 @@ def _barline_xs_for_system(
     for el in inters.iter():
         if (el.tag or "").lower() != "barline":
             continue
-
-        el_staff = el.get("staff")
-        if el_staff:
-            if el_staff not in staff_ids_in_system:
-                continue
 
         b = el.find("bounds")
         med = el.find("median")
@@ -485,14 +490,15 @@ def _barline_xs_for_system(
         if p1 is None or p2 is None:
             continue
 
-        y1 = _safe_float(p1.get("y"))
-        y2 = _safe_float(p2.get("y"))
-        if y1 is None or y2 is None:
+        yy1 = _safe_float(p1.get("y"))
+        yy2 = _safe_float(p2.get("y"))
+        if yy1 is None or yy2 is None:
             continue
 
-        by0 = float(min(y1, y2))
-        by1 = float(max(y1, y2))
-        if not _bounds_overlap_1d(by0, by1, y_top, y_bot):
+        by0 = float(min(yy1, yy2))
+        by1 = float(max(yy1, yy2))
+
+        if not _bounds_overlap_1d(by0, by1, y0, y1):
             continue
 
         xs.append(float(bx))
@@ -501,25 +507,13 @@ def _barline_xs_for_system(
     return xs
 
 
-def _dedupe_sorted_xs(xs: list[float], eps: float) -> list[float]:
-    if not xs:
-        return []
-    out = [xs[0]]
-    for x in xs[1:]:
-        if abs(x - out[-1]) <= eps:
-            out[-1] = 0.5 * (out[-1] + x)
-        else:
-            out.append(x)
-    return out
-
-
 def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
     """
     Returns:
       pic_w, pic_h: Audiveris picture size
       guides_px: list of (x_left_px, y_top_px, y_bot_px) in picture pixels
       staff_total: how many <staff> nodes exist (target guide count)
-      measures_px: list of (x_px, y_px, label_text) in picture pixels
+      measures_px: list of (x_px, y_px, label_text) in picture pixels (system-start labels)
       next_measure: next measure number after this sheet
     """
     data = z.read(sheet_xml_path)
@@ -546,11 +540,11 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
         return pic_w, pic_h, [], 0, [], start_measure
 
     staff_total = 0
-
     staff_recs: list[dict] = []
     system_recs: dict[str, dict] = {}
 
-    for page in pages:
+    # ---- Collect staff guides + spans per system (stable key) ----
+    for page_idx, page in enumerate(pages):
         inter_by_id = _index_inters(page)
         inters = page.find(".//sig/inters")
 
@@ -558,14 +552,17 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
         if not systems:
             systems = page.findall("system")
 
-        for system in systems:
+        for sys_idx, system in enumerate(systems):
             sys_id = system.get("id") or ""
-            sys_indented = system.get("indented")
+            sys_key = f"p{page_idx}_s{sys_idx}_id{sys_id}"
 
-            if sys_id not in system_recs:
-                system_recs[sys_id] = {
+            if sys_key not in system_recs:
+                system_recs[sys_key] = {
+                    "sys_key": sys_key,
                     "sys_id": sys_id,
-                    "indented": sys_indented,
+                    "page_idx": page_idx,
+                    "sys_idx": sys_idx,
+                    "indented": system.get("indented"),
                     "staff_spans": [],  # list of (y_top, y_bot, staff_id)
                 }
 
@@ -589,7 +586,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
 
                     min_x = None
                     y_at_min_x = None
-
                     for p in pts:
                         x = _safe_float(p.get("x"))
                         y = _safe_float(p.get("y"))
@@ -616,19 +612,14 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                     ys_partial = [t[0] for t in yxs]
                     ys5 = _synthesize_five_lines(ys_partial, expected_spacing)
 
-                if ys5 is not None:
-                    y_top = float(min(ys5))
-                    y_bot = float(max(ys5))
-                else:
+                if ys5 is None:
                     _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP no_y_span sheet={sheet_xml_path} staff={staff_id}")
                     continue
 
+                y_top = float(min(ys5))
+                y_bot = float(max(ys5))
                 if y_bot <= y_top or (y_bot - y_top) < 10.0:
-                    _dbg(
-                        sheet_xml_path,
-                        staff_id,
-                        f"[DBG] SKIP bad_y_span sheet={sheet_xml_path} staff={staff_id} y_top={y_top} y_bot={y_bot}",
-                    )
+                    _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP bad_y_span sheet={sheet_xml_path} staff={staff_id}")
                     continue
 
                 clef_b = _clef_bounds_from_header(inter_by_id, staff)
@@ -668,12 +659,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                         big_guard = max(28.0, (2.5 * expected_spacing) if expected_spacing > 0 else 28.0)
                         max_x2 = float(header_start) - big_guard
                         if x_left > max_x2:
-                            _dbg(
-                                sheet_xml_path,
-                                staff_id,
-                                f"[DBG] BIG_HEADER_GUARD staff={staff_id} header_start={header_start:.2f} "
-                                f"expected_spacing={expected_spacing:.2f} x={x_left:.2f} -> {max_x2:.2f}",
-                            )
+                            _dbg(sheet_xml_path, staff_id, f"[DBG] BIG_HEADER_GUARD staff={staff_id} x={x_left:.2f} -> {max_x2:.2f}")
                             x_left = max_x2
 
                 if clef_b is not None:
@@ -697,30 +683,21 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
 
                 x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
 
-                _dump_inters_near_staff(
-                    sheet_xml_path=sheet_xml_path,
-                    staff_id=staff_id,
-                    inters=inters,
-                    y_top=y_top,
-                    y_bot=y_bot,
-                    x_center=x_postpad,
-                    x_window=140.0,
-                )
+                _dump_inters_near_staff(sheet_xml_path, staff_id, inters, y_top, y_bot, x_postpad, x_window=140.0)
 
                 if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
                     _dbg(
                         sheet_xml_path,
                         staff_id,
-                        f"[DBG] sheet={sheet_xml_path} sys={sys_id} staff={staff_id} indented={system.get('indented')} "
-                        f"lines={len(line_nodes)} header_start={header_start} line_min_x={line_min_x} "
-                        f"expected_spacing={expected_spacing:.2f} "
-                        f"clef_b={'present' if clef_b is not None else None} "
-                        f"x_before={x_before:.2f} x_after={float(x_left):.2f} x_postpad={x_postpad:.2f} "
+                        f"[DBG] sheet={sheet_xml_path} sys_key={sys_key} staff={staff_id} indented={system.get('indented')} "
+                        f"header_start={header_start} line_min_x={line_min_x} expected_spacing={expected_spacing:.2f} "
+                        f"clef_b={'present' if clef_b is not None else None} x_before={x_before:.2f} x_after={float(x_left):.2f} x_postpad={x_postpad:.2f} "
                         f"y_top={y_top:.1f} y_bot={y_bot:.1f}",
                     )
 
                 staff_recs.append(
                     {
+                        "sys_key": sys_key,
                         "sys_id": sys_id,
                         "staff_id": staff_id,
                         "indented": system.get("indented"),
@@ -729,19 +706,15 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                         "y_bot": float(y_bot),
                     }
                 )
-                system_recs[sys_id]["staff_spans"].append((float(y_top), float(y_bot), staff_id))
+                system_recs[sys_key]["staff_spans"].append((float(y_top), float(y_bot), staff_id))
 
+    # ---- Outlier forcing for guide x (exclude indented) ----
     non_indented_xs = [
         r["x_postpad"] for r in staff_recs if not (r["indented"] not in (None, "", "false", "False", "0"))
     ]
-
-    forced_avg = None
-    outlier_ids: set[tuple[str, str]] = set()
-
     if len(non_indented_xs) >= 6:
         med = _median(non_indented_xs)
-        mad = _mad(non_indented_xs, med)
-        mad = max(mad, OUTLIER_ABS_FLOOR_PX)
+        mad = max(_mad(non_indented_xs, med), OUTLIER_ABS_FLOOR_PX)
 
         def mz(x: float) -> float:
             return abs(0.6745 * (x - med) / mad)
@@ -749,103 +722,82 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
         inliers = [x for x in non_indented_xs if mz(x) <= OUTLIER_MZ_THRESHOLD]
         if len(inliers) >= 4:
             forced_avg = sum(inliers) / float(len(inliers))
-
             for r in staff_recs:
                 if r["indented"] not in (None, "", "false", "False", "0"):
                     continue
                 score = mz(r["x_postpad"])
                 if score > OUTLIER_MZ_THRESHOLD:
-                    outlier_ids.add((r["sys_id"], r["staff_id"]))
-                    old = r["x_postpad"]
                     r["x_postpad"] = float(forced_avg)
-                    if _debug_enabled() and _debug_match(sheet_xml_path, r["staff_id"]):
-                        _dbg(
-                            sheet_xml_path,
-                            r["staff_id"],
-                            f"[DBG] FORCE_OUTLIER staff={r['staff_id']} sys={r['sys_id']} "
-                            f"x={old:.2f} -> {forced_avg:.2f} mz={score:.2f} med={med:.2f} mad={mad:.2f} n_inliers={len(inliers)}",
-                        )
-
-            if _debug_enabled():
-                print(
-                    f"[DBG] OUTLIER_SUMMARY sheet={sheet_xml_path} forced_avg={forced_avg:.2f} "
-                    f"non_indented={len(non_indented_xs)} outliers_forced={len(outlier_ids)}",
-                    flush=True,
-                )
 
     guides_px: list[tuple[float, float, float]] = [(r["x_postpad"], r["y_top"], r["y_bot"]) for r in staff_recs]
 
-    # ---------------------------
-    # Measure numbers: ONE per system start; advance by barline count in system
-    # ---------------------------
+    # ---- Measure system-start labels (streaming; never repeats) ----
     measures_px: list[tuple[float, float, str]] = []
     measure_no = int(start_measure)
 
     eps = max(6.0, 0.45 * expected_spacing) if expected_spacing > 0 else 10.0
     v_off = max(10.0, 0.90 * expected_spacing) if expected_spacing > 0 else 14.0
+    y_pad = max(8.0, 0.9 * expected_spacing) if expected_spacing > 0 else 14.0
 
     staff_x_by_sys_staff: dict[tuple[str, str], float] = {
-        (r["sys_id"], r["staff_id"]): r["x_postpad"] for r in staff_recs
+        (r["sys_key"], r["staff_id"]): r["x_postpad"] for r in staff_recs
     }
 
-    for page in pages:
+    last_good_adv = 0
+
+    for page_idx, page in enumerate(pages):
         inters = page.find(".//sig/inters")
         systems = page.findall(".//system")
         if not systems:
             systems = page.findall("system")
 
-        for system in systems:
+        for sys_idx, system in enumerate(systems):
             sys_id = system.get("id") or ""
-            spans = system_recs.get(sys_id, {}).get("staff_spans", [])
+            sys_key = f"p{page_idx}_s{sys_idx}_id{sys_id}"
+
+            spans = system_recs.get(sys_key, {}).get("staff_spans", [])
             if not spans:
                 continue
 
             spans_sorted = sorted(spans, key=lambda t: t[0])
             top_y_top, top_y_bot, top_staff_id = spans_sorted[0]
-            bottom_y_bot = max(t[1] for t in spans_sorted)
-            sys_y_top = min(t[0] for t in spans_sorted)
-            sys_y_bot = float(bottom_y_bot)
+            sys_y_top = float(min(t[0] for t in spans_sorted))
+            sys_y_bot = float(max(t[1] for t in spans_sorted))
 
-            sys_start_x = staff_x_by_sys_staff.get((sys_id, top_staff_id))
+            sys_start_x = staff_x_by_sys_staff.get((sys_key, top_staff_id))
             if sys_start_x is None:
                 continue
 
-            staff_ids_in_system = {sid for (_, _, sid) in spans_sorted if sid}
+            # how many measures does this system contain?
+            xml_meas_count = _count_measures_in_system(system)
 
-            bar_xs = _barline_xs_for_system(
-                inters=inters,
-                staff_ids_in_system=staff_ids_in_system,
-                y_top=float(sys_y_top),
-                y_bot=float(sys_y_bot),
-            )
-            bar_xs = _dedupe_sorted_xs(bar_xs, eps=eps)
+            bar_count = 0
+            if xml_meas_count <= 0:
+                xs = _barline_xs_in_y_band(inters, sys_y_top - y_pad, sys_y_bot + y_pad)
+                xs = _dedupe_sorted_xs(xs, eps=eps)
+                xs = [x for x in xs if x > (sys_start_x + eps)]
+                bar_count = len(xs)
 
-            bar_xs = [x for x in bar_xs if x > (sys_start_x + eps)]
+            adv_raw = xml_meas_count if xml_meas_count > 0 else bar_count
 
-            _meas_dbg(
-                sheet_xml_path,
-                sys_id,
-                f"[DBG] MEAS_SYS sheet={sheet_xml_path} sys={sys_id} "
-                f"top_staff={top_staff_id} start_x={sys_start_x:.2f} "
-                f"staffs={sorted(list(staff_ids_in_system))[:12]} "
-                f"sys_y=[{sys_y_top:.1f},{sys_y_bot:.1f}] "
-                f"bar_count={len(bar_xs)} xs={[round(x,1) for x in bar_xs[:20]]}",
-            )
+            # hardening: never allow 0 advance
+            if adv_raw <= 0:
+                adv = last_good_adv if last_good_adv > 0 else 1
+            else:
+                adv = adv_raw
+                last_good_adv = adv_raw
 
-            # Draw ONE label at system start (above guideline)
             x_text = float(sys_start_x) + (max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else 8.0)
             y_text = max(0.0, float(top_y_top) - v_off)
             measures_px.append((float(x_text), float(y_text), str(measure_no)))
 
             _meas_dbg(
                 sheet_xml_path,
-                sys_id,
-                f"[DBG] MEAS_DRAW_SYS_START sheet={sheet_xml_path} sys={sys_id} "
-                f"measure={measure_no} x={x_text:.2f} y={y_text:.2f}",
+                sys_key,
+                f"[DBG] MEAS sys_key={sys_key} id={sys_id} label={measure_no} adv={adv} raw={adv_raw} xml={xml_meas_count} bars={bar_count}",
             )
 
-            # Advance by number of barlines within this system.
-            measure_no += int(len(bar_xs))
+            measure_no += int(max(1, adv))
 
     return pic_w, pic_h, guides_px, staff_total, measures_px, measure_no
 
@@ -958,7 +910,6 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
     doc = fitz.open(input_pdf)
-
     measure_no = 1
 
     with zipfile.ZipFile(omr_path, "r") as z:
@@ -989,20 +940,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 y0_pdf = y0_px * scale_y
                 y1_pdf = y1_px * scale_y
                 guides_pdf.append((x_pdf, y0_pdf, y1_pdf))
-                page.draw_line(
-                    (x_pdf, y0_pdf),
-                    (x_pdf, y1_pdf),
-                    color=GUIDE_COLOR,
-                    width=GUIDE_WIDTH,
-                )
+                page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
 
-            # Draw measure numbers (already filtered to one per system start)
             if measures_px:
                 interline_pdf = None
                 if len(guides_pdf) >= 1:
                     staff_h = abs(guides_pdf[0][2] - guides_pdf[0][1])
                     interline_pdf = staff_h / 4.0 if staff_h > 0 else None
-
                 if interline_pdf is None:
                     interline_pdf = 16.0
 
@@ -1011,12 +955,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 for (x_px, y_px, label) in measures_px:
                     x_pdf = x_px * scale_x
                     y_pdf = y_px * scale_y
-                    page.insert_text(
-                        (x_pdf, y_pdf),
-                        label,
-                        fontsize=fontsize,
-                        color=MEASURE_TEXT_COLOR,
-                    )
+                    page.insert_text((x_pdf, y_pdf), label, fontsize=fontsize, color=MEASURE_TEXT_COLOR)
 
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
@@ -1027,12 +966,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         flush=True,
                     )
                 for (x_pdf, y0_pdf, y1_pdf) in extras:
-                    page.draw_line(
-                        (x_pdf, y0_pdf),
-                        (x_pdf, y1_pdf),
-                        color=GUIDE_COLOR,
-                        width=GUIDE_WIDTH,
-                    )
+                    page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
 
     doc.save(output_pdf)
     doc.close()
