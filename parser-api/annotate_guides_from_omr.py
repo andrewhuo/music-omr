@@ -459,49 +459,68 @@ def _count_measures_in_system(system: ET.Element) -> int:
 
     if ids:
         return len(set(ids))
-
     return len(ms)
+
+
+def _looks_like_barline_inter(el: ET.Element) -> bool:
+    t = (el.tag or "").lower()
+    if "barline" in t:
+        return True
+    for k in ("shape", "type", "kind", "name", "family"):
+        v = el.get(k)
+        if v and "barline" in v.lower():
+            return True
+        if v and "bar line" in v.lower():
+            return True
+    return False
 
 
 def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> list[float]:
     """
-    Collect barline x positions purely by y-overlap, not staff linkage.
-    This is the key fix for the "later systems advance=0 -> repeated label" bug.
+    Collect barline-like x positions by y-overlap, not staff linkage.
+    Uses median p1/p2 when available; otherwise falls back to bounds y/h.
     """
     if inters is None:
         return []
 
     xs: list[float] = []
     for el in inters.iter():
-        if (el.tag or "").lower() != "barline":
+        if not _looks_like_barline_inter(el):
             continue
 
         b = el.find("bounds")
-        med = el.find("median")
-        if b is None or med is None:
+        if b is None:
             continue
 
         bx = _safe_float(b.get("x"))
+        by = _safe_float(b.get("y"))
+        bw = _safe_float(b.get("w"))
+        bh = _safe_float(b.get("h"))
         if bx is None:
             continue
 
-        p1 = med.find("p1")
-        p2 = med.find("p2")
-        if p1 is None or p2 is None:
+        # Prefer the "median" vertical extent when it exists
+        med = el.find("median")
+        if med is not None:
+            p1 = med.find("p1")
+            p2 = med.find("p2")
+            if p1 is not None and p2 is not None:
+                yy1 = _safe_float(p1.get("y"))
+                yy2 = _safe_float(p2.get("y"))
+                if yy1 is not None and yy2 is not None:
+                    by0 = float(min(yy1, yy2))
+                    by1 = float(max(yy1, yy2))
+                    if _bounds_overlap_1d(by0, by1, y0, y1):
+                        xs.append(float(bx))
+                    continue
+
+        # Fallback: bounds vertical extent
+        if by is None or bw is None or bh is None:
             continue
-
-        yy1 = _safe_float(p1.get("y"))
-        yy2 = _safe_float(p2.get("y"))
-        if yy1 is None or yy2 is None:
-            continue
-
-        by0 = float(min(yy1, yy2))
-        by1 = float(max(yy1, yy2))
-
-        if not _bounds_overlap_1d(by0, by1, y0, y1):
-            continue
-
-        xs.append(float(bx))
+        by0 = float(by)
+        by1 = float(by) + float(bh)
+        if _bounds_overlap_1d(by0, by1, y0, y1):
+            xs.append(float(bx))
 
     xs.sort()
     return xs
@@ -543,7 +562,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
     staff_recs: list[dict] = []
     system_recs: dict[str, dict] = {}
 
-    # ---- Collect staff guides + spans per system (stable key) ----
     for page_idx, page in enumerate(pages):
         inter_by_id = _index_inters(page)
         inters = page.find(".//sig/inters")
@@ -578,6 +596,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
 
                 yxs: list[tuple[float, float]] = []
                 all_line_xmins: list[float] = []
+                all_line_xmaxs: list[float] = []
 
                 for ln in line_nodes:
                     pts = ln.findall("point")
@@ -585,7 +604,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                         continue
 
                     min_x = None
+                    max_x = None
                     y_at_min_x = None
+
                     for p in pts:
                         x = _safe_float(p.get("x"))
                         y = _safe_float(p.get("y"))
@@ -594,12 +615,16 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                         if min_x is None or x < min_x:
                             min_x = x
                             y_at_min_x = y
+                        if max_x is None or x > max_x:
+                            max_x = x
 
                     if min_x is None or y_at_min_x is None:
                         continue
 
                     yxs.append((float(y_at_min_x), float(min_x)))
                     all_line_xmins.append(float(min_x))
+                    if max_x is not None:
+                        all_line_xmaxs.append(float(max_x))
 
                 yxs.sort(key=lambda t: t[0])
 
@@ -628,6 +653,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
 
                 x_left = _safe_float(staff.get("left"))
                 line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
+                line_max_x = float(max(all_line_xmaxs)) if all_line_xmaxs else None
 
                 if x_left is None and line_min_x is not None:
                     x_left = line_min_x
@@ -690,7 +716,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                         sheet_xml_path,
                         staff_id,
                         f"[DBG] sheet={sheet_xml_path} sys_key={sys_key} staff={staff_id} indented={system.get('indented')} "
-                        f"header_start={header_start} line_min_x={line_min_x} expected_spacing={expected_spacing:.2f} "
+                        f"header_start={header_start} line_min_x={line_min_x} line_max_x={line_max_x} expected_spacing={expected_spacing:.2f} "
                         f"clef_b={'present' if clef_b is not None else None} x_before={x_before:.2f} x_after={float(x_left):.2f} x_postpad={x_postpad:.2f} "
                         f"y_top={y_top:.1f} y_bot={y_bot:.1f}",
                     )
@@ -704,11 +730,12 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                         "x_postpad": float(x_postpad),
                         "y_top": float(y_top),
                         "y_bot": float(y_bot),
+                        "line_max_x": float(line_max_x) if line_max_x is not None else None,
                     }
                 )
                 system_recs[sys_key]["staff_spans"].append((float(y_top), float(y_bot), staff_id))
 
-    # ---- Outlier forcing for guide x (exclude indented) ----
+    # Outlier forcing for guide x (exclude indented)
     non_indented_xs = [
         r["x_postpad"] for r in staff_recs if not (r["indented"] not in (None, "", "false", "False", "0"))
     ]
@@ -731,16 +758,20 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
 
     guides_px: list[tuple[float, float, float]] = [(r["x_postpad"], r["y_top"], r["y_bot"]) for r in staff_recs]
 
-    # ---- Measure system-start labels (streaming; never repeats) ----
+    # Measure system-start labels (streaming; robust to missing closing barline)
     measures_px: list[tuple[float, float, str]] = []
     measure_no = int(start_measure)
 
     eps = max(6.0, 0.45 * expected_spacing) if expected_spacing > 0 else 10.0
     v_off = max(10.0, 0.90 * expected_spacing) if expected_spacing > 0 else 14.0
     y_pad = max(8.0, 0.9 * expected_spacing) if expected_spacing > 0 else 14.0
+    close_tol = max(14.0, 0.9 * expected_spacing) if expected_spacing > 0 else 20.0
 
     staff_x_by_sys_staff: dict[tuple[str, str], float] = {
         (r["sys_key"], r["staff_id"]): r["x_postpad"] for r in staff_recs
+    }
+    staff_right_by_sys_staff: dict[tuple[str, str], float | None] = {
+        (r["sys_key"], r["staff_id"]): r["line_max_x"] for r in staff_recs
     }
 
     last_good_adv = 0
@@ -768,19 +799,46 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
             if sys_start_x is None:
                 continue
 
-            # how many measures does this system contain?
+            # Estimate system right edge from staff line max-x
+            sys_right_x = None
+            for (_, _, sid) in spans_sorted:
+                mx = staff_right_by_sys_staff.get((sys_key, sid))
+                if mx is None:
+                    continue
+                if sys_right_x is None or mx > sys_right_x:
+                    sys_right_x = float(mx)
+
             xml_meas_count = _count_measures_in_system(system)
 
+            adv_raw = 0
             bar_count = 0
-            if xml_meas_count <= 0:
+            closing_present = False
+
+            if xml_meas_count > 0:
+                adv_raw = xml_meas_count
+            else:
                 xs = _barline_xs_in_y_band(inters, sys_y_top - y_pad, sys_y_bot + y_pad)
                 xs = _dedupe_sorted_xs(xs, eps=eps)
-                xs = [x for x in xs if x > (sys_start_x + eps)]
+                xs = [x for x in xs if x > (float(sys_start_x) + eps)]
+
+                if sys_right_x is not None:
+                    # keep only plausible barlines inside (or very near) the system width
+                    xs = [x for x in xs if x <= (sys_right_x + 2.0 * close_tol)]
+
                 bar_count = len(xs)
 
-            adv_raw = xml_meas_count if xml_meas_count > 0 else bar_count
+                if bar_count > 0 and sys_right_x is not None:
+                    rightmost = xs[-1]
+                    if abs(rightmost - sys_right_x) <= close_tol or rightmost >= (sys_right_x - close_tol):
+                        closing_present = True
 
-            # hardening: never allow 0 advance
+                if bar_count > 0:
+                    # If closing barline is missing, measures are barlines + 1.
+                    adv_raw = bar_count if closing_present else (bar_count + 1)
+                else:
+                    adv_raw = 0
+
+            # Never allow 0 advance; carry forward last good system length if needed.
             if adv_raw <= 0:
                 adv = last_good_adv if last_good_adv > 0 else 1
             else:
@@ -794,7 +852,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
             _meas_dbg(
                 sheet_xml_path,
                 sys_key,
-                f"[DBG] MEAS sys_key={sys_key} id={sys_id} label={measure_no} adv={adv} raw={adv_raw} xml={xml_meas_count} bars={bar_count}",
+                f"[DBG] MEAS sys_key={sys_key} id={sys_id} label={measure_no} adv={adv} "
+                f"xml={xml_meas_count} bars={bar_count} closing={closing_present} right={sys_right_x}",
             )
 
             measure_no += int(max(1, adv))
