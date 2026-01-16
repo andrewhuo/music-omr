@@ -21,12 +21,19 @@ jobs:
       DEBUG_MEASURES: "0"
       DEBUG_GUIDES_DUMP_INTERS: "0"
 
+      # Draw the blue barlines + blue numbers above each detected barline (testing overlay)
+      DEBUG_DRAW_BARS: "0"
+      DEBUG_BARS_ALPHA: "0.85"
+
       # Leave blank to auto-pick a valid sheet from the .omr (avoids sheet#3 missing errors)
       DEBUG_SHEET: ""
       # Optional: set to one staff id to keep logs small
       DEBUG_STAFF: ""
       # Optional: set to one system id to keep logs small (measures debug)
       DEBUG_MEASURES_SYS: ""
+
+      # Make sure Python prints show up in Actions logs immediately
+      PYTHONUNBUFFERED: "1"
 
     permissions:
       contents: read
@@ -40,13 +47,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
       - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@v3
+        uses: google-github-actions/setup-gcloud@v2
         with:
           version: ">= 363.0.0"
 
@@ -57,10 +64,13 @@ jobs:
           echo "Output prefix: ${OUTPUT_PREFIX}"
           echo "DEBUG_GUIDES=${DEBUG_GUIDES}"
           echo "DEBUG_MEASURES=${DEBUG_MEASURES}"
+          echo "DEBUG_DRAW_BARS=${DEBUG_DRAW_BARS}"
+          echo "DEBUG_BARS_ALPHA=${DEBUG_BARS_ALPHA}"
           echo "DEBUG_SHEET=${DEBUG_SHEET}"
           echo "DEBUG_STAFF=${DEBUG_STAFF}"
           echo "DEBUG_MEASURES_SYS=${DEBUG_MEASURES_SYS}"
           echo "DEBUG_GUIDES_DUMP_INTERS=${DEBUG_GUIDES_DUMP_INTERS}"
+          echo "PYTHONUNBUFFERED=${PYTHONUNBUFFERED}"
 
       #################################################################
       # 2) Clean output prefix (safe)
@@ -142,6 +152,11 @@ jobs:
           DEBUG_MEASURES: "${{ env.DEBUG_MEASURES }}"
           DEBUG_MEASURES_SHEET: "${{ env.DEBUG_SHEET }}"
           DEBUG_MEASURES_SYS_ID: "${{ env.DEBUG_MEASURES_SYS }}"
+
+          DEBUG_DRAW_BARS: "${{ env.DEBUG_DRAW_BARS }}"
+          DEBUG_BARS_ALPHA: "${{ env.DEBUG_BARS_ALPHA }}"
+
+          PYTHONUNBUFFERED: "${{ env.PYTHONUNBUFFERED }}"
         run: |
           set -euo pipefail
           python -u parser-api/annotate_guides_from_omr.py \
@@ -164,7 +179,7 @@ jobs:
           PY
 
       #################################################################
-      # 8) Upload outputs (NO annotate.log)
+      # 8) Upload outputs
       #################################################################
       - name: Upload outputs to GCS
         run: |
