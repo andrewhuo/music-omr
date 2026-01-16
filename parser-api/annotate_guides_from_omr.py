@@ -25,6 +25,10 @@ MEASURE_MAX_FONTSIZE = 12.0
 OUTLIER_MZ_THRESHOLD = 3.5  # modified z-score threshold
 OUTLIER_ABS_FLOOR_PX = 10.0  # minimum MAD floor to avoid divide-by-near-zero
 
+# DEBUG: barline overlay (testing only)
+DEBUG_BAR_COLOR = (0, 0, 1)  # blue
+DEBUG_BAR_WIDTH = 0.9
+
 _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 
 
@@ -71,6 +75,18 @@ def _meas_debug_match(sheet_xml_path: str, system_key: str) -> bool:
 def _meas_dbg(sheet_xml_path: str, system_key: str, msg: str) -> None:
     if _meas_debug_enabled() and _meas_debug_match(sheet_xml_path, system_key):
         print(msg, flush=True)
+
+
+def _bars_debug_enabled() -> bool:
+    v = os.getenv("DEBUG_DRAW_BARS", "").strip()
+    return v in ("1", "true", "True", "yes", "YES")
+
+
+def _bars_alpha() -> float:
+    try:
+        return float(os.getenv("DEBUG_BARS_ALPHA", "0.85").strip())
+    except Exception:
+        return 0.85
 
 
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
@@ -526,6 +542,13 @@ def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> li
     return xs
 
 
+def _tail_xs(xs: list[float], n: int = 3) -> str:
+    if not xs:
+        return "[]"
+    t = xs[-n:] if len(xs) > n else xs
+    return "[" + ",".join(f"{x:.1f}" for x in t) + "]"
+
+
 def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
     """
     Returns:
@@ -533,6 +556,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
       guides_px: list of (x_left_px, y_top_px, y_bot_px) in picture pixels
       staff_total: how many <staff> nodes exist (target guide count)
       measures_px: list of (x_px, y_px, label_text) in picture pixels (system-start labels)
+      bars_px: list of (x_px, y_top_px, y_bot_px, label_text) for debug bar overlay (optional)
       next_measure: next measure number after this sheet
     """
     data = z.read(sheet_xml_path)
@@ -556,7 +580,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
 
     pages = root.findall("page")
     if not pages:
-        return pic_w, pic_h, [], 0, [], start_measure
+        return pic_w, pic_h, [], 0, [], [], start_measure
 
     staff_total = 0
     staff_recs: list[dict] = []
@@ -760,6 +784,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
 
     # Measure system-start labels (streaming; robust to missing closing barline)
     measures_px: list[tuple[float, float, str]] = []
+    bars_px: list[tuple[float, float, float, str]] = []  # debug: (x, y_top, y_bot, label)
+
     measure_no = int(start_measure)
 
     eps = max(6.0, 0.45 * expected_spacing) if expected_spacing > 0 else 10.0
@@ -813,9 +839,12 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
             adv_raw = 0
             bar_count = 0
             closing_present = False
+            xs_used: list[float] = []
+            reason = ""
 
             if xml_meas_count > 0:
                 adv_raw = xml_meas_count
+                reason = "use_xml_measures"
             else:
                 xs = _barline_xs_in_y_band(inters, sys_y_top - y_pad, sys_y_bot + y_pad)
                 xs = _dedupe_sorted_xs(xs, eps=eps)
@@ -825,6 +854,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                     # keep only plausible barlines inside (or very near) the system width
                     xs = [x for x in xs if x <= (sys_right_x + 2.0 * close_tol)]
 
+                xs_used = xs
                 bar_count = len(xs)
 
                 if bar_count > 0 and sys_right_x is not None:
@@ -833,32 +863,49 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str, start_measure: int):
                         closing_present = True
 
                 if bar_count > 0:
-                    # If closing barline is missing, measures are barlines + 1.
                     adv_raw = bar_count if closing_present else (bar_count + 1)
+                    reason = "bars" if closing_present else "bars_plus_edge"
                 else:
                     adv_raw = 0
+                    reason = "no_bars"
 
             # Never allow 0 advance; carry forward last good system length if needed.
             if adv_raw <= 0:
                 adv = last_good_adv if last_good_adv > 0 else 1
+                if reason == "no_bars":
+                    reason = "no_bars_fallback"
+                else:
+                    reason = reason + "_fallback"
             else:
                 adv = adv_raw
                 last_good_adv = adv_raw
 
+            # System-start label (your existing behavior)
             x_text = float(sys_start_x) + (max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else 8.0)
             y_text = max(0.0, float(top_y_top) - v_off)
             measures_px.append((float(x_text), float(y_text), str(measure_no)))
 
+            # NEW: high signal debug line (one per system)
             _meas_dbg(
                 sheet_xml_path,
                 sys_key,
-                f"[DBG] MEAS sys_key={sys_key} id={sys_id} label={measure_no} adv={adv} "
-                f"xml={xml_meas_count} bars={bar_count} closing={closing_present} right={sys_right_x}",
+                "[DBG] MEAS "
+                f"sys_key={sys_key} id={sys_id} "
+                f"start={measure_no} adv={adv} reason={reason} "
+                f"xml={xml_meas_count} bars={bar_count} tail_xs={_tail_xs(xs_used, 3)} "
+                f"closing={closing_present} right={sys_right_x} close_tol={close_tol:.1f}",
             )
+
+            # NEW: overlay barlines + numbers above barlines (testing only)
+            # We label each barline with the measure number we *think* it corresponds to.
+            # This is the fastest way to visually catch the first off-by-one.
+            if _bars_debug_enabled() and xs_used:
+                for i, bx in enumerate(xs_used):
+                    bars_px.append((float(bx), float(sys_y_top), float(sys_y_bot), str(measure_no + i)))
 
             measure_no += int(max(1, adv))
 
-    return pic_w, pic_h, guides_px, staff_total, measures_px, measure_no
+    return pic_w, pic_h, guides_px, staff_total, measures_px, bars_px, measure_no
 
 
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
@@ -983,7 +1030,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
 
-            pic_w, pic_h, guides_px, staff_total, measures_px, measure_no = _parse_sheet(
+            pic_w, pic_h, guides_px, staff_total, measures_px, bars_px, measure_no = _parse_sheet(
                 z, sheet_xml_path, start_measure=measure_no
             )
             if pic_w <= 0 or pic_h <= 0:
@@ -1000,6 +1047,43 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 y1_pdf = y1_px * scale_y
                 guides_pdf.append((x_pdf, y0_pdf, y1_pdf))
                 page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
+
+            # NEW: draw/label all barlines used (testing-only overlay)
+            if bars_px and _bars_debug_enabled():
+                alpha = _bars_alpha()
+
+                # Reuse the same fontsize logic as measure labels
+                interline_pdf = None
+                if len(guides_pdf) >= 1:
+                    staff_h = abs(guides_pdf[0][2] - guides_pdf[0][1])
+                    interline_pdf = staff_h / 4.0 if staff_h > 0 else None
+                if interline_pdf is None:
+                    interline_pdf = 16.0
+                fontsize = _clamp(0.55 * interline_pdf, MEASURE_MIN_FONTSIZE, MEASURE_MAX_FONTSIZE)
+
+                for (x_px, y0_px, y1_px, label) in bars_px:
+                    x_pdf = x_px * scale_x
+                    y0_pdf = y0_px * scale_y
+                    y1_pdf = y1_px * scale_y
+                    # vertical bar marker
+                    try:
+                        page.draw_line(
+                            (x_pdf, y0_pdf),
+                            (x_pdf, y1_pdf),
+                            color=DEBUG_BAR_COLOR,
+                            width=DEBUG_BAR_WIDTH,
+                            stroke_opacity=alpha,
+                        )
+                        # label above the barline (slightly above y0)
+                        page.insert_text(
+                            (x_pdf + 1.5, max(0.0, y0_pdf - 6.0)),
+                            label,
+                            fontsize=fontsize,
+                            color=DEBUG_BAR_COLOR,
+                            fill_opacity=alpha,
+                        )
+                    except Exception:
+                        pass
 
             if measures_px:
                 interline_pdf = None
