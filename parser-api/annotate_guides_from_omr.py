@@ -66,6 +66,7 @@ def _meas_debug_enabled() -> bool:
 
 
 def _meas_debug_match(sheet_xml_path: str, system_key: str) -> bool:
+    # IMPORTANT: leave these blank unless you intentionally want to filter.
     want_sheet = os.getenv("DEBUG_MEASURES_SHEET", "").strip()
     want_sys = os.getenv("DEBUG_MEASURES_SYS_ID", "").strip()
     if want_sheet and want_sheet not in sheet_xml_path:
@@ -99,10 +100,21 @@ def _use_cv_bars() -> bool:
 
 def _cv_zoom() -> float:
     try:
-        z = float(os.getenv("CV_ZOOM", "2.0").strip())
-        return z if z > 0 else 2.0
+        z = float(os.getenv("CV_ZOOM", "2.5").strip())
+        return z if z > 0 else 2.5
     except Exception:
-        return 2.0
+        return 2.5
+
+
+def _cv_min_support(nstaves: int) -> int:
+    """
+    How many staves must see a vertical line at ~same x to treat it as a real barline.
+    Packet recommendation: >=2 staves.
+    We keep that, but for very large systems we bump slightly.
+    """
+    if nstaves <= 0:
+        return 2
+    return max(2, 2 if nstaves <= 3 else 3)
 
 
 # --------------------------
@@ -534,7 +546,6 @@ def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> li
         if bx is None:
             continue
 
-        # Prefer the "median" vertical extent when it exists
         med = el.find("median")
         if med is not None:
             p1 = med.find("p1")
@@ -549,7 +560,6 @@ def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> li
                         xs.append(float(bx))
                     continue
 
-        # Fallback: bounds vertical extent
         if by is None or bw is None or bh is None:
             continue
         by0 = float(by)
@@ -568,12 +578,16 @@ def _tail_xs(xs: list[float], n: int = 3) -> str:
     return "[" + ",".join(f"{x:.1f}" for x in t) + "]"
 
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
 # --------------------------
 # CV barline detection (PDF space)
 # --------------------------
 def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -> tuple[list[float], float]:
     """
-    Detect barline x positions using image morphology in a PDF y-band.
+    Detect vertical-line x positions using image morphology in a PDF y-band.
     Returns: (xs_pdf, close_tol_pdf)
     """
     rect = page.rect
@@ -628,6 +642,54 @@ def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -
     return (xs_pdf, close_tol_pdf)
 
 
+def _cluster_consensus_xs(xs_by_staff: list[list[float]], tol: float) -> tuple[list[float], list[int]]:
+    """
+    Cluster x values across staves with tolerance tol, and compute per-cluster support count.
+    Returns (cluster_xs_sorted, support_counts_same_order).
+    """
+    pts: list[tuple[float, int]] = []
+    for si, xs in enumerate(xs_by_staff):
+        for x in xs:
+            pts.append((float(x), int(si)))
+    if not pts:
+        return ([], [])
+
+    pts.sort(key=lambda t: t[0])
+
+    clusters: list[dict] = []
+    cur_xs: list[float] = [pts[0][0]]
+    cur_staffs: set[int] = {pts[0][1]}
+    cur_min = pts[0][0]
+    cur_max = pts[0][0]
+
+    for x, si in pts[1:]:
+        if abs(x - cur_max) <= tol:
+            cur_xs.append(x)
+            cur_staffs.add(si)
+            cur_max = x
+        else:
+            clusters.append({"xs": cur_xs, "staffs": cur_staffs, "min": cur_min, "max": cur_max})
+            cur_xs = [x]
+            cur_staffs = {si}
+            cur_min = x
+            cur_max = x
+
+    clusters.append({"xs": cur_xs, "staffs": cur_staffs, "min": cur_min, "max": cur_max})
+
+    out_xs: list[float] = []
+    out_support: list[int] = []
+    for c in clusters:
+        xs = c["xs"]
+        # representative x: median
+        xs_sorted = sorted(xs)
+        rep = xs_sorted[len(xs_sorted) // 2]
+        out_xs.append(float(rep))
+        out_support.append(int(len(c["staffs"])))
+
+    # Already in increasing order by construction.
+    return (out_xs, out_support)
+
+
 # --------------------------
 # Sheet parsing (OMR XML)
 # --------------------------
@@ -642,7 +704,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
          sys_y_top, sys_y_bot, top_y_top,
          sys_start_x, sys_right_x,
          xml_meas_count,
-         xs_xml_used, close_tol, eps, y_pad
+         xs_xml_used,
+         staff_bands (list of (y_top, y_bot) per staff in this system, picture coords)
     """
     data = z.read(sheet_xml_path)
     root = ET.fromstring(data)
@@ -870,7 +933,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     # Build per-system descriptors (so measure logic can happen later with CV + continuity)
     systems_desc: list[dict] = []
 
-    # These are in picture coords
     eps = max(6.0, 0.45 * expected_spacing) if expected_spacing > 0 else 10.0
     y_pad = max(8.0, 0.9 * expected_spacing) if expected_spacing > 0 else 14.0
     close_tol = max(14.0, 0.9 * expected_spacing) if expected_spacing > 0 else 20.0
@@ -915,7 +977,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
             xml_meas_count = _count_measures_in_system(system)
 
-            # Keep XML barline scan around for fallback / debug (picture coords)
             xs_xml_used: list[float] = []
             if inters is not None:
                 xs = _barline_xs_in_y_band(inters, sys_y_top - y_pad, sys_y_bot + y_pad)
@@ -924,6 +985,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 if sys_right_x is not None:
                     xs = [x for x in xs if x <= (sys_right_x + 2.0 * close_tol)]
                 xs_xml_used = xs
+
+            staff_bands = [(float(y0), float(y1)) for (y0, y1, _sid) in spans_sorted]
 
             systems_desc.append(
                 {
@@ -940,6 +1003,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "sys_right_x": float(sys_right_x) if sys_right_x is not None else None,
                     "xml_meas_count": int(xml_meas_count),
                     "xs_xml_used": xs_xml_used,
+                    "staff_bands": staff_bands,
                 }
             )
 
@@ -1049,14 +1113,20 @@ def _fallback_missing_staff_guides(
     return extras
 
 
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
 # --------------------------
 # Main annotation
 # --------------------------
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
+    # One startup line that always prints (so “no debug” is never ambiguous).
+    print(
+        "[INFO] annotate_guides_from_omr "
+        f"input_pdf={input_pdf} omr={omr_path} output={output_pdf} "
+        f"DEBUG_MEASURES={os.getenv('DEBUG_MEASURES','')} DEBUG_MEASURES_SHEET={os.getenv('DEBUG_MEASURES_SHEET','')} "
+        f"DEBUG_MEASURES_SYS_ID={os.getenv('DEBUG_MEASURES_SYS_ID','')} DEBUG_DRAW_BARS={os.getenv('DEBUG_DRAW_BARS','')} "
+        f"USE_CV_BARS={os.getenv('USE_CV_BARS','')} CV_ZOOM={os.getenv('CV_ZOOM','')}",
+        flush=True,
+    )
+
     doc = fitz.open(input_pdf)
     measure_no = 1
 
@@ -1071,6 +1141,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
+
+            if _meas_debug_enabled() or _debug_enabled() or _bars_debug_enabled() or _use_cv_bars():
+                print(f"[DBG] PAGE page={page_index+1} sheet={sheet_xml_path}", flush=True)
 
             pic_w, pic_h, guides_px, staff_total, systems_desc = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
@@ -1098,7 +1171,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 interline_pdf = 16.0
             fontsize = _clamp(0.55 * interline_pdf, MEASURE_MIN_FONTSIZE, MEASURE_MAX_FONTSIZE)
 
-            # Measure logic per system (CV-first if enabled, else XML bars; always prefer XML <measures> when present)
+            # Measure logic per system (CV consensus if enabled; else XML bars; always prefer XML <measures> when present)
             last_good_adv = 0
 
             for sys in systems_desc:
@@ -1124,6 +1197,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 reason = ""
                 closing_present = False
                 xs_used_pdf: list[float] = []
+                cv_support_info = ""
 
                 # 1) Prefer Audiveris <measures> count when present
                 if xml_meas_count > 0:
@@ -1131,32 +1205,49 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     method = "xml_measures"
                     reason = "use_xml_measures"
                 else:
-                    # 2) CV bars (optional) else XML bar inters fallback
+                    # 2) CV bars (per-staff consensus) else XML bar inters fallback
+                    close_tol_used = close_tol_pdf_xml
+
                     if _use_cv_bars():
-                        xs_pdf, close_tol_pdf = _cv_barlines_xs_in_band_pdf(
-                            page,
-                            y0_pdf=(sys_y_top_pdf - y_pad_pdf),
-                            y1_pdf=(sys_y_bot_pdf + y_pad_pdf),
-                        )
-                        # filter plausible bars
-                        xs_pdf = [x for x in xs_pdf if x > (sys_start_x_pdf + eps_pdf)]
-                        if sys_right_x_pdf is not None:
-                            xs_pdf = [x for x in xs_pdf if x <= (sys_right_x_pdf + 2.0 * close_tol_pdf)]
-                        xs_used_pdf = xs_pdf
-                        method = "cv_bars"
-                        close_tol_used = close_tol_pdf
+                        staff_bands = list(sys.get("staff_bands") or [])
+                        staff_bands_pdf: list[tuple[float, float]] = [
+                            (float(y0) * scale_y, float(y1) * scale_y) for (y0, y1) in staff_bands
+                        ]
+
+                        xs_by_staff: list[list[float]] = []
+                        close_tols: list[float] = []
+                        for (y0s, y1s) in staff_bands_pdf:
+                            xs_pdf, close_tol_staff = _cv_barlines_xs_in_band_pdf(
+                                page,
+                                y0_pdf=(y0s - y_pad_pdf),
+                                y1_pdf=(y1s + y_pad_pdf),
+                            )
+                            # basic plausibility filter per staff
+                            xs_pdf = [x for x in xs_pdf if x > (sys_start_x_pdf + eps_pdf)]
+                            if sys_right_x_pdf is not None:
+                                xs_pdf = [x for x in xs_pdf if x <= (sys_right_x_pdf + 2.0 * close_tol_staff)]
+                            xs_by_staff.append(xs_pdf)
+                            close_tols.append(close_tol_staff)
+
+                        close_tol_used = max(close_tols) if close_tols else close_tol_used
+
+                        # Consensus clustering across staves
+                        tol_cluster = max(eps_pdf, 0.75 * close_tol_used)
+                        cluster_xs, supports = _cluster_consensus_xs(xs_by_staff, tol=tol_cluster)
+
+                        min_support = _cv_min_support(len(staff_bands_pdf))
+                        kept = [(x, s) for (x, s) in zip(cluster_xs, supports) if s >= min_support]
+                        xs_used_pdf = [x for (x, _s) in kept]
+                        cv_support_info = f"min_support={min_support} kept={len(xs_used_pdf)}/{len(cluster_xs)}"
+                        method = "cv_bars_consensus"
                     else:
-                        # Convert stored picture-space XML bar xs to PDF
                         xs_pic = list(sys.get("xs_xml_used") or [])
-                        xs_pdf = [float(x) * scale_x for x in xs_pic]
-                        xs_used_pdf = xs_pdf
+                        xs_used_pdf = [float(x) * scale_x for x in xs_pic]
                         method = "xml_bars"
-                        close_tol_used = close_tol_pdf_xml
 
                     bar_count = len(xs_used_pdf)
 
                     if bar_count > 0:
-                        # Decide bars vs bars+1 using right edge, then smooth with continuity
                         cand0 = bar_count
                         cand1 = bar_count + 1
 
@@ -1181,7 +1272,6 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                             alt = cand0
                             reason = "no_right_edge"
 
-                        # Continuity tie-break: if preferred is a weird jump but alt matches the previous system better, flip.
                         if last_good_adv > 0:
                             if abs(preferred - last_good_adv) > abs(alt - last_good_adv):
                                 preferred = alt
@@ -1200,7 +1290,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     adv = int(adv_raw)
                     last_good_adv = int(adv_raw)
 
-                # System-start label (your existing behavior)
+                # System-start label
                 v_off = max(10.0, 0.90 * expected_spacing) if expected_spacing > 0 else 14.0
                 x_text_pdf = sys_start_x_pdf + ((max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else 8.0) * scale_x)
                 y_text_pdf = max(0.0, top_y_top_pdf - (v_off * scale_y))
@@ -1214,10 +1304,11 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     f"sys_key={sys_key} id={sys_id} "
                     f"start={measure_no} adv={adv} method={method} reason={reason} "
                     f"xml={xml_meas_count} bars={len(xs_used_pdf)} tail_xs={_tail_xs(xs_used_pdf, 3)} "
-                    f"closing={closing_present} right={sys_right_x_pdf}",
+                    f"closing={closing_present} right={sys_right_x_pdf} "
+                    f"{('cv=' + cv_support_info) if cv_support_info else ''}",
                 )
 
-                # Debug overlay: draw/label all barlines we used (testing only)
+                # Debug overlay: draw/label barlines we USED (testing only)
                 if _bars_debug_enabled() and xs_used_pdf:
                     alpha = _bars_alpha()
                     for i, bx in enumerate(xs_used_pdf):
