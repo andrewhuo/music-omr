@@ -16,21 +16,25 @@ jobs:
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
 
       # ====== Debug knobs (OFF by default) ======
-      # Flip these to "1" only when you want [DBG] logs in the GitHub Actions step output.
       DEBUG_GUIDES: "0"
       DEBUG_MEASURES: "0"
       DEBUG_GUIDES_DUMP_INTERS: "0"
 
-      # NEW: draw the barlines we USED + label them (testing overlay)
+      # Draw the barlines we USED + label them (testing overlay)
       DEBUG_DRAW_BARS: "0"
       DEBUG_BARS_ALPHA: "0.85"
 
-      # Leave blank to auto-pick a valid sheet from the .omr (avoids sheet#3 missing errors)
+      # CV barline detection (per-staff consensus)
+      USE_CV_BARS: "0"
+      CV_ZOOM: "2.5"
+
+      # Optional: guide debug filtering
       DEBUG_SHEET: ""
-      # Optional: set to one staff id to keep logs small
       DEBUG_STAFF: ""
-      # Optional: set to one system id to keep logs small (measures debug)
+
+      # Optional: measure debug filtering (leave blank for ALL)
       DEBUG_MEASURES_SYS: ""
+      DEBUG_MEASURES_SHEET: ""
 
     permissions:
       contents: read
@@ -64,9 +68,12 @@ jobs:
           echo "DEBUG_GUIDES_DUMP_INTERS=${DEBUG_GUIDES_DUMP_INTERS}"
           echo "DEBUG_DRAW_BARS=${DEBUG_DRAW_BARS}"
           echo "DEBUG_BARS_ALPHA=${DEBUG_BARS_ALPHA}"
+          echo "USE_CV_BARS=${USE_CV_BARS}"
+          echo "CV_ZOOM=${CV_ZOOM}"
           echo "DEBUG_SHEET=${DEBUG_SHEET}"
           echo "DEBUG_STAFF=${DEBUG_STAFF}"
           echo "DEBUG_MEASURES_SYS=${DEBUG_MEASURES_SYS}"
+          echo "DEBUG_MEASURES_SHEET=${DEBUG_MEASURES_SHEET}"
 
       #################################################################
       # 2) Clean output prefix (safe)
@@ -101,14 +108,13 @@ jobs:
             toprock/audiveris:latest \
             /audiveris-extract/bin/Audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
 
-          # Fail fast if we didn't get an .omr
           test -f /tmp/work/audiveris_out/input/input.omr
 
       #################################################################
-      # 5) Auto-pick DEBUG_SHEET (only when debug is ON)
+      # 5) Auto-pick DEBUG_SHEET (only when guide debug enabled)
       #################################################################
-      - name: Auto-pick DEBUG_SHEET (only when debug enabled)
-        if: ${{ env.DEBUG_GUIDES == '1' || env.DEBUG_MEASURES == '1' }}
+      - name: Auto-pick DEBUG_SHEET (only when guide debug enabled)
+        if: ${{ env.DEBUG_GUIDES == '1' }}
         run: |
           set -euo pipefail
           OMR="/tmp/work/audiveris_out/input/input.omr"
@@ -146,11 +152,14 @@ jobs:
           DEBUG_GUIDES_DUMP_INTERS: "${{ env.DEBUG_GUIDES_DUMP_INTERS }}"
 
           DEBUG_MEASURES: "${{ env.DEBUG_MEASURES }}"
-          DEBUG_MEASURES_SHEET: "${{ env.DEBUG_SHEET }}"
+          DEBUG_MEASURES_SHEET: "${{ env.DEBUG_MEASURES_SHEET }}"   # leave blank unless you want filtering
           DEBUG_MEASURES_SYS_ID: "${{ env.DEBUG_MEASURES_SYS }}"
 
           DEBUG_DRAW_BARS: "${{ env.DEBUG_DRAW_BARS }}"
           DEBUG_BARS_ALPHA: "${{ env.DEBUG_BARS_ALPHA }}"
+
+          USE_CV_BARS: "${{ env.USE_CV_BARS }}"
+          CV_ZOOM: "${{ env.CV_ZOOM }}"
         run: |
           set -euo pipefail
           python -u parser-api/annotate_guides_from_omr.py \
@@ -180,7 +189,6 @@ jobs:
           set -euo pipefail
           gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
 
-          # Upload Audiveris outputs (useful for later debugging)
           if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
             gsutil -m cp -r /tmp/work/audiveris_out "${OUTPUT_PREFIX}/audiveris_out"
           fi
