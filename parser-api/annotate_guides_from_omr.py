@@ -602,15 +602,23 @@ def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -
     """
     Detect barline x positions using image morphology in a PDF y-band.
     Returns: (xs_pdf, close_tol_pdf)
+
+    IMPORTANT: y0_pdf/y1_pdf are expected in page coordinates (same space as page.rect),
+    and returned x values are also in that same page coordinate space.
     """
     rect = page.rect
-    y0_pdf = max(0.0, min(float(rect.height), float(y0_pdf)))
-    y1_pdf = max(0.0, min(float(rect.height), float(y1_pdf)))
-    if y1_pdf <= y0_pdf + 4.0:
+
+    # Convert absolute page coords -> coords relative to rect top-left (0..width/height)
+    y0_rel = float(y0_pdf) - float(rect.y0)
+    y1_rel = float(y1_pdf) - float(rect.y0)
+
+    y0_rel = max(0.0, min(float(rect.height), y0_rel))
+    y1_rel = max(0.0, min(float(rect.height), y1_rel))
+    if y1_rel <= y0_rel + 4.0:
         return ([], max(14.0, 0.02 * float(rect.width)))
 
     zoom = _cv_zoom()
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))  # renders the page rectangle
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
     if pix.n == 4:
         img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
@@ -619,22 +627,19 @@ def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -
     scale_y_px = float(pix.height) / float(rect.height)
     scale_x_px = float(pix.width) / float(rect.width)
 
-    y0_px = int(max(0, min(pix.height - 1, round(y0_pdf * scale_y_px))))
-    y1_px = int(max(0, min(pix.height, round(y1_pdf * scale_y_px))))
+    y0_px = int(max(0, min(pix.height - 1, round(y0_rel * scale_y_px))))
+    y1_px = int(max(0, min(pix.height, round(y1_rel * scale_y_px))))
     if y1_px <= y0_px + 6:
         return ([], max(14.0, 0.02 * float(rect.width)))
 
     band = gray[y0_px:y1_px, :]
 
-    # Adaptive threshold
     thr = cv2.adaptiveThreshold(band, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 10)
 
-    # Vertical morphology (standard approach) :contentReference[oaicite:2]{index=2}
     band_h = band.shape[0]
     k_h = max(18, int(round(band_h * 0.55)))
     vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, k_h))
     vertical = cv2.morphologyEx(thr, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
-
     vertical = cv2.dilate(vertical, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)), iterations=1)
 
     contours, _ = cv2.findContours(vertical, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -651,9 +656,11 @@ def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -
     xs_px.sort()
     eps_px = max(6.0, 0.012 * float(pix.width))
     xs_px = _dedupe_sorted_xs(xs_px, eps=eps_px)
-    xs_pdf = [float(x / scale_x_px) for x in xs_px]
 
-    close_tol_pdf = max(14.0, 0.10 * (float(y1_pdf - y0_pdf) / 4.0))
+    # Convert back to *page coordinates* (add rect.x0)
+    xs_pdf = [float(rect.x0) + float(x / scale_x_px) for x in xs_px]
+
+    close_tol_pdf = max(14.0, 0.10 * (float(y1_rel - y0_rel) / 4.0))
     return (xs_pdf, close_tol_pdf)
 
 
@@ -1052,14 +1059,19 @@ def _fallback_missing_staff_guides(
             continue
         staves.append((x_left, y_top, y_bot))
 
-    rect = page.rect
-    pad_pdf = (PAD_LEFT_PX / float(w)) * rect.width
+        rect = page.rect
+        if _meas_debug_enabled() or _debug_enabled():
+            print(f"[DBG] page_rect={rect} base=({rect.x0:.2f},{rect.y0:.2f}) size=({rect.width:.2f},{rect.height:.2f})", flush=True)
+
+        base_x = float(rect.x0)
+        base_y = float(rect.y0)
+        pad_pdf = (PAD_LEFT_PX / float(w)) * float(rect.width)
 
     extras = []
     for x_left_i, y_top_i, y_bot_i in staves:
-        x_pdf = (x_left_i / float(w)) * rect.width - pad_pdf
-        y0_pdf = (y_top_i / float(h)) * rect.height
-        y1_pdf = (y_bot_i / float(h)) * rect.height
+        x_pdf = base_x + ((x_left_i / float(w)) * float(rect.width) - pad_pdf)
+        y0_pdf = base_y + ((y_top_i / float(h)) * float(rect.height))
+        y1_pdf = base_y + ((y_bot_i / float(h)) * float(rect.height))
         if y1_pdf <= y0_pdf:
             continue
 
@@ -1264,15 +1276,19 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 continue
 
             rect = page.rect
-            scale_x = rect.width / pic_w
-            scale_y = rect.height / pic_h
+            base_x = float(rect.x0)
+            base_y = float(rect.y0)
+            scale_x = float(rect.width) / float(pic_w)
+            scale_y = float(rect.height) / float(pic_h)
+
 
             # Draw guides
             guides_pdf = []
             for (x_px, y0_px, y1_px) in guides_px:
-                x_pdf = x_px * scale_x
-                y0_pdf = y0_px * scale_y
-                y1_pdf = y1_px * scale_y
+                x_pdf = base_x + (x_px * scale_x)
+                y0_pdf = base_y + (y0_px * scale_y)
+                y1_pdf = base_y + (y1_px * scale_y)
+
                 guides_pdf.append((x_pdf, y0_pdf, y1_pdf))
                 page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
 
@@ -1293,11 +1309,12 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 expected_spacing = float(sys.get("expected_spacing") or 0.0)
 
                 # Convert system geometry to PDF coords
-                sys_start_x_pdf = float(sys["sys_start_x"]) * scale_x
-                sys_right_x_pdf = (float(sys["sys_right_x"]) * scale_x) if sys.get("sys_right_x") is not None else None
-                top_y_top_pdf = float(sys["top_y_top"]) * scale_y
-                sys_y_top_pdf = float(sys["sys_y_top"]) * scale_y
-                sys_y_bot_pdf = float(sys["sys_y_bot"]) * scale_y
+                sys_start_x_pdf = base_x + (float(sys["sys_start_x"]) * scale_x)
+                sys_right_x_pdf = (base_x + (float(sys["sys_right_x"]) * scale_x)) if sys.get("sys_right_x") is not None else None
+                top_y_top_pdf = base_y + (float(sys["top_y_top"]) * scale_y)
+                sys_y_top_pdf = base_y + (float(sys["sys_y_top"]) * scale_y)
+                sys_y_bot_pdf = base_y + (float(sys["sys_y_bot"]) * scale_y)
+
 
                 eps_pdf = float(sys.get("eps") or 10.0) * scale_x
                 y_pad_pdf = float(sys.get("y_pad") or 14.0) * scale_y
