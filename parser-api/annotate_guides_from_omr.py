@@ -35,9 +35,13 @@ _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 # --------------------------
 # Env toggles
 # --------------------------
-def _debug_enabled() -> bool:
-    v = os.getenv("DEBUG_GUIDES", "").strip()
+def _truthy(env_name: str, default: str = "0") -> bool:
+    v = os.getenv(env_name, default).strip()
     return v in ("1", "true", "True", "yes", "YES")
+
+
+def _debug_enabled() -> bool:
+    return _truthy("DEBUG_GUIDES", "0")
 
 
 def _debug_match(sheet_xml_path: str, staff_id: str) -> bool:
@@ -56,13 +60,11 @@ def _dbg(sheet_xml_path: str, staff_id: str, msg: str) -> None:
 
 
 def _debug_dump_enabled() -> bool:
-    v = os.getenv("DEBUG_GUIDES_DUMP_INTERS", "").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+    return _truthy("DEBUG_GUIDES_DUMP_INTERS", "0")
 
 
 def _meas_debug_enabled() -> bool:
-    v = os.getenv("DEBUG_MEASURES", "").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+    return _truthy("DEBUG_MEASURES", "0")
 
 
 def _meas_debug_match(sheet_xml_path: str, system_key: str) -> bool:
@@ -81,8 +83,7 @@ def _meas_dbg(sheet_xml_path: str, system_key: str, msg: str) -> None:
 
 
 def _bars_debug_enabled() -> bool:
-    v = os.getenv("DEBUG_DRAW_BARS", "").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+    return _truthy("DEBUG_DRAW_BARS", "0")
 
 
 def _bars_alpha() -> float:
@@ -93,8 +94,7 @@ def _bars_alpha() -> float:
 
 
 def _use_cv_bars() -> bool:
-    v = os.getenv("USE_CV_BARS", "").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+    return _truthy("USE_CV_BARS", "0")
 
 
 def _cv_zoom() -> float:
@@ -106,12 +106,12 @@ def _cv_zoom() -> float:
 
 
 def _use_xml_start_measures() -> bool:
-    """
-    If enabled, label each system using Audiveris's own per-measure numbering from <measures>.
-    This prevents drift because we stop accumulating counts in Python.
-    """
-    v = os.getenv("USE_XML_START_MEASURES", "1").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+    return _truthy("USE_XML_START_MEASURES", "1")
+
+
+def _label_each_staff() -> bool:
+    # User explicitly asked: put measure number for the very first measure of each staff on the guideline
+    return _truthy("LABEL_EACH_STAFF", "1")
 
 
 # --------------------------
@@ -225,15 +225,6 @@ def _safe_float(s: str | None) -> float | None:
         return None
     try:
         return float(s)
-    except Exception:
-        return None
-
-
-def _safe_int(s: str | None) -> int | None:
-    if s is None:
-        return None
-    try:
-        return int(str(s).strip())
     except Exception:
         return None
 
@@ -494,53 +485,6 @@ def _dedupe_sorted_xs(xs: list[float], eps: float) -> list[float]:
     return out
 
 
-def _extract_measure_label(m: ET.Element) -> str | None:
-    """
-    Try hard to get the actual 'measure number' that Audiveris computed.
-    Keep it as a string, but also allow int parsing later.
-    """
-    for k in ("number", "no", "id"):
-        v = m.get(k)
-        if v and str(v).strip():
-            return str(v).strip()
-
-    # Sometimes there are nested elements
-    for tag in ("number", "id", "no"):
-        t = m.findtext(tag)
-        if t and str(t).strip():
-            return str(t).strip()
-
-    return None
-
-
-def _system_measures_in_order(system: ET.Element) -> list[ET.Element]:
-    ms = system.findall("./measures/measure")
-    if not ms:
-        ms = system.findall("./measure")
-    if not ms:
-        ms = system.findall(".//measure")
-    return ms or []
-
-
-def _system_measure_labels(system: ET.Element) -> list[str]:
-    labels: list[str] = []
-    for m in _system_measures_in_order(system):
-        lab = _extract_measure_label(m)
-        if lab:
-            labels.append(lab)
-    return labels
-
-
-def _count_measures_in_system(system: ET.Element) -> int:
-    labels = _system_measure_labels(system)
-    if labels:
-        # Don't over-dedupe; if Audiveris produces duplicates, that's meaningful.
-        return len(labels)
-    # Fallback
-    ms = _system_measures_in_order(system)
-    return len(ms)
-
-
 def _looks_like_barline_inter(el: ET.Element) -> bool:
     t = (el.tag or "").lower()
     if "barline" in t:
@@ -555,10 +499,6 @@ def _looks_like_barline_inter(el: ET.Element) -> bool:
 
 
 def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> list[float]:
-    """
-    Collect barline-like x positions by y-overlap, not staff linkage.
-    Uses median p1/p2 when available; otherwise falls back to bounds y/h.
-    """
     if inters is None:
         return []
 
@@ -578,7 +518,6 @@ def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> li
         if bx is None:
             continue
 
-        # Prefer the "median" vertical extent when it exists
         med = el.find("median")
         if med is not None:
             p1 = med.find("p1")
@@ -593,7 +532,6 @@ def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> li
                         xs.append(float(bx))
                     continue
 
-        # Fallback: bounds vertical extent
         if by is None or bw is None or bh is None:
             continue
         by0 = float(by)
@@ -612,14 +550,66 @@ def _tail_xs(xs: list[float], n: int = 3) -> str:
     return "[" + ",".join(f"{x:.1f}" for x in t) + "]"
 
 
+def _first_measure_label_in_system(system: ET.Element) -> str | None:
+    """
+    Return a *string* label for the very first measure in this system,
+    using what Audiveris stored in the .omr (sheet#N.xml).
+    We intentionally DO NOT "advance" or infer; we just read the model.
+    """
+    # Preferred: measures directly under system
+    candidates = []
+    ms = system.findall("./measures/measure")
+    if not ms:
+        ms = system.findall(".//measures/measure")
+    if not ms:
+        ms = system.findall(".//measure")
+
+    for m in ms:
+        # Document-order first, but we want something meaningful:
+        for key in ("number", "id", "measureId", "seq", "index"):
+            v = (m.get(key) or "").strip()
+            if v:
+                candidates.append(v)
+                break
+        if candidates:
+            break
+
+    if candidates:
+        return candidates[0]
+
+    # Sometimes there is a <number> child element or similar
+    for m in ms[:3]:
+        t = (m.findtext("number") or m.findtext("id") or "").strip()
+        if t:
+            return t
+
+    return None
+
+
+def _count_measures_in_system(system: ET.Element) -> int:
+    ms = system.findall("./measures/measure")
+    if not ms:
+        ms = system.findall(".//measures/measure")
+    if not ms:
+        ms = system.findall(".//measure")
+    if not ms:
+        return 0
+
+    ids: list[str] = []
+    for m in ms:
+        mid = (m.get("id") or m.get("number") or "").strip()
+        if mid:
+            ids.append(mid)
+
+    if ids:
+        return len(set(ids))
+    return len(ms)
+
+
 # --------------------------
 # CV barline detection (PDF space)
 # --------------------------
 def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -> tuple[list[float], float]:
-    """
-    Detect barline x positions using image morphology in a PDF y-band.
-    Returns: (xs_pdf, close_tol_pdf)
-    """
     rect = page.rect
     y0_pdf = max(0.0, min(float(rect.height), float(y0_pdf)))
     y1_pdf = max(0.0, min(float(rect.height), float(y1_pdf)))
@@ -681,14 +671,13 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
       pic_w, pic_h: Audiveris picture size
       guides_px: list of (x_left_px, y_top_px, y_bot_px) in picture pixels
       staff_total: how many <staff> nodes exist (target guide count)
+      staff_recs: list of dict (per staff) including sys_key
       systems_desc: list of dict describing each system in picture coords, including:
          sys_key, sys_id, expected_spacing,
          sys_y_top, sys_y_bot, top_y_top,
          sys_start_x, sys_right_x,
          xml_meas_count,
-         xml_meas_labels (ordered labels),
-         xml_start_label,
-         xml_end_label,
+         xml_first_meas_label (string),
          xs_xml_used, close_tol, eps, y_pad
     """
     data = z.read(sheet_xml_path)
@@ -712,7 +701,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
     pages = root.findall("page")
     if not pages:
-        return pic_w, pic_h, [], 0, []
+        return pic_w, pic_h, [], 0, [], []
 
     staff_total = 0
     staff_recs: list[dict] = []
@@ -738,7 +727,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "sys_idx": sys_idx,
                     "indented": system.get("indented"),
                     "staff_spans": [],  # list of (y_top, y_bot, staff_id)
-                    "xml_meas_labels": _system_measure_labels(system),
+                    "system_el": system,  # keep handle for label extraction
                 }
 
             for staff in system.findall(".//staff"):
@@ -915,10 +904,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
     guides_px: list[tuple[float, float, float]] = [(r["x_postpad"], r["y_top"], r["y_bot"]) for r in staff_recs]
 
-    # Build per-system descriptors (so measure logic can happen later with CV + continuity)
     systems_desc: list[dict] = []
 
-    # These are in picture coords
     eps = max(6.0, 0.45 * expected_spacing) if expected_spacing > 0 else 10.0
     y_pad = max(8.0, 0.9 * expected_spacing) if expected_spacing > 0 else 14.0
     close_tol = max(14.0, 0.9 * expected_spacing) if expected_spacing > 0 else 20.0
@@ -961,13 +948,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 if sys_right_x is None or mx > sys_right_x:
                     sys_right_x = float(mx)
 
-            xml_labels = list(system_recs.get(sys_key, {}).get("xml_meas_labels", []) or [])
-            xml_meas_count = len(xml_labels) if xml_labels else _count_measures_in_system(system)
+            xml_meas_count = _count_measures_in_system(system)
+            xml_first_meas_label = _first_measure_label_in_system(system)
 
-            xml_start_label = xml_labels[0] if xml_labels else None
-            xml_end_label = xml_labels[-1] if xml_labels else None
-
-            # Keep XML barline scan around for fallback / debug (picture coords)
             xs_xml_used: list[float] = []
             if inters is not None:
                 xs = _barline_xs_in_y_band(inters, sys_y_top - y_pad, sys_y_bot + y_pad)
@@ -991,14 +974,12 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "sys_start_x": float(sys_start_x),
                     "sys_right_x": float(sys_right_x) if sys_right_x is not None else None,
                     "xml_meas_count": int(xml_meas_count),
-                    "xml_meas_labels": xml_labels,
-                    "xml_start_label": xml_start_label,
-                    "xml_end_label": xml_end_label,
+                    "xml_first_meas_label": xml_first_meas_label,
                     "xs_xml_used": xs_xml_used,
                 }
             )
 
-    return pic_w, pic_h, guides_px, staff_total, systems_desc
+    return pic_w, pic_h, guides_px, staff_total, staff_recs, systems_desc
 
 
 # --------------------------
@@ -1112,17 +1093,20 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 # Main annotation
 # --------------------------
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
-    # Un-skippable startup breadcrumb (helps prove env got through CI)
+    # Unskippable startup print
     print(
         "[DBG] startup "
         f"input_pdf={input_pdf} omr_path={omr_path} output_pdf={output_pdf} "
         f"DEBUG_MEASURES={os.getenv('DEBUG_MEASURES','')} DEBUG_DRAW_BARS={os.getenv('DEBUG_DRAW_BARS','')} "
-        f"USE_XML_START_MEASURES={os.getenv('USE_XML_START_MEASURES','1')} USE_CV_BARS={os.getenv('USE_CV_BARS','')}",
+        f"USE_XML_START_MEASURES={os.getenv('USE_XML_START_MEASURES','')} USE_CV_BARS={os.getenv('USE_CV_BARS','')} "
+        f"LABEL_EACH_STAFF={os.getenv('LABEL_EACH_STAFF','')}",
         flush=True,
     )
 
     doc = fitz.open(input_pdf)
-    measure_no_fallback = 1  # only used when XML labels are missing
+
+    # Only used as fallback when XML start labels are missing
+    measure_no_fallback = 1
 
     with zipfile.ZipFile(omr_path, "r") as z:
         sheet_paths = _sorted_sheet_xml_paths(z)
@@ -1136,7 +1120,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
 
-            pic_w, pic_h, guides_px, staff_total, systems_desc = _parse_sheet(z, sheet_xml_path)
+            pic_w, pic_h, guides_px, staff_total, staff_recs, systems_desc = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
                 continue
 
@@ -1144,16 +1128,20 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             scale_x = rect.width / pic_w
             scale_y = rect.height / pic_h
 
-            # Draw guides
+            # Draw guides + build sys_key -> list of guide segments (PDF coords)
             guides_pdf = []
-            for (x_px, y0_px, y1_px) in guides_px:
+            guides_by_sys_key: dict[str, list[tuple[float, float, float]]] = {}
+
+            for r in staff_recs:
+                x_px, y0_px, y1_px = r["x_postpad"], r["y_top"], r["y_bot"]
                 x_pdf = x_px * scale_x
                 y0_pdf = y0_px * scale_y
                 y1_pdf = y1_px * scale_y
                 guides_pdf.append((x_pdf, y0_pdf, y1_pdf))
+                guides_by_sys_key.setdefault(r["sys_key"], []).append((x_pdf, y0_pdf, y1_pdf))
                 page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
 
-            # Font size (shared by measure labels + debug bar labels)
+            # Font size
             interline_pdf = None
             if len(guides_pdf) >= 1:
                 staff_h = abs(guides_pdf[0][2] - guides_pdf[0][1])
@@ -1162,59 +1150,49 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 interline_pdf = 16.0
             fontsize = _clamp(0.55 * interline_pdf, MEASURE_MIN_FONTSIZE, MEASURE_MAX_FONTSIZE)
 
-            # Measure logic per system:
-            # - If XML provides measure labels, we use the system's own start label (no accumulation).
-            # - Else we fall back to bar counting (CV or XML bar inters) and accumulate.
+            # Measure logic per system
             last_good_adv = 0
 
-            for sysd in systems_desc:
-                sys_key = sysd["sys_key"]
-                sys_id = sysd["sys_id"]
-                expected_spacing = float(sysd.get("expected_spacing") or 0.0)
+            for sys in systems_desc:
+                sys_key = sys["sys_key"]
+                sys_id = sys["sys_id"]
+                expected_spacing = float(sys.get("expected_spacing") or 0.0)
 
                 # Convert system geometry to PDF coords
-                sys_start_x_pdf = float(sysd["sys_start_x"]) * scale_x
-                sys_right_x_pdf = (float(sysd["sys_right_x"]) * scale_x) if sysd.get("sys_right_x") is not None else None
-                top_y_top_pdf = float(sysd["top_y_top"]) * scale_y
-                sys_y_top_pdf = float(sysd["sys_y_top"]) * scale_y
-                sys_y_bot_pdf = float(sysd["sys_y_bot"]) * scale_y
+                sys_start_x_pdf = float(sys["sys_start_x"]) * scale_x
+                sys_right_x_pdf = (float(sys["sys_right_x"]) * scale_x) if sys.get("sys_right_x") is not None else None
+                top_y_top_pdf = float(sys["top_y_top"]) * scale_y
+                sys_y_top_pdf = float(sys["sys_y_top"]) * scale_y
+                sys_y_bot_pdf = float(sys["sys_y_bot"]) * scale_y
 
-                # Offsets / tolerances in PDF coords
-                eps_pdf = float(sysd.get("eps") or 10.0) * scale_x
-                y_pad_pdf = float(sysd.get("y_pad") or 14.0) * scale_y
-                close_tol_pdf_xml = float(sysd.get("close_tol") or 20.0) * scale_x
+                eps_pdf = float(sys.get("eps") or 10.0) * scale_x
+                y_pad_pdf = float(sys.get("y_pad") or 14.0) * scale_y
+                close_tol_pdf_xml = float(sys.get("close_tol") or 20.0) * scale_x
 
-                xml_meas_count = int(sysd.get("xml_meas_count") or 0)
-                xml_labels: list[str] = list(sysd.get("xml_meas_labels") or [])
-                xml_start = sysd.get("xml_start_label")
-                xml_end = sysd.get("xml_end_label")
+                xml_meas_count = int(sys.get("xml_meas_count") or 0)
+                xml_first_meas_label = (sys.get("xml_first_meas_label") or "").strip() or None
 
+                # ---------- NEW: choose label text from Audiveris model ----------
+                label_text = None
+                label_method = ""
+                if _use_xml_start_measures() and xml_first_meas_label:
+                    label_text = xml_first_meas_label
+                    label_method = "xml_first_measure_label"
+                else:
+                    label_text = str(measure_no_fallback)
+                    label_method = "fallback_running"
+
+                # Still compute adv only for fallback continuity / optional debug overlay numbering
                 method = ""
                 reason = ""
                 closing_present = False
                 xs_used_pdf: list[float] = []
 
-                label_text: str | None = None
-
-                # 1) Best: use Audiveris's own system-start measure label (prevents drift)
-                if _use_xml_start_measures() and xml_labels and xml_start:
-                    label_text = str(xml_start)
-                    method = "xml_start_label"
-                    reason = "use_xml_start_label"
-
-                    # Keep fallback accumulator roughly aligned for later missing-XML systems
-                    end_int = _safe_int(str(xml_end)) if xml_end is not None else None
-                    if end_int is not None:
-                        measure_no_fallback = end_int + 1
-                    else:
-                        # if end isn't numeric, at least advance by count
-                        measure_no_fallback = measure_no_fallback + max(1, xml_meas_count)
-
-                    adv = max(1, xml_meas_count)
-                    last_good_adv = adv
-
+                if xml_meas_count > 0:
+                    adv_raw = xml_meas_count
+                    method = "xml_measures_count"
+                    reason = "use_xml_measures_count"
                 else:
-                    # 2) Otherwise: derive advance by bars (CV optional) or XML bar inters fallback
                     if _use_cv_bars():
                         xs_pdf, close_tol_pdf = _cv_barlines_xs_in_band_pdf(
                             page,
@@ -1228,14 +1206,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         method = "cv_bars"
                         close_tol_used = close_tol_pdf
                     else:
-                        xs_pic = list(sysd.get("xs_xml_used") or [])
+                        xs_pic = list(sys.get("xs_xml_used") or [])
                         xs_pdf = [float(x) * scale_x for x in xs_pic]
                         xs_used_pdf = xs_pdf
                         method = "xml_bars"
                         close_tol_used = close_tol_pdf_xml
 
                     bar_count = len(xs_used_pdf)
-
                     if bar_count > 0:
                         cand0 = bar_count
                         cand1 = bar_count + 1
@@ -1271,21 +1248,25 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         adv_raw = 0
                         reason = "no_bars"
 
-                    if adv_raw <= 0:
-                        adv = last_good_adv if last_good_adv > 0 else 1
-                        reason = reason + "_fallback"
-                    else:
-                        adv = int(adv_raw)
-                        last_good_adv = int(adv_raw)
+                if adv_raw <= 0:
+                    adv = last_good_adv if last_good_adv > 0 else 1
+                    reason = reason + "_fallback"
+                else:
+                    adv = int(adv_raw)
+                    last_good_adv = int(adv_raw)
 
-                    label_text = str(measure_no_fallback)
-                    measure_no_fallback += int(max(1, adv))
-
-                # Draw system-start label
+                # ---------- Place label on guideline(s) ----------
                 v_off = max(10.0, 0.90 * expected_spacing) if expected_spacing > 0 else 14.0
                 x_text_pdf = sys_start_x_pdf + ((max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else 8.0) * scale_x)
-                y_text_pdf = max(0.0, top_y_top_pdf - (v_off * scale_y))
-                page.insert_text((x_text_pdf, y_text_pdf), str(label_text), fontsize=fontsize, color=MEASURE_TEXT_COLOR)
+
+                guides_for_sys = guides_by_sys_key.get(sys_key, [])
+                if guides_for_sys and _label_each_staff():
+                    for (gx, gy0, _gy1) in guides_for_sys:
+                        y_text_pdf = max(0.0, gy0 - (v_off * scale_y))
+                        page.insert_text((gx + 1.5, y_text_pdf), str(label_text), fontsize=fontsize, color=MEASURE_TEXT_COLOR)
+                else:
+                    y_text_pdf = max(0.0, top_y_top_pdf - (v_off * scale_y))
+                    page.insert_text((x_text_pdf, y_text_pdf), str(label_text), fontsize=fontsize, color=MEASURE_TEXT_COLOR)
 
                 # Debug log (one line per system)
                 _meas_dbg(
@@ -1293,17 +1274,16 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     sys_key,
                     "[DBG] MEAS "
                     f"sys_key={sys_key} id={sys_id} "
-                    f"label={label_text} method={method} reason={reason} "
-                    f"xml_count={xml_meas_count} xml_start={xml_start} xml_end={xml_end} "
+                    f"label={label_text} label_method={label_method} "
+                    f"adv={adv} adv_method={method} reason={reason} "
+                    f"xml_count={xml_meas_count} xml_first={xml_first_meas_label} "
                     f"bars={len(xs_used_pdf)} tail_xs={_tail_xs(xs_used_pdf, 3)} "
                     f"closing={closing_present} right={sys_right_x_pdf}",
                 )
 
-                # Debug overlay: draw/label all barlines we used (testing only)
+                # Debug overlay: draw/label barlines we used (testing only)
                 if _bars_debug_enabled() and xs_used_pdf:
                     alpha = _bars_alpha()
-                    # We only label bars numerically if label_text is numeric.
-                    base_int = _safe_int(str(label_text))
                     for i, bx in enumerate(xs_used_pdf):
                         try:
                             page.draw_line(
@@ -1313,16 +1293,19 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                                 width=DEBUG_BAR_WIDTH,
                                 stroke_opacity=alpha,
                             )
-                            if base_int is not None:
-                                page.insert_text(
-                                    (bx + 1.5, max(0.0, sys_y_top_pdf - 6.0)),
-                                    str(base_int + i),
-                                    fontsize=fontsize,
-                                    color=DEBUG_BAR_COLOR,
-                                    fill_opacity=alpha,
-                                )
+                            page.insert_text(
+                                (bx + 1.5, max(0.0, sys_y_top_pdf - 6.0)),
+                                str(i + 1),
+                                fontsize=fontsize,
+                                color=DEBUG_BAR_COLOR,
+                                fill_opacity=alpha,
+                            )
                         except Exception:
                             pass
+
+                # Update fallback only (never used when XML labels exist)
+                if label_method == "fallback_running":
+                    measure_no_fallback += int(max(1, adv))
 
             # If OMR missed some staves, try fallback guide detection (unchanged)
             if staff_total > 0 and len(guides_pdf) < staff_total:
