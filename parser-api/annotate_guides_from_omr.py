@@ -10,20 +10,23 @@ import numpy as np
 import cv2
 
 
+# --------------------------
+# Rendering knobs
+# --------------------------
 GUIDE_COLOR = (1, 0, 0)  # red
 GUIDE_WIDTH = 1.0
 
-# Small left shift so line sits just left of the staff start / clef
-PAD_LEFT_PX = 6.0
+# For "touch the very beginning of the staff", default padding is 0.
+# If you want a tiny left offset, set env PAD_LEFT_PX=2 (or similar).
+PAD_LEFT_PX_DEFAULT = 0.0
 
-# Measure number rendering (system-start labels)
 MEASURE_TEXT_COLOR = (0, 0, 0)  # black
 MEASURE_MIN_FONTSIZE = 7.0
 MEASURE_MAX_FONTSIZE = 12.0
 
-# Outlier forcing
-OUTLIER_MZ_THRESHOLD = 3.5  # modified z-score threshold
-OUTLIER_ABS_FLOOR_PX = 10.0  # minimum MAD floor to avoid divide-by-near-zero
+# Outlier forcing (now OFF by default, see env)
+OUTLIER_MZ_THRESHOLD = 3.5
+OUTLIER_ABS_FLOOR_PX = 10.0
 
 # DEBUG: barline overlay (testing only)
 DEBUG_BAR_COLOR = (0, 0, 1)  # blue
@@ -35,9 +38,13 @@ _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 # --------------------------
 # Env toggles
 # --------------------------
-def _debug_enabled() -> bool:
-    v = os.getenv("DEBUG_GUIDES", "").strip()
+def _env_truthy(name: str, default: str = "0") -> bool:
+    v = os.getenv(name, default).strip()
     return v in ("1", "true", "True", "yes", "YES")
+
+
+def _debug_enabled() -> bool:
+    return _env_truthy("DEBUG_GUIDES", "0")
 
 
 def _debug_match(sheet_xml_path: str, staff_id: str) -> bool:
@@ -56,13 +63,11 @@ def _dbg(sheet_xml_path: str, staff_id: str, msg: str) -> None:
 
 
 def _debug_dump_enabled() -> bool:
-    v = os.getenv("DEBUG_GUIDES_DUMP_INTERS", "").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+    return _env_truthy("DEBUG_GUIDES_DUMP_INTERS", "0")
 
 
 def _meas_debug_enabled() -> bool:
-    v = os.getenv("DEBUG_MEASURES", "").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+    return _env_truthy("DEBUG_MEASURES", "0")
 
 
 def _meas_debug_match(sheet_xml_path: str, system_key: str) -> bool:
@@ -81,8 +86,7 @@ def _meas_dbg(sheet_xml_path: str, system_key: str, msg: str) -> None:
 
 
 def _bars_debug_enabled() -> bool:
-    v = os.getenv("DEBUG_DRAW_BARS", "").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+    return _env_truthy("DEBUG_DRAW_BARS", "0")
 
 
 def _bars_alpha() -> float:
@@ -93,39 +97,32 @@ def _bars_alpha() -> float:
 
 
 def _use_cv_bars() -> bool:
-    v = os.getenv("USE_CV_BARS", "").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+    return _env_truthy("USE_CV_BARS", "0")
 
 
 def _cv_zoom() -> float:
     try:
-        z = float(os.getenv("CV_ZOOM", "2.5").strip())
-        return z if z > 0 else 2.5
+        z = float(os.getenv("CV_ZOOM", "2.0").strip())
+        return z if z > 0 else 2.0
     except Exception:
-        return 2.5
+        return 2.0
 
 
-def _meas_sane_max() -> int:
+def _pad_left_px() -> float:
     try:
-        return int(os.getenv("MEAS_SANE_MAX", "32").strip())
+        return float(os.getenv("PAD_LEFT_PX", str(PAD_LEFT_PX_DEFAULT)).strip())
     except Exception:
-        return 32
+        return float(PAD_LEFT_PX_DEFAULT)
 
 
-def _meas_disagree_warn() -> int:
-    try:
-        return int(os.getenv("MEAS_DISAGREE_WARN", "2").strip())
-    except Exception:
-        return 2
+def _guide_avoid_symbols() -> bool:
+    # Off by default: you asked for "touch staff start"
+    return _env_truthy("GUIDE_AVOID_SYMBOLS", "0")
 
 
-def _allow_override_on_strong_disagree() -> bool:
-    """
-    If XML measures are present+sane, we still prefer them, but we *may* override
-    when BOTH other independent signals agree against XML by >= warn.
-    """
-    v = os.getenv("ALLOW_XML_OVERRIDE", "1").strip()
-    return v in ("1", "true", "True", "yes", "YES")
+def _guide_force_nonindented_x() -> bool:
+    # Off by default: forcing x across staves breaks "touch staff start"
+    return _env_truthy("GUIDE_FORCE_NONINDENTED_X", "0")
 
 
 # --------------------------
@@ -306,52 +303,6 @@ def _clef_bounds_from_header(inter_by_id: dict[int, ET.Element], staff: ET.Eleme
     return _bounds_of(clef_el)
 
 
-def _clef_bounds_fallback(
-    inters: ET.Element | None,
-    staff_id: str,
-    y_top: float,
-    y_bot: float,
-    header_start: float | None,
-) -> tuple[float, float, float, float] | None:
-    if inters is None:
-        return None
-
-    y_pad = 0.20 * (y_bot - y_top)
-    want_y0 = y_top - y_pad
-    want_y1 = y_bot + y_pad
-
-    best = None
-    best_score = None
-
-    for el in inters.iter():
-        if not _tag_looks_like_clef(el):
-            continue
-
-        el_staff = el.get("staff")
-        if el_staff and staff_id and el_staff != staff_id:
-            continue
-
-        b = _bounds_of(el)
-        if b is None:
-            continue
-
-        x, y, w, h = b
-        by0, by1 = y, y + h
-        if by1 < want_y0 or by0 > want_y1:
-            continue
-
-        penalty = 0.0
-        if header_start is not None:
-            penalty = max(0.0, x - header_start) * 0.05
-        score = x + penalty
-
-        if best_score is None or score < best_score:
-            best_score = score
-            best = b
-
-    return best
-
-
 def _bounds_overlap_1d(a0: float, a1: float, b0: float, b1: float) -> bool:
     return not (a1 < b0 or b1 < a0)
 
@@ -418,28 +369,20 @@ def _push_left_if_inside_any_symbol(
     y_top: float,
     y_bot: float,
     x_left: float,
-    line_min_x: float | None,
-    header_start: float | None,
     expected_spacing: float,
     sheet_xml_path: str,
 ) -> float:
+    """
+    Optional: move the guideline left if it lands inside some symbol bounds.
+    OFF by default because you want the guideline to touch staff start.
+    """
     if inters is None:
         return x_left
 
     guard = max(10.0, (0.35 * expected_spacing) if expected_spacing > 0 else 10.0)
 
-    ref = None
-    for v in (line_min_x, header_start, x_left):
-        if v is not None:
-            ref = float(v)
-            break
-    if ref is None:
-        ref = float(x_left)
-
-    header_span = 1.25 * (expected_spacing if expected_spacing > 0 else 60.0)
-
     for _ in range(4):
-        x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
+        x_postpad = max(0.0, float(x_left) - _pad_left_px())
 
         hits: list[tuple[float, float, str]] = []
         for el in inters.iter():
@@ -451,11 +394,9 @@ def _push_left_if_inside_any_symbol(
             y0, y1 = y, y + h
 
             el_staff = el.get("staff")
-            if not el_staff or el_staff != staff_id:
+            if el_staff and el_staff != staff_id:
                 continue
 
-            if x0 > (ref + header_span):
-                continue
             if not _bounds_overlap_1d(y0, y1, y_top, y_bot):
                 continue
 
@@ -469,7 +410,7 @@ def _push_left_if_inside_any_symbol(
         hit_x0, hit_x1, hit_tag = hits[0]
 
         new_x_postpad = max(0.0, hit_x0 - guard)
-        new_x_left = new_x_postpad + PAD_LEFT_PX
+        new_x_left = new_x_postpad + _pad_left_px()
 
         _dbg(
             sheet_xml_path,
@@ -477,7 +418,7 @@ def _push_left_if_inside_any_symbol(
             "[DBG] PUSH_LEFT "
             f"staff={staff_id} x_postpad={x_postpad:.2f} -> {new_x_postpad:.2f} "
             f"hit_tag={hit_tag} hit_x0={hit_x0:.2f} hit_x1={hit_x1:.2f} "
-            f"guard={guard:.2f} ref={ref:.2f} header_span={header_span:.2f}",
+            f"guard={guard:.2f}",
         )
 
         if abs(new_x_left - x_left) < 0.01:
@@ -534,10 +475,6 @@ def _looks_like_barline_inter(el: ET.Element) -> bool:
 
 
 def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> list[float]:
-    """
-    Collect barline-like x positions by y-overlap, not staff linkage.
-    Uses median p1/p2 when available; otherwise falls back to bounds y/h.
-    """
     if inters is None:
         return []
 
@@ -557,7 +494,6 @@ def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> li
         if bx is None:
             continue
 
-        # Prefer the "median" vertical extent when it exists
         med = el.find("median")
         if med is not None:
             p1 = med.find("p1")
@@ -572,7 +508,6 @@ def _barline_xs_in_y_band(inters: ET.Element | None, y0: float, y1: float) -> li
                         xs.append(float(bx))
                     continue
 
-        # Fallback: bounds vertical extent
         if by is None or bw is None or bh is None:
             continue
         by0 = float(by)
@@ -591,24 +526,19 @@ def _tail_xs(xs: list[float], n: int = 3) -> str:
     return "[" + ",".join(f"{x:.1f}" for x in t) + "]"
 
 
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
 # --------------------------
-# CV barline detection (PDF space)
+# CV barline detection (PAGE coordinate space)
 # --------------------------
 def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -> tuple[list[float], float]:
     """
     Detect barline x positions using image morphology in a PDF y-band.
     Returns: (xs_pdf, close_tol_pdf)
 
-    IMPORTANT: y0_pdf/y1_pdf are expected in page coordinates (same space as page.rect),
-    and returned x values are also in that same page coordinate space.
+    y0_pdf / y1_pdf are in page coordinate space (same as page.rect).
+    Output xs are also in page coordinate space (includes rect.x0).
     """
     rect = page.rect
 
-    # Convert absolute page coords -> coords relative to rect top-left (0..width/height)
     y0_rel = float(y0_pdf) - float(rect.y0)
     y1_rel = float(y1_pdf) - float(rect.y0)
 
@@ -618,7 +548,7 @@ def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -
         return ([], max(14.0, 0.02 * float(rect.width)))
 
     zoom = _cv_zoom()
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))  # renders the page rectangle
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
     if pix.n == 4:
         img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
@@ -657,7 +587,6 @@ def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -
     eps_px = max(6.0, 0.012 * float(pix.width))
     xs_px = _dedupe_sorted_xs(xs_px, eps=eps_px)
 
-    # Convert back to *page coordinates* (add rect.x0)
     xs_pdf = [float(rect.x0) + float(x / scale_x_px) for x in xs_px]
 
     close_tol_pdf = max(14.0, 0.10 * (float(y1_rel - y0_rel) / 4.0))
@@ -672,13 +601,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     Returns:
       pic_w, pic_h: Audiveris picture size
       guides_px: list of (x_left_px, y_top_px, y_bot_px) in picture pixels
-      staff_total: how many <staff> nodes exist (target guide count)
-      systems_desc: list of dict describing each system in picture coords, including:
-         sys_key, sys_id, expected_spacing,
-         sys_y_top, sys_y_bot, top_y_top,
-         sys_start_x, sys_right_x,
-         xml_meas_count,
-         xs_xml_used, close_tol, eps, y_pad
+      staff_total: how many <staff> nodes exist
+      systems_desc: list describing each system (picture coords)
     """
     data = z.read(sheet_xml_path)
     root = ET.fromstring(data)
@@ -706,6 +630,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     staff_total = 0
     staff_recs: list[dict] = []
     system_recs: dict[str, dict] = {}
+
+    pad_left = _pad_left_px()
 
     for page_idx, page in enumerate(pages):
         inter_by_id = _index_inters(page)
@@ -792,79 +718,57 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP bad_y_span sheet={sheet_xml_path} staff={staff_id}")
                     continue
 
+                # ---- NEW: guideline x anchored to staff line start ----
+                if all_line_xmins:
+                    # 5th percentile avoids one stray point far left
+                    staff_start_x = float(_pct(all_line_xmins, 0.05))
+                else:
+                    # last resort: staff@left or header_start
+                    x_left = _safe_float(staff.get("left"))
+                    if x_left is None and header_start is not None:
+                        x_left = float(header_start)
+                    if x_left is None:
+                        _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP no_x sheet={sheet_xml_path} staff={staff_id}")
+                        continue
+                    staff_start_x = float(x_left)
+
+                # Touch staff start: pad_left default 0
+                x_postpad = max(0.0, staff_start_x - pad_left)
+
+                # Optional symbol avoidance (OFF by default)
+                if _guide_avoid_symbols():
+                    x_left2 = x_postpad + pad_left
+                    x_left2 = _push_left_if_inside_any_symbol(
+                        inters=inters,
+                        staff_id=staff_id,
+                        y_top=y_top,
+                        y_bot=y_bot,
+                        x_left=x_left2,
+                        expected_spacing=expected_spacing,
+                        sheet_xml_path=sheet_xml_path,
+                    )
+                    x_postpad = max(0.0, x_left2 - pad_left)
+
+                # Debug context (clef info kept for visibility only)
                 clef_b = _clef_bounds_from_header(inter_by_id, staff)
-                if clef_b is None:
-                    clef_b = _clef_bounds_fallback(inters, staff_id, y_top, y_bot, header_start)
-
-                x_left = _safe_float(staff.get("left"))
-                line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
-                line_max_x = float(max(all_line_xmaxs)) if all_line_xmaxs else None
-
-                if x_left is None and line_min_x is not None:
-                    x_left = line_min_x
-                if x_left is None and header_start is not None:
-                    x_left = float(header_start)
-                if x_left is None and clef_b is not None:
-                    clef_x, _, clef_w, _ = clef_b
-                    extra = (expected_spacing if expected_spacing > 0 else 20.0)
-                    x_left = float(clef_x) - float(clef_w) - float(extra)
-                if x_left is None and all_line_xmins:
-                    x_left = float(_pct(all_line_xmins, 0.05))
-                if x_left is None:
-                    _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP no_x sheet={sheet_xml_path} staff={staff_id}")
-                    continue
-
-                x_before = float(x_left)
-
-                if line_min_x is not None and expected_spacing > 0.0:
-                    if x_left > (line_min_x + 0.60 * expected_spacing):
-                        x_left = line_min_x
-
-                if header_start is not None:
-                    base_guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
-                    max_x = float(header_start) - base_guard
-                    if x_left > max_x:
-                        x_left = max_x
-
-                    if clef_b is None:
-                        big_guard = max(28.0, (2.5 * expected_spacing) if expected_spacing > 0 else 28.0)
-                        max_x2 = float(header_start) - big_guard
-                        if x_left > max_x2:
-                            _dbg(sheet_xml_path, staff_id, f"[DBG] BIG_HEADER_GUARD staff={staff_id} x={x_left:.2f} -> {max_x2:.2f}")
-                            x_left = max_x2
-
-                if clef_b is not None:
-                    clef_x, _, _, _ = clef_b
-                    guard = (0.25 * expected_spacing) if expected_spacing > 0 else 6.0
-                    max_x = float(clef_x) - guard
-                    if x_left > max_x:
-                        x_left = max_x
-
-                x_left = _push_left_if_inside_any_symbol(
-                    inters=inters,
-                    staff_id=staff_id,
-                    y_top=y_top,
-                    y_bot=y_bot,
-                    x_left=float(x_left),
-                    line_min_x=line_min_x,
-                    header_start=header_start,
-                    expected_spacing=expected_spacing,
-                    sheet_xml_path=sheet_xml_path,
-                )
-
-                x_postpad = max(0.0, float(x_left) - PAD_LEFT_PX)
 
                 _dump_inters_near_staff(sheet_xml_path, staff_id, inters, y_top, y_bot, x_postpad, x_window=140.0)
 
                 if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
+                    line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
+                    line_max_x = float(max(all_line_xmaxs)) if all_line_xmaxs else None
                     _dbg(
                         sheet_xml_path,
                         staff_id,
                         f"[DBG] sheet={sheet_xml_path} sys_key={sys_key} staff={staff_id} indented={system.get('indented')} "
-                        f"header_start={header_start} line_min_x={line_min_x} line_max_x={line_max_x} expected_spacing={expected_spacing:.2f} "
-                        f"clef_b={'present' if clef_b is not None else None} x_before={x_before:.2f} x_after={float(x_left):.2f} x_postpad={x_postpad:.2f} "
+                        f"expected_spacing={expected_spacing:.2f} "
+                        f"clef_b={'present' if clef_b is not None else None} "
+                        f"line_min_x={line_min_x} line_max_x={line_max_x} "
+                        f"staff_start_x(p05)={staff_start_x:.2f} PAD_LEFT_PX={pad_left:.2f} x_postpad={x_postpad:.2f} "
                         f"y_top={y_top:.1f} y_bot={y_bot:.1f}",
                     )
+
+                line_max_x = float(max(all_line_xmaxs)) if all_line_xmaxs else None
 
                 staff_recs.append(
                     {
@@ -880,33 +784,33 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 )
                 system_recs[sys_key]["staff_spans"].append((float(y_top), float(y_bot), staff_id))
 
-    # Outlier forcing for guide x (exclude indented)
-    non_indented_xs = [
-        r["x_postpad"] for r in staff_recs if not (r["indented"] not in (None, "", "false", "False", "0"))
-    ]
-    if len(non_indented_xs) >= 6:
-        med = _median(non_indented_xs)
-        mad = max(_mad(non_indented_xs, med), OUTLIER_ABS_FLOOR_PX)
+    # Optional: old behavior (forcing non-indented x to common avg). OFF by default.
+    if _guide_force_nonindented_x():
+        non_indented_xs = [
+            r["x_postpad"] for r in staff_recs if not (r["indented"] not in (None, "", "false", "False", "0"))
+        ]
+        if len(non_indented_xs) >= 6:
+            med = _median(non_indented_xs)
+            mad = max(_mad(non_indented_xs, med), OUTLIER_ABS_FLOOR_PX)
 
-        def mz(x: float) -> float:
-            return abs(0.6745 * (x - med) / mad)
+            def mz(x: float) -> float:
+                return abs(0.6745 * (x - med) / mad)
 
-        inliers = [x for x in non_indented_xs if mz(x) <= OUTLIER_MZ_THRESHOLD]
-        if len(inliers) >= 4:
-            forced_avg = sum(inliers) / float(len(inliers))
-            for r in staff_recs:
-                if r["indented"] not in (None, "", "false", "False", "0"):
-                    continue
-                score = mz(r["x_postpad"])
-                if score > OUTLIER_MZ_THRESHOLD:
-                    r["x_postpad"] = float(forced_avg)
+            inliers = [x for x in non_indented_xs if mz(x) <= OUTLIER_MZ_THRESHOLD]
+            if len(inliers) >= 4:
+                forced_avg = sum(inliers) / float(len(inliers))
+                for r in staff_recs:
+                    if r["indented"] not in (None, "", "false", "False", "0"):
+                        continue
+                    score = mz(r["x_postpad"])
+                    if score > OUTLIER_MZ_THRESHOLD:
+                        r["x_postpad"] = float(forced_avg)
 
     guides_px: list[tuple[float, float, float]] = [(r["x_postpad"], r["y_top"], r["y_bot"]) for r in staff_recs]
 
-    # Build per-system descriptors (so measure logic can happen later with CV + continuity)
+    # Build per-system descriptors (picture coords)
     systems_desc: list[dict] = []
 
-    # Picture-coords tolerances
     eps = max(6.0, 0.45 * expected_spacing) if expected_spacing > 0 else 10.0
     y_pad = max(8.0, 0.9 * expected_spacing) if expected_spacing > 0 else 14.0
     close_tol = max(14.0, 0.9 * expected_spacing) if expected_spacing > 0 else 20.0
@@ -951,7 +855,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
             xml_meas_count = _count_measures_in_system(system)
 
-            # XML barline xs (picture coords) for fallback/check
             xs_xml_used: list[float] = []
             if inters is not None:
                 xs = _barline_xs_in_y_band(inters, sys_y_top - y_pad, sys_y_bot + y_pad)
@@ -983,7 +886,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
 
 # --------------------------
-# Guide fallback (unchanged)
+# Guide fallback (unchanged, but uses page.rect offsets)
 # --------------------------
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
@@ -1059,13 +962,11 @@ def _fallback_missing_staff_guides(
             continue
         staves.append((x_left, y_top, y_bot))
 
-        rect = page.rect
-        if _meas_debug_enabled() or _debug_enabled():
-            print(f"[DBG] page_rect={rect} base=({rect.x0:.2f},{rect.y0:.2f}) size=({rect.width:.2f},{rect.height:.2f})", flush=True)
+    rect = page.rect
+    base_x = float(rect.x0)
+    base_y = float(rect.y0)
 
-        base_x = float(rect.x0)
-        base_y = float(rect.y0)
-        pad_pdf = (PAD_LEFT_PX / float(w)) * float(rect.width)
+    pad_pdf = (_pad_left_px() / float(w)) * float(rect.width)
 
     extras = []
     for x_left_i, y_top_i, y_bot_i in staves:
@@ -1085,174 +986,27 @@ def _fallback_missing_staff_guides(
                 break
 
         if not overlaps:
-            extras.append((max(0.0, x_pdf), y0_pdf, y1_pdf))
+            extras.append((max(base_x, x_pdf), y0_pdf, y1_pdf))
 
     return extras
 
 
-# --------------------------
-# Measure helpers (integrated checks)
-# --------------------------
-def _count_from_bars(
-    xs: list[float],
-    sys_right_x: float | None,
-    close_tol: float,
-) -> tuple[int, bool, str]:
-    """
-    Return (count, closing_present, reason)
-    """
-    if not xs:
-        return (0, False, "no_bars")
-
-    bar_count = len(xs)
-    # default: bars + system-edge
-    preferred = bar_count + 1
-    closing_present = False
-    reason = "bars_plus_edge"
-
-    if sys_right_x is not None:
-        rightmost = xs[-1]
-        if abs(rightmost - sys_right_x) <= close_tol or rightmost >= (sys_right_x - close_tol):
-            # last barline is closing bar
-            closing_present = True
-            preferred = bar_count
-            reason = "bars"
-        else:
-            closing_present = False
-            preferred = bar_count + 1
-            reason = "bars_plus_edge"
-    else:
-        reason = "no_right_edge"
-        preferred = bar_count + 1
-
-    return (int(preferred), bool(closing_present), reason)
-
-
-def _is_sane_count(count: int, last_good_adv: int | None) -> bool:
-    if count <= 0:
-        return False
-    if count > _meas_sane_max():
-        return False
-    # avoid wild spikes relative to neighbors
-    if last_good_adv and last_good_adv > 0:
-        if count > int(max(_meas_sane_max(), 2.2 * last_good_adv)):
-            return False
-    return True
-
-
-def _absdiff(a: int | None, b: int | None) -> int | None:
-    if a is None or b is None:
-        return None
-    return abs(int(a) - int(b))
-
-
-def _choose_adv(
-    xml_count: int | None,
-    cv_count: int | None,
-    xmlbar_count: int | None,
-    last_good_adv: int,
-) -> tuple[int, str, str, dict]:
-    """
-    Decide adv (measures in system) with cross-checking.
-    Returns: (adv, chosen_method, status, debug_dict)
-    """
-    warn = _meas_disagree_warn()
-
-    xml_sane = (xml_count is not None) and _is_sane_count(int(xml_count), last_good_adv)
-    cv_sane = (cv_count is not None) and _is_sane_count(int(cv_count), last_good_adv)
-    xmlbar_sane = (xmlbar_count is not None) and _is_sane_count(int(xmlbar_count), last_good_adv)
-
-    d_xml_cv = _absdiff(xml_count, cv_count)
-    d_xml_xmlbar = _absdiff(xml_count, xmlbar_count)
-    d_cv_xmlbar = _absdiff(cv_count, xmlbar_count)
-
-    status = "OK"
-    chosen_method = "fallback"
-    chosen = 0
-    reason = ""
-
-    # Strict Step 3: trust XML measures when present and sane
-    if xml_sane:
-        chosen = int(xml_count)
-        chosen_method = "xml_measures"
-        reason = "xml_sane_prefer"
-
-        # If we have other sane signals and they disagree by >= warn, mark suspect
-        strong_disagree = False
-        if cv_sane and d_xml_cv is not None and d_xml_cv >= warn:
-            strong_disagree = True
-        if xmlbar_sane and d_xml_xmlbar is not None and d_xml_xmlbar >= warn:
-            strong_disagree = True
-
-        if strong_disagree:
-            status = "SUSPECT"
-
-            # Optional override only when BOTH independent signals agree against XML
-            if _allow_override_on_strong_disagree():
-                # Case 1: cv and xmlbar agree with each other and disagree with xml
-                if cv_sane and xmlbar_sane and (d_cv_xmlbar == 0) and (d_xml_cv is not None) and d_xml_cv >= warn:
-                    chosen = int(cv_count)
-                    chosen_method = "override_cv_xmlbar_agree"
-                    reason = "both_nonxml_agree"
-                    status = "OVERRIDE"
-
-                # Case 2: only CV available and continuity strongly favors it
-                elif cv_sane and last_good_adv > 0 and d_xml_cv is not None and d_xml_cv >= warn:
-                    if abs(int(cv_count) - last_good_adv) < abs(int(xml_count) - last_good_adv):
-                        chosen = int(cv_count)
-                        chosen_method = "override_cv_continuity"
-                        reason = "cv_matches_prev"
-                        status = "OVERRIDE"
-
-    else:
-        # XML missing/insane: fall back to CV then xmlbar then continuity
-        if cv_sane:
-            chosen = int(cv_count)
-            chosen_method = "cv_bars"
-            reason = "xml_missing_or_insane"
-        elif xmlbar_sane:
-            chosen = int(xmlbar_count)
-            chosen_method = "xml_bars"
-            reason = "xml_missing_or_insane"
-        else:
-            chosen = int(last_good_adv) if last_good_adv > 0 else 1
-            chosen_method = "continuity"
-            reason = "no_sane_sources"
-            status = "SUSPECT"
-
-    if chosen <= 0:
-        chosen = int(last_good_adv) if last_good_adv > 0 else 1
-        chosen_method = "continuity"
-        reason = reason + "_forced"
-        status = "SUSPECT"
-
-    dbg = {
-        "xml": int(xml_count) if xml_count is not None else None,
-        "cv": int(cv_count) if cv_count is not None else None,
-        "xmlbar": int(xmlbar_count) if xmlbar_count is not None else None,
-        "xml_sane": bool(xml_sane),
-        "cv_sane": bool(cv_sane),
-        "xmlbar_sane": bool(xmlbar_sane),
-        "d_xml_cv": d_xml_cv,
-        "d_xml_xmlbar": d_xml_xmlbar,
-        "d_cv_xmlbar": d_cv_xmlbar,
-        "reason": reason,
-    }
-    return (int(chosen), chosen_method, status, dbg)
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 # --------------------------
 # Main annotation
 # --------------------------
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
-    # Startup log always (so you can prove env got through)
+    # Unskippable startup print (proves env actually arrived)
     print(
         "[DBG] startup "
         f"input_pdf={input_pdf} omr_path={omr_path} output_pdf={output_pdf} "
-        f"DEBUG_MEASURES={os.getenv('DEBUG_MEASURES','')} DEBUG_DRAW_BARS={os.getenv('DEBUG_DRAW_BARS','')} "
-        f"USE_CV_BARS={os.getenv('USE_CV_BARS','')} CV_ZOOM={os.getenv('CV_ZOOM','')} "
-        f"MEAS_SANE_MAX={os.getenv('MEAS_SANE_MAX','')} MEAS_DISAGREE_WARN={os.getenv('MEAS_DISAGREE_WARN','')} "
-        f"ALLOW_XML_OVERRIDE={os.getenv('ALLOW_XML_OVERRIDE','')}",
+        f"DEBUG_GUIDES={os.getenv('DEBUG_GUIDES','')} DEBUG_MEASURES={os.getenv('DEBUG_MEASURES','')} "
+        f"DEBUG_DRAW_BARS={os.getenv('DEBUG_DRAW_BARS','')} USE_CV_BARS={os.getenv('USE_CV_BARS','')} "
+        f"CV_ZOOM={os.getenv('CV_ZOOM','')} PAD_LEFT_PX={os.getenv('PAD_LEFT_PX', str(PAD_LEFT_PX_DEFAULT))} "
+        f"GUIDE_AVOID_SYMBOLS={os.getenv('GUIDE_AVOID_SYMBOLS','0')} GUIDE_FORCE_NONINDENTED_X={os.getenv('GUIDE_FORCE_NONINDENTED_X','0')}",
         flush=True,
     )
 
@@ -1271,28 +1025,34 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
 
+            rect = page.rect
+            base_x = float(rect.x0)
+            base_y = float(rect.y0)
+
             pic_w, pic_h, guides_px, staff_total, systems_desc = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
                 continue
 
-            rect = page.rect
-            base_x = float(rect.x0)
-            base_y = float(rect.y0)
             scale_x = float(rect.width) / float(pic_w)
             scale_y = float(rect.height) / float(pic_h)
 
+            if _debug_enabled() or _meas_debug_enabled():
+                print(
+                    f"[DBG] page={page_index+1} sheet={sheet_xml_path} page_rect={rect} base=({base_x:.2f},{base_y:.2f}) "
+                    f"scale=({scale_x:.6f},{scale_y:.6f}) guides={len(guides_px)} systems={len(systems_desc)}",
+                    flush=True,
+                )
 
-            # Draw guides
+            # Draw guides (anchored to staff start x from line geometry)
             guides_pdf = []
             for (x_px, y0_px, y1_px) in guides_px:
                 x_pdf = base_x + (x_px * scale_x)
                 y0_pdf = base_y + (y0_px * scale_y)
                 y1_pdf = base_y + (y1_px * scale_y)
-
                 guides_pdf.append((x_pdf, y0_pdf, y1_pdf))
                 page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
 
-            # Font size (shared by measure labels + debug bar labels)
+            # Font size
             interline_pdf = None
             if len(guides_pdf) >= 1:
                 staff_h = abs(guides_pdf[0][2] - guides_pdf[0][1])
@@ -1301,102 +1061,121 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 interline_pdf = 16.0
             fontsize = _clamp(0.55 * interline_pdf, MEASURE_MIN_FONTSIZE, MEASURE_MAX_FONTSIZE)
 
+            # Measure logic per system (unchanged strategy)
             last_good_adv = 0
 
-            for sys in systems_desc:
-                sys_key = sys["sys_key"]
-                sys_id = sys["sys_id"]
-                expected_spacing = float(sys.get("expected_spacing") or 0.0)
+            for sysd in systems_desc:
+                sys_key = sysd["sys_key"]
+                sys_id = sysd["sys_id"]
+                expected_spacing = float(sysd.get("expected_spacing") or 0.0)
 
-                # Convert system geometry to PDF coords
-                sys_start_x_pdf = base_x + (float(sys["sys_start_x"]) * scale_x)
-                sys_right_x_pdf = (base_x + (float(sys["sys_right_x"]) * scale_x)) if sys.get("sys_right_x") is not None else None
-                top_y_top_pdf = base_y + (float(sys["top_y_top"]) * scale_y)
-                sys_y_top_pdf = base_y + (float(sys["sys_y_top"]) * scale_y)
-                sys_y_bot_pdf = base_y + (float(sys["sys_y_bot"]) * scale_y)
-
-
-                eps_pdf = float(sys.get("eps") or 10.0) * scale_x
-                y_pad_pdf = float(sys.get("y_pad") or 14.0) * scale_y
-                close_tol_pdf_xml = float(sys.get("close_tol") or 20.0) * scale_x
-
-                xml_meas_count = int(sys.get("xml_meas_count") or 0)
-
-                # --- Candidate 1: XML measures (count only)
-                xml_count = xml_meas_count if xml_meas_count > 0 else None
-
-                # --- Candidate 2: XML bar inters (convert stored pic-space xs to PDF)
-                xs_xml_pdf: list[float] = [float(x) * scale_x for x in (sys.get("xs_xml_used") or [])]
-                xs_xml_pdf = [x for x in xs_xml_pdf if x > (sys_start_x_pdf + eps_pdf)]
-                if sys_right_x_pdf is not None:
-                    xs_xml_pdf = [x for x in xs_xml_pdf if x <= (sys_right_x_pdf + 2.0 * close_tol_pdf_xml)]
-                xmlbar_count, xmlbar_closing, xmlbar_reason = _count_from_bars(xs_xml_pdf, sys_right_x_pdf, close_tol_pdf_xml)
-                xmlbar_count = xmlbar_count if xs_xml_pdf else 0
-                xmlbar_count = xmlbar_count if xmlbar_count > 0 else 0
-
-                # --- Candidate 3: CV bars (optional, but recommended as checker)
-                xs_cv_pdf: list[float] = []
-                cv_close_tol_used = None
-                cv_count = None
-                cv_closing = False
-                cv_reason = ""
-                if _use_cv_bars():
-                    xs_cv_pdf, cv_close_tol_used = _cv_barlines_xs_in_band_pdf(
-                        page,
-                        y0_pdf=(sys_y_top_pdf - y_pad_pdf),
-                        y1_pdf=(sys_y_bot_pdf + y_pad_pdf),
-                    )
-                    xs_cv_pdf = [x for x in xs_cv_pdf if x > (sys_start_x_pdf + eps_pdf)]
-                    if sys_right_x_pdf is not None and cv_close_tol_used is not None:
-                        xs_cv_pdf = [x for x in xs_cv_pdf if x <= (sys_right_x_pdf + 2.0 * float(cv_close_tol_used))]
-                    cv_count_raw, cv_closing, cv_reason = _count_from_bars(
-                        xs_cv_pdf,
-                        sys_right_x_pdf,
-                        float(cv_close_tol_used) if cv_close_tol_used is not None else close_tol_pdf_xml,
-                    )
-                    cv_count = cv_count_raw if xs_cv_pdf else 0
-                    if cv_count <= 0:
-                        cv_count = None
-
-                xmlbar_count = xmlbar_count if xmlbar_count > 0 else None
-
-                # Decide adv with cross-checks
-                adv, method, status, dbg = _choose_adv(
-                    xml_count=xml_count,
-                    cv_count=cv_count,
-                    xmlbar_count=xmlbar_count,
-                    last_good_adv=last_good_adv,
+                sys_start_x_pdf = base_x + (float(sysd["sys_start_x"]) * scale_x)
+                sys_right_x_pdf = (
+                    base_x + (float(sysd["sys_right_x"]) * scale_x) if sysd.get("sys_right_x") is not None else None
                 )
-                if adv > 0:
-                    last_good_adv = adv
+                top_y_top_pdf = base_y + (float(sysd["top_y_top"]) * scale_y)
+                sys_y_top_pdf = base_y + (float(sysd["sys_y_top"]) * scale_y)
+                sys_y_bot_pdf = base_y + (float(sysd["sys_y_bot"]) * scale_y)
 
-                # Place system-start label (unchanged behavior)
+                eps_pdf = float(sysd.get("eps") or 10.0) * scale_x
+                y_pad_pdf = float(sysd.get("y_pad") or 14.0) * scale_y
+                close_tol_pdf_xml = float(sysd.get("close_tol") or 20.0) * scale_x
+
+                xml_meas_count = int(sysd.get("xml_meas_count") or 0)
+
+                method = ""
+                reason = ""
+                closing_present = False
+                xs_used_pdf: list[float] = []
+
+                if xml_meas_count > 0:
+                    adv_raw = xml_meas_count
+                    method = "xml_measures"
+                    reason = "use_xml_measures"
+                else:
+                    if _use_cv_bars():
+                        xs_pdf, close_tol_pdf = _cv_barlines_xs_in_band_pdf(
+                            page,
+                            y0_pdf=(sys_y_top_pdf - y_pad_pdf),
+                            y1_pdf=(sys_y_bot_pdf + y_pad_pdf),
+                        )
+                        xs_pdf = [x for x in xs_pdf if x > (sys_start_x_pdf + eps_pdf)]
+                        if sys_right_x_pdf is not None:
+                            xs_pdf = [x for x in xs_pdf if x <= (sys_right_x_pdf + 2.0 * close_tol_pdf)]
+                        xs_used_pdf = xs_pdf
+                        method = "cv_bars"
+                        close_tol_used = close_tol_pdf
+                    else:
+                        xs_pic = list(sysd.get("xs_xml_used") or [])
+                        xs_pdf = [base_x + (float(x) * scale_x) for x in xs_pic]
+                        xs_used_pdf = xs_pdf
+                        method = "xml_bars"
+                        close_tol_used = close_tol_pdf_xml
+
+                    bar_count = len(xs_used_pdf)
+
+                    if bar_count > 0:
+                        cand0 = bar_count
+                        cand1 = bar_count + 1
+
+                        preferred = cand1
+                        alt = cand0
+
+                        if sys_right_x_pdf is not None:
+                            rightmost = xs_used_pdf[-1]
+                            if abs(rightmost - sys_right_x_pdf) <= close_tol_used or rightmost >= (
+                                sys_right_x_pdf - close_tol_used
+                            ):
+                                closing_present = True
+                                preferred = cand0
+                                alt = cand1
+                                reason = "bars"
+                            else:
+                                closing_present = False
+                                preferred = cand1
+                                alt = cand0
+                                reason = "bars_plus_edge"
+                        else:
+                            closing_present = False
+                            preferred = cand1
+                            alt = cand0
+                            reason = "no_right_edge"
+
+                        if last_good_adv > 0:
+                            if abs(preferred - last_good_adv) > abs(alt - last_good_adv):
+                                preferred = alt
+                                reason = reason + "_smooth"
+
+                        adv_raw = preferred
+                    else:
+                        adv_raw = 0
+                        reason = "no_bars"
+
+                if adv_raw <= 0:
+                    adv = last_good_adv if last_good_adv > 0 else 1
+                    reason = reason + "_fallback"
+                else:
+                    adv = int(adv_raw)
+                    last_good_adv = int(adv_raw)
+
                 v_off = max(10.0, 0.90 * expected_spacing) if expected_spacing > 0 else 14.0
                 x_text_pdf = sys_start_x_pdf + ((max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else 8.0) * scale_x)
-                y_text_pdf = max(0.0, top_y_top_pdf - (v_off * scale_y))
+                y_text_pdf = max(base_y, top_y_top_pdf - (v_off * scale_y))
                 page.insert_text((x_text_pdf, y_text_pdf), str(measure_no), fontsize=fontsize, color=MEASURE_TEXT_COLOR)
 
-                # Debug log (one line per system)
                 _meas_dbg(
                     sheet_xml_path,
                     sys_key,
                     "[DBG] MEAS "
-                    f"sys_key={sys_key} id={sys_id} start={measure_no} adv={adv} chosen={method} status={status} "
-                    f"xml={dbg['xml']} xml_sane={dbg['xml_sane']} "
-                    f"cv={dbg['cv']} cv_sane={dbg['cv_sane']} "
-                    f"xmlbar={dbg['xmlbar']} xmlbar_sane={dbg['xmlbar_sane']} "
-                    f"d_xml_cv={dbg['d_xml_cv']} d_xml_xmlbar={dbg['d_xml_xmlbar']} d_cv_xmlbar={dbg['d_cv_xmlbar']} "
-                    f"right={sys_right_x_pdf} "
-                    f"tail_xml={_tail_xs(xs_xml_pdf, 3)} tail_cv={_tail_xs(xs_cv_pdf, 3)} "
-                    f"xmlbar_reason={xmlbar_reason} cv_reason={cv_reason} reason={dbg['reason']}",
+                    f"sys_key={sys_key} id={sys_id} "
+                    f"start={measure_no} adv={adv} method={method} reason={reason} "
+                    f"xml={xml_meas_count} bars={len(xs_used_pdf)} tail_xs={_tail_xs(xs_used_pdf, 3)} "
+                    f"closing={closing_present} right={sys_right_x_pdf}",
                 )
 
-                # Debug overlay: draw/label barlines (CV + XML) when enabled
-                if _bars_debug_enabled():
+                if _bars_debug_enabled() and xs_used_pdf:
                     alpha = _bars_alpha()
-
-                    # Draw XML bars
-                    for i, bx in enumerate(xs_xml_pdf):
+                    for i, bx in enumerate(xs_used_pdf):
                         try:
                             page.draw_line(
                                 (bx, sys_y_top_pdf),
@@ -1406,29 +1185,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                                 stroke_opacity=alpha,
                             )
                             page.insert_text(
-                                (bx + 1.5, max(0.0, sys_y_top_pdf - 6.0)),
-                                f"X{i+1}",
-                                fontsize=max(6.0, fontsize * 0.9),
-                                color=DEBUG_BAR_COLOR,
-                                fill_opacity=alpha,
-                            )
-                        except Exception:
-                            pass
-
-                    # Draw CV bars (slightly offset label so you can distinguish)
-                    for i, bx in enumerate(xs_cv_pdf):
-                        try:
-                            page.draw_line(
-                                (bx, sys_y_top_pdf),
-                                (bx, sys_y_bot_pdf),
-                                color=DEBUG_BAR_COLOR,
-                                width=DEBUG_BAR_WIDTH,
-                                stroke_opacity=alpha,
-                            )
-                            page.insert_text(
-                                (bx + 1.5, max(0.0, sys_y_top_pdf - 14.0)),
-                                f"C{i+1}",
-                                fontsize=max(6.0, fontsize * 0.9),
+                                (bx + 1.5, max(base_y, sys_y_top_pdf - 6.0)),
+                                str(measure_no + i),
+                                fontsize=fontsize,
                                 color=DEBUG_BAR_COLOR,
                                 fill_opacity=alpha,
                             )
@@ -1437,7 +1196,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
                 measure_no += int(max(1, adv))
 
-            # If OMR missed some staves, try fallback guide detection (unchanged)
+            # Fallback staff detection (if Audiveris missed some)
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
                 if _debug_enabled():
