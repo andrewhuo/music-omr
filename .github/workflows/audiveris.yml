@@ -24,17 +24,19 @@ jobs:
       DEBUG_DRAW_BARS: "0"
       DEBUG_BARS_ALPHA: "0.85"
 
-      # CV barline detection (per-staff consensus)
+      # NEW: Prefer Audiveris measure labels from <measures> (prevents drift)
+      USE_XML_START_MEASURES: "1"
+
+      # Optional: if you want to force CV bar fallback (only used when XML measures are missing)
       USE_CV_BARS: "0"
-      CV_ZOOM: "2.5"
+      CV_ZOOM: "2.0"
 
-      # Optional: guide debug filtering
+      # Leave blank to auto-pick a valid sheet from the .omr (avoids sheet#3 missing errors)
       DEBUG_SHEET: ""
+      # Optional: set to one staff id to keep logs small
       DEBUG_STAFF: ""
-
-      # Optional: measure debug filtering (leave blank for ALL)
+      # Optional: set to one system id to keep logs small (measures debug)
       DEBUG_MEASURES_SYS: ""
-      DEBUG_MEASURES_SHEET: ""
 
     permissions:
       contents: read
@@ -68,12 +70,12 @@ jobs:
           echo "DEBUG_GUIDES_DUMP_INTERS=${DEBUG_GUIDES_DUMP_INTERS}"
           echo "DEBUG_DRAW_BARS=${DEBUG_DRAW_BARS}"
           echo "DEBUG_BARS_ALPHA=${DEBUG_BARS_ALPHA}"
+          echo "USE_XML_START_MEASURES=${USE_XML_START_MEASURES}"
           echo "USE_CV_BARS=${USE_CV_BARS}"
           echo "CV_ZOOM=${CV_ZOOM}"
           echo "DEBUG_SHEET=${DEBUG_SHEET}"
           echo "DEBUG_STAFF=${DEBUG_STAFF}"
           echo "DEBUG_MEASURES_SYS=${DEBUG_MEASURES_SYS}"
-          echo "DEBUG_MEASURES_SHEET=${DEBUG_MEASURES_SHEET}"
 
       #################################################################
       # 2) Clean output prefix (safe)
@@ -108,13 +110,14 @@ jobs:
             toprock/audiveris:latest \
             /audiveris-extract/bin/Audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
 
+          # Fail fast if we didn't get an .omr
           test -f /tmp/work/audiveris_out/input/input.omr
 
       #################################################################
-      # 5) Auto-pick DEBUG_SHEET (only when guide debug enabled)
+      # 5) Auto-pick DEBUG_SHEET (only when debug is ON)
       #################################################################
-      - name: Auto-pick DEBUG_SHEET (only when guide debug enabled)
-        if: ${{ env.DEBUG_GUIDES == '1' }}
+      - name: Auto-pick DEBUG_SHEET (only when debug enabled)
+        if: ${{ env.DEBUG_GUIDES == '1' || env.DEBUG_MEASURES == '1' }}
         run: |
           set -euo pipefail
           OMR="/tmp/work/audiveris_out/input/input.omr"
@@ -152,12 +155,13 @@ jobs:
           DEBUG_GUIDES_DUMP_INTERS: "${{ env.DEBUG_GUIDES_DUMP_INTERS }}"
 
           DEBUG_MEASURES: "${{ env.DEBUG_MEASURES }}"
-          DEBUG_MEASURES_SHEET: "${{ env.DEBUG_MEASURES_SHEET }}"   # leave blank unless you want filtering
+          DEBUG_MEASURES_SHEET: "${{ env.DEBUG_SHEET }}"
           DEBUG_MEASURES_SYS_ID: "${{ env.DEBUG_MEASURES_SYS }}"
 
           DEBUG_DRAW_BARS: "${{ env.DEBUG_DRAW_BARS }}"
           DEBUG_BARS_ALPHA: "${{ env.DEBUG_BARS_ALPHA }}"
 
+          USE_XML_START_MEASURES: "${{ env.USE_XML_START_MEASURES }}"
           USE_CV_BARS: "${{ env.USE_CV_BARS }}"
           CV_ZOOM: "${{ env.CV_ZOOM }}"
         run: |
@@ -189,6 +193,7 @@ jobs:
           set -euo pipefail
           gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
 
+          # Upload Audiveris outputs (useful for later debugging)
           if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
             gsutil -m cp -r /tmp/work/audiveris_out "${OUTPUT_PREFIX}/audiveris_out"
           fi
