@@ -16,19 +16,14 @@ import cv2
 GUIDE_COLOR = (1, 0, 0)  # red
 GUIDE_WIDTH = 1.0
 
-# For "touch the very beginning of the staff", default padding is 0.
-# If you want a tiny left offset, set env PAD_LEFT_PX=2 (or similar).
+# Touch staff start by default.
 PAD_LEFT_PX_DEFAULT = 0.0
 
 MEASURE_TEXT_COLOR = (0, 0, 0)  # black
 MEASURE_MIN_FONTSIZE = 7.0
 MEASURE_MAX_FONTSIZE = 12.0
 
-# Outlier forcing (now OFF by default, see env)
-OUTLIER_MZ_THRESHOLD = 3.5
-OUTLIER_ABS_FLOOR_PX = 10.0
-
-# DEBUG: barline overlay (testing only)
+# DEBUG: barline overlay
 DEBUG_BAR_COLOR = (0, 0, 1)  # blue
 DEBUG_BAR_WIDTH = 0.9
 
@@ -36,7 +31,7 @@ _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 
 
 # --------------------------
-# Env toggles
+# Env helpers
 # --------------------------
 def _env_truthy(name: str, default: str = "0") -> bool:
     v = os.getenv(name, default).strip()
@@ -115,14 +110,32 @@ def _pad_left_px() -> float:
         return float(PAD_LEFT_PX_DEFAULT)
 
 
-def _guide_avoid_symbols() -> bool:
-    # Off by default: you asked for "touch staff start"
-    return _env_truthy("GUIDE_AVOID_SYMBOLS", "0")
+def _guide_consensus_enabled() -> bool:
+    # ON by default: prevents the 1–2 "in-clef" outliers.
+    return _env_truthy("GUIDE_CONSENSUS", "1")
 
 
-def _guide_force_nonindented_x() -> bool:
-    # Off by default: forcing x across staves breaks "touch staff start"
-    return _env_truthy("GUIDE_FORCE_NONINDENTED_X", "0")
+def _guide_consensus_percentile() -> float:
+    # Robust "system start" estimator across staves.
+    try:
+        p = float(os.getenv("GUIDE_CONSENSUS_P", "0.10").strip())
+        return max(0.0, min(1.0, p))
+    except Exception:
+        return 0.10
+
+
+def _guide_consensus_thresh_mult() -> float:
+    # Threshold = max(10px, mult * expected_spacing)
+    try:
+        m = float(os.getenv("GUIDE_CONSENSUS_THRESH_MULT", "0.60").strip())
+        return max(0.0, m)
+    except Exception:
+        return 0.60
+
+
+def _guide_clef_clamp_enabled() -> bool:
+    # ON by default: last-ditch safety to avoid landing inside clef bbox.
+    return _env_truthy("GUIDE_CLEF_CLAMP", "1")
 
 
 # --------------------------
@@ -157,10 +170,6 @@ def _median(xs: list[float]) -> float:
     if n % 2 == 1:
         return ys[mid]
     return 0.5 * (ys[mid - 1] + ys[mid])
-
-
-def _mad(xs: list[float], med: float) -> float:
-    return _median([abs(x - med) for x in xs])
 
 
 def _best_five_by_spacing(yxs: list[tuple[float, float]], expected_spacing: float) -> list[tuple[float, float]]:
@@ -286,20 +295,16 @@ def _clef_bounds_from_header(inter_by_id: dict[int, ET.Element], staff: ET.Eleme
     header = staff.find("header")
     if header is None:
         return None
-
     clef_id_txt = header.findtext("clef")
     if not clef_id_txt:
         return None
-
     try:
         clef_id = int(clef_id_txt.strip())
     except Exception:
         return None
-
     clef_el = inter_by_id.get(clef_id)
     if clef_el is None:
         return None
-
     return _bounds_of(clef_el)
 
 
@@ -361,71 +366,6 @@ def _dump_inters_near_staff(
             staff_id,
             f"  [DBG] inter tag={tag} staff={st} id={iid} {shape or ''} x=[{x0:.1f},{x1:.1f}] y=[{y0:.1f},{y1:.1f}]",
         )
-
-
-def _push_left_if_inside_any_symbol(
-    inters: ET.Element | None,
-    staff_id: str,
-    y_top: float,
-    y_bot: float,
-    x_left: float,
-    expected_spacing: float,
-    sheet_xml_path: str,
-) -> float:
-    """
-    Optional: move the guideline left if it lands inside some symbol bounds.
-    OFF by default because you want the guideline to touch staff start.
-    """
-    if inters is None:
-        return x_left
-
-    guard = max(10.0, (0.35 * expected_spacing) if expected_spacing > 0 else 10.0)
-
-    for _ in range(4):
-        x_postpad = max(0.0, float(x_left) - _pad_left_px())
-
-        hits: list[tuple[float, float, str]] = []
-        for el in inters.iter():
-            b = _bounds_of(el)
-            if b is None:
-                continue
-            x, y, w, h = b
-            x0, x1 = x, x + w
-            y0, y1 = y, y + h
-
-            el_staff = el.get("staff")
-            if el_staff and el_staff != staff_id:
-                continue
-
-            if not _bounds_overlap_1d(y0, y1, y_top, y_bot):
-                continue
-
-            if x0 <= x_postpad <= x1:
-                hits.append((x0, x1, el.tag))
-
-        if not hits:
-            return x_left
-
-        hits.sort(key=lambda t: t[0])
-        hit_x0, hit_x1, hit_tag = hits[0]
-
-        new_x_postpad = max(0.0, hit_x0 - guard)
-        new_x_left = new_x_postpad + _pad_left_px()
-
-        _dbg(
-            sheet_xml_path,
-            staff_id,
-            "[DBG] PUSH_LEFT "
-            f"staff={staff_id} x_postpad={x_postpad:.2f} -> {new_x_postpad:.2f} "
-            f"hit_tag={hit_tag} hit_x0={hit_x0:.2f} hit_x1={hit_x1:.2f} "
-            f"guard={guard:.2f}",
-        )
-
-        if abs(new_x_left - x_left) < 0.01:
-            return new_x_left
-        x_left = new_x_left
-
-    return x_left
 
 
 def _dedupe_sorted_xs(xs: list[float], eps: float) -> list[float]:
@@ -527,16 +467,9 @@ def _tail_xs(xs: list[float], n: int = 3) -> str:
 
 
 # --------------------------
-# CV barline detection (PAGE coordinate space)
+# CV barline detection (page coordinate space)
 # --------------------------
 def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -> tuple[list[float], float]:
-    """
-    Detect barline x positions using image morphology in a PDF y-band.
-    Returns: (xs_pdf, close_tol_pdf)
-
-    y0_pdf / y1_pdf are in page coordinate space (same as page.rect).
-    Output xs are also in page coordinate space (includes rect.x0).
-    """
     rect = page.rect
 
     y0_rel = float(y0_pdf) - float(rect.y0)
@@ -588,7 +521,6 @@ def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -
     xs_px = _dedupe_sorted_xs(xs_px, eps=eps_px)
 
     xs_pdf = [float(rect.x0) + float(x / scale_x_px) for x in xs_px]
-
     close_tol_pdf = max(14.0, 0.10 * (float(y1_rel - y0_rel) / 4.0))
     return (xs_pdf, close_tol_pdf)
 
@@ -627,11 +559,12 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     if not pages:
         return pic_w, pic_h, [], 0, []
 
-    staff_total = 0
-    staff_recs: list[dict] = []
-    system_recs: dict[str, dict] = {}
-
     pad_left = _pad_left_px()
+    staff_total = 0
+
+    staff_recs: list[dict] = []
+    # system_key -> dict(sys_key, sys_id, staff_spans[], staff_x_postpads[], sys_consensus_x_postpad)
+    system_recs: dict[str, dict] = {}
 
     for page_idx, page in enumerate(pages):
         inter_by_id = _index_inters(page)
@@ -652,19 +585,18 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "page_idx": page_idx,
                     "sys_idx": sys_idx,
                     "indented": system.get("indented"),
-                    "staff_spans": [],  # list of (y_top, y_bot, staff_id)
+                    "staff_spans": [],       # list of (y_top, y_bot, staff_id)
+                    "x_postpads": [],        # list of x_postpad per staff (for consensus)
                 }
 
             for staff in system.findall(".//staff"):
                 staff_total += 1
                 staff_id = staff.get("id") or ""
 
-                header = staff.find("header")
-                header_start = _safe_float(header.get("start")) if header is not None else None
-
                 lines_node = staff.find("lines")
                 line_nodes = [] if lines_node is None else lines_node.findall("line")
 
+                # y span from staff lines
                 yxs: list[tuple[float, float]] = []
                 all_line_xmins: list[float] = []
                 all_line_xmaxs: list[float] = []
@@ -718,40 +650,26 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP bad_y_span sheet={sheet_xml_path} staff={staff_id}")
                     continue
 
-                # ---- NEW: guideline x anchored to staff line start ----
+                # Anchor x to staff line start (robust percentile)
                 if all_line_xmins:
-                    # 5th percentile avoids one stray point far left
                     staff_start_x = float(_pct(all_line_xmins, 0.05))
                 else:
-                    # last resort: staff@left or header_start
                     x_left = _safe_float(staff.get("left"))
-                    if x_left is None and header_start is not None:
-                        x_left = float(header_start)
                     if x_left is None:
                         _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP no_x sheet={sheet_xml_path} staff={staff_id}")
                         continue
                     staff_start_x = float(x_left)
 
-                # Touch staff start: pad_left default 0
                 x_postpad = max(0.0, staff_start_x - pad_left)
 
-                # Optional symbol avoidance (OFF by default)
-                if _guide_avoid_symbols():
-                    x_left2 = x_postpad + pad_left
-                    x_left2 = _push_left_if_inside_any_symbol(
-                        inters=inters,
-                        staff_id=staff_id,
-                        y_top=y_top,
-                        y_bot=y_bot,
-                        x_left=x_left2,
-                        expected_spacing=expected_spacing,
-                        sheet_xml_path=sheet_xml_path,
-                    )
-                    x_postpad = max(0.0, x_left2 - pad_left)
+                # Save for consensus
+                system_recs[sys_key]["x_postpads"].append(float(x_postpad))
+                system_recs[sys_key]["staff_spans"].append((float(y_top), float(y_bot), staff_id))
 
-                # Debug context (clef info kept for visibility only)
+                # Keep clef bounds for clamp (safety)
                 clef_b = _clef_bounds_from_header(inter_by_id, staff)
 
+                # Optional dump around computed x
                 _dump_inters_near_staff(sheet_xml_path, staff_id, inters, y_top, y_bot, x_postpad, x_window=140.0)
 
                 if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
@@ -760,11 +678,11 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     _dbg(
                         sheet_xml_path,
                         staff_id,
-                        f"[DBG] sheet={sheet_xml_path} sys_key={sys_key} staff={staff_id} indented={system.get('indented')} "
+                        f"[DBG] sheet={sheet_xml_path} sys_key={sys_key} staff={staff_id} "
                         f"expected_spacing={expected_spacing:.2f} "
-                        f"clef_b={'present' if clef_b is not None else None} "
                         f"line_min_x={line_min_x} line_max_x={line_max_x} "
                         f"staff_start_x(p05)={staff_start_x:.2f} PAD_LEFT_PX={pad_left:.2f} x_postpad={x_postpad:.2f} "
+                        f"clef_b={'present' if clef_b is not None else None} "
                         f"y_top={y_top:.1f} y_bot={y_bot:.1f}",
                     )
 
@@ -775,36 +693,61 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         "sys_key": sys_key,
                         "sys_id": sys_id,
                         "staff_id": staff_id,
-                        "indented": system.get("indented"),
                         "x_postpad": float(x_postpad),
                         "y_top": float(y_top),
                         "y_bot": float(y_bot),
                         "line_max_x": float(line_max_x) if line_max_x is not None else None,
+                        "clef_b": clef_b,
                     }
                 )
-                system_recs[sys_key]["staff_spans"].append((float(y_top), float(y_bot), staff_id))
 
-    # Optional: old behavior (forcing non-indented x to common avg). OFF by default.
-    if _guide_force_nonindented_x():
-        non_indented_xs = [
-            r["x_postpad"] for r in staff_recs if not (r["indented"] not in (None, "", "false", "False", "0"))
-        ]
-        if len(non_indented_xs) >= 6:
-            med = _median(non_indented_xs)
-            mad = max(_mad(non_indented_xs, med), OUTLIER_ABS_FLOOR_PX)
+    # --- NEW: system consensus clamp (prevents 1–2 staff outliers drifting into clef) ---
+    if _guide_consensus_enabled():
+        p = _guide_consensus_percentile()
+        thr_mult = _guide_consensus_thresh_mult()
 
-            def mz(x: float) -> float:
-                return abs(0.6745 * (x - med) / mad)
+        sys_consensus: dict[str, float] = {}
+        for sys_key, rec in system_recs.items():
+            xs = [float(x) for x in rec.get("x_postpads", []) if x is not None]
+            if not xs:
+                continue
+            # Robust: p10-ish consensus
+            try:
+                sys_consensus[sys_key] = float(_pct(xs, p))
+            except Exception:
+                sys_consensus[sys_key] = float(min(xs))
 
-            inliers = [x for x in non_indented_xs if mz(x) <= OUTLIER_MZ_THRESHOLD]
-            if len(inliers) >= 4:
-                forced_avg = sum(inliers) / float(len(inliers))
-                for r in staff_recs:
-                    if r["indented"] not in (None, "", "false", "False", "0"):
-                        continue
-                    score = mz(r["x_postpad"])
-                    if score > OUTLIER_MZ_THRESHOLD:
-                        r["x_postpad"] = float(forced_avg)
+        # Apply to each staff record
+        for r in staff_recs:
+            sk = r["sys_key"]
+            if sk not in sys_consensus:
+                continue
+            c = float(sys_consensus[sk])
+
+            # threshold in picture px
+            thresh_px = max(10.0, thr_mult * float(expected_spacing if expected_spacing > 0 else 0.0))
+            if expected_spacing <= 0:
+                thresh_px = 14.0  # safe default when spacing unknown
+
+            x0 = float(r["x_postpad"])
+            if x0 > c + thresh_px:
+                if _debug_enabled() and _debug_match(sheet_xml_path, r["staff_id"]):
+                    _dbg(sheet_xml_path, r["staff_id"], f"[DBG] CONSENSUS_CLAMP sys={sk} x={x0:.2f} -> {c:.2f} thresh={thresh_px:.2f}")
+                r["x_postpad"] = c
+
+    # --- NEW: clef clamp (secondary safety) ---
+    if _guide_clef_clamp_enabled():
+        for r in staff_recs:
+            clef_b = r.get("clef_b")
+            if clef_b is None:
+                continue
+            clef_x, _, _, _ = clef_b
+            guard = max(2.0, 0.25 * float(expected_spacing if expected_spacing > 0 else 0.0))
+            if expected_spacing <= 0:
+                guard = 6.0
+            max_postpad = max(0.0, float(clef_x) - guard - _pad_left_px())
+            if float(r["x_postpad"]) > max_postpad:
+                r["x_postpad"] = max_postpad
 
     guides_px: list[tuple[float, float, float]] = [(r["x_postpad"], r["y_top"], r["y_bot"]) for r in staff_recs]
 
@@ -815,12 +758,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     y_pad = max(8.0, 0.9 * expected_spacing) if expected_spacing > 0 else 14.0
     close_tol = max(14.0, 0.9 * expected_spacing) if expected_spacing > 0 else 20.0
 
-    staff_x_by_sys_staff: dict[tuple[str, str], float] = {
-        (r["sys_key"], r["staff_id"]): r["x_postpad"] for r in staff_recs
-    }
-    staff_right_by_sys_staff: dict[tuple[str, str], float | None] = {
-        (r["sys_key"], r["staff_id"]): r["line_max_x"] for r in staff_recs
-    }
+    staff_x_by_sys_staff: dict[tuple[str, str], float] = {(r["sys_key"], r["staff_id"]): r["x_postpad"] for r in staff_recs}
+    staff_right_by_sys_staff: dict[tuple[str, str], float | None] = {(r["sys_key"], r["staff_id"]): r["line_max_x"] for r in staff_recs}
 
     for page_idx, page in enumerate(pages):
         inters = page.find(".//sig/inters")
@@ -886,7 +825,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
 
 # --------------------------
-# Guide fallback (unchanged, but uses page.rect offsets)
+# Missing staff guide fallback (unchanged)
 # --------------------------
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
@@ -999,14 +938,14 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 # Main annotation
 # --------------------------
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
-    # Unskippable startup print (proves env actually arrived)
     print(
         "[DBG] startup "
         f"input_pdf={input_pdf} omr_path={omr_path} output_pdf={output_pdf} "
         f"DEBUG_GUIDES={os.getenv('DEBUG_GUIDES','')} DEBUG_MEASURES={os.getenv('DEBUG_MEASURES','')} "
         f"DEBUG_DRAW_BARS={os.getenv('DEBUG_DRAW_BARS','')} USE_CV_BARS={os.getenv('USE_CV_BARS','')} "
         f"CV_ZOOM={os.getenv('CV_ZOOM','')} PAD_LEFT_PX={os.getenv('PAD_LEFT_PX', str(PAD_LEFT_PX_DEFAULT))} "
-        f"GUIDE_AVOID_SYMBOLS={os.getenv('GUIDE_AVOID_SYMBOLS','0')} GUIDE_FORCE_NONINDENTED_X={os.getenv('GUIDE_FORCE_NONINDENTED_X','0')}",
+        f"GUIDE_CONSENSUS={os.getenv('GUIDE_CONSENSUS','1')} GUIDE_CONSENSUS_P={os.getenv('GUIDE_CONSENSUS_P','0.10')} "
+        f"GUIDE_CONSENSUS_THRESH_MULT={os.getenv('GUIDE_CONSENSUS_THRESH_MULT','0.60')} GUIDE_CLEF_CLAMP={os.getenv('GUIDE_CLEF_CLAMP','1')}",
         flush=True,
     )
 
@@ -1036,14 +975,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             scale_x = float(rect.width) / float(pic_w)
             scale_y = float(rect.height) / float(pic_h)
 
-            if _debug_enabled() or _meas_debug_enabled():
-                print(
-                    f"[DBG] page={page_index+1} sheet={sheet_xml_path} page_rect={rect} base=({base_x:.2f},{base_y:.2f}) "
-                    f"scale=({scale_x:.6f},{scale_y:.6f}) guides={len(guides_px)} systems={len(systems_desc)}",
-                    flush=True,
-                )
-
-            # Draw guides (anchored to staff start x from line geometry)
+            # Draw guides
             guides_pdf = []
             for (x_px, y0_px, y1_px) in guides_px:
                 x_pdf = base_x + (x_px * scale_x)
@@ -1061,7 +993,6 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 interline_pdf = 16.0
             fontsize = _clamp(0.55 * interline_pdf, MEASURE_MIN_FONTSIZE, MEASURE_MAX_FONTSIZE)
 
-            # Measure logic per system (unchanged strategy)
             last_good_adv = 0
 
             for sysd in systems_desc:
@@ -1159,7 +1090,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     last_good_adv = int(adv_raw)
 
                 v_off = max(10.0, 0.90 * expected_spacing) if expected_spacing > 0 else 14.0
-                x_text_pdf = sys_start_x_pdf + ((max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else 8.0) * scale_x)
+                x_text_pdf = sys_start_x_pdf + (
+                    (max(6.0, 0.30 * expected_spacing) if expected_spacing > 0 else 8.0) * scale_x
+                )
                 y_text_pdf = max(base_y, top_y_top_pdf - (v_off * scale_y))
                 page.insert_text((x_text_pdf, y_text_pdf), str(measure_no), fontsize=fontsize, color=MEASURE_TEXT_COLOR)
 
@@ -1196,7 +1129,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
                 measure_no += int(max(1, adv))
 
-            # Fallback staff detection (if Audiveris missed some)
+            # Fallback staff detection if OMR missed some staves
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
                 if _debug_enabled():
