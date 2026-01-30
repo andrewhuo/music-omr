@@ -27,6 +27,10 @@ MEASURE_MAX_FONTSIZE = 12.0
 DEBUG_BAR_COLOR = (0, 0, 1)  # blue
 DEBUG_BAR_WIDTH = 0.9
 
+# Default robust outlier params (matches what you printed in logs)
+OUTLIER_MZ_THRESHOLD_DEFAULT = 3.5
+OUTLIER_ABS_FLOOR_PX_DEFAULT = 10.0
+
 _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 
 
@@ -36,6 +40,13 @@ _SHEET_XML_RE = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
 def _env_truthy(name: str, default: str = "0") -> bool:
     v = os.getenv(name, default).strip()
     return v in ("1", "true", "True", "yes", "YES")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return float(default)
 
 
 def _debug_enabled() -> bool:
@@ -138,33 +149,30 @@ def _guide_clef_clamp_enabled() -> bool:
     return _env_truthy("GUIDE_CLEF_CLAMP", "1")
 
 
-def _guide_force_nonindented_enabled() -> bool:
-    # The “old fix”: compute a robust global good-x for non-indented staves,
-    # then force non-indented outliers to that x.
-    return _env_truthy("GUIDE_FORCE_NONINDENTED_X", "1")
+def _guide_force_nonindented_x_enabled() -> bool:
+    # This is the “force outliers to non-outlier average” feature you mentioned.
+    return _env_truthy("GUIDE_FORCE_NONINDENTED_X", "0")
 
 
 def _outlier_mz_threshold() -> float:
-    try:
-        return float(os.getenv("OUTLIER_MZ_THRESHOLD", "3.5").strip())
-    except Exception:
-        return 3.5
+    return _env_float("OUTLIER_MZ_THRESHOLD", OUTLIER_MZ_THRESHOLD_DEFAULT)
 
 
 def _outlier_abs_floor_px() -> float:
-    try:
-        return float(os.getenv("OUTLIER_ABS_FLOOR_PX", "10.0").strip())
-    except Exception:
-        return 10.0
+    return _env_float("OUTLIER_ABS_FLOOR_PX", OUTLIER_ABS_FLOOR_PX_DEFAULT)
 
 
-def _xml_truthy_attr(v: str | None) -> bool:
-    if v is None:
-        return False
-    s = v.strip()
-    if s == "":
-        return False
-    return s not in ("0", "false", "False", "no", "NO")
+def _guide_force_hard_enabled() -> bool:
+    # If you say FORCE THEM, this should be on.
+    # Default: if GUIDE_FORCE_NONINDENTED_X is enabled, also enable hard forcing unless explicitly disabled.
+    if os.getenv("GUIDE_FORCE_HARD") is None:
+        return _guide_force_nonindented_x_enabled()
+    return _env_truthy("GUIDE_FORCE_HARD", "1")
+
+
+def _guide_force_hard_thresh_mult() -> float:
+    # How tight the hard clamp is, in expected_spacing units.
+    return _env_float("GUIDE_FORCE_HARD_THRESH_MULT", 0.35)
 
 
 # --------------------------
@@ -199,11 +207,6 @@ def _median(xs: list[float]) -> float:
     if n % 2 == 1:
         return ys[mid]
     return 0.5 * (ys[mid - 1] + ys[mid])
-
-
-def _mad(xs: list[float], med: float) -> float:
-    # median absolute deviation from median
-    return _median([abs(x - med) for x in xs])
 
 
 def _best_five_by_spacing(yxs: list[tuple[float, float]], expected_spacing: float) -> list[tuple[float, float]]:
@@ -312,17 +315,6 @@ def _bounds_of(el: ET.Element) -> tuple[float, float, float, float] | None:
     if w <= 0 or h <= 0:
         return None
     return (float(x), float(y), float(w), float(h))
-
-
-def _tag_looks_like_clef(el: ET.Element) -> bool:
-    t = (el.tag or "").lower()
-    if t == "clef" or t.endswith("clef"):
-        return True
-    for k in ("shape", "type", "kind", "name", "family"):
-        v = el.get(k)
-        if v and "clef" in v.lower():
-            return True
-    return False
 
 
 def _clef_bounds_from_header(inter_by_id: dict[int, ET.Element], staff: ET.Element) -> tuple[float, float, float, float] | None:
@@ -500,6 +492,10 @@ def _tail_xs(xs: list[float], n: int = 3) -> str:
     return "[" + ",".join(f"{x:.1f}" for x in t) + "]"
 
 
+def _is_indented(indented_attr: str | None) -> bool:
+    return indented_attr not in (None, "", "false", "False", "0")
+
+
 # --------------------------
 # CV barline detection (page coordinate space)
 # --------------------------
@@ -611,9 +607,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         for sys_idx, system in enumerate(systems):
             sys_id = system.get("id") or ""
             sys_key = f"p{page_idx}_s{sys_idx}_id{sys_id}"
-
-            sys_indented_raw = system.get("indented")
-            sys_is_indented = _xml_truthy_attr(sys_indented_raw)
+            sys_indented = system.get("indented")
 
             if sys_key not in system_recs:
                 system_recs[sys_key] = {
@@ -621,8 +615,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "sys_id": sys_id,
                     "page_idx": page_idx,
                     "sys_idx": sys_idx,
-                    "indented": sys_indented_raw,
-                    "is_indented": sys_is_indented,
+                    "indented": sys_indented,
                     "staff_spans": [],
                     "x_postpads": [],
                 }
@@ -707,7 +700,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 # Keep clef bounds for clamp (safety)
                 clef_b = _clef_bounds_from_header(inter_by_id, staff)
 
-                # Optional dump around computed x
                 _dump_inters_near_staff(sheet_xml_path, staff_id, inters, y_top, y_bot, x_postpad, x_window=140.0)
 
                 if _debug_enabled() and _debug_match(sheet_xml_path, staff_id):
@@ -717,8 +709,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         sheet_xml_path,
                         staff_id,
                         f"[DBG] sheet={sheet_xml_path} sys_key={sys_key} staff={staff_id} "
-                        f"indented={sys_indented_raw} "
-                        f"expected_spacing={expected_spacing:.2f} "
+                        f"expected_spacing={expected_spacing:.2f} indented={sys_indented} "
                         f"line_min_x={line_min_x} line_max_x={line_max_x} "
                         f"staff_start_x(p05)={staff_start_x:.2f} PAD_LEFT_PX={pad_left:.2f} x_postpad={x_postpad:.2f} "
                         f"clef_b={'present' if clef_b is not None else None} "
@@ -729,10 +720,11 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 staff_recs.append(
                     {
+                        "sheet_xml_path": sheet_xml_path,
                         "sys_key": sys_key,
                         "sys_id": sys_id,
                         "staff_id": staff_id,
-                        "is_indented": bool(sys_is_indented),
+                        "indented": sys_indented,
                         "x_postpad": float(x_postpad),
                         "y_top": float(y_top),
                         "y_bot": float(y_bot),
@@ -741,15 +733,13 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     }
                 )
 
-    # --- system consensus clamp (skip indented systems/staves) ---
+    # --- System consensus clamp (prevents per-staff outliers inside a system) ---
     if _guide_consensus_enabled():
         p = _guide_consensus_percentile()
         thr_mult = _guide_consensus_thresh_mult()
 
         sys_consensus: dict[str, float] = {}
         for sys_key, rec in system_recs.items():
-            if rec.get("is_indented"):
-                continue
             xs = [float(x) for x in rec.get("x_postpads", []) if x is not None]
             if not xs:
                 continue
@@ -759,7 +749,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 sys_consensus[sys_key] = float(min(xs))
 
         for r in staff_recs:
-            if r.get("is_indented"):
+            if _is_indented(r.get("indented")):
                 continue
             sk = r["sys_key"]
             if sk not in sys_consensus:
@@ -771,52 +761,71 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 thresh_px = 14.0
 
             x0 = float(r["x_postpad"])
-            if x0 > c + thresh_px:
-                if _debug_enabled() and _debug_match(sheet_xml_path, r["staff_id"]):
+            if abs(x0 - c) > thresh_px:
+                if _debug_enabled() and _debug_match(r["sheet_xml_path"], r["staff_id"]):
                     _dbg(
-                        sheet_xml_path,
+                        r["sheet_xml_path"],
                         r["staff_id"],
                         f"[DBG] CONSENSUS_CLAMP sys={sk} x={x0:.2f} -> {c:.2f} thresh={thresh_px:.2f}",
                     )
                 r["x_postpad"] = c
 
-    # --- NEW: global non-indented outlier forcing (the “old fix”) ---
-    if _guide_force_nonindented_enabled():
-        xs = [float(r["x_postpad"]) for r in staff_recs if not r.get("is_indented")]
-        if len(xs) >= 4:
-            med = _median(xs)
-            mad = _mad(xs, med)
-            mad = max(mad, _outlier_abs_floor_px())
-            thr = _outlier_mz_threshold()
+    # --- Global non-indented outlier force (your “average non-outlier x, force outliers to it”) ---
+    if _guide_force_nonindented_x_enabled():
+        xs_nonindent = [float(r["x_postpad"]) for r in staff_recs if not _is_indented(r.get("indented"))]
+        if len(xs_nonindent) >= 6:
+            med = _median(xs_nonindent)
+            mad = max(_median([abs(x - med) for x in xs_nonindent]), _outlier_abs_floor_px())
 
             def mz(x: float) -> float:
-                # Modified z-score using MAD
-                return 0.6745 * (x - med) / mad
+                return abs(0.6745 * (x - med) / mad) if mad > 0 else 0.0
 
-            inliers = [x for x in xs if abs(mz(x)) <= thr]
-            if len(inliers) >= 2:
-                forced = sum(inliers) / float(len(inliers))
+            thr = float(_outlier_mz_threshold())
+            inliers = [x for x in xs_nonindent if mz(x) <= thr]
+            if len(inliers) >= 4:
+                forced_x = float(sum(inliers) / float(len(inliers)))
             else:
-                forced = med
+                forced_x = float(med)
 
-            # Apply to non-indented outliers only
+            # First pass: only mz outliers
             for r in staff_recs:
-                if r.get("is_indented"):
+                if _is_indented(r.get("indented")):
                     continue
                 x0 = float(r["x_postpad"])
-                score = abs(mz(x0))
-                if score > thr:
-                    if _debug_enabled() and _debug_match(sheet_xml_path, r["staff_id"]):
+                if mz(x0) > thr:
+                    if _debug_enabled() and _debug_match(r["sheet_xml_path"], r["staff_id"]):
                         _dbg(
-                            sheet_xml_path,
+                            r["sheet_xml_path"],
                             r["staff_id"],
-                            f"[DBG] GLOBAL_FORCE x={x0:.2f} -> {forced:.2f} mz={score:.2f} thr={thr:.2f} med={med:.2f} mad={mad:.2f}",
+                            f"[DBG] FORCE_MZ sys={r['sys_key']} x={x0:.2f} -> {forced_x:.2f} mz={mz(x0):.2f} thr={thr:.2f}",
                         )
-                    r["x_postpad"] = float(forced)
+                    r["x_postpad"] = forced_x
 
-    # --- clef clamp (secondary safety; applies to all staves, including indented) ---
+            # Second pass: HARD force (kills the last 1–2 “not quite outlier” glitches)
+            if _guide_force_hard_enabled():
+                hard_mult = float(_guide_force_hard_thresh_mult())
+                hard_thresh = max(6.0, hard_mult * float(expected_spacing if expected_spacing > 0 else 0.0))
+                if expected_spacing <= 0:
+                    hard_thresh = 10.0
+
+                for r in staff_recs:
+                    if _is_indented(r.get("indented")):
+                        continue
+                    x0 = float(r["x_postpad"])
+                    if abs(x0 - forced_x) > hard_thresh:
+                        if _debug_enabled() and _debug_match(r["sheet_xml_path"], r["staff_id"]):
+                            _dbg(
+                                r["sheet_xml_path"],
+                                r["staff_id"],
+                                f"[DBG] FORCE_HARD sys={r['sys_key']} x={x0:.2f} -> {forced_x:.2f} hard_thresh={hard_thresh:.2f}",
+                            )
+                        r["x_postpad"] = forced_x
+
+    # --- Clef clamp (secondary safety) ---
     if _guide_clef_clamp_enabled():
         for r in staff_recs:
+            if _is_indented(r.get("indented")):
+                continue
             clef_b = r.get("clef_b")
             if clef_b is None:
                 continue
@@ -1025,8 +1034,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         f"CV_ZOOM={os.getenv('CV_ZOOM','')} PAD_LEFT_PX={os.getenv('PAD_LEFT_PX', str(PAD_LEFT_PX_DEFAULT))} "
         f"GUIDE_CONSENSUS={os.getenv('GUIDE_CONSENSUS','1')} GUIDE_CONSENSUS_P={os.getenv('GUIDE_CONSENSUS_P','0.10')} "
         f"GUIDE_CONSENSUS_THRESH_MULT={os.getenv('GUIDE_CONSENSUS_THRESH_MULT','0.60')} GUIDE_CLEF_CLAMP={os.getenv('GUIDE_CLEF_CLAMP','1')} "
-        f"GUIDE_FORCE_NONINDENTED_X={os.getenv('GUIDE_FORCE_NONINDENTED_X','1')} "
-        f"OUTLIER_MZ_THRESHOLD={os.getenv('OUTLIER_MZ_THRESHOLD','3.5')} OUTLIER_ABS_FLOOR_PX={os.getenv('OUTLIER_ABS_FLOOR_PX','10.0')}",
+        f"GUIDE_FORCE_NONINDENTED_X={os.getenv('GUIDE_FORCE_NONINDENTED_X','0')} GUIDE_FORCE_HARD={os.getenv('GUIDE_FORCE_HARD','')} "
+        f"OUTLIER_MZ_THRESHOLD={os.getenv('OUTLIER_MZ_THRESHOLD', str(OUTLIER_MZ_THRESHOLD_DEFAULT))} "
+        f"OUTLIER_ABS_FLOOR_PX={os.getenv('OUTLIER_ABS_FLOOR_PX', str(OUTLIER_ABS_FLOOR_PX_DEFAULT))}",
         flush=True,
     )
 
