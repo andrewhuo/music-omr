@@ -16,14 +16,12 @@ import cv2
 GUIDE_COLOR = (1, 0, 0)  # red
 GUIDE_WIDTH = 1.0
 
-# Touch staff start by default.
 PAD_LEFT_PX_DEFAULT = 0.0
 
 MEASURE_TEXT_COLOR = (0, 0, 0)  # black
 MEASURE_MIN_FONTSIZE = 7.0
 MEASURE_MAX_FONTSIZE = 12.0
 
-# DEBUG: barline overlay
 DEBUG_BAR_COLOR = (0, 0, 1)  # blue
 DEBUG_BAR_WIDTH = 0.9
 
@@ -49,14 +47,6 @@ def _debug_enabled() -> bool:
     return _env_truthy("DEBUG_GUIDES", "0")
 
 
-def _debug_guides_summary_enabled() -> bool:
-    return _env_truthy("DEBUG_GUIDES_SUMMARY", "0")
-
-
-def _debug_guides_suspect_only() -> bool:
-    return _env_truthy("DEBUG_GUIDES_SUSPECT_ONLY", "0")
-
-
 def _debug_match(sheet_xml_path: str, staff_id: str) -> bool:
     want_sheet = os.getenv("DEBUG_GUIDES_SHEET", "").strip()
     want_staff = os.getenv("DEBUG_GUIDES_STAFF_ID", "").strip()
@@ -74,6 +64,14 @@ def _dbg(sheet_xml_path: str, staff_id: str, msg: str) -> None:
 
 def _debug_dump_enabled() -> bool:
     return _env_truthy("DEBUG_GUIDES_DUMP_INTERS", "0")
+
+
+def _debug_guides_summary() -> bool:
+    return _env_truthy("DEBUG_GUIDES_SUMMARY", "0")
+
+
+def _debug_guides_suspect_only() -> bool:
+    return _env_truthy("DEBUG_GUIDES_SUSPECT_ONLY", "0")
 
 
 def _meas_debug_enabled() -> bool:
@@ -117,65 +115,28 @@ def _pad_left_px() -> float:
 
 
 def _guide_consensus_enabled() -> bool:
-    # ON by default: prevents the 1–2 "in-clef" outliers.
     return _env_truthy("GUIDE_CONSENSUS", "1")
 
 
 def _guide_consensus_percentile() -> float:
-    # Robust "system start" estimator across staves.
     p = _env_float("GUIDE_CONSENSUS_P", 0.10)
     return max(0.0, min(1.0, p))
 
 
 def _guide_consensus_thresh_mult() -> float:
-    # Threshold = max(10px, mult * expected_spacing)
     m = _env_float("GUIDE_CONSENSUS_THRESH_MULT", 0.60)
     return max(0.0, m)
 
 
 def _guide_clef_clamp_enabled() -> bool:
-    # ON by default: last-ditch safety to avoid landing inside clef bbox.
     return _env_truthy("GUIDE_CLEF_CLAMP", "1")
 
 
 def _guide_force_nonindented_x_enabled() -> bool:
-    # master switch for "fix X drift"
     return _env_truthy("GUIDE_FORCE_NONINDENTED_X", "1")
 
 
-def _guide_page_force_enabled() -> bool:
-    # legacy behavior (old page-level force). Default OFF now to avoid fighting neighbor-force.
-    return _env_truthy("GUIDE_PAGE_FORCE", "0")
-
-
-def _guide_snap_eps_px() -> float:
-    # tiny eps: anything to the right of "normal" by this much is considered wrong
-    return max(0.0, _env_float("GUIDE_SNAP_EPS_PX", 2.0))
-
-
-def _guide_cluster_tol_px(expected_spacing: float) -> float:
-    # How tight we treat X values as "same cluster"
-    # If spacing is known, tie tol to it; else use a small constant.
-    tol = _env_float("GUIDE_CLUSTER_TOL_PX", -1.0)
-    if tol > 0:
-        return tol
-    if expected_spacing > 0:
-        return max(2.0, 0.20 * expected_spacing)
-    return 4.0
-
-
-def _guide_indent_thresh_px(expected_spacing: float) -> float:
-    # If a system's median staff X is to the right of normal by this much, treat as indented.
-    v = _env_float("GUIDE_INDENT_THRESH_PX", -1.0)
-    if v > 0:
-        return v
-    if expected_spacing > 0:
-        return max(25.0, 1.5 * expected_spacing)
-    return 30.0
-
-
 def _guide_force_hard() -> bool:
-    # If 1: force ALL non-indented to page normal X (super aggressive)
     return _env_truthy("GUIDE_FORCE_HARD", "0")
 
 
@@ -185,6 +146,35 @@ def _outlier_mz_threshold() -> float:
 
 def _outlier_abs_floor_px() -> float:
     return _env_float("OUTLIER_ABS_FLOOR_PX", 10.0)
+
+
+# NEW: neighbor-snap method (your idea)
+def _guide_neighbor_snap_enabled() -> bool:
+    return _env_truthy("GUIDE_NEIGHBOR_SNAP", "1")
+
+
+def _guide_snap_eps_px() -> float:
+    # If x is > normal_x + eps => we consider it suspect and force it.
+    return max(0.5, _env_float("GUIDE_SNAP_EPS_PX", 2.0))
+
+
+def _guide_indent_gap_mult() -> float:
+    # If x is > normal_x + indent_gap => treat as indented (do NOT force).
+    return max(0.5, _env_float("GUIDE_INDENT_GAP_MULT", 2.0))
+
+
+def _guide_indent_gap_abs_px() -> float:
+    return max(8.0, _env_float("GUIDE_INDENT_GAP_ABS_PX", 20.0))
+
+
+def _guide_cluster_bin_px() -> float:
+    # For "mode binning" to find normal cluster.
+    return max(0.5, _env_float("GUIDE_CLUSTER_BIN_PX", 2.0))
+
+
+def _guide_cluster_tol_px() -> float:
+    # How close to normal_x counts as "normal"
+    return max(1.0, _env_float("GUIDE_CLUSTER_TOL_PX", 3.0))
 
 
 def _attr_truthy(v: str | None) -> bool:
@@ -363,8 +353,48 @@ def _clef_bounds_from_header(inter_by_id: dict[int, ET.Element], staff: ET.Eleme
     return _bounds_of(clef_el)
 
 
+def _looks_like_clef(el: ET.Element) -> bool:
+    t = (el.tag or "").lower()
+    if "clef" in t:
+        return True
+    for k in ("shape", "type", "kind", "name", "family"):
+        v = el.get(k)
+        if v and "clef" in v.lower():
+            return True
+    return False
+
+
 def _bounds_overlap_1d(a0: float, a1: float, b0: float, b1: float) -> bool:
     return not (a1 < b0 or b1 < a0)
+
+
+def _clef_bounds_fallback(
+    inters: ET.Element | None,
+    y_top: float,
+    y_bot: float,
+) -> tuple[float, float, float, float] | None:
+    if inters is None:
+        return None
+    y_pad = 0.30 * (y_bot - y_top)
+    want_y0 = y_top - y_pad
+    want_y1 = y_bot + y_pad
+
+    best = None
+    best_x = None
+    for el in inters.iter():
+        if not _looks_like_clef(el):
+            continue
+        b = _bounds_of(el)
+        if b is None:
+            continue
+        x, y, w, h = b
+        y0, y1 = y, y + h
+        if y1 < want_y0 or y0 > want_y1:
+            continue
+        if best_x is None or x < best_x:
+            best = b
+            best_x = x
+    return best
 
 
 def _dump_inters_near_staff(
@@ -521,46 +551,6 @@ def _tail_xs(xs: list[float], n: int = 3) -> str:
     return "[" + ",".join(f"{x:.1f}" for x in t) + "]"
 
 
-def _cluster_1d(xs: list[float], tol: float) -> list[list[float]]:
-    """Cluster sorted 1D points: new cluster when gap > tol."""
-    if not xs:
-        return []
-    ys = sorted(xs)
-    clusters: list[list[float]] = []
-    cur = [ys[0]]
-    for x in ys[1:]:
-        if abs(x - cur[-1]) <= tol:
-            cur.append(x)
-        else:
-            clusters.append(cur)
-            cur = [x]
-    clusters.append(cur)
-    return clusters
-
-
-def _pick_left_normal_x(xs: list[float], tol: float) -> float | None:
-    """
-    Pick the 'normal' left cluster X.
-    We prefer the leftmost cluster that is not tiny.
-    """
-    if not xs:
-        return None
-    clusters = _cluster_1d(xs, tol=tol)
-    if not clusters:
-        return None
-
-    n = len(xs)
-    min_sz = max(2, int(0.25 * n))
-
-    # candidate clusters: size >= min_sz
-    candidates = [c for c in clusters if len(c) >= min_sz]
-    if candidates:
-        # leftmost median among candidates (they're already left->right)
-        return float(_median(candidates[0]))
-    # fallback: just leftmost cluster
-    return float(_median(clusters[0]))
-
-
 # --------------------------
 # CV barline detection (page coordinate space)
 # --------------------------
@@ -620,6 +610,55 @@ def _cv_barlines_xs_in_band_pdf(page: fitz.Page, y0_pdf: float, y1_pdf: float) -
 
 
 # --------------------------
+# Neighbor snap helpers (your idea)
+# --------------------------
+def _mode_bin_x(xs: list[float], bin_px: float) -> float | None:
+    if not xs:
+        return None
+    counts: dict[int, list[float]] = {}
+    for x in xs:
+        b = int(round(x / bin_px))
+        counts.setdefault(b, []).append(x)
+    # pick bin with most members; tie-break by smaller x
+    best_bin = None
+    best_n = -1
+    best_x = None
+    for b, vals in counts.items():
+        n = len(vals)
+        mx = _mean(vals)
+        if n > best_n or (n == best_n and (best_x is None or mx < best_x)):
+            best_bin = b
+            best_n = n
+            best_x = mx
+    return best_x
+
+
+def _page_normal_x(
+    xs: list[float],
+    expected_spacing: float,
+) -> float | None:
+    if not xs:
+        return None
+    # left-trim: average lowest 70% (or at least 2)
+    left_frac = 0.70
+    ys = sorted(xs)
+    k = max(2, int(round(left_frac * len(ys))))
+    base = _mean(ys[:k])
+
+    # refine by mode bin near that base
+    bin_px = _guide_cluster_bin_px()
+    mode = _mode_bin_x(ys[:k], bin_px=bin_px)
+    return float(mode if mode is not None else base)
+
+
+def _indent_gap_px(expected_spacing: float) -> float:
+    gap = _guide_indent_gap_abs_px()
+    if expected_spacing > 0:
+        gap = max(gap, _guide_indent_gap_mult() * float(expected_spacing))
+    return float(gap)
+
+
+# --------------------------
 # Sheet parsing (OMR XML)
 # --------------------------
 def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
@@ -644,13 +683,16 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
     pages = root.findall("page")
     if not pages:
-        return pic_w, pic_h, [], 0, []
+        return pic_w, pic_h, [], 0, [], {}
 
     pad_left = _pad_left_px()
     staff_total = 0
 
     staff_recs: list[dict] = []
     system_recs: dict[str, dict] = {}
+
+    # Keep per-page lists so we can do page-level clustering/snapping
+    page_staff_ids: dict[int, list[int]] = {}  # page_idx -> indices into staff_recs
 
     for page_idx, page in enumerate(pages):
         inter_by_id = _index_inters(page)
@@ -663,7 +705,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         for sys_idx, system in enumerate(systems):
             sys_id = system.get("id") or ""
             sys_key = f"p{page_idx}_s{sys_idx}_id{sys_id}"
-            sys_is_indented = _attr_truthy(system.get("indented"))
+            sys_is_indented_xml = _attr_truthy(system.get("indented"))
 
             if sys_key not in system_recs:
                 system_recs[sys_key] = {
@@ -671,11 +713,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "sys_id": sys_id,
                     "page_idx": page_idx,
                     "sys_idx": sys_idx,
-                    "is_indented_xml": sys_is_indented,
-                    "is_indented_eff": sys_is_indented,
+                    "is_indented_xml": sys_is_indented_xml,
                     "staff_spans": [],
                     "x_postpads": [],
-                    "staff_ids": [],
                 }
 
             for staff in system.findall(".//staff"):
@@ -738,7 +778,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP bad_y_span sheet={sheet_xml_path} staff={staff_id}")
                     continue
 
-                # Anchor x to staff line start (robust percentile)
                 if all_line_xmins:
                     staff_start_x = float(_pct(all_line_xmins, 0.05))
                 else:
@@ -752,9 +791,10 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 system_recs[sys_key]["x_postpads"].append(float(x_postpad))
                 system_recs[sys_key]["staff_spans"].append((float(y_top), float(y_bot), staff_id))
-                system_recs[sys_key]["staff_ids"].append(str(staff_id))
 
+                # clef bbox: header first, fallback later if needed
                 clef_b = _clef_bounds_from_header(inter_by_id, staff)
+                clef_src = "header" if clef_b is not None else "none"
 
                 _dump_inters_near_staff(sheet_xml_path, staff_id, inters, y_top, y_bot, x_postpad, x_window=140.0)
 
@@ -764,8 +804,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     _dbg(
                         sheet_xml_path,
                         staff_id,
-                        f"[DBG] sheet={sheet_xml_path} sys_key={sys_key} staff={staff_id} "
-                        f"indented_xml={int(sys_is_indented)} expected_spacing={expected_spacing:.2f} "
+                        f"[DBG] RAW sheet={sheet_xml_path} sys_key={sys_key} staff={staff_id} "
+                        f"indented_xml={int(sys_is_indented_xml)} expected_spacing={expected_spacing:.2f} "
                         f"line_min_x={line_min_x} line_max_x={line_max_x} "
                         f"staff_start_x(p05)={staff_start_x:.2f} PAD_LEFT_PX={pad_left:.2f} x_postpad={x_postpad:.2f} "
                         f"clef_b={'present' if clef_b is not None else None} "
@@ -774,40 +814,144 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 line_max_x = float(max(all_line_xmaxs)) if all_line_xmaxs else None
 
-                staff_recs.append(
-                    {
-                        "page_idx": int(page_idx),
-                        "sys_idx": int(sys_idx),
-                        "sys_key": sys_key,
-                        "sys_id": sys_id,
-                        "staff_id": staff_id,
-                        "is_indented_xml": bool(sys_is_indented),
-                        "is_indented_eff": bool(sys_is_indented),  # will update later
-                        "x_postpad_raw": float(x_postpad),
-                        "x_postpad": float(x_postpad),
-                        "y_top": float(y_top),
-                        "y_bot": float(y_bot),
-                        "line_max_x": float(line_max_x) if line_max_x is not None else None,
-                        "clef_b": clef_b,
-                    }
-                )
+                rec = {
+                    "page_idx": int(page_idx),
+                    "sys_key": sys_key,
+                    "sys_id": sys_id,
+                    "staff_id": staff_id,
+                    "is_indented_xml": bool(sys_is_indented_xml),
+                    "is_indented_calc": False,
+                    "is_indented": False,
+                    "x_postpad_raw": float(x_postpad),
+                    "x_postpad": float(x_postpad),
+                    "y_top": float(y_top),
+                    "y_bot": float(y_bot),
+                    "y_mid": 0.5 * (float(y_top) + float(y_bot)),
+                    "line_max_x": float(line_max_x) if line_max_x is not None else None,
+                    "clef_b": clef_b,
+                    "clef_src": clef_src,
+                    "class": "raw",
+                }
+                staff_recs.append(rec)
+                page_staff_ids.setdefault(int(page_idx), []).append(len(staff_recs) - 1)
 
-    # Threshold in picture px
+    # Threshold in picture px for older clamps
     thr_mult = _guide_consensus_thresh_mult()
     if expected_spacing > 0:
         thresh_px = max(10.0, thr_mult * float(expected_spacing))
     else:
         thresh_px = 14.0
 
-    # --- 1) per-system consensus clamp (non-indented XML systems only) ---
-    # Keep it, but it only triggers on big errors. Your new neighbor-force will fix the small ones.
+    # ------------------------------------------------------------
+    # NEW (your method): per-page classify normal vs indented vs suspect,
+    # then FORCE suspects to nearest normal above/below.
+    # ------------------------------------------------------------
+    if _guide_force_nonindented_x_enabled() and _guide_neighbor_snap_enabled():
+        snap_eps = _guide_snap_eps_px()
+        indent_gap = _indent_gap_px(expected_spacing)
+        cluster_tol = max(_guide_cluster_tol_px(), 0.25 * expected_spacing) if expected_spacing > 0 else _guide_cluster_tol_px()
+
+        for page_idx, idxs in page_staff_ids.items():
+            xs_all = [float(staff_recs[i]["x_postpad"]) for i in idxs]
+            if len(xs_all) < 3:
+                continue
+
+            normal_x = _page_normal_x(xs_all, expected_spacing=expected_spacing)
+            if normal_x is None:
+                continue
+
+            # Compute calc-indented per staff and finalize is_indented
+            for i in idxs:
+                r = staff_recs[i]
+                r["is_indented_calc"] = (float(r["x_postpad"]) > float(normal_x) + indent_gap)
+                r["is_indented"] = bool(r["is_indented_xml"] or r["is_indented_calc"])
+
+            # Choose candidates for normal cluster: not indented (calc + xml)
+            cand = [staff_recs[i] for i in idxs if not staff_recs[i]["is_indented"]]
+            if len(cand) < 2:
+                # relax: ignore xml indentation if it killed everything
+                cand = [staff_recs[i] for i in idxs if not staff_recs[i]["is_indented_calc"]]
+
+            cand_xs = [float(r["x_postpad"]) for r in cand]
+            if len(cand_xs) < 2:
+                continue
+
+            # Refine normal_x by mode bin among candidates
+            refined = _mode_bin_x(cand_xs, bin_px=_guide_cluster_bin_px())
+            if refined is not None:
+                normal_x = float(refined)
+
+            # Define "normal" list
+            normals = [r for r in cand if abs(float(r["x_postpad"]) - float(normal_x)) <= cluster_tol]
+            # If too few normals, widen tolerance
+            if len(normals) < 2 and len(cand) >= 2:
+                normals = [r for r in cand if abs(float(r["x_postpad"]) - float(normal_x)) <= (2.0 * cluster_tol)]
+
+            # Suspects: non-indented and to the right of normal_x + eps
+            suspects = [r for r in staff_recs if r.get("page_idx") == page_idx and (not r.get("is_indented")) and float(r["x_postpad"]) > float(normal_x) + snap_eps]
+
+            # Force each suspect to nearest normal by y_mid
+            forced_n = 0
+            for r in suspects:
+                if normals:
+                    best = min(normals, key=lambda n: abs(float(n["y_mid"]) - float(r["y_mid"])))
+                    target = float(best["x_postpad"])
+                else:
+                    target = float(normal_x)
+
+                if float(r["x_postpad"]) != target:
+                    r["x_postpad"] = target
+                    r["class"] = "forced_neighbor"
+                    forced_n += 1
+
+            # Mark remaining non-indented items as normal/raw
+            for r in staff_recs:
+                if r.get("page_idx") != page_idx:
+                    continue
+                if r.get("is_indented"):
+                    if r["class"] == "raw":
+                        r["class"] = "indented"
+                else:
+                    if r["class"] == "raw":
+                        # normal-ish
+                        r["class"] = "normal" if abs(float(r["x_postpad"]) - float(normal_x)) <= (2.0 * cluster_tol) else "nonindented"
+
+            if _debug_guides_summary() and _debug_enabled():
+                xs_now = [float(staff_recs[i]["x_postpad"]) for i in idxs]
+                msg = (
+                    f"[DBG] PAGE_SUM page={page_idx} normal_x={normal_x:.2f} "
+                    f"indent_gap={indent_gap:.1f} snap_eps={snap_eps:.1f} forced={forced_n} "
+                    f"min/med/max={min(xs_now):.2f}/{_median(xs_now):.2f}/{max(xs_now):.2f} "
+                    f"normals={len(normals)} suspects={len(suspects)}"
+                )
+                print(msg, flush=True)
+
+                if not _debug_guides_suspect_only():
+                    for i in idxs:
+                        r = staff_recs[i]
+                        print(
+                            f"  [DBG] staff={r['staff_id']} sys={r['sys_key']} "
+                            f"x_raw={r['x_postpad_raw']:.2f} x_now={r['x_postpad']:.2f} "
+                            f"ind_xml={int(r['is_indented_xml'])} ind_calc={int(r['is_indented_calc'])} class={r['class']}",
+                            flush=True,
+                        )
+                else:
+                    for r in suspects:
+                        print(
+                            f"  [DBG] SUSPECT staff={r['staff_id']} x_raw={r['x_postpad_raw']:.2f} x_now={r['x_postpad']:.2f} class={r['class']}",
+                            flush=True,
+                        )
+
+    # --- Older per-system consensus clamp (optional) ---
+    # Keep it as a mild safety net, but it usually won't trigger after neighbor snap.
     if _guide_consensus_enabled():
         p = _guide_consensus_percentile()
 
         sys_consensus: dict[str, float] = {}
         for sys_key, rec in system_recs.items():
+            # Never touch indented systems by XML marker (still a good rule)
             if rec.get("is_indented_xml"):
-                continue  # never touch indented systems (xml)
+                continue
             xs = [float(x) for x in rec.get("x_postpads", []) if x is not None]
             if not xs:
                 continue
@@ -817,151 +961,20 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 sys_consensus[sys_key] = float(min(xs))
 
         for r in staff_recs:
-            if r.get("is_indented_xml"):
+            if r.get("is_indented"):
                 continue
             sk = r["sys_key"]
             c = sys_consensus.get(sk)
             if c is None:
                 continue
+
             x0 = float(r["x_postpad"])
             if x0 > float(c) + thresh_px:
-                if _debug_enabled() and _debug_match(sheet_xml_path, r["staff_id"]):
-                    _dbg(sheet_xml_path, r["staff_id"], f"[DBG] SYS_CLAMP sys={sk} x={x0:.2f} -> {c:.2f} thresh={thresh_px:.2f}")
                 r["x_postpad"] = float(c)
 
-    # --- 2) YOUR METHOD: per-page neighbor FORCE for non-indented only ---
-    if _guide_force_nonindented_x_enabled() and staff_recs:
-        snap_eps = _guide_snap_eps_px()
-        tol = _guide_cluster_tol_px(expected_spacing)
-        indent_thresh = _guide_indent_thresh_px(expected_spacing)
-        hard = _guide_force_hard()
-
-        # group staff indices by page
-        page_to_idxs: dict[int, list[int]] = {}
-        for i, r in enumerate(staff_recs):
-            page_to_idxs.setdefault(int(r["page_idx"]), []).append(i)
-
-        # compute system medians (current x_postpad after sys clamp)
-        sys_median_x: dict[str, float] = {}
-        for sk, rec in system_recs.items():
-            xs = [float(x) for x in rec.get("x_postpads", []) if x is not None]
-            if not xs:
-                continue
-            # Note: use staff_recs current x_postpad if possible (more accurate after sys clamp)
-            xs2 = [float(sr["x_postpad"]) for sr in staff_recs if sr["sys_key"] == sk]
-            xs_use = xs2 if xs2 else xs
-            sys_median_x[sk] = float(_median(xs_use))
-
-        for page_idx, idxs in page_to_idxs.items():
-            # Build baseline (normal) X from ALL staff on page (raw-ish), then pick left cluster
-            xs_page = [float(staff_recs[i]["x_postpad"]) for i in idxs]
-            normal_x = _pick_left_normal_x(xs_page, tol=tol)
-            if normal_x is None:
-                continue
-
-            # Auto-indent systems on this page (fallback in case XML is missing/wrong)
-            sys_keys_on_page = sorted({staff_recs[i]["sys_key"] for i in idxs})
-            auto_indented_sys: set[str] = set()
-            for sk in sys_keys_on_page:
-                mx = sys_median_x.get(sk)
-                if mx is None:
-                    continue
-                if mx > (normal_x + indent_thresh):
-                    auto_indented_sys.add(sk)
-
-            # Update effective indentation
-            for sk in sys_keys_on_page:
-                xml_ind = bool(system_recs.get(sk, {}).get("is_indented_xml", False))
-                eff = xml_ind or (sk in auto_indented_sys)
-                if sk in system_recs:
-                    system_recs[sk]["is_indented_eff"] = bool(eff)
-
-            for i in idxs:
-                r = staff_recs[i]
-                sk = r["sys_key"]
-                r["is_indented_eff"] = bool(system_recs.get(sk, {}).get("is_indented_eff", r.get("is_indented_xml", False)))
-
-            # Define normals and outliers among NON-indented
-            normal_idxs: list[int] = []
-            outlier_idxs: list[int] = []
-
-            for i in idxs:
-                r = staff_recs[i]
-                if r.get("is_indented_eff"):
-                    continue
-                x = float(r["x_postpad"])
-                if hard:
-                    # hard means: everything non-indented becomes normal_x
-                    outlier_idxs.append(i)
-                else:
-                    if x > (normal_x + snap_eps):
-                        outlier_idxs.append(i)
-                    else:
-                        normal_idxs.append(i)
-
-            # If we have no normals (rare), fall back: treat all as normal (no snapping)
-            if not normal_idxs and outlier_idxs and not hard:
-                # second try: take the leftmost half as normals
-                xs_nonind = [(float(staff_recs[i]["x_postpad"]), i) for i in idxs if not staff_recs[i].get("is_indented_eff")]
-                xs_nonind.sort(key=lambda t: t[0])
-                half = max(1, len(xs_nonind) // 2)
-                normal_idxs = [i for _, i in xs_nonind[:half]]
-
-            # FORCE: each outlier copies nearest normal above/below (by y-center)
-            snapped = 0
-            for oi in outlier_idxs:
-                ro = staff_recs[oi]
-                if ro.get("is_indented_eff"):
-                    continue
-
-                if hard:
-                    ro["x_postpad"] = float(normal_x)
-                    snapped += 1
-                    continue
-
-                yco = 0.5 * (float(ro["y_top"]) + float(ro["y_bot"]))
-                best_i = None
-                best_d = float("inf")
-
-                for ni in normal_idxs:
-                    rn = staff_recs[ni]
-                    ycn = 0.5 * (float(rn["y_top"]) + float(rn["y_bot"]))
-                    d = abs(ycn - yco)
-                    if d < best_d:
-                        best_d = d
-                        best_i = ni
-
-                if best_i is not None:
-                    ro["x_postpad"] = float(staff_recs[best_i]["x_postpad"])
-                    snapped += 1
-                else:
-                    # no neighbor found: force to normal_x
-                    ro["x_postpad"] = float(normal_x)
-                    snapped += 1
-
-            if _debug_enabled() and _debug_guides_summary_enabled():
-                nonind = [i for i in idxs if not staff_recs[i].get("is_indented_eff")]
-                xs_non = [float(staff_recs[i]["x_postpad"]) for i in nonind]
-                msg = (
-                    f"[DBG] GUIDES_SUMMARY page={page_idx} "
-                    f"normal_x={normal_x:.2f} tol={tol:.2f} snap_eps={snap_eps:.2f} indent_thresh={indent_thresh:.2f} "
-                    f"nonind={len(nonind)} outliers={len(outlier_idxs)} snapped={snapped} "
-                    f"x_min={min(xs_non):.2f} x_med={_median(xs_non):.2f} x_max={max(xs_non):.2f} "
-                    f"auto_indented_systems={len(auto_indented_sys)}"
-                )
-                print(msg, flush=True)
-
-            # Optional: suspect-only debug (prints only when there were outliers)
-            if _debug_enabled() and _debug_guides_suspect_only() and outlier_idxs:
-                print(
-                    f"[DBG] GUIDES_SUSPECT page={page_idx} outliers={len(outlier_idxs)} normal_x={normal_x:.2f} "
-                    f"auto_indented_systems={len(auto_indented_sys)}",
-                    flush=True,
-                )
-
-    # --- 2b) legacy page-level force (disabled by default) ---
-    if _guide_page_force_enabled():
-        xs = [float(r["x_postpad"]) for r in staff_recs if not r.get("is_indented_xml")]
+    # --- Page-level mz force (kept, but usually unnecessary) ---
+    if _guide_force_nonindented_x_enabled() and _guide_neighbor_snap_enabled() is False:
+        xs = [float(r["x_postpad"]) for r in staff_recs if not r.get("is_indented")]
         if len(xs) >= 6:
             med = _median(xs)
             mad = max(_mad(xs, med), _outlier_abs_floor_px())
@@ -973,33 +986,51 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             inliers = [x for x in xs if abs(mz(x)) <= mz_thr or x <= med]
             forced_x = _mean(inliers) if len(inliers) >= 4 else med
 
+            hard = _guide_force_hard()
             for r in staff_recs:
-                if r.get("is_indented_xml"):
+                if r.get("is_indented"):
                     continue
                 x0 = float(r["x_postpad"])
-                if (x0 > forced_x + thresh_px) or (mz(x0) > mz_thr):
-                    if _debug_enabled() and _debug_match(sheet_xml_path, r["staff_id"]):
-                        _dbg(
-                            sheet_xml_path,
-                            r["staff_id"],
-                            f"[DBG] PAGE_FORCE(legacy) x={x0:.2f} -> {forced_x:.2f} mz={mz(x0):.2f} thr={mz_thr:.2f}",
-                        )
+                if hard:
                     r["x_postpad"] = float(forced_x)
+                else:
+                    if (x0 > forced_x + thresh_px) or (mz(x0) > mz_thr):
+                        r["x_postpad"] = float(forced_x)
 
-    # --- 3) clef clamp (secondary safety), non-indented only (effective) ---
+    # --- clef clamp (secondary safety), non-indented only ---
     if _guide_clef_clamp_enabled():
+        inters_by_page = {}
+        # Build a quick map page_idx -> inters element (for fallback clef scan)
+        # We re-parse pages here from root, but it's cheap.
+        root2 = ET.fromstring(data)
+        pages2 = root2.findall("page")
+        for pi, pg in enumerate(pages2):
+            inters_by_page[int(pi)] = pg.find(".//sig/inters")
+
         guard = (max(2.0, 0.25 * float(expected_spacing)) if expected_spacing > 0 else 6.0)
         for r in staff_recs:
-            # use effective indentation if present, else xml
-            if r.get("is_indented_eff", r.get("is_indented_xml", False)):
+            if r.get("is_indented"):
                 continue
+
             clef_b = r.get("clef_b")
             if clef_b is None:
+                # fallback clef find by scanning inters near staff band
+                inters = inters_by_page.get(int(r["page_idx"]))
+                fb = _clef_bounds_fallback(inters, float(r["y_top"]), float(r["y_bot"]))
+                if fb is not None:
+                    r["clef_b"] = fb
+                    r["clef_src"] = "fallback"
+                    clef_b = fb
+
+            if clef_b is None:
                 continue
+
             clef_x, _, _, _ = clef_b
             max_postpad = max(0.0, float(clef_x) - guard - _pad_left_px())
             if float(r["x_postpad"]) > max_postpad:
                 r["x_postpad"] = max_postpad
+                if r.get("class") == "normal":
+                    r["class"] = "clef_clamped"
 
     guides_px: list[tuple[float, float, float]] = [(r["x_postpad"], r["y_top"], r["y_bot"]) for r in staff_recs]
 
@@ -1073,11 +1104,20 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 }
             )
 
-    return pic_w, pic_h, guides_px, staff_total, systems_desc
+    # Provide per-page normal_x for snapping fallback extras (picture coords)
+    page_normals_px: dict[int, float] = {}
+    for page_idx, idxs in page_staff_ids.items():
+        xs_now = [float(staff_recs[i]["x_postpad"]) for i in idxs if not staff_recs[i].get("is_indented")]
+        if len(xs_now) >= 2:
+            nx = _page_normal_x(xs_now, expected_spacing=expected_spacing)
+            if nx is not None:
+                page_normals_px[int(page_idx)] = float(nx)
+
+    return pic_w, pic_h, guides_px, staff_total, systems_desc, page_normals_px
 
 
 # --------------------------
-# Missing staff guide fallback (unchanged)
+# Missing staff guide fallback
 # --------------------------
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
@@ -1199,7 +1239,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         f"GUIDE_CONSENSUS={os.getenv('GUIDE_CONSENSUS','1')} GUIDE_CONSENSUS_P={os.getenv('GUIDE_CONSENSUS_P','0.10')} "
         f"GUIDE_CONSENSUS_THRESH_MULT={os.getenv('GUIDE_CONSENSUS_THRESH_MULT','0.60')} GUIDE_CLEF_CLAMP={os.getenv('GUIDE_CLEF_CLAMP','1')} "
         f"GUIDE_FORCE_NONINDENTED_X={os.getenv('GUIDE_FORCE_NONINDENTED_X','1')} GUIDE_FORCE_HARD={os.getenv('GUIDE_FORCE_HARD','0')} "
-        f"GUIDE_SNAP_EPS_PX={os.getenv('GUIDE_SNAP_EPS_PX','2.0')} GUIDE_PAGE_FORCE={os.getenv('GUIDE_PAGE_FORCE','0')} "
+        f"GUIDE_NEIGHBOR_SNAP={os.getenv('GUIDE_NEIGHBOR_SNAP','1')} GUIDE_SNAP_EPS_PX={os.getenv('GUIDE_SNAP_EPS_PX','2.0')} "
+        f"GUIDE_INDENT_GAP_MULT={os.getenv('GUIDE_INDENT_GAP_MULT','2.0')} GUIDE_INDENT_GAP_ABS_PX={os.getenv('GUIDE_INDENT_GAP_ABS_PX','20.0')} "
+        f"GUIDE_CLUSTER_BIN_PX={os.getenv('GUIDE_CLUSTER_BIN_PX','2.0')} GUIDE_CLUSTER_TOL_PX={os.getenv('GUIDE_CLUSTER_TOL_PX','3.0')} "
         f"DEBUG_GUIDES_SUMMARY={os.getenv('DEBUG_GUIDES_SUMMARY','0')} DEBUG_GUIDES_SUSPECT_ONLY={os.getenv('DEBUG_GUIDES_SUSPECT_ONLY','0')} "
         f"OUTLIER_MZ_THRESHOLD={os.getenv('OUTLIER_MZ_THRESHOLD','3.5')} OUTLIER_ABS_FLOOR_PX={os.getenv('OUTLIER_ABS_FLOOR_PX','10.0')}",
         flush=True,
@@ -1224,7 +1266,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             base_x = float(rect.x0)
             base_y = float(rect.y0)
 
-            pic_w, pic_h, guides_px, staff_total, systems_desc = _parse_sheet(z, sheet_xml_path)
+            pic_w, pic_h, guides_px, staff_total, systems_desc, page_normals_px = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
                 continue
 
@@ -1388,14 +1430,22 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             # Fallback staff detection if OMR missed some staves
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
+
+                # IMPORTANT: snap fallback extras to page-normal x (so broken extras don't stay broken)
+                normal_px = page_normals_px.get(int(page_index))
+                normal_x_pdf = (base_x + (float(normal_px) * scale_x)) if normal_px is not None else None
+
                 if _debug_enabled():
                     print(
                         f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
-                        f"staff_total={staff_total} omr_guides={len(guides_pdf)} fallback_extras={len(extras)}",
+                        f"staff_total={staff_total} omr_guides={len(guides_pdf)} fallback_extras={len(extras)} "
+                        f"fallback_snap={'yes' if normal_x_pdf is not None else 'no'}",
                         flush=True,
                     )
+
                 for (x_pdf, y0_pdf, y1_pdf) in extras:
-                    page.draw_line((x_pdf, y0_pdf), (x_pdf, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
+                    xx = normal_x_pdf if normal_x_pdf is not None else x_pdf
+                    page.draw_line((xx, y0_pdf), (xx, y1_pdf), color=GUIDE_COLOR, width=GUIDE_WIDTH)
 
     doc.save(output_pdf)
     doc.close()
