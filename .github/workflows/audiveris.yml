@@ -147,7 +147,7 @@ jobs:
       #################################################################
       # 7) Annotate PDF (guides + measure numbers)
       #################################################################
-<<<<<<< HEAD
+
       - name: Annotate PDF from Audiveris OMR
         env:
           DEBUG_GUIDES: "${{ env.DEBUG_GUIDES }}"
