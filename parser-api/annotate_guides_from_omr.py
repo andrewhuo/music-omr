@@ -58,6 +58,13 @@ def _measure_labels_enabled() -> bool:
     return v not in ("0", "false", "False", "no", "NO")
 
 
+def _measure_label_mode() -> str:
+    v = os.getenv("MEASURE_LABEL_MODE", "first_only").strip().lower()
+    if v == "sequential":
+        return "sequential"
+    return "first_only"
+
+
 def _debug_measure_labels_enabled() -> bool:
     v = os.getenv("DEBUG_MEASURE_LABELS", "").strip()
     return v in ("1", "true", "True", "yes", "YES")
@@ -485,6 +492,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             expected_spacing = _safe_float(inter.get("main")) or 0.0
 
     guides_px: list[tuple[float, float, float]] = []
+    measure_marks_px: list[tuple[float, float, float, str]] = []
 
     pages = root.findall("page")
     if not pages:
@@ -565,6 +573,65 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 if best_any is not None:
                     return (best_any[1], best_any[2])
                 return None
+
+            def barline_xs_for_staff(staff_id: str, y_top: float, y_bot: float) -> list[float]:
+                if system_inters is None:
+                    return []
+
+                y_pad = max(2.0, 0.15 * (y_bot - y_top))
+                want_y0 = y_top - y_pad
+                want_y1 = y_bot + y_pad
+
+                xs: list[float] = []
+                for el in system_inters.iter():
+                    if (el.tag or "").lower() != "barline":
+                        continue
+
+                    el_staff = el.get("staff")
+                    if el_staff and staff_id and el_staff != staff_id:
+                        continue
+
+                    b = el.find("bounds")
+                    if b is None:
+                        continue
+                    bx = _safe_float(b.get("x"))
+                    if bx is None:
+                        continue
+
+                    med = el.find("median")
+                    if med is not None:
+                        p1 = med.find("p1")
+                        p2 = med.find("p2")
+                        if p1 is not None and p2 is not None:
+                            y1 = _safe_float(p1.get("y"))
+                            y2 = _safe_float(p2.get("y"))
+                            if y1 is not None and y2 is not None:
+                                by0 = float(min(y1, y2))
+                                by1 = float(max(y1, y2))
+                                if _bounds_overlap_1d(by0, by1, want_y0, want_y1):
+                                    xs.append(float(bx))
+                                continue
+
+                    by = _safe_float(b.get("y"))
+                    bh = _safe_float(b.get("h"))
+                    if by is None or bh is None or bh <= 0:
+                        continue
+                    by0 = float(by)
+                    by1 = float(by + bh)
+                    if _bounds_overlap_1d(by0, by1, want_y0, want_y1):
+                        xs.append(float(bx))
+
+                if not xs:
+                    return []
+
+                xs.sort()
+                deduped: list[float] = []
+                merge_tol = max(2.0, (0.25 * expected_spacing) if expected_spacing > 0 else 3.0)
+                for x in xs:
+                    if deduped and abs(x - deduped[-1]) <= merge_tol:
+                        continue
+                    deduped.append(x)
+                return deduped
 
             for staff in system.findall(".//staff"):
                 staff_total += 1
@@ -734,8 +801,11 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     )
 
                 guides_px.append((x_postpad, y_top, y_bot))
+                staff_barline_xs = barline_xs_for_staff(staff_id, y_top, y_bot)
+                for measure_num, bx in enumerate(staff_barline_xs, start=1):
+                    measure_marks_px.append((bx, y_top, y_bot, str(measure_num)))
 
-    return pic_w, pic_h, guides_px, staff_total
+    return pic_w, pic_h, guides_px, measure_marks_px, staff_total
 
 
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
@@ -843,6 +913,7 @@ def _fallback_missing_staff_guides(
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
     doc = fitz.open(input_pdf)
     write_measure_labels = _measure_labels_enabled()
+    measure_label_mode = _measure_label_mode()
 
     with zipfile.ZipFile(omr_path, "r") as z:
         sheet_paths = _sorted_sheet_xml_paths(z)
@@ -856,7 +927,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
 
-            pic_w, pic_h, guides_px, staff_total = _parse_sheet(z, sheet_xml_path)
+            pic_w, pic_h, guides_px, measure_marks_px, staff_total = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
                 continue
 
@@ -865,7 +936,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             scale_y = rect.height / pic_h
 
             guides_pdf = []
-            measure_labels_pdf = []
+            first_labels_pdf = []
             for (x_px, y0_px, y1_px) in guides_px:
                 x_pdf = x_px * scale_x
                 y0_pdf = y0_px * scale_y
@@ -877,7 +948,11 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     color=GUIDE_COLOR,
                     width=GUIDE_WIDTH,
                 )
-                measure_labels_pdf.append((x_pdf, y0_pdf, y1_pdf))
+                first_labels_pdf.append((x_pdf, y0_pdf, y1_pdf, "1"))
+
+            sequential_labels_pdf = []
+            for (x_px, y0_px, y1_px, text) in measure_marks_px:
+                sequential_labels_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y, text))
 
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
@@ -894,18 +969,22 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         color=GUIDE_COLOR,
                         width=GUIDE_WIDTH,
                     )
-                    measure_labels_pdf.append((x_pdf, y0_pdf, y1_pdf))
+                    first_labels_pdf.append((x_pdf, y0_pdf, y1_pdf, "1"))
 
             if write_measure_labels:
+                labels_to_draw = first_labels_pdf
+                if measure_label_mode == "sequential" and sequential_labels_pdf:
+                    labels_to_draw = sequential_labels_pdf
+
                 labels_drawn = 0
-                for (x_pdf, y0_pdf, y1_pdf) in measure_labels_pdf:
+                for (x_pdf, y0_pdf, y1_pdf, label_text) in labels_to_draw:
                     staff_h = max(1.0, y1_pdf - y0_pdf)
                     y_offset = max(8.0, 0.45 * staff_h)
                     x_text = min(max(0.0, x_pdf + MEASURE_TEXT_X_OFFSET), rect.width - 4.0)
                     y_text = max(MEASURE_TEXT_SIZE + 2.0, y0_pdf - y_offset)
                     page.insert_text(
                         (x_text, y_text),
-                        "1",
+                        label_text,
                         fontsize=MEASURE_TEXT_SIZE,
                         color=MEASURE_TEXT_COLOR,
                     )
@@ -913,7 +992,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
                 if _debug_measure_labels_enabled():
                     print(
-                        f"[DBG] page={page_index+1} sheet={sheet_xml_path} measure_labels={labels_drawn}",
+                        f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
+                        f"measure_mode={measure_label_mode} sequential_candidates={len(sequential_labels_pdf)} "
+                        f"drawn={labels_drawn}",
                         flush=True,
                     )
 
