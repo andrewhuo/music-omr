@@ -999,12 +999,23 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     labels_to_draw = sequential_labels_pdf
 
                 labels_drawn = 0
+                labels_in_bounds = 0
+                sample_positions = []
                 for (x_pdf, y0_pdf, y1_pdf, label_text) in labels_to_draw:
                     staff_h = max(1.0, y1_pdf - y0_pdf)
                     y_offset = max(8.0, 0.45 * staff_h)
                     tw = float(fitz.get_text_length(label_text, fontsize=MEASURE_TEXT_SIZE))
                     x_text = min(max(0.0, x_pdf + MEASURE_TEXT_X_OFFSET), max(0.0, rect.width - tw - 2.0))
                     y_text = max(MEASURE_TEXT_SIZE + 2.0, y0_pdf - y_offset)
+                    y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, rect.height - 2.0))
+
+                    if 0.0 <= x_text <= max(0.0, rect.width - tw) and (MEASURE_TEXT_SIZE + 2.0) <= y_text <= rect.height:
+                        labels_in_bounds += 1
+                        if len(sample_positions) < 5:
+                            sample_positions.append(
+                                f"{label_text}@({x_text:.1f},{y_text:.1f}) staff_y=({y0_pdf:.1f},{y1_pdf:.1f})"
+                            )
+
                     _draw_measure_label(page, rect, x_text, y_text, label_text)
                     labels_drawn += 1
 
@@ -1012,9 +1023,12 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     print(
                         f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
                         f"measure_mode={measure_label_mode} sequential_candidates={len(sequential_labels_pdf)} "
-                        f"drawn={labels_drawn}",
+                        f"drawn={labels_drawn} in_bounds={labels_in_bounds} "
+                        f"page_size=({rect.width:.1f},{rect.height:.1f})",
                         flush=True,
                     )
+                    if sample_positions:
+                        print(f"[DBG] page={page_index+1} label_samples: " + " | ".join(sample_positions), flush=True)
 
     doc.save(output_pdf)
     doc.close()
