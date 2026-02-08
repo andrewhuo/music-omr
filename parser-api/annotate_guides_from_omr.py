@@ -61,6 +61,8 @@ def _measure_labels_enabled() -> bool:
 
 def _measure_label_mode() -> str:
     v = os.getenv("MEASURE_LABEL_MODE", "first_only").strip().lower()
+    if v == "staff_start":
+        return "staff_start"
     if v == "sequential":
         return "sequential"
     return "first_only"
@@ -527,12 +529,15 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
     guides_px: list[tuple[float, float, float]] = []
     measure_marks_px: list[tuple[float, float, float, str]] = []
+    staff_start_marks_px: list[tuple[float, float, float, str]] = []
 
     pages = root.findall("page")
     if not pages:
-        return pic_w, pic_h, guides_px, measure_marks_px, 0
+        return pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, 0
 
     staff_total = 0
+
+    measure_counter = 1
 
     for page in pages:
         systems = page.findall(".//system")
@@ -836,10 +841,13 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 guides_px.append((x_postpad, y_top, y_bot))
                 staff_barline_xs = barline_xs_for_staff(staff_id, y_top, y_bot)
+                if staff_barline_xs:
+                    staff_start_marks_px.append((x_postpad, y_top, y_bot, str(measure_counter)))
+                    measure_counter += len(staff_barline_xs)
                 for measure_num, bx in enumerate(staff_barline_xs, start=1):
                     measure_marks_px.append((bx, y_top, y_bot, str(measure_num)))
 
-    return pic_w, pic_h, guides_px, measure_marks_px, staff_total
+    return pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, staff_total
 
 
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
@@ -961,7 +969,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
 
-            pic_w, pic_h, guides_px, measure_marks_px, staff_total = _parse_sheet(z, sheet_xml_path)
+            pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, staff_total = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
                 continue
 
@@ -987,6 +995,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             sequential_labels_pdf = []
             for (x_px, y0_px, y1_px, text) in measure_marks_px:
                 sequential_labels_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y, text))
+            staff_start_labels_pdf = []
+            for (x_px, y0_px, y1_px, text) in staff_start_marks_px:
+                staff_start_labels_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y, text))
 
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
@@ -1007,7 +1018,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
             if write_measure_labels:
                 labels_to_draw = first_labels_pdf
-                if measure_label_mode == "sequential" and sequential_labels_pdf:
+                if measure_label_mode == "staff_start" and staff_start_labels_pdf:
+                    labels_to_draw = staff_start_labels_pdf
+                elif measure_label_mode == "sequential" and sequential_labels_pdf:
                     labels_to_draw = sequential_labels_pdf
 
                 labels_drawn = 0
@@ -1035,6 +1048,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     print(
                         f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
                         f"measure_mode={measure_label_mode} sequential_candidates={len(sequential_labels_pdf)} "
+                        f"staff_start_candidates={len(staff_start_labels_pdf)} "
                         f"drawn={labels_drawn} in_bounds={labels_in_bounds} "
                         f"page_size=({rect.width:.1f},{rect.height:.1f})",
                         flush=True,

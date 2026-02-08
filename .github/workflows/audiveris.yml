@@ -154,9 +154,9 @@ jobs:
           DEBUG_GUIDES_STAFF_ID: "${{ env.DEBUG_STAFF }}"
           DEBUG_GUIDES_DUMP_INTERS: "1"
           ENABLE_MEASURE_LABELS: "1"
-          MEASURE_LABEL_MODE: "sequential"
+          MEASURE_LABEL_MODE: "staff_start"
           DEBUG_MEASURE_LABELS: "1"
-          DEBUG_MEASURE_MARKERS: "1"
+          DEBUG_MEASURE_MARKERS: "0"
         run: |
           set -euo pipefail
           python -u parser-api/annotate_guides_from_omr.py \
