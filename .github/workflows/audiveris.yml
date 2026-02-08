@@ -98,6 +98,7 @@ jobs:
           MEASURE_LABEL_MODE: "staff_start"
           MEASURE_SOURCE_POLICY: "mxl_with_omr_fallback"
           MXL_PARSER_POLICY: "auto"
+          MXL_SANITIZE_PREFIXES: "1"
           DEBUG_MEASURE_LABELS: "1"
           DEBUG_MEASURE_MARKERS: "0"
           MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"

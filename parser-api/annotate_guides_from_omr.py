@@ -84,6 +84,11 @@ def _mxl_parser_policy() -> str:
     return "auto"
 
 
+def _mxl_sanitize_prefixes_enabled() -> bool:
+    v = os.getenv("MXL_SANITIZE_PREFIXES", "1").strip().lower()
+    return v not in ("0", "false", "no")
+
+
 def _debug_measure_labels_enabled() -> bool:
     v = os.getenv("DEBUG_MEASURE_LABELS", "").strip()
     return v in ("1", "true", "True", "yes", "YES")
@@ -168,14 +173,37 @@ def _score_xml_member_from_mxl(z: zipfile.ZipFile) -> str | None:
     return None
 
 
+def _sanitize_xml_unbound_prefixes(xml_bytes: bytes) -> tuple[bytes, list[str]]:
+    text = xml_bytes.decode("utf-8", errors="replace")
+    root_match = re.search(r"<([A-Za-z_][\w.\-]*:)?[A-Za-z_][\w.\-]*\b[^>]*>", text)
+    if not root_match:
+        return xml_bytes, []
+
+    root_tag = root_match.group(0)
+    declared = set(re.findall(r'xmlns:([A-Za-z_][\w.\-]*)\s*=', root_tag))
+    used = set(re.findall(r"(?:</?|\s)([A-Za-z_][\w.\-]*):[A-Za-z_][\w.\-]*", text))
+    used = {p for p in used if p not in ("xml", "xmlns")}
+    missing = sorted(list(used - declared))
+    if not missing:
+        return xml_bytes, []
+
+    inject = "".join([f' xmlns:{p}="urn:recovered:{p}"' for p in missing])
+    new_root = root_tag[:-1] + inject + ">"
+    new_text = text.replace(root_tag, new_root, 1)
+    return new_text.encode("utf-8"), missing
+
+
 def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
     meta = {
         "mxl_path": mxl_path,
         "mxl_parse_status": "error",
         "mxl_member_path": None,
         "mxl_parser_used": "none",
+        "mxl_parse_attempts": [],
+        "mxl_sanitized_prefixes": [],
         "mxl_pages": 0,
         "mxl_system_starts_per_page": [],
+        "mxl_extract_status": "error",
         "mxl_error": None,
     }
 
@@ -195,16 +223,23 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
         meta["mxl_error"] = str(exc)
         return meta
 
+    parse_input = xml_bytes
+    if _mxl_sanitize_prefixes_enabled():
+        parse_input, sanitized_prefixes = _sanitize_xml_unbound_prefixes(xml_bytes)
+        meta["mxl_sanitized_prefixes"] = sanitized_prefixes
+
     root = None
     stdlib_error = None
     lxml_error = None
 
     if parser_policy in ("stdlib", "auto"):
         try:
-            root = ET.fromstring(xml_bytes)
+            root = ET.fromstring(parse_input)
             meta["mxl_parser_used"] = "stdlib"
+            meta["mxl_parse_attempts"].append({"parser": "stdlib", "status": "ok", "error": None})
         except Exception as exc:
             stdlib_error = str(exc)
+            meta["mxl_parse_attempts"].append({"parser": "stdlib", "status": "error", "error": stdlib_error})
             if parser_policy == "stdlib":
                 meta["mxl_parse_status"] = "xml_parse_error"
                 meta["mxl_error"] = stdlib_error
@@ -213,12 +248,14 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
     if root is None and parser_policy in ("lxml_recover", "auto"):
         try:
             lxml_parser = LET.XMLParser(recover=True, resolve_entities=False, huge_tree=True)
-            lxml_root = LET.fromstring(xml_bytes, parser=lxml_parser)
+            lxml_root = LET.fromstring(parse_input, parser=lxml_parser)
             xml_clean = LET.tostring(lxml_root, encoding="utf-8")
             root = ET.fromstring(xml_clean)
             meta["mxl_parser_used"] = "lxml_recover"
+            meta["mxl_parse_attempts"].append({"parser": "lxml_recover", "status": "ok", "error": None})
         except Exception as exc:
             lxml_error = str(exc)
+            meta["mxl_parse_attempts"].append({"parser": "lxml_recover", "status": "error", "error": lxml_error})
             meta["mxl_parse_status"] = "zip_or_xml_error"
             if stdlib_error and lxml_error:
                 meta["mxl_error"] = f"stdlib={stdlib_error} | lxml={lxml_error}"
@@ -267,6 +304,7 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
     meta["mxl_parse_status"] = "ok"
     meta["mxl_pages"] = len(pages)
     meta["mxl_system_starts_per_page"] = pages
+    meta["mxl_extract_status"] = "ok" if pages else "empty"
     return meta
 
 
@@ -294,6 +332,18 @@ def _apply_mxl_staff_start_labels(
     if idx != len(staff_start_labels_pdf):
         return None, "staff_label_overflow"
     return out, "ok"
+
+
+def _omr_fallback_confidence(used_bars: int, increment_after: int, carryover: bool) -> str:
+    if increment_after <= 0:
+        return "low"
+    if increment_after > 8:
+        return "low"
+    if used_bars - increment_after >= 2:
+        return "low"
+    if carryover:
+        return "medium"
+    return "high"
 
 
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
@@ -721,10 +771,20 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     measure_marks_px: list[tuple[float, float, float, str]] = []
     staff_start_marks_px: list[tuple[float, float, float, str]] = []
     system_staff_counts: list[int] = []
+    omr_fallback_rows: list[dict] = []
 
     pages = root.findall("page")
     if not pages:
-        return pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, 0, system_staff_counts
+        return (
+            pic_w,
+            pic_h,
+            guides_px,
+            measure_marks_px,
+            staff_start_marks_px,
+            0,
+            system_staff_counts,
+            omr_fallback_rows,
+        )
 
     staff_total = 0
 
@@ -1073,11 +1133,34 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         f"counter_before={counter_before} counter_after={counter_after}",
                         flush=True,
                     )
+                omr_fallback_rows.append(
+                    {
+                        "page_id": page_id,
+                        "system_id": system_id,
+                        "staff_id": staff_id,
+                        "used_barlines": len(staff_barline_xs),
+                        "carryover_detected": carryover_detected,
+                        "increment_before": len(staff_barline_xs),
+                        "increment_after": increment_bars,
+                        "fallback_confidence": _omr_fallback_confidence(
+                            len(staff_barline_xs), increment_bars, carryover_detected
+                        ),
+                    }
+                )
 
                 for measure_num, bx in enumerate(staff_barline_xs, start=1):
                     measure_marks_px.append((bx, y_top, y_bot, str(measure_num)))
 
-    return pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, staff_total, system_staff_counts
+    return (
+        pic_w,
+        pic_h,
+        guides_px,
+        measure_marks_px,
+        staff_start_marks_px,
+        staff_total,
+        system_staff_counts,
+        omr_fallback_rows,
+    )
 
 
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
@@ -1195,8 +1278,11 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         "mxl_parse_status": "not_requested",
         "mxl_member_path": None,
         "mxl_parser_used": "none",
+        "mxl_parse_attempts": [],
+        "mxl_sanitized_prefixes": [],
         "mxl_pages": 0,
         "mxl_system_starts_per_page": [],
+        "mxl_extract_status": "error",
         "mxl_error": None,
     }
     mxl_path = _find_mxl_path_for_omr(omr_path)
@@ -1209,8 +1295,11 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 "mxl_parse_status": "missing_mxl_file",
                 "mxl_member_path": None,
                 "mxl_parser_used": "none",
+                "mxl_parse_attempts": [],
+                "mxl_sanitized_prefixes": [],
                 "mxl_pages": 0,
                 "mxl_system_starts_per_page": [],
+                "mxl_extract_status": "error",
                 "mxl_error": None,
             }
 
@@ -1245,6 +1334,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 staff_start_marks_px,
                 staff_total,
                 system_staff_counts,
+                omr_fallback_rows,
             ) = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
                 continue
@@ -1339,7 +1429,6 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
                 labels_drawn = 0
                 labels_in_bounds = 0
-                sample_positions = []
                 for (x_pdf, y0_pdf, y1_pdf, label_text) in labels_to_draw:
                     staff_h = max(1.0, y1_pdf - y0_pdf)
                     y_offset = max(8.0, 0.45 * staff_h)
@@ -1350,10 +1439,6 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
                     if 0.0 <= x_text <= max(0.0, rect.width - tw) and (MEASURE_TEXT_SIZE + 2.0) <= y_text <= rect.height:
                         labels_in_bounds += 1
-                        if len(sample_positions) < 5:
-                            sample_positions.append(
-                                f"{label_text}@({x_text:.1f},{y_text:.1f}) staff_y=({y0_pdf:.1f},{y1_pdf:.1f})"
-                            )
 
                     _draw_measure_label(page, rect, x_text, y_text, label_text)
                     labels_drawn += 1
@@ -1375,11 +1460,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "mxl_parse_status": mxl_meta.get("mxl_parse_status"),
                     "mxl_member_path": mxl_meta.get("mxl_member_path"),
                     "mxl_parser_used": mxl_meta.get("mxl_parser_used"),
+                    "mxl_extract_status": mxl_meta.get("mxl_extract_status"),
                     "mxl_page_system_starts": page_mxl_starts,
                     "omr_system_staff_counts": system_staff_counts,
                     "staff_start_source": staff_start_source,
                     "mapping_status": mapping_status,
                     "mapping_reason": mapping_reason,
+                    "omr_fallback_rows": omr_fallback_rows,
                     "assigned_labels": [t[3] for t in staff_start_labels_pdf],
                     "staff_start_candidate_count": len(staff_start_labels_pdf),
                 }
@@ -1398,8 +1485,11 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             "mxl_parse_status": mxl_meta.get("mxl_parse_status"),
             "mxl_member_path": mxl_meta.get("mxl_member_path"),
             "mxl_parser_used": mxl_meta.get("mxl_parser_used"),
+            "mxl_parse_attempts": mxl_meta.get("mxl_parse_attempts"),
+            "mxl_sanitized_prefixes": mxl_meta.get("mxl_sanitized_prefixes"),
             "mxl_pages": mxl_meta.get("mxl_pages"),
             "mxl_system_starts_per_page": mxl_meta.get("mxl_system_starts_per_page"),
+            "mxl_extract_status": mxl_meta.get("mxl_extract_status"),
             "mxl_error": mxl_meta.get("mxl_error"),
             "pages": mapping_debug,
         }
