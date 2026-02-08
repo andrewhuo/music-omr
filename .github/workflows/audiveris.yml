@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       pdf_gcs_uri:
-        description: "GCS URI to input PDF (gs://.../input/score.pdf)"
+        description: "GCS URI to input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
         required: true
         type: string
 
