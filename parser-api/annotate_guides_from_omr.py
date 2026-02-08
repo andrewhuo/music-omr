@@ -867,64 +867,107 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     return (best_any[1], best_any[2])
                 return None
 
-            def barline_xs_for_staff(staff_id: str, y_top: float, y_bot: float) -> list[float]:
+            def barline_xs_for_staff(
+                staff_id: str,
+                y_top: float,
+                y_bot: float,
+                staff_barline_ids: list[str],
+                staff_left: float | None,
+                staff_right: float | None,
+            ) -> tuple[list[float], str]:
                 if system_inters is None:
-                    return []
+                    return ([], "none")
 
-                y_pad = max(2.0, 0.15 * (y_bot - y_top))
-                want_y0 = y_top - y_pad
-                want_y1 = y_bot + y_pad
-
-                xs: list[float] = []
-                for el in system_inters.iter():
-                    if (el.tag or "").lower() != "barline":
-                        continue
-
-                    el_staff = el.get("staff")
-                    if el_staff and staff_id and el_staff != staff_id:
-                        continue
-
+                def _extract_barline_geom(el) -> tuple[float, float, float, float] | None:
                     b = el.find("bounds")
                     if b is None:
-                        continue
+                        return None
                     bx = _safe_float(b.get("x"))
                     if bx is None:
-                        continue
+                        return None
 
                     med = el.find("median")
                     if med is not None:
                         p1 = med.find("p1")
                         p2 = med.find("p2")
                         if p1 is not None and p2 is not None:
+                            x1 = _safe_float(p1.get("x"))
                             y1 = _safe_float(p1.get("y"))
+                            x2 = _safe_float(p2.get("x"))
                             y2 = _safe_float(p2.get("y"))
-                            if y1 is not None and y2 is not None:
-                                by0 = float(min(y1, y2))
-                                by1 = float(max(y1, y2))
-                                if _bounds_overlap_1d(by0, by1, want_y0, want_y1):
-                                    xs.append(float(bx))
-                                continue
+                            if x1 is not None and y1 is not None and x2 is not None and y2 is not None:
+                                return (float(bx), float(min(y1, y2)), float(max(y1, y2)), abs(float(x2 - x1)))
 
                     by = _safe_float(b.get("y"))
                     bh = _safe_float(b.get("h"))
+                    bw = _safe_float(b.get("w"))
                     if by is None or bh is None or bh <= 0:
+                        return None
+                    # Bounds-only fallback: treat width as a weak verticality proxy.
+                    dx_abs = abs(float(bw)) if bw is not None else 0.0
+                    return (float(bx), float(by), float(by + bh), dx_abs)
+
+                # Prefer explicit staff barline ids from staff XML.
+                candidate_elements: list = []
+                for bid in staff_barline_ids:
+                    bel = inter_by_id.get(str(bid))
+                    if bel is None:
                         continue
-                    by0 = float(by)
-                    by1 = float(by + bh)
-                    if _bounds_overlap_1d(by0, by1, want_y0, want_y1):
-                        xs.append(float(bx))
+                    if (bel.tag or "").lower() != "barline":
+                        continue
+                    candidate_elements.append(bel)
+                candidate_source = "staff_ids" if candidate_elements else "overlap_scan"
+
+                if not candidate_elements:
+                    for el in system_inters.iter():
+                        if (el.tag or "").lower() != "barline":
+                            continue
+                        el_staff = el.get("staff")
+                        if el_staff and staff_id and el_staff != staff_id:
+                            continue
+                        candidate_elements.append(el)
+
+                if not candidate_elements:
+                    return ([], candidate_source)
+
+                staff_h = max(1.0, float(y_bot - y_top))
+                vertical_min_ratio = 0.80
+                vertical_tol = max(3.0, (0.18 * expected_spacing) if expected_spacing > 0 else 3.0)
+                x_margin = max(8.0, (0.70 * expected_spacing) if expected_spacing > 0 else 8.0)
+
+                xs: list[float] = []
+                for el in candidate_elements:
+                    geom = _extract_barline_geom(el)
+                    if geom is None:
+                        continue
+                    bx, by0, by1, dx_abs = geom
+                    if by1 <= by0:
+                        continue
+
+                    overlap = max(0.0, min(by1, y_bot) - max(by0, y_top))
+                    if (overlap / staff_h) < vertical_min_ratio:
+                        continue
+
+                    if dx_abs > vertical_tol:
+                        continue
+
+                    if staff_left is not None and bx < (float(staff_left) - x_margin):
+                        continue
+                    if staff_right is not None and bx > (float(staff_right) + x_margin):
+                        continue
+                    xs.append(float(bx))
 
                 if not xs:
-                    return []
+                    return ([], candidate_source)
 
                 xs.sort()
                 deduped: list[float] = []
-                merge_tol = max(2.0, (0.25 * expected_spacing) if expected_spacing > 0 else 3.0)
+                merge_tol = max(2.0, (0.20 * expected_spacing) if expected_spacing > 0 else 2.5)
                 for x in xs:
                     if deduped and abs(x - deduped[-1]) <= merge_tol:
                         continue
                     deduped.append(x)
-                return deduped
+                return (deduped, candidate_source)
 
             for staff in staff_nodes:
                 staff_total += 1
@@ -1022,6 +1065,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 x_left = _safe_float(staff.get("left"))
                 line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
                 staff_left_raw = _safe_float(staff.get("left"))
+                staff_right_raw = _safe_float(staff.get("right"))
 
                 if x_left is None and line_min_x is not None:
                     x_left = line_min_x
@@ -1097,27 +1141,38 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     )
 
                 guides_px.append((x_postpad, y_top, y_bot))
-                staff_barline_xs = barline_xs_for_staff(staff_id, y_top, y_bot)
                 staff_barline_ids_raw = (staff.findtext("barlines") or "").strip()
                 staff_barline_ids = [tok for tok in staff_barline_ids_raw.split() if tok]
-                increment_bars = len(staff_barline_xs)
-                carryover_detected = False
+                staff_barline_xs, candidate_source = barline_xs_for_staff(
+                    staff_id=staff_id,
+                    y_top=y_top,
+                    y_bot=y_bot,
+                    staff_barline_ids=staff_barline_ids,
+                    staff_left=staff_left_raw,
+                    staff_right=staff_right_raw,
+                )
+                increment_before = len(staff_barline_xs)
+                increment_bars = increment_before
+                left_carryover_detected = False
+                right_carryover_detected = False
 
-                if increment_bars > 0 and sys_index > 0:
+                carry_tol = max(8.0, (0.7 * expected_spacing) if expected_spacing > 0 else 8.0)
+                if increment_bars > 0:
                     left_ref = None
                     for cand in (header_start, staff_left_raw, line_min_x):
                         if cand is not None:
                             left_ref = float(cand)
                             break
-
-                    if left_ref is not None:
+                    if left_ref is not None and sys_index > 0:
                         first_bar_x = float(min(staff_barline_xs))
-                        carry_tol = max(8.0, (0.7 * expected_spacing) if expected_spacing > 0 else 8.0)
                         if abs(first_bar_x - left_ref) <= carry_tol:
-                            carryover_detected = True
-                            # This barline starts the same measure as the previous system ended on.
-                            if measure_counter > 1:
-                                measure_counter -= 1
+                            left_carryover_detected = True
+                            increment_bars = max(0, increment_bars - 1)
+
+                    if staff_right_raw is not None:
+                        last_bar_x = float(max(staff_barline_xs))
+                        if abs(float(staff_right_raw) - last_bar_x) <= carry_tol:
+                            right_carryover_detected = True
                             increment_bars = max(0, increment_bars - 1)
 
                 counter_before = measure_counter
@@ -1131,9 +1186,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     print(
                         f"[DBG] count page={page_id} sys={system_id} staff={staff_id} "
                         f"staff_xml_barlines={len(staff_barline_ids)} barline_ids={staff_barline_ids_raw or '-'} "
-                        f"used_barlines={len(staff_barline_xs)} "
-                        f"omr_carryover_detected={str(carryover_detected).lower()} "
-                        f"increment_before={len(staff_barline_xs)} increment_after={increment_bars} "
+                        f"source={candidate_source} filtered_barlines={len(staff_barline_xs)} used_barlines={len(staff_barline_xs)} "
+                        f"left_carryover={str(left_carryover_detected).lower()} right_carryover={str(right_carryover_detected).lower()} "
+                        f"increment_before={increment_before} increment_after={increment_bars} "
                         f"counter_before={counter_before} counter_after={counter_after}",
                         flush=True,
                     )
@@ -1142,12 +1197,16 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         "page_id": page_id,
                         "system_id": system_id,
                         "staff_id": staff_id,
+                        "candidate_source": candidate_source,
+                        "filtered_barlines": len(staff_barline_xs),
                         "used_barlines": len(staff_barline_xs),
-                        "carryover_detected": carryover_detected,
-                        "increment_before": len(staff_barline_xs),
+                        "carryover_detected": bool(left_carryover_detected or right_carryover_detected),
+                        "left_carryover_detected": left_carryover_detected,
+                        "right_carryover_detected": right_carryover_detected,
+                        "increment_before": increment_before,
                         "increment_after": increment_bars,
                         "fallback_confidence": _omr_fallback_confidence(
-                            len(staff_barline_xs), increment_bars, carryover_detected
+                            len(staff_barline_xs), increment_bars, bool(left_carryover_detected or right_carryover_detected)
                         ),
                     }
                 )
