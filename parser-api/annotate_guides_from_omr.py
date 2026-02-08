@@ -1100,7 +1100,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 staff_barline_xs = barline_xs_for_staff(staff_id, y_top, y_bot)
                 staff_barline_ids_raw = (staff.findtext("barlines") or "").strip()
                 staff_barline_ids = [tok for tok in staff_barline_ids_raw.split() if tok]
-                counter_before = measure_counter
                 increment_bars = len(staff_barline_xs)
                 carryover_detected = False
 
@@ -1116,7 +1115,12 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         carry_tol = max(8.0, (0.7 * expected_spacing) if expected_spacing > 0 else 8.0)
                         if abs(first_bar_x - left_ref) <= carry_tol:
                             carryover_detected = True
+                            # This barline starts the same measure as the previous system ended on.
+                            if measure_counter > 1:
+                                measure_counter -= 1
                             increment_bars = max(0, increment_bars - 1)
+
+                counter_before = measure_counter
 
                 if staff_barline_xs:
                     staff_start_marks_px.append((x_postpad, y_top, y_bot, str(measure_counter)))
