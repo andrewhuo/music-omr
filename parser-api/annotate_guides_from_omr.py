@@ -12,6 +12,9 @@ import cv2
 
 GUIDE_COLOR = (1, 0, 0)  # red
 GUIDE_WIDTH = 1.0
+MEASURE_TEXT_COLOR = (0, 0, 0)  # black
+MEASURE_TEXT_SIZE = 10.0
+MEASURE_TEXT_X_OFFSET = 2.0
 
 # Small left shift so line sits just left of the staff start / clef
 PAD_LEFT_PX = 6.0
@@ -47,6 +50,16 @@ def _debug_dump_enabled() -> bool:
 
 def _debug_dump_sigs_enabled() -> bool:
     v = os.getenv("DEBUG_GUIDES_DUMP_SIGS", "").strip()
+    return v in ("1", "true", "True", "yes", "YES")
+
+
+def _measure_labels_enabled() -> bool:
+    v = os.getenv("ENABLE_MEASURE_LABELS", "1").strip()
+    return v not in ("0", "false", "False", "no", "NO")
+
+
+def _debug_measure_labels_enabled() -> bool:
+    v = os.getenv("DEBUG_MEASURE_LABELS", "").strip()
     return v in ("1", "true", "True", "yes", "YES")
 
 
@@ -829,6 +842,7 @@ def _fallback_missing_staff_guides(
 
 def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> None:
     doc = fitz.open(input_pdf)
+    write_measure_labels = _measure_labels_enabled()
 
     with zipfile.ZipFile(omr_path, "r") as z:
         sheet_paths = _sorted_sheet_xml_paths(z)
@@ -851,6 +865,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             scale_y = rect.height / pic_h
 
             guides_pdf = []
+            measure_labels_pdf = []
             for (x_px, y0_px, y1_px) in guides_px:
                 x_pdf = x_px * scale_x
                 y0_pdf = y0_px * scale_y
@@ -862,6 +877,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     color=GUIDE_COLOR,
                     width=GUIDE_WIDTH,
                 )
+                measure_labels_pdf.append((x_pdf, y0_pdf, y1_pdf))
 
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
@@ -877,6 +893,28 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         (x_pdf, y1_pdf),
                         color=GUIDE_COLOR,
                         width=GUIDE_WIDTH,
+                    )
+                    measure_labels_pdf.append((x_pdf, y0_pdf, y1_pdf))
+
+            if write_measure_labels:
+                labels_drawn = 0
+                for (x_pdf, y0_pdf, y1_pdf) in measure_labels_pdf:
+                    staff_h = max(1.0, y1_pdf - y0_pdf)
+                    y_offset = max(8.0, 0.45 * staff_h)
+                    x_text = min(max(0.0, x_pdf + MEASURE_TEXT_X_OFFSET), rect.width - 4.0)
+                    y_text = max(MEASURE_TEXT_SIZE + 2.0, y0_pdf - y_offset)
+                    page.insert_text(
+                        (x_text, y_text),
+                        "1",
+                        fontsize=MEASURE_TEXT_SIZE,
+                        color=MEASURE_TEXT_COLOR,
+                    )
+                    labels_drawn += 1
+
+                if _debug_measure_labels_enabled():
+                    print(
+                        f"[DBG] page={page_index+1} sheet={sheet_xml_path} measure_labels={labels_drawn}",
+                        flush=True,
                     )
 
     doc.save(output_pdf)
