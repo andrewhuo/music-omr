@@ -106,6 +106,122 @@ def _draw_measure_label(page: fitz.Page, rect: fitz.Rect, x: float, y: float, te
         page.draw_line((cx, cy - 5.0), (cx, cy + 5.0), color=(0, 0, 1), width=0.7)
 
 
+def _local_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def _children_named(el: ET.Element, name: str) -> list[ET.Element]:
+    return [c for c in list(el) if _local_name(c.tag) == name]
+
+
+def _truthy_attr(v: str | None) -> bool:
+    if not v:
+        return False
+    return v.strip().lower() in ("1", "true", "yes")
+
+
+def _find_mxl_path_for_omr(omr_path: str) -> str | None:
+    root, ext = os.path.splitext(omr_path)
+    if ext.lower() != ".omr":
+        return None
+    mxl_path = f"{root}.mxl"
+    return mxl_path if os.path.exists(mxl_path) else None
+
+
+def _score_xml_member_from_mxl(z: zipfile.ZipFile) -> str | None:
+    container_path = "META-INF/container.xml"
+    if container_path in z.namelist():
+        try:
+            root = ET.fromstring(z.read(container_path))
+            for rf in root.iter():
+                if _local_name(rf.tag) == "rootfile":
+                    full_path = rf.get("full-path")
+                    if full_path and full_path in z.namelist():
+                        return full_path
+        except Exception:
+            pass
+
+    for name in z.namelist():
+        lname = name.lower()
+        if name.startswith("META-INF/"):
+            continue
+        if lname.endswith(".musicxml") or lname.endswith(".xml"):
+            return name
+    return None
+
+
+def _parse_mxl_system_start_numbers(mxl_path: str) -> list[list[str]]:
+    pages: list[list[str]] = []
+    try:
+        with zipfile.ZipFile(mxl_path, "r") as z:
+            score_member = _score_xml_member_from_mxl(z)
+            if not score_member:
+                return []
+            root = ET.fromstring(z.read(score_member))
+    except Exception:
+        return []
+
+    if _local_name(root.tag) != "score-partwise":
+        return []
+
+    parts = _children_named(root, "part")
+    if not parts:
+        return []
+
+    measures = _children_named(parts[0], "measure")
+    if not measures:
+        return []
+
+    for i, measure in enumerate(measures):
+        label = (measure.get("number") or "").strip() or str(i + 1)
+        if i == 0:
+            pages = [[label]]
+            continue
+
+        is_new_page = False
+        is_new_system = False
+        for pr in _children_named(measure, "print"):
+            is_new_page = is_new_page or _truthy_attr(pr.get("new-page"))
+            is_new_system = is_new_system or _truthy_attr(pr.get("new-system"))
+
+        if is_new_page:
+            pages.append([label])
+        elif is_new_system:
+            if not pages:
+                pages = [[]]
+            pages[-1].append(label)
+
+    return pages
+
+
+def _apply_mxl_staff_start_labels(
+    staff_start_labels_pdf: list[tuple[float, float, float, str]],
+    system_staff_counts: list[int],
+    mxl_page_system_starts: list[str],
+) -> list[tuple[float, float, float, str]] | None:
+    if not staff_start_labels_pdf or not system_staff_counts or not mxl_page_system_starts:
+        return None
+    if len(system_staff_counts) != len(mxl_page_system_starts):
+        return None
+
+    out: list[tuple[float, float, float, str]] = []
+    idx = 0
+    for sys_idx, staff_cnt in enumerate(system_staff_counts):
+        label = mxl_page_system_starts[sys_idx]
+        for _ in range(staff_cnt):
+            if idx >= len(staff_start_labels_pdf):
+                return None
+            x, y0, y1, _ = staff_start_labels_pdf[idx]
+            out.append((x, y0, y1, label))
+            idx += 1
+
+    if idx != len(staff_start_labels_pdf):
+        return None
+    return out
+
+
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
     found = []
     for name in z.namelist():
@@ -530,10 +646,11 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     guides_px: list[tuple[float, float, float]] = []
     measure_marks_px: list[tuple[float, float, float, str]] = []
     staff_start_marks_px: list[tuple[float, float, float, str]] = []
+    system_staff_counts: list[int] = []
 
     pages = root.findall("page")
     if not pages:
-        return pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, 0
+        return pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, 0, system_staff_counts
 
     staff_total = 0
 
@@ -545,6 +662,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             systems = page.findall("system")
 
         for system in systems:
+            staff_nodes = system.findall(".//staff")
+            system_staff_counts.append(len(staff_nodes))
+
             # FIX: SIG is per-system; prefer system-local inters
             system_inters = system.find(".//sig/inters")
             if system_inters is None:
@@ -672,7 +792,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     deduped.append(x)
                 return deduped
 
-            for staff in system.findall(".//staff"):
+            for staff in staff_nodes:
                 staff_total += 1
                 staff_id = staff.get("id") or ""
 
@@ -847,7 +967,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 for measure_num, bx in enumerate(staff_barline_xs, start=1):
                     measure_marks_px.append((bx, y_top, y_bot, str(measure_num)))
 
-    return pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, staff_total
+    return pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, staff_total, system_staff_counts
 
 
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
@@ -956,6 +1076,10 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
     doc = fitz.open(input_pdf)
     write_measure_labels = _measure_labels_enabled()
     measure_label_mode = _measure_label_mode()
+    mxl_pages: list[list[str]] = []
+    mxl_path = _find_mxl_path_for_omr(omr_path)
+    if measure_label_mode == "staff_start" and mxl_path:
+        mxl_pages = _parse_mxl_system_start_numbers(mxl_path)
 
     with zipfile.ZipFile(omr_path, "r") as z:
         sheet_paths = _sorted_sheet_xml_paths(z)
@@ -969,7 +1093,15 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
 
-            pic_w, pic_h, guides_px, measure_marks_px, staff_start_marks_px, staff_total = _parse_sheet(z, sheet_xml_path)
+            (
+                pic_w,
+                pic_h,
+                guides_px,
+                measure_marks_px,
+                staff_start_marks_px,
+                staff_total,
+                system_staff_counts,
+            ) = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
                 continue
 
@@ -998,6 +1130,24 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             staff_start_labels_pdf = []
             for (x_px, y0_px, y1_px, text) in staff_start_marks_px:
                 staff_start_labels_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y, text))
+
+            staff_start_source = "omr"
+            if measure_label_mode == "staff_start" and mxl_pages and page_index < len(mxl_pages):
+                mxl_mapped = _apply_mxl_staff_start_labels(
+                    staff_start_labels_pdf=staff_start_labels_pdf,
+                    system_staff_counts=system_staff_counts,
+                    mxl_page_system_starts=mxl_pages[page_index],
+                )
+                if mxl_mapped is not None:
+                    staff_start_labels_pdf = mxl_mapped
+                    staff_start_source = "mxl"
+                elif _debug_measure_labels_enabled():
+                    print(
+                        f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
+                        f"mxl_map_failed systems_omr={len(system_staff_counts)} "
+                        f"systems_mxl={len(mxl_pages[page_index])}",
+                        flush=True,
+                    )
 
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
@@ -1049,6 +1199,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
                         f"measure_mode={measure_label_mode} sequential_candidates={len(sequential_labels_pdf)} "
                         f"staff_start_candidates={len(staff_start_labels_pdf)} "
+                        f"staff_start_source={staff_start_source} "
                         f"drawn={labels_drawn} in_bounds={labels_in_bounds} "
                         f"page_size=({rect.width:.1f},{rect.height:.1f})",
                         flush=True,
