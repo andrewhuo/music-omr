@@ -71,6 +71,11 @@ def _debug_measure_labels_enabled() -> bool:
     return v in ("1", "true", "True", "yes", "YES")
 
 
+def _debug_measure_markers_enabled() -> bool:
+    v = os.getenv("DEBUG_MEASURE_MARKERS", "").strip()
+    return v in ("1", "true", "True", "yes", "YES")
+
+
 def _draw_measure_label(page: fitz.Page, rect: fitz.Rect, x: float, y: float, text: str) -> None:
     # Draw a tiny white background so labels stay visible over notation.
     tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
@@ -90,6 +95,13 @@ def _draw_measure_label(page: fitz.Page, rect: fitz.Rect, x: float, y: float, te
         fontsize=MEASURE_TEXT_SIZE,
         color=MEASURE_TEXT_COLOR,
     )
+
+    if _debug_measure_markers_enabled():
+        cx = x
+        cy = max(0.0, y - 6.0)
+        page.draw_circle((cx, cy), 3.0, color=(0, 0, 1), fill=(1, 1, 0), width=0.7)
+        page.draw_line((cx - 5.0, cy), (cx + 5.0, cy), color=(0, 0, 1), width=0.7)
+        page.draw_line((cx, cy - 5.0), (cx, cy + 5.0), color=(0, 0, 1), width=0.7)
 
 
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:

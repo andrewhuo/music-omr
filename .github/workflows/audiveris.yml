@@ -156,6 +156,7 @@ jobs:
           ENABLE_MEASURE_LABELS: "1"
           MEASURE_LABEL_MODE: "sequential"
           DEBUG_MEASURE_LABELS: "1"
+          DEBUG_MEASURE_MARKERS: "1"
         run: |
           set -euo pipefail
           python -u parser-api/annotate_guides_from_omr.py \
@@ -186,7 +187,11 @@ jobs:
       - name: Upload outputs and debug artifacts
         run: |
           set -euo pipefail
+          RUN_OUT="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}/annotated.pdf"
           gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
+          gsutil cp /tmp/work/annotated.pdf "${RUN_OUT}"
+          echo "uploaded_latest=${OUTPUT_PREFIX}/annotated.pdf"
+          echo "uploaded_run_specific=${RUN_OUT}"
 
           if [ -d /tmp/work/debug ]; then
             gsutil -m cp -r /tmp/work/debug "${OUTPUT_PREFIX}/debug"
