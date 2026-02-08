@@ -89,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
+          pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0
 
       - name: Annotate PDF (guides + measure labels) with verbose debug
         env:
@@ -97,6 +97,7 @@ jobs:
           ENABLE_MEASURE_LABELS: "1"
           MEASURE_LABEL_MODE: "staff_start"
           MEASURE_SOURCE_POLICY: "mxl_with_omr_fallback"
+          MXL_PARSER_POLICY: "auto"
           DEBUG_MEASURE_LABELS: "1"
           DEBUG_MEASURE_MARKERS: "0"
           MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"

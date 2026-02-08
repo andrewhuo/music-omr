@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 import fitz  # PyMuPDF
 import numpy as np
 import cv2
+from lxml import etree as LET
 
 
 GUIDE_COLOR = (1, 0, 0)  # red
@@ -74,6 +75,13 @@ def _measure_source_policy() -> str:
     if v == "mxl_with_omr_fallback":
         return "mxl_with_omr_fallback"
     return "mxl_strict"
+
+
+def _mxl_parser_policy() -> str:
+    v = os.getenv("MXL_PARSER_POLICY", "auto").strip().lower()
+    if v in ("stdlib", "lxml_recover", "auto"):
+        return v
+    return "auto"
 
 
 def _debug_measure_labels_enabled() -> bool:
@@ -165,12 +173,15 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
         "mxl_path": mxl_path,
         "mxl_parse_status": "error",
         "mxl_member_path": None,
+        "mxl_parser_used": "none",
         "mxl_pages": 0,
         "mxl_system_starts_per_page": [],
         "mxl_error": None,
     }
 
+    parser_policy = _mxl_parser_policy()
     pages: list[list[str]] = []
+    xml_bytes = b""
     try:
         with zipfile.ZipFile(mxl_path, "r") as z:
             score_member = _score_xml_member_from_mxl(z)
@@ -178,10 +189,46 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
                 meta["mxl_parse_status"] = "missing_score_member"
                 return meta
             meta["mxl_member_path"] = score_member
-            root = ET.fromstring(z.read(score_member))
+            xml_bytes = z.read(score_member)
     except Exception as exc:
-        meta["mxl_parse_status"] = "zip_or_xml_error"
+        meta["mxl_parse_status"] = "zip_error"
         meta["mxl_error"] = str(exc)
+        return meta
+
+    root = None
+    stdlib_error = None
+    lxml_error = None
+
+    if parser_policy in ("stdlib", "auto"):
+        try:
+            root = ET.fromstring(xml_bytes)
+            meta["mxl_parser_used"] = "stdlib"
+        except Exception as exc:
+            stdlib_error = str(exc)
+            if parser_policy == "stdlib":
+                meta["mxl_parse_status"] = "xml_parse_error"
+                meta["mxl_error"] = stdlib_error
+                return meta
+
+    if root is None and parser_policy in ("lxml_recover", "auto"):
+        try:
+            lxml_parser = LET.XMLParser(recover=True, resolve_entities=False, huge_tree=True)
+            lxml_root = LET.fromstring(xml_bytes, parser=lxml_parser)
+            xml_clean = LET.tostring(lxml_root, encoding="utf-8")
+            root = ET.fromstring(xml_clean)
+            meta["mxl_parser_used"] = "lxml_recover"
+        except Exception as exc:
+            lxml_error = str(exc)
+            meta["mxl_parse_status"] = "zip_or_xml_error"
+            if stdlib_error and lxml_error:
+                meta["mxl_error"] = f"stdlib={stdlib_error} | lxml={lxml_error}"
+            else:
+                meta["mxl_error"] = stdlib_error or lxml_error
+            return meta
+
+    if root is None:
+        meta["mxl_parse_status"] = "zip_or_xml_error"
+        meta["mxl_error"] = stdlib_error or lxml_error or "unknown parse failure"
         return meta
 
     if _local_name(root.tag) != "score-partwise":
@@ -688,7 +735,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         if not systems:
             systems = page.findall("system")
 
-        for system in systems:
+        for sys_index, system in enumerate(systems):
             staff_nodes = system.findall(".//staff")
             system_staff_counts.append(len(staff_nodes))
 
@@ -914,6 +961,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 x_left = _safe_float(staff.get("left"))
                 line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
+                staff_left_raw = _safe_float(staff.get("left"))
 
                 if x_left is None and line_min_x is not None:
                     x_left = line_min_x
@@ -993,16 +1041,36 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 staff_barline_ids_raw = (staff.findtext("barlines") or "").strip()
                 staff_barline_ids = [tok for tok in staff_barline_ids_raw.split() if tok]
                 counter_before = measure_counter
+                increment_bars = len(staff_barline_xs)
+                carryover_detected = False
+
+                if increment_bars > 0 and sys_index > 0:
+                    left_ref = None
+                    for cand in (header_start, staff_left_raw, line_min_x):
+                        if cand is not None:
+                            left_ref = float(cand)
+                            break
+
+                    if left_ref is not None:
+                        first_bar_x = float(min(staff_barline_xs))
+                        carry_tol = max(8.0, (0.7 * expected_spacing) if expected_spacing > 0 else 8.0)
+                        if abs(first_bar_x - left_ref) <= carry_tol:
+                            carryover_detected = True
+                            increment_bars = max(0, increment_bars - 1)
+
                 if staff_barline_xs:
                     staff_start_marks_px.append((x_postpad, y_top, y_bot, str(measure_counter)))
-                    measure_counter += len(staff_barline_xs)
+                    measure_counter += increment_bars
                 counter_after = measure_counter
 
                 if _debug_measure_labels_enabled():
                     print(
                         f"[DBG] count page={page_id} sys={system_id} staff={staff_id} "
                         f"staff_xml_barlines={len(staff_barline_ids)} barline_ids={staff_barline_ids_raw or '-'} "
-                        f"used_barlines={len(staff_barline_xs)} counter_before={counter_before} counter_after={counter_after}",
+                        f"used_barlines={len(staff_barline_xs)} "
+                        f"omr_carryover_detected={str(carryover_detected).lower()} "
+                        f"increment_before={len(staff_barline_xs)} increment_after={increment_bars} "
+                        f"counter_before={counter_before} counter_after={counter_after}",
                         flush=True,
                     )
 
@@ -1126,6 +1194,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         "mxl_path": None,
         "mxl_parse_status": "not_requested",
         "mxl_member_path": None,
+        "mxl_parser_used": "none",
         "mxl_pages": 0,
         "mxl_system_starts_per_page": [],
         "mxl_error": None,
@@ -1139,6 +1208,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 "mxl_path": None,
                 "mxl_parse_status": "missing_mxl_file",
                 "mxl_member_path": None,
+                "mxl_parser_used": "none",
                 "mxl_pages": 0,
                 "mxl_system_starts_per_page": [],
                 "mxl_error": None,
@@ -1149,6 +1219,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             "[DBG] measure_source "
             f"policy={measure_source_policy} "
             f"mxl_parse_status={mxl_meta.get('mxl_parse_status')} "
+            f"mxl_parser_used={mxl_meta.get('mxl_parser_used')} "
             f"mxl_member_path={mxl_meta.get('mxl_member_path')} "
             f"mxl_pages={mxl_meta.get('mxl_pages')}",
             flush=True,
@@ -1303,6 +1374,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "measure_source_policy": measure_source_policy,
                     "mxl_parse_status": mxl_meta.get("mxl_parse_status"),
                     "mxl_member_path": mxl_meta.get("mxl_member_path"),
+                    "mxl_parser_used": mxl_meta.get("mxl_parser_used"),
                     "mxl_page_system_starts": page_mxl_starts,
                     "omr_system_staff_counts": system_staff_counts,
                     "staff_start_source": staff_start_source,
@@ -1325,6 +1397,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             "measure_source_policy": measure_source_policy,
             "mxl_parse_status": mxl_meta.get("mxl_parse_status"),
             "mxl_member_path": mxl_meta.get("mxl_member_path"),
+            "mxl_parser_used": mxl_meta.get("mxl_parser_used"),
             "mxl_pages": mxl_meta.get("mxl_pages"),
             "mxl_system_starts_per_page": mxl_meta.get("mxl_system_starts_per_page"),
             "mxl_error": mxl_meta.get("mxl_error"),
