@@ -795,6 +795,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             for staff in staff_nodes:
                 staff_total += 1
                 staff_id = staff.get("id") or ""
+                system_id = system.get("id") or "?"
+                page_id = page.get("id") or "?"
 
                 header = staff.find("header")
                 header_start = _safe_float(header.get("start")) if header is not None else None
@@ -961,9 +963,22 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 guides_px.append((x_postpad, y_top, y_bot))
                 staff_barline_xs = barline_xs_for_staff(staff_id, y_top, y_bot)
+                staff_barline_ids_raw = (staff.findtext("barlines") or "").strip()
+                staff_barline_ids = [tok for tok in staff_barline_ids_raw.split() if tok]
+                counter_before = measure_counter
                 if staff_barline_xs:
                     staff_start_marks_px.append((x_postpad, y_top, y_bot, str(measure_counter)))
                     measure_counter += len(staff_barline_xs)
+                counter_after = measure_counter
+
+                if _debug_measure_labels_enabled():
+                    print(
+                        f"[DBG] count page={page_id} sys={system_id} staff={staff_id} "
+                        f"staff_xml_barlines={len(staff_barline_ids)} barline_ids={staff_barline_ids_raw or '-'} "
+                        f"used_barlines={len(staff_barline_xs)} counter_before={counter_before} counter_after={counter_after}",
+                        flush=True,
+                    )
+
                 for measure_num, bx in enumerate(staff_barline_xs, start=1):
                     measure_marks_px.append((bx, y_top, y_bot, str(measure_num)))
 
