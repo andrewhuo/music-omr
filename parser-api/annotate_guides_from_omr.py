@@ -15,6 +15,7 @@ GUIDE_WIDTH = 1.0
 MEASURE_TEXT_COLOR = (0, 0, 0)  # black
 MEASURE_TEXT_SIZE = 10.0
 MEASURE_TEXT_X_OFFSET = 1.0
+MEASURE_TEXT_BG_COLOR = (1, 1, 1)  # white
 
 # Small left shift so line sits just left of the staff start / clef
 PAD_LEFT_PX = 6.0
@@ -68,6 +69,27 @@ def _measure_label_mode() -> str:
 def _debug_measure_labels_enabled() -> bool:
     v = os.getenv("DEBUG_MEASURE_LABELS", "").strip()
     return v in ("1", "true", "True", "yes", "YES")
+
+
+def _draw_measure_label(page: fitz.Page, rect: fitz.Rect, x: float, y: float, text: str) -> None:
+    # Draw a tiny white background so labels stay visible over notation.
+    tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
+    th = float(MEASURE_TEXT_SIZE + 2.0)
+    bg = fitz.Rect(x - 1.0, y - th + 1.0, x + tw + 1.0, y + 1.0)
+
+    x0 = max(0.0, min(bg.x0, rect.width))
+    y0 = max(0.0, min(bg.y0, rect.height))
+    x1 = max(0.0, min(bg.x1, rect.width))
+    y1 = max(0.0, min(bg.y1, rect.height))
+    if x1 > x0 and y1 > y0:
+        page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
+
+    page.insert_text(
+        (x, y),
+        text,
+        fontsize=MEASURE_TEXT_SIZE,
+        color=MEASURE_TEXT_COLOR,
+    )
 
 
 def _sorted_sheet_xml_paths(z: zipfile.ZipFile) -> list[str]:
@@ -496,7 +518,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
     pages = root.findall("page")
     if not pages:
-        return pic_w, pic_h, guides_px, 0
+        return pic_w, pic_h, guides_px, measure_marks_px, 0
 
     staff_total = 0
 
@@ -980,14 +1002,10 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 for (x_pdf, y0_pdf, y1_pdf, label_text) in labels_to_draw:
                     staff_h = max(1.0, y1_pdf - y0_pdf)
                     y_offset = max(8.0, 0.45 * staff_h)
-                    x_text = min(max(0.0, x_pdf + MEASURE_TEXT_X_OFFSET), rect.width - 4.0)
+                    tw = float(fitz.get_text_length(label_text, fontsize=MEASURE_TEXT_SIZE))
+                    x_text = min(max(0.0, x_pdf + MEASURE_TEXT_X_OFFSET), max(0.0, rect.width - tw - 2.0))
                     y_text = max(MEASURE_TEXT_SIZE + 2.0, y0_pdf - y_offset)
-                    page.insert_text(
-                        (x_text, y_text),
-                        label_text,
-                        fontsize=MEASURE_TEXT_SIZE,
-                        color=MEASURE_TEXT_COLOR,
-                    )
+                    _draw_measure_label(page, rect, x_text, y_text, label_text)
                     labels_drawn += 1
 
                 if _debug_measure_labels_enabled():
