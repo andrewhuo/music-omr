@@ -155,8 +155,10 @@ jobs:
           DEBUG_GUIDES_DUMP_INTERS: "1"
           ENABLE_MEASURE_LABELS: "1"
           MEASURE_LABEL_MODE: "staff_start"
+          MEASURE_SOURCE_POLICY: "mxl_with_omr_fallback"
           DEBUG_MEASURE_LABELS: "1"
           DEBUG_MEASURE_MARKERS: "0"
+          MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/debug/measure_mapping_debug_fallback.json"
         run: |
           set -euo pipefail
           python -u parser-api/annotate_guides_from_omr.py \
@@ -164,6 +166,26 @@ jobs:
             /tmp/work/audiveris_out/input/input.omr \
             /tmp/work/annotated.pdf
           ls -lh /tmp/work/annotated.pdf
+
+      - name: Annotate PDF (MXL strict candidate)
+        env:
+          DEBUG_GUIDES: "1"
+          DEBUG_GUIDES_SHEET: "${{ env.DEBUG_SHEET }}"
+          DEBUG_GUIDES_STAFF_ID: "${{ env.DEBUG_STAFF }}"
+          DEBUG_GUIDES_DUMP_INTERS: "1"
+          ENABLE_MEASURE_LABELS: "1"
+          MEASURE_LABEL_MODE: "staff_start"
+          MEASURE_SOURCE_POLICY: "mxl_strict"
+          DEBUG_MEASURE_LABELS: "1"
+          DEBUG_MEASURE_MARKERS: "0"
+          MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/debug/measure_mapping_debug_mxl_strict.json"
+        run: |
+          set -euo pipefail
+          python -u parser-api/annotate_guides_from_omr.py \
+            /tmp/work/input.pdf \
+            /tmp/work/audiveris_out/input/input.omr \
+            /tmp/work/annotated_mxl.pdf
+          ls -lh /tmp/work/annotated_mxl.pdf
 
       - name: Sanity-check output PDF
         run: |
@@ -178,20 +200,34 @@ jobs:
           if in_doc.page_count != out_doc.page_count:
             raise SystemExit('ERROR: output page count mismatch')
 
+          out_doc_mxl = fitz.open('/tmp/work/annotated_mxl.pdf')
+          print('output_mxl_pages=', out_doc_mxl.page_count)
+          if in_doc.page_count != out_doc_mxl.page_count:
+            raise SystemExit('ERROR: output_mxl page count mismatch')
+
           # Basic text extraction probe; numbers may or may not be extractable depending on PDF internals.
           for i in range(min(3, out_doc.page_count)):
             txt = out_doc[i].get_text('text')
             print(f'page_{i+1}_text_probe_has_digit1=', ('1' in txt))
+
+          for i in range(min(3, out_doc_mxl.page_count)):
+            txt = out_doc_mxl[i].get_text('text')
+            print(f'page_{i+1}_mxl_text_probe_has_digit1=', ('1' in txt))
           PY
 
       - name: Upload outputs and debug artifacts
         run: |
           set -euo pipefail
           RUN_OUT="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}/annotated.pdf"
+          RUN_OUT_MXL="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}/annotated_mxl.pdf"
           gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
           gsutil cp /tmp/work/annotated.pdf "${RUN_OUT}"
+          gsutil cp /tmp/work/annotated_mxl.pdf "${OUTPUT_PREFIX}/annotated_mxl.pdf"
+          gsutil cp /tmp/work/annotated_mxl.pdf "${RUN_OUT_MXL}"
           echo "uploaded_latest=${OUTPUT_PREFIX}/annotated.pdf"
           echo "uploaded_run_specific=${RUN_OUT}"
+          echo "uploaded_latest_mxl=${OUTPUT_PREFIX}/annotated_mxl.pdf"
+          echo "uploaded_run_specific_mxl=${RUN_OUT_MXL}"
 
           if [ -d /tmp/work/debug ]; then
             gsutil -m cp -r /tmp/work/debug "${OUTPUT_PREFIX}/debug"
