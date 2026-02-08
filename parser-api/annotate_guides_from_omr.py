@@ -1153,11 +1153,6 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             f"mxl_pages={mxl_meta.get('mxl_pages')}",
             flush=True,
         )
-        if mxl_meta.get("mxl_system_starts_per_page"):
-            preview = [p[:8] for p in mxl_meta["mxl_system_starts_per_page"]]
-            print(f"[DBG] mxl_system_starts_per_page={preview}", flush=True)
-        if mxl_meta.get("mxl_error"):
-            print(f"[DBG] mxl_error={mxl_meta.get('mxl_error')}", flush=True)
 
     with zipfile.ZipFile(omr_path, "r") as z:
         sheet_paths = _sorted_sheet_xml_paths(z)
@@ -1295,17 +1290,10 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 if _debug_measure_labels_enabled():
                     print(
                         f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
-                        f"measure_mode={measure_label_mode} sequential_candidates={len(sequential_labels_pdf)} "
-                        f"staff_start_candidates={len(staff_start_labels_pdf)} "
                         f"staff_start_source={staff_start_source} "
-                        f"mapping_status={mapping_status} mapping_reason={mapping_reason} "
-                        f"systems_omr={len(system_staff_counts)} systems_mxl={len(page_mxl_starts)} "
-                        f"drawn={labels_drawn} in_bounds={labels_in_bounds} "
-                        f"page_size=({rect.width:.1f},{rect.height:.1f})",
+                        f"mapping_status={mapping_status} mapping_reason={mapping_reason}",
                         flush=True,
                     )
-                    if sample_positions:
-                        print(f"[DBG] page={page_index+1} label_samples: " + " | ".join(sample_positions), flush=True)
 
             mapping_debug.append(
                 {

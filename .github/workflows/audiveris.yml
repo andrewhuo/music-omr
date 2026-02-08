@@ -13,8 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
-      DEBUG_SHEET: "sheet#3/sheet#3.xml"
-      DEBUG_STAFF: "5"
 
     permissions:
       contents: read
@@ -42,13 +40,11 @@ jobs:
           echo "sha:  $GITHUB_SHA"
           echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
-          echo "DEBUG_SHEET=${DEBUG_SHEET}"
-          echo "DEBUG_STAFF=${DEBUG_STAFF}"
 
       - name: Download input PDF
         run: |
           set -euo pipefail
-          mkdir -p /tmp/work /tmp/work/debug
+          mkdir -p /tmp/work
           gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
           ls -lh /tmp/work/input.pdf
 
@@ -95,70 +91,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy
 
-      - name: OMR structure debug (logs + artifact)
-        run: |
-          set -euo pipefail
-          python - << 'PY'
-          import json
-          import os
-          import re
-          import xml.etree.ElementTree as ET
-          import zipfile
-
-          omr = "/tmp/work/audiveris_out/input/input.omr"
-          sheet_re = re.compile(r"^sheet#(\d+)/sheet#\1\.xml$")
-          out = []
-
-          with zipfile.ZipFile(omr, "r") as z:
-            sheets = sorted([n for n in z.namelist() if sheet_re.match(n)], key=lambda n: int(sheet_re.match(n).group(1)))
-            print(f"sheet_xml_count={len(sheets)}")
-
-            for path in sheets:
-              root = ET.fromstring(z.read(path))
-              pages = root.findall("page")
-              page_rows = []
-              print(f"sheet={path} pages={len(pages)}")
-
-              for page in pages:
-                systems = page.findall(".//system")
-                staff_count = 0
-                barline_count = 0
-                for sys_el in systems:
-                  staves = sys_el.findall(".//staff")
-                  staff_count += len(staves)
-                  inters = sys_el.find(".//sig/inters")
-                  if inters is not None:
-                    for el in inters.iter():
-                      if (el.tag or "").lower() == "barline":
-                        barline_count += 1
-                print(f"  page_id={page.get('id')} systems={len(systems)} staves={staff_count} barlines={barline_count}")
-                page_rows.append({
-                  "page_id": page.get("id"),
-                  "systems": len(systems),
-                  "staves": staff_count,
-                  "barlines": barline_count,
-                })
-
-              out.append({"sheet": path, "pages": page_rows})
-
-          os.makedirs("/tmp/work/debug", exist_ok=True)
-          with open("/tmp/work/debug/omr_debug_summary.json", "w") as f:
-            json.dump(out, f, indent=2)
-          print("wrote /tmp/work/debug/omr_debug_summary.json")
-          PY
-
       - name: Annotate PDF (guides + measure labels) with verbose debug
         env:
-          DEBUG_GUIDES: "1"
-          DEBUG_GUIDES_SHEET: "${{ env.DEBUG_SHEET }}"
-          DEBUG_GUIDES_STAFF_ID: "${{ env.DEBUG_STAFF }}"
-          DEBUG_GUIDES_DUMP_INTERS: "1"
+          DEBUG_GUIDES: "0"
           ENABLE_MEASURE_LABELS: "1"
           MEASURE_LABEL_MODE: "staff_start"
           MEASURE_SOURCE_POLICY: "mxl_with_omr_fallback"
           DEBUG_MEASURE_LABELS: "1"
           DEBUG_MEASURE_MARKERS: "0"
-          MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/debug/measure_mapping_debug_fallback.json"
+          MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"
         run: |
           set -euo pipefail
           python -u parser-api/annotate_guides_from_omr.py \
@@ -166,26 +107,6 @@ jobs:
             /tmp/work/audiveris_out/input/input.omr \
             /tmp/work/annotated.pdf
           ls -lh /tmp/work/annotated.pdf
-
-      - name: Annotate PDF (MXL strict candidate)
-        env:
-          DEBUG_GUIDES: "1"
-          DEBUG_GUIDES_SHEET: "${{ env.DEBUG_SHEET }}"
-          DEBUG_GUIDES_STAFF_ID: "${{ env.DEBUG_STAFF }}"
-          DEBUG_GUIDES_DUMP_INTERS: "1"
-          ENABLE_MEASURE_LABELS: "1"
-          MEASURE_LABEL_MODE: "staff_start"
-          MEASURE_SOURCE_POLICY: "mxl_strict"
-          DEBUG_MEASURE_LABELS: "1"
-          DEBUG_MEASURE_MARKERS: "0"
-          MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/debug/measure_mapping_debug_mxl_strict.json"
-        run: |
-          set -euo pipefail
-          python -u parser-api/annotate_guides_from_omr.py \
-            /tmp/work/input.pdf \
-            /tmp/work/audiveris_out/input/input.omr \
-            /tmp/work/annotated_mxl.pdf
-          ls -lh /tmp/work/annotated_mxl.pdf
 
       - name: Sanity-check output PDF
         run: |
@@ -199,42 +120,14 @@ jobs:
           print('output_pages=', out_doc.page_count)
           if in_doc.page_count != out_doc.page_count:
             raise SystemExit('ERROR: output page count mismatch')
-
-          out_doc_mxl = fitz.open('/tmp/work/annotated_mxl.pdf')
-          print('output_mxl_pages=', out_doc_mxl.page_count)
-          if in_doc.page_count != out_doc_mxl.page_count:
-            raise SystemExit('ERROR: output_mxl page count mismatch')
-
-          # Basic text extraction probe; numbers may or may not be extractable depending on PDF internals.
-          for i in range(min(3, out_doc.page_count)):
-            txt = out_doc[i].get_text('text')
-            print(f'page_{i+1}_text_probe_has_digit1=', ('1' in txt))
-
-          for i in range(min(3, out_doc_mxl.page_count)):
-            txt = out_doc_mxl[i].get_text('text')
-            print(f'page_{i+1}_mxl_text_probe_has_digit1=', ('1' in txt))
           PY
 
       - name: Upload outputs and debug artifacts
         run: |
           set -euo pipefail
-          RUN_OUT="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}/annotated.pdf"
-          RUN_OUT_MXL="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}/annotated_mxl.pdf"
           gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
-          gsutil cp /tmp/work/annotated.pdf "${RUN_OUT}"
-          gsutil cp /tmp/work/annotated_mxl.pdf "${OUTPUT_PREFIX}/annotated_mxl.pdf"
-          gsutil cp /tmp/work/annotated_mxl.pdf "${RUN_OUT_MXL}"
+          gsutil cp /tmp/work/measure_mapping_debug.json "${OUTPUT_PREFIX}/measure_mapping_debug.json"
           echo "uploaded_latest=${OUTPUT_PREFIX}/annotated.pdf"
-          echo "uploaded_run_specific=${RUN_OUT}"
-          echo "uploaded_latest_mxl=${OUTPUT_PREFIX}/annotated_mxl.pdf"
-          echo "uploaded_run_specific_mxl=${RUN_OUT_MXL}"
-
-          if [ -d /tmp/work/debug ]; then
-            gsutil -m cp -r /tmp/work/debug "${OUTPUT_PREFIX}/debug"
-          fi
-
-          if [ -d /tmp/work/audiveris_out ] && [ "$(ls -A /tmp/work/audiveris_out)" ]; then
-            gsutil -m cp -r /tmp/work/audiveris_out "${OUTPUT_PREFIX}/audiveris_out"
-          fi
+          echo "uploaded_mapping_debug=${OUTPUT_PREFIX}/measure_mapping_debug.json"
 
           echo "Upload complete"
