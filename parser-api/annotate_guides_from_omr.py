@@ -177,26 +177,59 @@ def _find_mxl_path_for_omr(omr_path: str) -> str | None:
     return ext_candidates[0]
 
 
-def _score_xml_member_from_mxl(z: zipfile.ZipFile) -> str | None:
-    container_path = "META-INF/container.xml"
-    if container_path in z.namelist():
-        try:
-            root = ET.fromstring(z.read(container_path))
-            for rf in root.iter():
-                if _local_name(rf.tag) == "rootfile":
-                    full_path = rf.get("full-path")
-                    if full_path and full_path in z.namelist():
-                        return full_path
-        except Exception:
-            pass
-
+def _scan_mxl_members(z: zipfile.ZipFile) -> list[dict]:
+    members: list[dict] = []
     for name in z.namelist():
         lname = name.lower()
         if name.startswith("META-INF/"):
             continue
-        if lname.endswith(".musicxml") or lname.endswith(".xml"):
-            return name
-    return None
+        if not (lname.endswith(".musicxml") or lname.endswith(".xml")):
+            continue
+
+        root_name = "unknown"
+        measure_count = 0
+        parse_ok = False
+        try:
+            data = z.read(name)
+            root = ET.fromstring(data)
+            root_name = _local_name(root.tag)
+            parse_ok = True
+            measures = root.findall(".//measure")
+            measure_count = len(measures)
+        except Exception:
+            pass
+
+        members.append(
+            {
+                "name": name,
+                "root": root_name,
+                "measure_count": measure_count,
+                "parse_ok": parse_ok,
+            }
+        )
+    return members
+
+
+def _score_xml_member_from_mxl(z: zipfile.ZipFile) -> tuple[str | None, list[dict]]:
+    members = _scan_mxl_members(z)
+    if not members:
+        return None, members
+
+    # Prefer real score roots with measures.
+    def score_rank(m: dict) -> tuple[int, int]:
+        is_score = 1 if m["root"] in ("score-partwise", "score-timewise") else 0
+        return (is_score, m["measure_count"])
+
+    best = max(members, key=score_rank)
+    if best["measure_count"] > 0:
+        return best["name"], members
+
+    # If no measures, still prefer score-partwise/timewise if present.
+    scored = [m for m in members if m["root"] in ("score-partwise", "score-timewise")]
+    if scored:
+        return scored[0]["name"], members
+
+    return members[0]["name"], members
 
 
 def _sanitize_xml_unbound_prefixes(xml_bytes: bytes) -> tuple[bytes, list[str]]:
@@ -230,6 +263,8 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
         "mxl_measure_count": 0,
         "mxl_print_count": 0,
         "mxl_system_start_mode": "explicit_only",
+        "mxl_members": [],
+        "mxl_member_choice_reason": "unknown",
         "mxl_pages": 0,
         "mxl_system_starts_per_page": [],
         "mxl_extract_status": "error",
@@ -239,23 +274,41 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
     parser_policy = _mxl_parser_policy()
     pages: list[list[str]] = []
     xml_bytes = b""
+    mxl_members: list[dict] = []
+    mxl_member_choice_reason = "unknown"
     try:
         if zipfile.is_zipfile(mxl_path):
             with zipfile.ZipFile(mxl_path, "r") as z:
-                score_member = _score_xml_member_from_mxl(z)
+                score_member, mxl_members = _score_xml_member_from_mxl(z)
                 if not score_member:
                     meta["mxl_parse_status"] = "missing_score_member"
                     return meta
                 meta["mxl_member_path"] = score_member
+                if mxl_members:
+                    best = [m for m in mxl_members if m["name"] == score_member]
+                    if best:
+                        b = best[0]
+                        if b["root"] in ("score-partwise", "score-timewise") and b["measure_count"] > 0:
+                            mxl_member_choice_reason = "score_root_with_measures"
+                        elif b["root"] in ("score-partwise", "score-timewise"):
+                            mxl_member_choice_reason = "score_root_no_measures"
+                        elif b["measure_count"] > 0:
+                            mxl_member_choice_reason = "max_measures_non_score_root"
+                        else:
+                            mxl_member_choice_reason = "fallback_first"
                 xml_bytes = z.read(score_member)
         else:
             with open(mxl_path, "rb") as f:
                 xml_bytes = f.read()
             meta["mxl_member_path"] = os.path.basename(mxl_path)
+            mxl_member_choice_reason = "plain_xml"
     except Exception as exc:
         meta["mxl_parse_status"] = "zip_error"
         meta["mxl_error"] = str(exc)
         return meta
+
+    meta["mxl_members"] = mxl_members
+    meta["mxl_member_choice_reason"] = mxl_member_choice_reason
 
     parse_input = xml_bytes
     if _mxl_sanitize_prefixes_enabled():
@@ -308,7 +361,44 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
 
     parts = _children_named(root, "part")
     if not parts:
-        meta["mxl_parse_status"] = "missing_parts"
+        # Try a permissive fallback: locate measures anywhere in the document.
+        measures = root.findall(".//measure")
+        if not measures:
+            meta["mxl_parse_status"] = "missing_parts"
+            return meta
+        meta["mxl_parse_status"] = "ok"
+        meta["mxl_extract_status"] = "ok"
+        meta["mxl_measure_count"] = len(measures)
+        # Build pages from measures even without part structure.
+        pages = []
+        print_count = 0
+        system_start_mode = "implicit_global_measures"
+        for i, measure in enumerate(measures):
+            label = (measure.get("number") or "").strip() or str(i + 1)
+            if i == 0:
+                pages = [[label]]
+                continue
+            is_new_page = False
+            is_new_system = False
+            has_system_layout = False
+            for pr in _children_named(measure, "print"):
+                print_count += 1
+                is_new_page = is_new_page or _truthy_attr(pr.get("new-page"))
+                is_new_system = is_new_system or _truthy_attr(pr.get("new-system"))
+                if _children_named(pr, "system-layout"):
+                    has_system_layout = True
+            if is_new_page:
+                pages.append([label])
+            elif is_new_system or has_system_layout:
+                if not pages:
+                    pages = [[]]
+                pages[-1].append(label)
+                if has_system_layout and not is_new_system:
+                    system_start_mode = "implicit_global_measures"
+        meta["mxl_print_count"] = print_count
+        meta["mxl_system_start_mode"] = system_start_mode
+        meta["mxl_pages"] = len(pages)
+        meta["mxl_system_starts_per_page"] = pages
         return meta
 
     measures = _children_named(parts[0], "measure")
@@ -1442,6 +1532,21 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             f"start_mode={mxl_meta.get('mxl_system_start_mode')}",
             flush=True,
         )
+        if mxl_meta.get("mxl_members"):
+            print(
+                "[DBG] mxl_members " +
+                "; ".join(
+                    f"{m.get('name')} root={m.get('root')} measures={m.get('measure_count')} parse_ok={m.get('parse_ok')}"
+                    for m in mxl_meta.get("mxl_members")
+                ),
+                flush=True,
+            )
+            print(
+                "[DBG] mxl_member_choice "
+                f"reason={mxl_meta.get('mxl_member_choice_reason')} "
+                f"chosen={mxl_meta.get('mxl_member_path')}",
+                flush=True,
+            )
 
     with zipfile.ZipFile(omr_path, "r") as z:
         sheet_paths = _sorted_sheet_xml_paths(z)
@@ -1601,6 +1706,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "mxl_measure_count": mxl_meta.get("mxl_measure_count"),
                     "mxl_print_count": mxl_meta.get("mxl_print_count"),
                     "mxl_system_start_mode": mxl_meta.get("mxl_system_start_mode"),
+                    "mxl_member_choice_reason": mxl_meta.get("mxl_member_choice_reason"),
+                    "mxl_members": mxl_meta.get("mxl_members"),
                     "mxl_extract_status": mxl_meta.get("mxl_extract_status"),
                     "mxl_page_system_starts": page_mxl_starts,
                     "omr_system_staff_counts": system_staff_counts,
@@ -1632,6 +1739,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             "mxl_measure_count": mxl_meta.get("mxl_measure_count"),
             "mxl_print_count": mxl_meta.get("mxl_print_count"),
             "mxl_system_start_mode": mxl_meta.get("mxl_system_start_mode"),
+            "mxl_member_choice_reason": mxl_meta.get("mxl_member_choice_reason"),
+            "mxl_members": mxl_meta.get("mxl_members"),
             "mxl_pages": mxl_meta.get("mxl_pages"),
             "mxl_system_starts_per_page": mxl_meta.get("mxl_system_starts_per_page"),
             "mxl_extract_status": mxl_meta.get("mxl_extract_status"),
