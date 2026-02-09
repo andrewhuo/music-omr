@@ -227,6 +227,9 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
         "mxl_parser_used": "none",
         "mxl_parse_attempts": [],
         "mxl_sanitized_prefixes": [],
+        "mxl_measure_count": 0,
+        "mxl_print_count": 0,
+        "mxl_system_start_mode": "explicit_only",
         "mxl_pages": 0,
         "mxl_system_starts_per_page": [],
         "mxl_extract_status": "error",
@@ -313,6 +316,10 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
         meta["mxl_parse_status"] = "missing_measures"
         return meta
 
+    meta["mxl_measure_count"] = len(measures)
+    print_count = 0
+    system_start_mode = "explicit_only"
+
     for i, measure in enumerate(measures):
         label = (measure.get("number") or "").strip() or str(i + 1)
         if i == 0:
@@ -321,18 +328,26 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
 
         is_new_page = False
         is_new_system = False
+        has_system_layout = False
         for pr in _children_named(measure, "print"):
+            print_count += 1
             is_new_page = is_new_page or _truthy_attr(pr.get("new-page"))
             is_new_system = is_new_system or _truthy_attr(pr.get("new-system"))
+            if _children_named(pr, "system-layout"):
+                has_system_layout = True
 
         if is_new_page:
             pages.append([label])
-        elif is_new_system:
+        elif is_new_system or has_system_layout:
             if not pages:
                 pages = [[]]
             pages[-1].append(label)
+            if has_system_layout and not is_new_system:
+                system_start_mode = "explicit_or_layout"
 
     meta["mxl_parse_status"] = "ok"
+    meta["mxl_print_count"] = print_count
+    meta["mxl_system_start_mode"] = system_start_mode
     meta["mxl_pages"] = len(pages)
     meta["mxl_system_starts_per_page"] = pages
     meta["mxl_extract_status"] = "ok" if pages else "empty"
@@ -1419,6 +1434,14 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             f"mxl_pages={mxl_meta.get('mxl_pages')}",
             flush=True,
         )
+        print(
+            "[DBG] mxl_info "
+            f"path={mxl_meta.get('mxl_path')} "
+            f"measures={mxl_meta.get('mxl_measure_count')} "
+            f"prints={mxl_meta.get('mxl_print_count')} "
+            f"start_mode={mxl_meta.get('mxl_system_start_mode')}",
+            flush=True,
+        )
 
     with zipfile.ZipFile(omr_path, "r") as z:
         sheet_paths = _sorted_sheet_xml_paths(z)
@@ -1480,6 +1503,14 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 mxl_pages = mxl_meta.get("mxl_system_starts_per_page", [])
                 if mxl_meta.get("mxl_parse_status") == "ok" and page_index < len(mxl_pages):
                     page_mxl_starts = list(mxl_pages[page_index])
+                    if _debug_measure_labels_enabled():
+                        print(
+                            f"[DBG] mxl_map page={page_index+1} "
+                            f"omr_systems={len(system_staff_counts)} "
+                            f"mxl_system_starts={len(page_mxl_starts)} "
+                            f"mxl_starts_sample={page_mxl_starts[:8]}",
+                            flush=True,
+                        )
                     mxl_mapped, map_reason = _apply_mxl_staff_start_labels(
                         staff_start_labels_pdf=staff_start_labels_pdf,
                         system_staff_counts=system_staff_counts,
@@ -1567,6 +1598,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "mxl_parse_status": mxl_meta.get("mxl_parse_status"),
                     "mxl_member_path": mxl_meta.get("mxl_member_path"),
                     "mxl_parser_used": mxl_meta.get("mxl_parser_used"),
+                    "mxl_measure_count": mxl_meta.get("mxl_measure_count"),
+                    "mxl_print_count": mxl_meta.get("mxl_print_count"),
+                    "mxl_system_start_mode": mxl_meta.get("mxl_system_start_mode"),
                     "mxl_extract_status": mxl_meta.get("mxl_extract_status"),
                     "mxl_page_system_starts": page_mxl_starts,
                     "omr_system_staff_counts": system_staff_counts,
@@ -1595,6 +1629,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             "mxl_parser_used": mxl_meta.get("mxl_parser_used"),
             "mxl_parse_attempts": mxl_meta.get("mxl_parse_attempts"),
             "mxl_sanitized_prefixes": mxl_meta.get("mxl_sanitized_prefixes"),
+            "mxl_measure_count": mxl_meta.get("mxl_measure_count"),
+            "mxl_print_count": mxl_meta.get("mxl_print_count"),
+            "mxl_system_start_mode": mxl_meta.get("mxl_system_start_mode"),
             "mxl_pages": mxl_meta.get("mxl_pages"),
             "mxl_system_starts_per_page": mxl_meta.get("mxl_system_starts_per_page"),
             "mxl_extract_status": mxl_meta.get("mxl_extract_status"),

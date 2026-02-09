@@ -59,6 +59,9 @@ jobs:
 
           echo "Audiveris outputs:"
           find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
+          echo "MusicXML candidates:"
+          ls -lh /tmp/work/audiveris_out/input || true
+          find /tmp/work/audiveris_out -maxdepth 4 -type f \( -name "*.mxl" -o -name "*.musicxml" -o -name "*.xml" \) -print || true
 
       - name: Validate OMR and print archive debug
         run: |
