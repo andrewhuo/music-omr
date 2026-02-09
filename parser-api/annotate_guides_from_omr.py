@@ -935,9 +935,15 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     return ([], candidate_source)
 
                 staff_h = max(1.0, float(y_bot - y_top))
-                vertical_min_ratio = 0.80
-                vertical_tol = max(3.0, (0.18 * expected_spacing) if expected_spacing > 0 else 3.0)
-                x_margin = max(8.0, (0.70 * expected_spacing) if expected_spacing > 0 else 8.0)
+                if candidate_source == "staff_ids":
+                    # Trust staff-declared barlines; keep filtering very light.
+                    vertical_min_ratio = 0.20
+                    vertical_tol = None
+                    x_margin = None
+                else:
+                    vertical_min_ratio = 0.80
+                    vertical_tol = max(3.0, (0.18 * expected_spacing) if expected_spacing > 0 else 3.0)
+                    x_margin = max(8.0, (0.70 * expected_spacing) if expected_spacing > 0 else 8.0)
 
                 xs: list[float] = []
                 for el in candidate_elements:
@@ -952,13 +958,14 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     if (overlap / staff_h) < vertical_min_ratio:
                         continue
 
-                    if dx_abs > vertical_tol:
+                    if vertical_tol is not None and dx_abs > vertical_tol:
                         continue
 
-                    if staff_left is not None and bx < (float(staff_left) - x_margin):
-                        continue
-                    if staff_right is not None and bx > (float(staff_right) + x_margin):
-                        continue
+                    if x_margin is not None:
+                        if staff_left is not None and bx < (float(staff_left) - x_margin):
+                            continue
+                        if staff_right is not None and bx > (float(staff_right) + x_margin):
+                            continue
                     xs.append(float(bx))
 
                 if not xs:
