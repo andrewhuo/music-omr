@@ -86,6 +86,20 @@ jobs:
           ls -lh /tmp/work/audiveris_out/input || true
           find /tmp/work/audiveris_out -maxdepth 4 -type f \( -name "*.mxl" -o -name "*.musicxml" -o -name "*.xml" \) -print || true
 
+      - name: MusicXML debug (member list + head)
+        run: |
+          set -euo pipefail
+          MXL="/tmp/work/audiveris_out/input/input.mvt1.mxl"
+          if [[ ! -f "$MXL" ]]; then
+            echo "No MXL at $MXL"
+            find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
+            exit 0
+          fi
+          echo "=== MXL member list (xml/musicxml only) ==="
+          unzip -l "$MXL" | grep -E '\.xml$|\.musicxml$' || true
+          echo "=== Head of input.mvt1.xml (if present) ==="
+          unzip -p "$MXL" input.mvt1.xml | head -n 200 || true
+
       - name: Validate OMR and print archive debug
         run: |
           set -euo pipefail
