@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import zipfile
+import glob
 import xml.etree.ElementTree as ET
 
 import fitz  # PyMuPDF
@@ -147,8 +148,33 @@ def _find_mxl_path_for_omr(omr_path: str) -> str | None:
     root, ext = os.path.splitext(omr_path)
     if ext.lower() != ".omr":
         return None
-    mxl_path = f"{root}.mxl"
-    return mxl_path if os.path.exists(mxl_path) else None
+
+    base = os.path.basename(root)
+    dir_path = os.path.dirname(omr_path) or "."
+
+    direct_candidates = [
+        f"{root}.mxl",
+        f"{root}.musicxml",
+        f"{root}.xml",
+    ]
+    for c in direct_candidates:
+        if os.path.exists(c):
+            return c
+
+    ext_candidates = []
+    for extn in (".mxl", ".musicxml", ".xml"):
+        ext_candidates.extend(glob.glob(os.path.join(dir_path, f"*{extn}")))
+
+    if not ext_candidates:
+        return None
+
+    same_base = [p for p in ext_candidates if os.path.splitext(os.path.basename(p))[0] == base]
+    if same_base:
+        same_base.sort()
+        return same_base[0]
+
+    ext_candidates.sort()
+    return ext_candidates[0]
 
 
 def _score_xml_member_from_mxl(z: zipfile.ZipFile) -> str | None:
@@ -211,13 +237,18 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
     pages: list[list[str]] = []
     xml_bytes = b""
     try:
-        with zipfile.ZipFile(mxl_path, "r") as z:
-            score_member = _score_xml_member_from_mxl(z)
-            if not score_member:
-                meta["mxl_parse_status"] = "missing_score_member"
-                return meta
-            meta["mxl_member_path"] = score_member
-            xml_bytes = z.read(score_member)
+        if zipfile.is_zipfile(mxl_path):
+            with zipfile.ZipFile(mxl_path, "r") as z:
+                score_member = _score_xml_member_from_mxl(z)
+                if not score_member:
+                    meta["mxl_parse_status"] = "missing_score_member"
+                    return meta
+                meta["mxl_member_path"] = score_member
+                xml_bytes = z.read(score_member)
+        else:
+            with open(mxl_path, "rb") as f:
+                xml_bytes = f.read()
+            meta["mxl_member_path"] = os.path.basename(mxl_path)
     except Exception as exc:
         meta["mxl_parse_status"] = "zip_error"
         meta["mxl_error"] = str(exc)
@@ -1188,8 +1219,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 counter_before = measure_counter
 
+                # Always record a staff-start label position; MXL can replace text later.
+                staff_start_marks_px.append((x_postpad, y_top, y_bot, str(measure_counter)))
                 if staff_barline_xs:
-                    staff_start_marks_px.append((x_postpad, y_top, y_bot, str(measure_counter)))
                     measure_counter += increment_bars
                 counter_after = measure_counter
 
@@ -1531,6 +1563,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "sheet_xml_path": sheet_xml_path,
                     "measure_mode": measure_label_mode,
                     "measure_source_policy": measure_source_policy,
+                    "mxl_path": mxl_meta.get("mxl_path"),
                     "mxl_parse_status": mxl_meta.get("mxl_parse_status"),
                     "mxl_member_path": mxl_meta.get("mxl_member_path"),
                     "mxl_parser_used": mxl_meta.get("mxl_parser_used"),
@@ -1556,6 +1589,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         payload = {
             "measure_mode": measure_label_mode,
             "measure_source_policy": measure_source_policy,
+            "mxl_path": mxl_meta.get("mxl_path"),
             "mxl_parse_status": mxl_meta.get("mxl_parse_status"),
             "mxl_member_path": mxl_meta.get("mxl_member_path"),
             "mxl_parser_used": mxl_meta.get("mxl_parser_used"),

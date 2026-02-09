@@ -96,7 +96,7 @@ jobs:
           DEBUG_GUIDES: "0"
           ENABLE_MEASURE_LABELS: "1"
           MEASURE_LABEL_MODE: "staff_start"
-          MEASURE_SOURCE_POLICY: "mxl_with_omr_fallback"
+          MEASURE_SOURCE_POLICY: "mxl_strict"
           MXL_PARSER_POLICY: "auto"
           MXL_SANITIZE_PREFIXES: "1"
           DEBUG_MEASURE_LABELS: "1"
