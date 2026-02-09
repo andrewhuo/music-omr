@@ -27,6 +27,7 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+          create_credentials_file: true
 
       - name: Set up Google Cloud SDK (apt)
         run: |
@@ -42,6 +43,18 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y google-cloud-cli
           gcloud --version
+
+      - name: Configure gcloud auth for gsutil
+        run: |
+          set -euo pipefail
+          if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+            echo "ERROR: GOOGLE_APPLICATION_CREDENTIALS not set"
+            exit 1
+          fi
+          echo "GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS}"
+          echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=${GOOGLE_APPLICATION_CREDENTIALS}" >> "$GITHUB_ENV"
+          gcloud auth login --cred-file="${GOOGLE_APPLICATION_CREDENTIALS}"
+          gcloud auth list
 
       - name: Show run context
         run: |
