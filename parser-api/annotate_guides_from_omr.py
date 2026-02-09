@@ -910,7 +910,11 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 # Prefer explicit staff barline ids from staff XML.
                 candidate_elements: list = []
                 for bid in staff_barline_ids:
-                    bel = inter_by_id.get(str(bid))
+                    try:
+                        bid_int = int(bid)
+                    except Exception:
+                        continue
+                    bel = inter_by_id.get(bid_int)
                     if bel is None:
                         continue
                     if (bel.tag or "").lower() != "barline":
@@ -1163,13 +1167,13 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         if cand is not None:
                             left_ref = float(cand)
                             break
-                    if left_ref is not None and sys_index > 0:
+                    if left_ref is not None and sys_index > 0 and increment_bars > 1:
                         first_bar_x = float(min(staff_barline_xs))
                         if abs(first_bar_x - left_ref) <= carry_tol:
                             left_carryover_detected = True
                             increment_bars = max(0, increment_bars - 1)
 
-                    if staff_right_raw is not None:
+                    if staff_right_raw is not None and increment_bars > 1:
                         last_bar_x = float(max(staff_barline_xs))
                         if abs(float(staff_right_raw) - last_bar_x) <= carry_tol:
                             right_carryover_detected = True
