@@ -75,10 +75,63 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/work/audiveris_out
-          docker run --rm \
-            -v /tmp/work:/work \
-            toprock/audiveris:latest \
-            /audiveris-extract/bin/Audiveris -batch -export -output /work/audiveris_out /work/input.pdf || true
+
+          run_omr() {
+            local image="$1"
+            echo "Audiveris image: $image"
+            docker run --rm \
+              -v /tmp/work:/work \
+              "$image" \
+              sh -c 'AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; echo "Audiveris bin: $AUDI_BIN"; $AUDI_BIN -batch -export -output /work/audiveris_out /work/input.pdf' || true
+          }
+
+          check_mxl() {
+            python - << 'PY'
+import glob, zipfile, xml.etree.ElementTree as ET
+def local(tag):
+    return tag.split('}',1)[-1] if '}' in tag else tag
+def count_parts_measures(root):
+    parts = [el for el in root.iter() if local(el.tag) == 'part']
+    measures = [el for el in root.iter() if local(el.tag) == 'measure']
+    return len(parts), len(measures)
+
+cands = sorted(glob.glob('/tmp/work/audiveris_out/input/*.mxl'))
+if not cands:
+    print("MXL_CHECK: no .mxl found")
+    raise SystemExit(2)
+mxl = cands[0]
+with zipfile.ZipFile(mxl, 'r') as z:
+    members = []
+    for name in z.namelist():
+        if name.startswith('META-INF/'):
+            continue
+        if not (name.lower().endswith('.xml') or name.lower().endswith('.musicxml')):
+            continue
+        try:
+            root = ET.fromstring(z.read(name))
+        except Exception:
+            continue
+        parts, measures = count_parts_measures(root)
+        members.append((name, local(root.tag), parts, measures))
+    if not members:
+        print("MXL_CHECK: no xml members")
+        raise SystemExit(3)
+    members.sort(key=lambda x: (x[3], x[2]), reverse=True)
+    name, root, parts, measures = members[0]
+    print(f"MXL_CHECK: mxl={mxl} member={name} root={root} parts={parts} measures={measures}")
+    if parts == 0 or measures == 0:
+        raise SystemExit(1)
+PY
+          }
+
+          run_omr toprock/audiveris:latest
+          if ! check_mxl; then
+            echo "MusicXML export has no parts/measures. Retrying with full Audiveris image."
+            rm -rf /tmp/work/audiveris_out
+            mkdir -p /tmp/work/audiveris_out
+            run_omr audiveris/audiveris
+            check_mxl
+          fi
 
           echo "Audiveris outputs:"
           find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
