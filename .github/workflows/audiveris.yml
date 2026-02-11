@@ -75,6 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/work
+          mkdir -p /tmp/work/.cache /tmp/work/.config /tmp/work/tmp
           echo "WORKFLOW_SIGNATURE=xml-select-v4"
           echo "WORKFLOW_SHA=${GITHUB_SHA}"
 
@@ -86,8 +87,12 @@ jobs:
               -v /tmp/work:/work \
               -e AUDI_IMAGE="${image}" \
               -e AUDI_OUT_DIR="/work/${out_dir_name}" \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
               "$image" \
-              sh -c 'AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN}"; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" /work/input.pdf' || true
+              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN} HOME=${HOME} XDG_CACHE_HOME=${XDG_CACHE_HOME}"; "$AUDI_BIN" -help >/work/audi_help.txt 2>&1 || true; if grep -Eq "AccessDeniedException: /\\.cache|Loader\\.getCacheDir\\(\\).*null|ExceptionInInitializerError" /work/audi_help.txt; then echo "AUDIVERIS_PREFLIGHT_ERROR"; tail -n 120 /work/audi_help.txt || true; exit 86; fi; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" /work/input.pdf'
           }
 
           check_mxl() {
@@ -237,10 +242,9 @@ jobs:
           run_omr toprock/audiveris:latest audiveris_out_try1
           SELECTED_OUT="/tmp/work/audiveris_out_try1"
           if ! check_mxl "$SELECTED_OUT"; then
-            echo "MusicXML export has no parts/measures. Retrying with full Audiveris image."
-            run_omr audiveris/audiveris audiveris_out_try2
-            SELECTED_OUT="/tmp/work/audiveris_out_try2"
-            check_mxl "$SELECTED_OUT"
+            echo "MusicXML export has no parts/measures after successful startup."
+            echo "Failing fast in xml-strict mode (no fallback image retry)."
+            exit 1
           fi
 
           AUDI_SELECTED_OUT="${SELECTED_OUT}"
