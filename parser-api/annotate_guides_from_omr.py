@@ -177,6 +177,16 @@ def _find_mxl_path_for_omr(omr_path: str) -> str | None:
     return ext_candidates[0]
 
 
+def _resolve_mxl_path(omr_path: str) -> str | None:
+    override = os.getenv("MXL_PATH_OVERRIDE", "").strip()
+    if override:
+        if os.path.exists(override):
+            return override
+        if _debug_measure_labels_enabled():
+            print(f"[DBG] mxl_override_missing path={override}", flush=True)
+    return _find_mxl_path_for_omr(omr_path)
+
+
 def _scan_mxl_members(z: zipfile.ZipFile) -> list[dict]:
     members: list[dict] = []
     for name in z.namelist():
@@ -1496,7 +1506,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         "mxl_extract_status": "error",
         "mxl_error": None,
     }
-    mxl_path = _find_mxl_path_for_omr(omr_path)
+    mxl_path = _resolve_mxl_path(omr_path)
     if measure_label_mode == "staff_start":
         if mxl_path:
             mxl_meta = _parse_mxl_system_start_numbers_with_meta(mxl_path)

@@ -74,92 +74,229 @@ jobs:
       - name: Run Audiveris OMR
         run: |
           set -euo pipefail
-          mkdir -p /tmp/work/audiveris_out
+          mkdir -p /tmp/work
+          echo "WORKFLOW_SIGNATURE=xml-select-v4"
+          echo "WORKFLOW_SHA=${GITHUB_SHA}"
 
           run_omr() {
             local image="$1"
-            echo "Audiveris image: $image"
+            local out_dir_name="$2"
             docker run --rm \
+              --user "$(id -u):$(id -g)" \
               -v /tmp/work:/work \
+              -e AUDI_IMAGE="${image}" \
+              -e AUDI_OUT_DIR="/work/${out_dir_name}" \
               "$image" \
-              sh -c 'AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; echo "Audiveris bin: $AUDI_BIN"; $AUDI_BIN -batch -export -output /work/audiveris_out /work/input.pdf' || true
+              sh -c 'AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN}"; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" /work/input.pdf' || true
           }
 
           check_mxl() {
-          python - <<'PY'
-          import glob, zipfile, xml.etree.ElementTree as ET
+            local out_dir="$1"
+            python - "$out_dir" <<'PY'
+          import glob
+          import os
+          import re
+          import sys
+          import zipfile
+          import xml.etree.ElementTree as ET
+
+          try:
+              from lxml import etree as LET  # type: ignore
+          except Exception:
+              LET = None
+
+
           def local(tag):
-              return tag.split('}',1)[-1] if '}' in tag else tag
-          def count_parts_measures(root):
-              parts = [el for el in root.iter() if local(el.tag) == 'part']
-              measures = [el for el in root.iter() if local(el.tag) == 'measure']
-              return len(parts), len(measures)
-          
-          cands = sorted(glob.glob('/tmp/work/audiveris_out/input/*.mxl'))
-          if not cands:
-              print("MXL_CHECK: no .mxl found")
-              raise SystemExit(2)
-          mxl = cands[0]
-          with zipfile.ZipFile(mxl, 'r') as z:
-              members = []
-              for name in z.namelist():
-                  if name.startswith('META-INF/'):
-                      continue
-                  if not (name.lower().endswith('.xml') or name.lower().endswith('.musicxml')):
-                      continue
+              if isinstance(tag, str):
+                  return tag.split("}", 1)[-1] if "}" in tag else tag
+              return str(tag)
+
+
+          def count_by_tagscan(raw: bytes):
+              parts = len(re.findall(br"<\s*part(\s|>)", raw, flags=re.IGNORECASE))
+              measures = len(re.findall(br"<\s*measure(\s|>)", raw, flags=re.IGNORECASE))
+              return parts, measures
+
+
+          def score_xml_member(raw: bytes):
+              try:
+                  root = ET.fromstring(raw)
+                  parts = sum(1 for el in root.iter() if local(el.tag) == "part")
+                  measures = sum(1 for el in root.iter() if local(el.tag) == "measure")
+                  return {
+                      "parse": "stdlib",
+                      "root": local(root.tag),
+                      "parts": parts,
+                      "measures": measures,
+                  }
+              except Exception:
+                  pass
+
+              if LET is not None:
                   try:
-                      root = ET.fromstring(z.read(name))
+                      parser = LET.XMLParser(recover=True, huge_tree=True)
+                      root = LET.fromstring(raw, parser=parser)
+                      root_name = local(root.tag) if root is not None else "unknown"
+                      parts = len(root.xpath('//*[local-name()="part"]')) if root is not None else 0
+                      measures = len(root.xpath('//*[local-name()="measure"]')) if root is not None else 0
+                      return {
+                          "parse": "lxml_recover",
+                          "root": root_name,
+                          "parts": parts,
+                          "measures": measures,
+                      }
                   except Exception:
-                      continue
-                  parts, measures = count_parts_measures(root)
-                  members.append((name, local(root.tag), parts, measures))
-              if not members:
-                  print("MXL_CHECK: no xml members")
-                  raise SystemExit(3)
-              members.sort(key=lambda x: (x[3], x[2]), reverse=True)
-              name, root, parts, measures = members[0]
-              print(f"MXL_CHECK: mxl={mxl} member={name} root={root} parts={parts} measures={measures}")
-              if parts == 0 or measures == 0:
-                  raise SystemExit(1)
+                      pass
+
+              parts, measures = count_by_tagscan(raw)
+              return {
+                  "parse": "tagscan",
+                  "root": "unknown",
+                  "parts": parts,
+                  "measures": measures,
+              }
+
+
+          def score_mxl(mxl_path):
+              best_member = None
+              try:
+                  with zipfile.ZipFile(mxl_path, "r") as z:
+                      for name in z.namelist():
+                          if name.startswith("META-INF/"):
+                              continue
+                          if not (name.lower().endswith(".xml") or name.lower().endswith(".musicxml")):
+                              continue
+                          try:
+                              raw = z.read(name)
+                          except Exception:
+                              continue
+                          scored = score_xml_member(raw)
+                          cand = {"member": name, **scored}
+                          if best_member is None or (cand["measures"], cand["parts"]) > (
+                              best_member["measures"],
+                              best_member["parts"],
+                          ):
+                              best_member = cand
+              except Exception as exc:
+                  return {
+                      "path": mxl_path,
+                      "member": None,
+                      "parse": "zip_error",
+                      "root": "zip_error",
+                      "parts": 0,
+                      "measures": 0,
+                      "error": str(exc),
+                  }
+
+              if best_member is None:
+                  return {
+                      "path": mxl_path,
+                      "member": None,
+                      "parse": "none",
+                      "root": "no_xml_members",
+                      "parts": 0,
+                      "measures": 0,
+                      "error": None,
+                  }
+
+              return {"path": mxl_path, **best_member, "error": None}
+
+
+          out_dir = sys.argv[1]
+          mxl_candidates = sorted(glob.glob(os.path.join(out_dir, "input", "*.mxl")))
+          if not mxl_candidates:
+              print(f"MXL_CHECK: no .mxl found under {out_dir}/input")
+              raise SystemExit(2)
+
+          scored = [score_mxl(path) for path in mxl_candidates]
+          for row in scored:
+              err = f" error={row['error']}" if row.get("error") else ""
+              print(
+                  "MXL_CANDIDATE "
+                  f"path={row['path']} member={row['member']} parse={row['parse']} "
+                  f"root={row['root']} parts={row['parts']} measures={row['measures']}{err}"
+              )
+
+          best = max(scored, key=lambda r: (r["measures"], r["parts"]))
+          print(
+              "MXL_SELECTED "
+              f"path={best['path']} member={best['member']} parse={best['parse']} "
+              f"parts={best['parts']} measures={best['measures']}"
+          )
+
+          with open("/tmp/work/selected_mxl_path.txt", "w", encoding="utf-8") as f:
+              f.write(best["path"])
+          with open("/tmp/work/selected_mxl_member.txt", "w", encoding="utf-8") as f:
+              f.write(best["member"] or "")
+
+          if best["parts"] <= 0 or best["measures"] <= 0:
+              raise SystemExit(1)
           PY
           }
 
-          run_omr toprock/audiveris:latest
-          if ! check_mxl; then
+          run_omr toprock/audiveris:latest audiveris_out_try1
+          SELECTED_OUT="/tmp/work/audiveris_out_try1"
+          if ! check_mxl "$SELECTED_OUT"; then
             echo "MusicXML export has no parts/measures. Retrying with full Audiveris image."
-            rm -rf /tmp/work/audiveris_out
-            mkdir -p /tmp/work/audiveris_out
-            run_omr audiveris/audiveris
-            check_mxl
+            run_omr audiveris/audiveris audiveris_out_try2
+            SELECTED_OUT="/tmp/work/audiveris_out_try2"
+            check_mxl "$SELECTED_OUT"
           fi
 
+          AUDI_SELECTED_OUT="${SELECTED_OUT}"
+          MXL_MEMBER_OVERRIDE="$(cat /tmp/work/selected_mxl_member.txt)"
+          MXL_PATH_OVERRIDE="$(cat /tmp/work/selected_mxl_path.txt)"
+          echo "AUDI_SELECTED_OUT=${AUDI_SELECTED_OUT}" >> "$GITHUB_ENV"
+          echo "MXL_MEMBER_OVERRIDE=${MXL_MEMBER_OVERRIDE}" >> "$GITHUB_ENV"
+          echo "MXL_PATH_OVERRIDE=${MXL_PATH_OVERRIDE}" >> "$GITHUB_ENV"
+          echo "AUDI_SELECTED_OUT=${AUDI_SELECTED_OUT}"
+          echo "MXL_PATH_OVERRIDE=${MXL_PATH_OVERRIDE}"
+          echo "MXL_MEMBER_OVERRIDE=${MXL_MEMBER_OVERRIDE}"
+
           echo "Audiveris outputs:"
-          find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
+          find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f -print || true
           echo "MusicXML candidates:"
-          ls -lh /tmp/work/audiveris_out/input || true
-          find /tmp/work/audiveris_out -maxdepth 4 -type f \( -name "*.mxl" -o -name "*.musicxml" -o -name "*.xml" \) -print || true
+          ls -lh "${AUDI_SELECTED_OUT}/input" || true
+          find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f \( -name "*.mxl" -o -name "*.musicxml" -o -name "*.xml" \) -print || true
 
       - name: MusicXML debug (member list + head)
         run: |
           set -euo pipefail
-          MXL="/tmp/work/audiveris_out/input/input.mvt1.mxl"
+          MXL="${MXL_PATH_OVERRIDE:-}"
+          MEMBER="${MXL_MEMBER_OVERRIDE:-}"
+          if [[ -z "$MXL" && -f /tmp/work/selected_mxl_path.txt ]]; then
+            MXL="$(cat /tmp/work/selected_mxl_path.txt)"
+          fi
+          if [[ -z "$MEMBER" && -f /tmp/work/selected_mxl_member.txt ]]; then
+            MEMBER="$(cat /tmp/work/selected_mxl_member.txt)"
+          fi
           if [[ ! -f "$MXL" ]]; then
             echo "No MXL at $MXL"
-            find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
+            find "${AUDI_SELECTED_OUT:-/tmp/work}" -maxdepth 4 -type f -print || true
             exit 0
           fi
           echo "=== MXL member list (xml/musicxml only) ==="
           unzip -l "$MXL" | grep -E '\.xml$|\.musicxml$' || true
-          echo "=== Head of input.mvt1.xml (if present) ==="
-          unzip -p "$MXL" input.mvt1.xml | head -n 200 || true
+          echo "=== Head of selected XML member ==="
+          if [[ -n "$MEMBER" ]]; then
+            echo "Selected member: $MEMBER"
+            unzip -p "$MXL" "$MEMBER" | head -n 200 || true
+          else
+            echo "No selected member found, printing first xml member."
+            FIRST_MEMBER="$(unzip -Z1 "$MXL" | grep -E '\.xml$|\.musicxml$' | head -n 1 || true)"
+            if [[ -n "$FIRST_MEMBER" ]]; then
+              echo "First member: $FIRST_MEMBER"
+              unzip -p "$MXL" "$FIRST_MEMBER" | head -n 200 || true
+            fi
+          fi
 
       - name: Validate OMR and print archive debug
         run: |
           set -euo pipefail
-          OMR="/tmp/work/audiveris_out/input/input.omr"
+          OMR="${AUDI_SELECTED_OUT}/input/input.omr"
           if [[ ! -f "$OMR" ]]; then
             echo "ERROR: missing $OMR"
-            find /tmp/work/audiveris_out -maxdepth 4 -type f -print || true
+            find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f -print || true
             exit 1
           fi
 
@@ -167,7 +304,7 @@ jobs:
           unzip -l "$OMR" | sed -n '1,220p'
 
           echo "Audiveris logs (tail):"
-          for f in /tmp/work/audiveris_out/input/*.log; do
+          for f in "${AUDI_SELECTED_OUT}"/input/*.log; do
             [[ -f "$f" ]] || continue
             echo "--- $f (last 120 lines) ---"
             tail -n 120 "$f" || true
@@ -192,6 +329,7 @@ jobs:
           MEASURE_SOURCE_POLICY: "mxl_strict"
           MXL_PARSER_POLICY: "auto"
           MXL_SANITIZE_PREFIXES: "1"
+          MXL_PATH_OVERRIDE: "${{ env.MXL_PATH_OVERRIDE }}"
           DEBUG_MEASURE_LABELS: "1"
           DEBUG_MEASURE_MARKERS: "0"
           MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"
@@ -199,7 +337,7 @@ jobs:
           set -euo pipefail
           python -u parser-api/annotate_guides_from_omr.py \
             /tmp/work/input.pdf \
-            /tmp/work/audiveris_out/input/input.omr \
+            "${AUDI_SELECTED_OUT}/input/input.omr" \
             /tmp/work/annotated.pdf
           ls -lh /tmp/work/annotated.pdf
 
