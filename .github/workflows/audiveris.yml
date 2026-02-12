@@ -334,6 +334,7 @@ jobs:
           MXL_PARSER_POLICY: "auto"
           MXL_SANITIZE_PREFIXES: "1"
           MXL_PATH_OVERRIDE: "${{ env.MXL_PATH_OVERRIDE }}"
+          MXL_MEMBER_OVERRIDE: "${{ env.MXL_MEMBER_OVERRIDE }}"
           DEBUG_MEASURE_LABELS: "1"
           DEBUG_MEASURE_MARKERS: "0"
           MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"
@@ -357,6 +358,40 @@ jobs:
           print('output_pages=', out_doc.page_count)
           if in_doc.page_count != out_doc.page_count:
             raise SystemExit('ERROR: output page count mismatch')
+          PY
+
+      - name: Mapping debug summary
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json
+
+          p = "/tmp/work/measure_mapping_debug.json"
+          d = json.load(open(p, "r", encoding="utf-8"))
+          print("SUMMARY mxl_path=", d.get("mxl_path"))
+          print("SUMMARY mxl_paths=", d.get("mxl_paths"))
+          movements = d.get("mxl_movements") or []
+          for i, m in enumerate(movements, start=1):
+              print(
+                  f"SUMMARY movement#{i} path={m.get('mxl_path')} "
+                  f"status={m.get('mxl_parse_status')} pages={m.get('mxl_pages')} "
+                  f"member={m.get('mxl_member_path')} "
+                  f"source_sheets={m.get('mxl_source_sheet_numbers')}"
+              )
+
+          pages = d.get("pages") or []
+          for pg in pages:
+              print(
+                  f"SUMMARY page={pg.get('page_index', 0)+1} "
+                  f"source={pg.get('staff_start_source')} "
+                  f"status={pg.get('mapping_status')} "
+                  f"reason={pg.get('mapping_reason')} "
+                  f"mode={pg.get('mapping_mode')} "
+                  f"mxl_sys={len(pg.get('mxl_page_system_starts') or [])} "
+                  f"omr_sys={len(pg.get('omr_system_staff_counts') or [])} "
+                  f"assigned={len(pg.get('assigned_labels') or [])} "
+                  f"candidates={pg.get('staff_start_candidate_count')}"
+              )
           PY
 
       - name: Upload outputs and debug artifacts

@@ -187,6 +187,93 @@ def _resolve_mxl_path(omr_path: str) -> str | None:
     return _find_mxl_path_for_omr(omr_path)
 
 
+def _mxl_sort_key(path: str, omr_base: str) -> tuple[int, int, str]:
+    name = os.path.basename(path)
+    plain_name = f"{omr_base}.mxl"
+    if name == plain_name:
+        return (0, 0, name)
+    m = re.match(rf"^{re.escape(omr_base)}\.mvt(\d+)\.mxl$", name)
+    if m:
+        return (1, int(m.group(1)), name)
+    return (2, 0, name)
+
+
+def _resolve_mxl_paths(omr_path: str) -> list[str]:
+    root, ext = os.path.splitext(omr_path)
+    if ext.lower() != ".omr":
+        return []
+
+    omr_base = os.path.basename(root)
+    omr_dir = os.path.dirname(omr_path) or "."
+    override = os.getenv("MXL_PATH_OVERRIDE", "").strip()
+    primary = _resolve_mxl_path(omr_path)
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add_path(p: str | None) -> None:
+        if not p:
+            return
+        ap = os.path.abspath(p)
+        if ap in seen:
+            return
+        if not os.path.exists(ap):
+            return
+        if not ap.lower().endswith(".mxl"):
+            return
+        seen.add(ap)
+        candidates.append(ap)
+
+    _add_path(override if override else None)
+    _add_path(primary)
+
+    search_dirs = {os.path.abspath(omr_dir)}
+    if override:
+        search_dirs.add(os.path.abspath(os.path.dirname(override) or "."))
+    if primary:
+        search_dirs.add(os.path.abspath(os.path.dirname(primary) or "."))
+
+    for d in sorted(search_dirs):
+        for p in glob.glob(os.path.join(d, f"{omr_base}*.mxl")):
+            _add_path(p)
+
+    candidates.sort(key=lambda p: _mxl_sort_key(p, omr_base))
+    return candidates
+
+
+def _iter_named(root: ET.Element, name: str) -> list[ET.Element]:
+    out: list[ET.Element] = []
+    for el in root.iter():
+        try:
+            tag = el.tag
+        except Exception:
+            continue
+        if isinstance(tag, str) and _local_name(tag) == name:
+            out.append(el)
+    return out
+
+
+def _parse_xml_bytes_for_inspection(xml_bytes: bytes) -> tuple[ET.Element | None, str]:
+    parse_input = xml_bytes
+    if _mxl_sanitize_prefixes_enabled():
+        parse_input, _ = _sanitize_xml_unbound_prefixes(xml_bytes)
+
+    try:
+        root = ET.fromstring(parse_input)
+        return root, "stdlib"
+    except Exception:
+        pass
+
+    try:
+        parser = LET.XMLParser(recover=True, resolve_entities=False, huge_tree=True)
+        lxml_root = LET.fromstring(parse_input, parser=parser)
+        xml_clean = LET.tostring(lxml_root, encoding="utf-8")
+        root = ET.fromstring(xml_clean)
+        return root, "lxml_recover"
+    except Exception:
+        return None, "error"
+
+
 def _scan_mxl_members(z: zipfile.ZipFile) -> list[dict]:
     members: list[dict] = []
     for name in z.namelist():
@@ -199,13 +286,14 @@ def _scan_mxl_members(z: zipfile.ZipFile) -> list[dict]:
         root_name = "unknown"
         measure_count = 0
         parse_ok = False
+        parser_used = "none"
         try:
             data = z.read(name)
-            root = ET.fromstring(data)
-            root_name = _local_name(root.tag)
-            parse_ok = True
-            measures = root.findall(".//measure")
-            measure_count = len(measures)
+            root, parser_used = _parse_xml_bytes_for_inspection(data)
+            if root is not None:
+                root_name = _local_name(root.tag)
+                parse_ok = True
+                measure_count = len(_iter_named(root, "measure"))
         except Exception:
             pass
 
@@ -215,31 +303,43 @@ def _scan_mxl_members(z: zipfile.ZipFile) -> list[dict]:
                 "root": root_name,
                 "measure_count": measure_count,
                 "parse_ok": parse_ok,
+                "parser_used": parser_used,
             }
         )
     return members
 
 
-def _score_xml_member_from_mxl(z: zipfile.ZipFile) -> tuple[str | None, list[dict]]:
+def _score_xml_member_from_mxl(
+    z: zipfile.ZipFile,
+    preferred_member: str | None = None,
+) -> tuple[str | None, list[dict], str]:
     members = _scan_mxl_members(z)
     if not members:
-        return None, members
+        return None, members, "missing_score_member"
+
+    if preferred_member:
+        preferred = [m for m in members if m["name"] == preferred_member]
+        if preferred:
+            return preferred[0]["name"], members, "workflow_override"
 
     # Prefer real score roots with measures.
-    def score_rank(m: dict) -> tuple[int, int]:
+    def score_rank(m: dict) -> tuple[int, int, int]:
         is_score = 1 if m["root"] in ("score-partwise", "score-timewise") else 0
-        return (is_score, m["measure_count"])
+        parse_ok = 1 if m["parse_ok"] else 0
+        return (is_score, m["measure_count"], parse_ok)
 
     best = max(members, key=score_rank)
     if best["measure_count"] > 0:
-        return best["name"], members
+        if best["root"] in ("score-partwise", "score-timewise"):
+            return best["name"], members, "score_root_with_measures"
+        return best["name"], members, "max_measures_non_score_root"
 
     # If no measures, still prefer score-partwise/timewise if present.
     scored = [m for m in members if m["root"] in ("score-partwise", "score-timewise")]
     if scored:
-        return scored[0]["name"], members
+        return scored[0]["name"], members, "score_root_no_measures"
 
-    return members[0]["name"], members
+    return members[0]["name"], members, "fallback_first"
 
 
 def _sanitize_xml_unbound_prefixes(xml_bytes: bytes) -> tuple[bytes, list[str]]:
@@ -262,7 +362,25 @@ def _sanitize_xml_unbound_prefixes(xml_bytes: bytes) -> tuple[bytes, list[str]]:
     return new_text.encode("utf-8"), missing
 
 
-def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
+def _extract_source_sheet_system_counts(root: ET.Element) -> dict[int, int]:
+    out: dict[int, int] = {}
+    for el in root.iter():
+        if _local_name(el.tag) != "miscellaneous-field":
+            continue
+        name = (el.get("name") or "").strip()
+        m = re.match(r"^source-sheet-(\d+)$", name)
+        if not m:
+            continue
+        sheet_num = int(m.group(1))
+        text = (el.text or "").strip()
+        out[sheet_num] = len([tok for tok in text.split() if tok])
+    return out
+
+
+def _parse_mxl_system_start_numbers_with_meta(
+    mxl_path: str,
+    preferred_member: str | None = None,
+) -> dict:
     meta = {
         "mxl_path": mxl_path,
         "mxl_parse_status": "error",
@@ -275,6 +393,8 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
         "mxl_system_start_mode": "explicit_only",
         "mxl_members": [],
         "mxl_member_choice_reason": "unknown",
+        "mxl_source_sheet_numbers": [],
+        "mxl_source_sheet_system_counts": {},
         "mxl_pages": 0,
         "mxl_system_starts_per_page": [],
         "mxl_extract_status": "error",
@@ -289,23 +409,14 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
     try:
         if zipfile.is_zipfile(mxl_path):
             with zipfile.ZipFile(mxl_path, "r") as z:
-                score_member, mxl_members = _score_xml_member_from_mxl(z)
+                score_member, mxl_members, mxl_member_choice_reason = _score_xml_member_from_mxl(
+                    z,
+                    preferred_member=preferred_member,
+                )
                 if not score_member:
                     meta["mxl_parse_status"] = "missing_score_member"
                     return meta
                 meta["mxl_member_path"] = score_member
-                if mxl_members:
-                    best = [m for m in mxl_members if m["name"] == score_member]
-                    if best:
-                        b = best[0]
-                        if b["root"] in ("score-partwise", "score-timewise") and b["measure_count"] > 0:
-                            mxl_member_choice_reason = "score_root_with_measures"
-                        elif b["root"] in ("score-partwise", "score-timewise"):
-                            mxl_member_choice_reason = "score_root_no_measures"
-                        elif b["measure_count"] > 0:
-                            mxl_member_choice_reason = "max_measures_non_score_root"
-                        else:
-                            mxl_member_choice_reason = "fallback_first"
                 xml_bytes = z.read(score_member)
         else:
             with open(mxl_path, "rb") as f:
@@ -369,10 +480,15 @@ def _parse_mxl_system_start_numbers_with_meta(mxl_path: str) -> dict:
         meta["mxl_parse_status"] = "unsupported_root"
         return meta
 
+    source_sheet_system_counts = _extract_source_sheet_system_counts(root)
+    source_sheet_numbers = sorted(source_sheet_system_counts.keys())
+    meta["mxl_source_sheet_numbers"] = source_sheet_numbers
+    meta["mxl_source_sheet_system_counts"] = source_sheet_system_counts
+
     parts = _children_named(root, "part")
     if not parts:
         # Try a permissive fallback: locate measures anywhere in the document.
-        measures = root.findall(".//measure")
+        measures = _iter_named(root, "measure")
         if not measures:
             meta["mxl_parse_status"] = "missing_parts"
             return meta
@@ -461,13 +577,34 @@ def _apply_mxl_staff_start_labels(
 ) -> tuple[list[tuple[float, float, float, str]] | None, str]:
     if not staff_start_labels_pdf or not system_staff_counts or not mxl_page_system_starts:
         return None, "empty_inputs"
-    if len(system_staff_counts) != len(mxl_page_system_starts):
-        return None, "system_count_mismatch"
+
+    omr_system_count = len(system_staff_counts)
+    mxl_system_count = len(mxl_page_system_starts)
+    if omr_system_count <= 0 or mxl_system_count <= 0:
+        return None, "empty_inputs"
+
+    if omr_system_count == mxl_system_count:
+        remapped_labels = list(mxl_page_system_starts)
+        map_mode = "exact"
+    else:
+        remapped_labels: list[str] = []
+        if omr_system_count == 1:
+            remapped_labels = [mxl_page_system_starts[0]]
+            map_mode = "compress_single"
+        elif mxl_system_count == 1:
+            remapped_labels = [mxl_page_system_starts[0] for _ in range(omr_system_count)]
+            map_mode = "expand_single"
+        else:
+            for i in range(omr_system_count):
+                src_idx = int(round(i * (mxl_system_count - 1) / float(omr_system_count - 1)))
+                src_idx = max(0, min(mxl_system_count - 1, src_idx))
+                remapped_labels.append(mxl_page_system_starts[src_idx])
+            map_mode = "compress" if mxl_system_count > omr_system_count else "expand"
 
     out: list[tuple[float, float, float, str]] = []
     idx = 0
     for sys_idx, staff_cnt in enumerate(system_staff_counts):
-        label = mxl_page_system_starts[sys_idx]
+        label = remapped_labels[sys_idx]
         for _ in range(staff_cnt):
             if idx >= len(staff_start_labels_pdf):
                 return None, "staff_label_underflow"
@@ -477,7 +614,81 @@ def _apply_mxl_staff_start_labels(
 
     if idx != len(staff_start_labels_pdf):
         return None, "staff_label_overflow"
-    return out, "ok"
+    return out, f"ok_{map_mode}"
+
+
+def _build_mxl_page_candidates(
+    mxl_metas: list[dict],
+    total_pages: int,
+) -> tuple[dict[int, list[dict]], list[dict]]:
+    by_sheet: dict[int, list[dict]] = {}
+    sequential: list[dict] = []
+    for move_idx, meta in enumerate(mxl_metas):
+        if meta.get("mxl_parse_status") != "ok":
+            continue
+        starts_pages = meta.get("mxl_system_starts_per_page") or []
+        if not starts_pages:
+            continue
+
+        source_sheet_numbers = list(meta.get("mxl_source_sheet_numbers") or [])
+        mapped_any = False
+        for i, starts in enumerate(starts_pages):
+            if i >= len(source_sheet_numbers):
+                continue
+            sheet_no = source_sheet_numbers[i]
+            page_idx = int(sheet_no) - 1
+            if page_idx < 0 or page_idx >= total_pages:
+                continue
+            by_sheet.setdefault(page_idx, []).append(
+                {
+                    "labels": list(starts),
+                    "path": meta.get("mxl_path"),
+                    "source": "source_sheet",
+                    "movement_index": move_idx,
+                }
+            )
+            mapped_any = True
+
+        if not mapped_any:
+            for starts in starts_pages:
+                sequential.append(
+                    {
+                        "labels": list(starts),
+                        "path": meta.get("mxl_path"),
+                        "source": "sequential",
+                        "movement_index": move_idx,
+                    }
+                )
+
+    return by_sheet, sequential
+
+
+def _select_mxl_page_starts(
+    page_index: int,
+    omr_system_count: int,
+    by_sheet: dict[int, list[dict]],
+    sequential: list[dict],
+) -> tuple[list[str], str, str | None]:
+    candidates = by_sheet.get(page_index, [])
+    if not candidates and page_index < len(sequential):
+        candidates = [sequential[page_index]]
+
+    if not candidates:
+        return [], "missing", None
+
+    def rank(c: dict) -> tuple[int, int, int]:
+        labels = c.get("labels") or []
+        delta = abs(len(labels) - omr_system_count)
+        source_rank = 0 if c.get("source") == "source_sheet" else 1
+        return (delta, source_rank, -len(labels))
+
+    best = min(candidates, key=rank)
+    labels = list(best.get("labels") or [])
+    detail = (
+        f"{best.get('source')}|path={best.get('path')}|"
+        f"mxl_sys={len(labels)}|omr_sys={omr_system_count}"
+    )
+    return labels, str(best.get("source") or "unknown"), str(best.get("path") or "")
 
 
 def _omr_fallback_confidence(used_bars: int, increment_after: int, carryover: bool) -> str:
@@ -1493,6 +1704,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
     measure_source_policy = _measure_source_policy()
     mapping_debug_path = os.getenv("MEASURE_MAPPING_DEBUG_PATH", "").strip()
     mapping_debug: list[dict] = []
+    mxl_member_override = os.getenv("MXL_MEMBER_OVERRIDE", "").strip()
 
     mxl_meta = {
         "mxl_path": None,
@@ -1501,15 +1713,48 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         "mxl_parser_used": "none",
         "mxl_parse_attempts": [],
         "mxl_sanitized_prefixes": [],
+        "mxl_source_sheet_numbers": [],
+        "mxl_source_sheet_system_counts": {},
         "mxl_pages": 0,
         "mxl_system_starts_per_page": [],
         "mxl_extract_status": "error",
         "mxl_error": None,
     }
     mxl_path = _resolve_mxl_path(omr_path)
+    mxl_paths = _resolve_mxl_paths(omr_path)
+    mxl_metas: list[dict] = []
+    mxl_any_ok = False
     if measure_label_mode == "staff_start":
-        if mxl_path:
-            mxl_meta = _parse_mxl_system_start_numbers_with_meta(mxl_path)
+        if mxl_paths:
+            for path in mxl_paths:
+                preferred_member = None
+                if (
+                    mxl_member_override
+                    and mxl_path
+                    and os.path.abspath(path) == os.path.abspath(mxl_path)
+                ):
+                    preferred_member = mxl_member_override
+                move_meta = _parse_mxl_system_start_numbers_with_meta(
+                    path,
+                    preferred_member=preferred_member,
+                )
+                mxl_metas.append(move_meta)
+            mxl_any_ok = any(
+                m.get("mxl_parse_status") == "ok" and (m.get("mxl_pages") or 0) > 0
+                for m in mxl_metas
+            )
+            if mxl_path:
+                same = [
+                    m
+                    for m in mxl_metas
+                    if os.path.abspath(str(m.get("mxl_path") or "")) == os.path.abspath(mxl_path)
+                ]
+                if same:
+                    mxl_meta = same[0]
+                elif mxl_metas:
+                    mxl_meta = mxl_metas[0]
+            elif mxl_metas:
+                mxl_meta = mxl_metas[0]
         else:
             mxl_meta = {
                 "mxl_path": None,
@@ -1518,6 +1763,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 "mxl_parser_used": "none",
                 "mxl_parse_attempts": [],
                 "mxl_sanitized_prefixes": [],
+                "mxl_source_sheet_numbers": [],
+                "mxl_source_sheet_system_counts": {},
                 "mxl_pages": 0,
                 "mxl_system_starts_per_page": [],
                 "mxl_extract_status": "error",
@@ -1531,7 +1778,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             f"mxl_parse_status={mxl_meta.get('mxl_parse_status')} "
             f"mxl_parser_used={mxl_meta.get('mxl_parser_used')} "
             f"mxl_member_path={mxl_meta.get('mxl_member_path')} "
-            f"mxl_pages={mxl_meta.get('mxl_pages')}",
+            f"mxl_pages={mxl_meta.get('mxl_pages')} "
+            f"mxl_paths={len(mxl_paths)}",
             flush=True,
         )
         print(
@@ -1557,11 +1805,22 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 f"chosen={mxl_meta.get('mxl_member_path')}",
                 flush=True,
             )
+        if mxl_metas:
+            for idx, move_meta in enumerate(mxl_metas, start=1):
+                print(
+                    "[DBG] mxl_movement "
+                    f"idx={idx} path={move_meta.get('mxl_path')} "
+                    f"parse_status={move_meta.get('mxl_parse_status')} "
+                    f"pages={move_meta.get('mxl_pages')} "
+                    f"source_sheets={move_meta.get('mxl_source_sheet_numbers')}",
+                    flush=True,
+                )
 
     with zipfile.ZipFile(omr_path, "r") as z:
         sheet_paths = _sorted_sheet_xml_paths(z)
         if not sheet_paths:
             raise RuntimeError("No sheet#N/sheet#N.xml found inside .omr")
+        mxl_by_sheet, mxl_sequential = _build_mxl_page_candidates(mxl_metas, len(sheet_paths))
 
         for page_index in range(doc.page_count):
             if page_index >= len(sheet_paths):
@@ -1612,39 +1871,56 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             staff_start_source = "none"
             mapping_status = "not_applicable"
             mapping_reason = "-"
+            mapping_mode = "-"
+            mxl_page_candidate_source = "-"
+            mxl_page_candidate_path = None
             page_mxl_starts: list[str] = []
 
             if measure_label_mode == "staff_start":
-                mxl_pages = mxl_meta.get("mxl_system_starts_per_page", [])
-                if mxl_meta.get("mxl_parse_status") == "ok" and page_index < len(mxl_pages):
-                    page_mxl_starts = list(mxl_pages[page_index])
+                if mxl_any_ok:
+                    page_mxl_starts, mxl_page_candidate_source, mxl_page_candidate_path = _select_mxl_page_starts(
+                        page_index=page_index,
+                        omr_system_count=len(system_staff_counts),
+                        by_sheet=mxl_by_sheet,
+                        sequential=mxl_sequential,
+                    )
                     if _debug_measure_labels_enabled():
                         print(
                             f"[DBG] mxl_map page={page_index+1} "
                             f"omr_systems={len(system_staff_counts)} "
                             f"mxl_system_starts={len(page_mxl_starts)} "
-                            f"mxl_starts_sample={page_mxl_starts[:8]}",
+                            f"mxl_starts_sample={page_mxl_starts[:8]} "
+                            f"candidate_source={mxl_page_candidate_source} "
+                            f"candidate_path={mxl_page_candidate_path}",
                             flush=True,
                         )
-                    mxl_mapped, map_reason = _apply_mxl_staff_start_labels(
-                        staff_start_labels_pdf=staff_start_labels_pdf,
-                        system_staff_counts=system_staff_counts,
-                        mxl_page_system_starts=page_mxl_starts,
-                    )
-                    if mxl_mapped is not None:
-                        staff_start_labels_pdf = mxl_mapped
-                        staff_start_source = "mxl"
-                        mapping_status = "ok"
-                        mapping_reason = "mxl_mapping_ok"
+                    if page_mxl_starts:
+                        mxl_mapped, map_reason = _apply_mxl_staff_start_labels(
+                            staff_start_labels_pdf=staff_start_labels_pdf,
+                            system_staff_counts=system_staff_counts,
+                            mxl_page_system_starts=page_mxl_starts,
+                        )
+                        if mxl_mapped is not None:
+                            staff_start_labels_pdf = mxl_mapped
+                            staff_start_source = "mxl"
+                            mapping_status = "ok"
+                            mapping_reason = f"mxl_mapping_{map_reason}"
+                            if map_reason.startswith("ok_"):
+                                mapping_mode = map_reason[3:]
+                            else:
+                                mapping_mode = map_reason
+                        else:
+                            mapping_status = "error"
+                            mapping_reason = f"mxl_map_{map_reason}"
+                            mapping_mode = "error"
                     else:
                         mapping_status = "error"
-                        mapping_reason = f"mxl_map_{map_reason}"
+                        mapping_reason = "mxl_page_index_missing"
+                        mapping_mode = "missing"
                 else:
                     mapping_status = "error"
-                    if mxl_meta.get("mxl_parse_status") != "ok":
-                        mapping_reason = f"mxl_parse_{mxl_meta.get('mxl_parse_status')}"
-                    else:
-                        mapping_reason = "mxl_page_index_missing"
+                    mapping_reason = f"mxl_parse_{mxl_meta.get('mxl_parse_status')}"
+                    mapping_mode = "parse_error"
 
                 if staff_start_source != "mxl":
                     if measure_source_policy == "mxl_with_omr_fallback" and staff_start_labels_pdf:
@@ -1724,6 +2000,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "staff_start_source": staff_start_source,
                     "mapping_status": mapping_status,
                     "mapping_reason": mapping_reason,
+                    "mapping_mode": mapping_mode,
+                    "mxl_page_candidate_source": mxl_page_candidate_source,
+                    "mxl_page_candidate_path": mxl_page_candidate_path,
                     "omr_fallback_rows": omr_fallback_rows,
                     "assigned_labels": [t[3] for t in staff_start_labels_pdf],
                     "staff_start_candidate_count": len(staff_start_labels_pdf),
@@ -1746,6 +2025,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             "mxl_parser_used": mxl_meta.get("mxl_parser_used"),
             "mxl_parse_attempts": mxl_meta.get("mxl_parse_attempts"),
             "mxl_sanitized_prefixes": mxl_meta.get("mxl_sanitized_prefixes"),
+            "mxl_source_sheet_numbers": mxl_meta.get("mxl_source_sheet_numbers"),
+            "mxl_source_sheet_system_counts": mxl_meta.get("mxl_source_sheet_system_counts"),
             "mxl_measure_count": mxl_meta.get("mxl_measure_count"),
             "mxl_print_count": mxl_meta.get("mxl_print_count"),
             "mxl_system_start_mode": mxl_meta.get("mxl_system_start_mode"),
@@ -1755,6 +2036,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             "mxl_system_starts_per_page": mxl_meta.get("mxl_system_starts_per_page"),
             "mxl_extract_status": mxl_meta.get("mxl_extract_status"),
             "mxl_error": mxl_meta.get("mxl_error"),
+            "mxl_paths": mxl_paths,
+            "mxl_movements": mxl_metas,
             "pages": mapping_debug,
         }
         with open(mapping_debug_path, "w", encoding="utf-8") as f:
