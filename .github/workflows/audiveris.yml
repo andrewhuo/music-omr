@@ -337,9 +337,23 @@ jobs:
           MXL_MEMBER_OVERRIDE: "${{ env.MXL_MEMBER_OVERRIDE }}"
           DEBUG_MEASURE_LABELS: "1"
           DEBUG_MEASURE_MARKERS: "0"
+          DEBUG_SENTINEL_TEXT: "1"
           MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"
         run: |
           set -euo pipefail
+          echo "PARSER_SHA=$(git rev-parse --short HEAD)"
+          python - << 'PY'
+          p = "parser-api/annotate_guides_from_omr.py"
+          text = open(p, "r", encoding="utf-8").read()
+          markers = [
+              "mxl_movement",
+              "mapping_mode",
+              "labels_to_draw_count",
+              "DEBUG_SENTINEL_TEXT",
+          ]
+          for m in markers:
+              print(f"PARSER_MARKER {m} present={m in text}")
+          PY
           python -u parser-api/annotate_guides_from_omr.py \
             /tmp/work/input.pdf \
             "${AUDI_SELECTED_OUT}/input/input.omr" \
@@ -381,16 +395,45 @@ jobs:
 
           pages = d.get("pages") or []
           for pg in pages:
+              source = pg.get("staff_start_source")
+              status = pg.get("mapping_status")
+              mode = pg.get("mapping_mode")
+              draw_attempted = bool(pg.get("draw_attempted"))
+              labels_to_draw = int(pg.get("labels_to_draw_count") or 0)
+              labels_drawn = int(pg.get("labels_drawn") or 0)
+              labels_in_bounds = int(pg.get("labels_in_bounds") or 0)
+
+              if source != "mxl":
+                  if mode == "missing":
+                      failure_class = "NO_XML_COVERAGE"
+                  elif status == "error":
+                      failure_class = "MAP_EMPTY"
+                  else:
+                      failure_class = "MAP_NOT_MXL"
+              elif labels_to_draw == 0:
+                  failure_class = "DRAW_EMPTY"
+              elif labels_drawn == 0:
+                  failure_class = "DRAW_ZERO"
+              elif labels_in_bounds == 0:
+                  failure_class = "DRAW_OFFPAGE"
+              else:
+                  failure_class = "DRAW_OK"
+
               print(
                   f"SUMMARY page={pg.get('page_index', 0)+1} "
-                  f"source={pg.get('staff_start_source')} "
-                  f"status={pg.get('mapping_status')} "
+                  f"source={source} "
+                  f"status={status} "
                   f"reason={pg.get('mapping_reason')} "
-                  f"mode={pg.get('mapping_mode')} "
+                  f"mode={mode} "
                   f"mxl_sys={len(pg.get('mxl_page_system_starts') or [])} "
                   f"omr_sys={len(pg.get('omr_system_staff_counts') or [])} "
                   f"assigned={len(pg.get('assigned_labels') or [])} "
-                  f"candidates={pg.get('staff_start_candidate_count')}"
+                  f"candidates={pg.get('staff_start_candidate_count')} "
+                  f"draw_attempted={draw_attempted} "
+                  f"labels_to_draw={labels_to_draw} "
+                  f"labels_drawn={labels_drawn} "
+                  f"labels_in_bounds={labels_in_bounds} "
+                  f"failure_class={failure_class}"
               )
           PY
 

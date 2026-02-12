@@ -100,6 +100,11 @@ def _debug_measure_markers_enabled() -> bool:
     return v in ("1", "true", "True", "yes", "YES")
 
 
+def _debug_sentinel_text_enabled() -> bool:
+    v = os.getenv("DEBUG_SENTINEL_TEXT", "").strip()
+    return v in ("1", "true", "True", "yes", "YES")
+
+
 def _draw_measure_label(page: fitz.Page, rect: fitz.Rect, x: float, y: float, text: str) -> None:
     # Draw a tiny white background so labels stay visible over notation.
     tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
@@ -1955,8 +1960,20 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 elif measure_label_mode == "sequential" and sequential_labels_pdf:
                     labels_to_draw = sequential_labels_pdf
 
+                if _debug_sentinel_text_enabled():
+                    sentinel_text = f"DBG-P{page_index+1}"
+                    page.insert_text(
+                        (8.0, 14.0),
+                        sentinel_text,
+                        fontsize=7.0,
+                        color=(0, 0, 1),
+                    )
+
+                labels_to_draw_count = len(labels_to_draw)
+                draw_attempted = labels_to_draw_count > 0
                 labels_drawn = 0
                 labels_in_bounds = 0
+                label_preview: list[dict] = []
                 for (x_pdf, y0_pdf, y1_pdf, label_text) in labels_to_draw:
                     staff_h = max(1.0, y1_pdf - y0_pdf)
                     y_offset = max(8.0, 0.45 * staff_h)
@@ -1965,8 +1982,22 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     y_text = max(MEASURE_TEXT_SIZE + 2.0, y0_pdf - y_offset)
                     y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, rect.height - 2.0))
 
-                    if 0.0 <= x_text <= max(0.0, rect.width - tw) and (MEASURE_TEXT_SIZE + 2.0) <= y_text <= rect.height:
+                    in_bounds = (
+                        0.0 <= x_text <= max(0.0, rect.width - tw)
+                        and (MEASURE_TEXT_SIZE + 2.0) <= y_text <= rect.height
+                    )
+                    if in_bounds:
                         labels_in_bounds += 1
+
+                    if len(label_preview) < 5:
+                        label_preview.append(
+                            {
+                                "text": label_text,
+                                "x": round(float(x_text), 2),
+                                "y": round(float(y_text), 2),
+                                "in_bounds": bool(in_bounds),
+                            }
+                        )
 
                     _draw_measure_label(page, rect, x_text, y_text, label_text)
                     labels_drawn += 1
@@ -1975,9 +2006,16 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     print(
                         f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
                         f"staff_start_source={staff_start_source} "
-                        f"mapping_status={mapping_status} mapping_reason={mapping_reason}",
+                        f"mapping_status={mapping_status} mapping_reason={mapping_reason} "
+                        f"labels_to_draw={labels_to_draw_count} labels_drawn={labels_drawn} labels_in_bounds={labels_in_bounds}",
                         flush=True,
                     )
+            else:
+                draw_attempted = False
+                labels_to_draw_count = 0
+                labels_drawn = 0
+                labels_in_bounds = 0
+                label_preview = []
 
             mapping_debug.append(
                 {
@@ -2006,6 +2044,11 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "omr_fallback_rows": omr_fallback_rows,
                     "assigned_labels": [t[3] for t in staff_start_labels_pdf],
                     "staff_start_candidate_count": len(staff_start_labels_pdf),
+                    "draw_attempted": draw_attempted,
+                    "labels_to_draw_count": labels_to_draw_count,
+                    "labels_drawn": labels_drawn,
+                    "labels_in_bounds": labels_in_bounds,
+                    "label_preview": label_preview,
                 }
             )
 
