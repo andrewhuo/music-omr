@@ -7,6 +7,11 @@ on:
         description: "GCS URI to input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
         required: true
         type: string
+      audiveris_image:
+        description: "Pinned Audiveris image digest (ghcr.io/<owner>/audiveris-engine@sha256:...)"
+        required: false
+        default: "ghcr.io/REPLACE_WITH_OWNER/audiveris-engine@sha256:REPLACE_WITH_REAL_DIGEST"
+        type: string
 
 jobs:
   pipeline:
@@ -62,6 +67,7 @@ jobs:
           echo "repo: $GITHUB_REPOSITORY"
           echo "sha:  $GITHUB_SHA"
           echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
+          echo "audiveris_image: ${{ inputs.audiveris_image }}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
 
       - name: Download input PDF
@@ -76,8 +82,63 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/work
           mkdir -p /tmp/work/.cache /tmp/work/.config /tmp/work/tmp
-          echo "WORKFLOW_SIGNATURE=xml-select-v4"
+          AUDIVERIS_IMAGE="${{ inputs.audiveris_image }}"
+          echo "WORKFLOW_SIGNATURE=engine-pin-v1"
           echo "WORKFLOW_SHA=${GITHUB_SHA}"
+          echo "AUDIVERIS_IMAGE=${AUDIVERIS_IMAGE}"
+
+          if [[ -z "${AUDIVERIS_IMAGE}" ]]; then
+            echo "ERROR: audiveris_image input is empty"
+            exit 1
+          fi
+          if [[ "${AUDIVERIS_IMAGE}" == *"REPLACE_WITH_REAL_DIGEST"* ]] || [[ "${AUDIVERIS_IMAGE}" == *"REPLACE_WITH_OWNER"* ]]; then
+            echo "ERROR: audiveris_image is still placeholder text. Set a real GHCR digest."
+            exit 1
+          fi
+          if [[ "${AUDIVERIS_IMAGE}" != *@sha256:* ]]; then
+            echo "ERROR: audiveris_image must be pinned by digest using @sha256:"
+            exit 1
+          fi
+          echo "PULLING_AUDIVERIS_IMAGE=${AUDIVERIS_IMAGE}"
+          docker pull "${AUDIVERIS_IMAGE}"
+          echo "AUDIVERIS_IMAGE_ID=$(docker image inspect "${AUDIVERIS_IMAGE}" --format '{{.Id}}')"
+          echo "AUDIVERIS_IMAGE_REPODIGESTS=$(docker image inspect "${AUDIVERIS_IMAGE}" --format '{{json .RepoDigests}}')"
+
+          probe_omr_version() {
+            local image="$1"
+            local required="5.9.0"
+            docker run --rm \
+              --user "$(id -u):$(id -g)" \
+              -v /tmp/work:/work \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              "$image" \
+              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; "$AUDI_BIN" -help >/work/audi_help_probe.txt 2>&1 || true;'
+
+            local version_raw
+            version_raw="$(grep -Eo '([0-9]+\.[0-9]+\.[0-9]+([-.:][A-Za-z0-9]+)?)' /tmp/work/audi_help_probe.txt | head -n 1 || true)"
+            local version_num
+            version_num="$(grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' /tmp/work/audi_help_probe.txt | head -n 1 || true)"
+
+            echo "AUDIVERIS_VERSION_RAW=${version_raw}"
+            echo "AUDIVERIS_VERSION_NUM=${version_num}"
+
+            if [[ -z "${version_num}" ]]; then
+              echo "ERROR: unable to detect Audiveris version from -help output"
+              tail -n 120 /tmp/work/audi_help_probe.txt || true
+              exit 1
+            fi
+            echo "AUDIVERIS_HELP_PROBE_HEAD_BEGIN"
+            sed -n '1,80p' /tmp/work/audi_help_probe.txt || true
+            echo "AUDIVERIS_HELP_PROBE_HEAD_END"
+
+            if [[ "$(printf '%s\n%s\n' "${required}" "${version_num}" | sort -V | head -n 1)" != "${required}" ]]; then
+              echo "ERROR: Audiveris version ${version_num} is below required ${required}"
+              exit 1
+            fi
+          }
 
           run_omr() {
             local image="$1"
@@ -92,12 +153,29 @@ jobs:
               -e XDG_CONFIG_HOME="/work/.config" \
               -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
               "$image" \
-              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN} HOME=${HOME} XDG_CACHE_HOME=${XDG_CACHE_HOME}"; "$AUDI_BIN" -help >/work/audi_help.txt 2>&1 || true; if grep -Eq "AccessDeniedException: /\\.cache|Loader\\.getCacheDir\\(\\).*null|ExceptionInInitializerError" /work/audi_help.txt; then echo "AUDIVERIS_PREFLIGHT_ERROR"; tail -n 120 /work/audi_help.txt || true; exit 86; fi; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" /work/input.pdf'
+              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN} HOME=${HOME} XDG_CACHE_HOME=${XDG_CACHE_HOME}"; "$AUDI_BIN" -help >/work/audi_help.txt 2>&1 || true; if grep -Eq "AccessDeniedException: /\\.cache|Loader\\.getCacheDir\\(\\).*null|ExceptionInInitializerError" /work/audi_help.txt; then echo "AUDIVERIS_PREFLIGHT_ERROR"; tail -n 120 /work/audi_help.txt || true; exit 86; fi; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" /work/input.pdf'
+          }
+
+          run_omr_smoke() {
+            local image="$1"
+            local out_dir_name="$2"
+            docker run --rm \
+              --user "$(id -u):$(id -g)" \
+              -v /tmp/work:/work \
+              -e AUDI_IMAGE="${image}" \
+              -e AUDI_OUT_DIR="/work/${out_dir_name}" \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              "$image" \
+              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_SMOKE image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN}"; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" -sheets 1 /work/input.pdf'
           }
 
           check_mxl() {
             local out_dir="$1"
-            python - "$out_dir" <<'PY'
+            local context="${2:-unknown}"
+            python - "$out_dir" "$context" <<'PY'
           import glob
           import os
           import re
@@ -208,9 +286,11 @@ jobs:
 
 
           out_dir = sys.argv[1]
+          context = sys.argv[2]
           mxl_candidates = sorted(glob.glob(os.path.join(out_dir, "input", "*.mxl")))
+          print(f"MXL_CHECK_CONTEXT context={context} out_dir={out_dir} candidate_count={len(mxl_candidates)}")
           if not mxl_candidates:
-              print(f"MXL_CHECK: no .mxl found under {out_dir}/input")
+              print(f"MXL_CHECK_FAIL context={context} reason=no_mxl_files out_dir={out_dir}")
               raise SystemExit(2)
 
           scored = [score_mxl(path) for path in mxl_candidates]
@@ -218,30 +298,50 @@ jobs:
               err = f" error={row['error']}" if row.get("error") else ""
               print(
                   "MXL_CANDIDATE "
-                  f"path={row['path']} member={row['member']} parse={row['parse']} "
+                  f"context={context} path={row['path']} member={row['member']} parse={row['parse']} "
                   f"root={row['root']} parts={row['parts']} measures={row['measures']}{err}"
               )
 
           best = max(scored, key=lambda r: (r["measures"], r["parts"]))
           print(
               "MXL_SELECTED "
-              f"path={best['path']} member={best['member']} parse={best['parse']} "
+              f"context={context} path={best['path']} member={best['member']} parse={best['parse']} "
               f"parts={best['parts']} measures={best['measures']}"
           )
 
-          with open("/tmp/work/selected_mxl_path.txt", "w", encoding="utf-8") as f:
+          with open(f"/tmp/work/selected_mxl_path_{context}.txt", "w", encoding="utf-8") as f:
               f.write(best["path"])
-          with open("/tmp/work/selected_mxl_member.txt", "w", encoding="utf-8") as f:
+          with open(f"/tmp/work/selected_mxl_member_{context}.txt", "w", encoding="utf-8") as f:
               f.write(best["member"] or "")
+          if context == "full":
+              with open("/tmp/work/selected_mxl_path.txt", "w", encoding="utf-8") as f:
+                  f.write(best["path"])
+              with open("/tmp/work/selected_mxl_member.txt", "w", encoding="utf-8") as f:
+                  f.write(best["member"] or "")
 
           if best["parts"] <= 0 or best["measures"] <= 0:
+              print(
+                  "MXL_CHECK_FAIL "
+                  f"context={context} reason=parts_or_measures_zero path={best['path']} "
+                  f"member={best['member']} parts={best['parts']} measures={best['measures']}"
+              )
               raise SystemExit(1)
           PY
           }
 
-          run_omr toprock/audiveris:latest audiveris_out_try1
+          probe_omr_version "${AUDIVERIS_IMAGE}"
+
+          run_omr_smoke "${AUDIVERIS_IMAGE}" audiveris_smoke
+          if ! check_mxl "/tmp/work/audiveris_smoke" "smoke"; then
+            echo "ERROR: smoke run did not produce usable MusicXML (parts/measures > 0 required)."
+            exit 1
+          fi
+          echo "SMOKE_SELECTED_PATH=$(cat /tmp/work/selected_mxl_path_smoke.txt)"
+          echo "SMOKE_SELECTED_MEMBER=$(cat /tmp/work/selected_mxl_member_smoke.txt)"
+
+          run_omr "${AUDIVERIS_IMAGE}" audiveris_out_try1
           SELECTED_OUT="/tmp/work/audiveris_out_try1"
-          if ! check_mxl "$SELECTED_OUT"; then
+          if ! check_mxl "$SELECTED_OUT" "full"; then
             echo "MusicXML export has no parts/measures after successful startup."
             echo "Failing fast in xml-strict mode (no fallback image retry)."
             exit 1
@@ -259,6 +359,8 @@ jobs:
 
           echo "Audiveris outputs:"
           find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f -print || true
+          echo "Smoke outputs:"
+          find /tmp/work/audiveris_smoke -maxdepth 4 -type f -print || true
           echo "MusicXML candidates:"
           ls -lh "${AUDI_SELECTED_OUT}/input" || true
           find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f \( -name "*.mxl" -o -name "*.musicxml" -o -name "*.xml" \) -print || true
@@ -394,6 +496,9 @@ jobs:
               )
 
           pages = d.get("pages") or []
+          strict_xml_pages_ok = 0
+          total_pages = len(pages)
+          strict_xml_missing = []
           for pg in pages:
               source = pg.get("staff_start_source")
               status = pg.get("mapping_status")
@@ -419,6 +524,18 @@ jobs:
               else:
                   failure_class = "DRAW_OK"
 
+              if source == "mxl":
+                  strict_xml_pages_ok += 1
+              else:
+                  strict_xml_missing.append(
+                      (
+                          int(pg.get("page_index", 0)) + 1,
+                          str(pg.get("mapping_reason")),
+                          str(status),
+                          str(mode),
+                      )
+                  )
+
               print(
                   f"SUMMARY page={pg.get('page_index', 0)+1} "
                   f"source={source} "
@@ -435,14 +552,58 @@ jobs:
                   f"labels_in_bounds={labels_in_bounds} "
                   f"failure_class={failure_class}"
               )
+
+          print(f"SUMMARY strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}")
+          if strict_xml_pages_ok != total_pages:
+              for page_no, reason, status, mode in strict_xml_missing:
+                  print(
+                      "SUMMARY strict_xml_missing "
+                      f"page={page_no} reason={reason} status={status} mode={mode}"
+                  )
+              raise SystemExit(
+                  f"ERROR: strict XML coverage failed strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}"
+              )
           PY
 
-      - name: Upload outputs and debug artifacts
+      - name: Bundle debug artifacts
+        if: always()
         run: |
           set -euo pipefail
-          gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
-          gsutil cp /tmp/work/measure_mapping_debug.json "${OUTPUT_PREFIX}/measure_mapping_debug.json"
-          echo "uploaded_latest=${OUTPUT_PREFIX}/annotated.pdf"
-          echo "uploaded_mapping_debug=${OUTPUT_PREFIX}/measure_mapping_debug.json"
+          rm -f /tmp/work/omr_debug_bundle.tar.gz
+          tar -czf /tmp/work/omr_debug_bundle.tar.gz \
+            /tmp/work/audi_help_probe.txt \
+            /tmp/work/audi_help.txt \
+            /tmp/work/selected_mxl_path*.txt \
+            /tmp/work/selected_mxl_member*.txt \
+            /tmp/work/audiveris_smoke \
+            /tmp/work/audiveris_out_try1 \
+            /tmp/work/measure_mapping_debug.json \
+            2>/dev/null || true
+          if [[ -f /tmp/work/omr_debug_bundle.tar.gz ]]; then
+            ls -lh /tmp/work/omr_debug_bundle.tar.gz
+          fi
+
+      - name: Upload outputs and debug artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f /tmp/work/annotated.pdf ]]; then
+            gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
+            echo "uploaded_latest=${OUTPUT_PREFIX}/annotated.pdf"
+          else
+            echo "WARN: /tmp/work/annotated.pdf not found"
+          fi
+          if [[ -f /tmp/work/measure_mapping_debug.json ]]; then
+            gsutil cp /tmp/work/measure_mapping_debug.json "${OUTPUT_PREFIX}/measure_mapping_debug.json"
+            echo "uploaded_mapping_debug=${OUTPUT_PREFIX}/measure_mapping_debug.json"
+          else
+            echo "WARN: /tmp/work/measure_mapping_debug.json not found"
+          fi
+          if [[ -f /tmp/work/omr_debug_bundle.tar.gz ]]; then
+            gsutil cp /tmp/work/omr_debug_bundle.tar.gz "${OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
+            echo "uploaded_debug_bundle=${OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
+          else
+            echo "WARN: /tmp/work/omr_debug_bundle.tar.gz not found"
+          fi
 
           echo "Upload complete"
