@@ -246,6 +246,82 @@ def _resolve_mxl_paths(omr_path: str) -> list[str]:
     return candidates
 
 
+def _load_mxl_page_manifest(path: str) -> tuple[dict[int, dict], dict]:
+    summary = {
+        "path": path,
+        "status": "not_requested",
+        "entries": 0,
+        "missing": 0,
+        "error": None,
+    }
+    if not path:
+        return {}, summary
+    if not os.path.exists(path):
+        summary["status"] = "missing_file"
+        summary["error"] = f"manifest_not_found:{path}"
+        return {}, summary
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as exc:
+        summary["status"] = "parse_error"
+        summary["error"] = str(exc)
+        return {}, summary
+
+    entries_raw = raw.get("entries") if isinstance(raw, dict) else raw
+    if not isinstance(entries_raw, list):
+        summary["status"] = "invalid_format"
+        summary["error"] = "manifest_entries_not_list"
+        return {}, summary
+
+    by_page: dict[int, dict] = {}
+    missing = 0
+    for item in entries_raw:
+        if not isinstance(item, dict):
+            continue
+        page_index = item.get("page_index")
+        if page_index is None:
+            page_number = item.get("page_number")
+            if page_number is None:
+                continue
+            try:
+                page_index = int(page_number) - 1
+            except Exception:
+                continue
+        try:
+            page_index = int(page_index)
+        except Exception:
+            continue
+        if page_index < 0:
+            continue
+
+        status = str(item.get("status") or "missing")
+        if status != "ok":
+            missing += 1
+
+        normalized = dict(item)
+        normalized.setdefault("status", status)
+        normalized.setdefault("error", None)
+        normalized.setdefault("mxl_path", None)
+        normalized.setdefault("mxl_member", None)
+        normalized.setdefault("parts_count", 0)
+        normalized.setdefault("measures_count", 0)
+        normalized.setdefault("system_starts", [])
+        normalized.setdefault("selection_source", "none")
+        normalized.setdefault("selection_reason", "manifest_entry")
+        normalized.setdefault("confidence_tier", "none")
+        normalized.setdefault("low_confidence_used", False)
+        normalized.setdefault("retry_attempted", False)
+        normalized.setdefault("retry_profile", "none")
+        by_page[page_index] = normalized
+
+    summary["entries"] = len(by_page)
+    summary["missing"] = missing
+    summary["status"] = "ok" if by_page else "empty"
+    return by_page, summary
+
+
 def _iter_named(root: ET.Element, name: str) -> list[ET.Element]:
     out: list[ET.Element] = []
     for el in root.iter():
@@ -1710,6 +1786,20 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
     mapping_debug_path = os.getenv("MEASURE_MAPPING_DEBUG_PATH", "").strip()
     mapping_debug: list[dict] = []
     mxl_member_override = os.getenv("MXL_MEMBER_OVERRIDE", "").strip()
+    mxl_page_manifest_path = os.getenv("MXL_PAGE_MANIFEST_PATH", "").strip()
+    mxl_page_manifest_by_page: dict[int, dict] = {}
+    mxl_page_manifest_summary = {
+        "path": mxl_page_manifest_path or None,
+        "status": "not_requested",
+        "entries": 0,
+        "missing": 0,
+        "error": None,
+    }
+    mxl_manifest_active = measure_label_mode == "staff_start" and bool(mxl_page_manifest_path)
+    if mxl_manifest_active:
+        mxl_page_manifest_by_page, mxl_page_manifest_summary = _load_mxl_page_manifest(
+            mxl_page_manifest_path
+        )
 
     mxl_meta = {
         "mxl_path": None,
@@ -1729,7 +1819,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
     mxl_paths = _resolve_mxl_paths(omr_path)
     mxl_metas: list[dict] = []
     mxl_any_ok = False
-    if measure_label_mode == "staff_start":
+    if measure_label_mode == "staff_start" and not mxl_manifest_active:
         if mxl_paths:
             for path in mxl_paths:
                 preferred_member = None
@@ -1784,9 +1874,21 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             f"mxl_parser_used={mxl_meta.get('mxl_parser_used')} "
             f"mxl_member_path={mxl_meta.get('mxl_member_path')} "
             f"mxl_pages={mxl_meta.get('mxl_pages')} "
-            f"mxl_paths={len(mxl_paths)}",
+            f"mxl_paths={len(mxl_paths)} "
+            f"manifest_mode={str(mxl_manifest_active).lower()} "
+            f"manifest_path={mxl_page_manifest_path or '-'} "
+            f"manifest_status={mxl_page_manifest_summary.get('status')}",
             flush=True,
         )
+        if mxl_page_manifest_path:
+            print(
+                "[DBG] mxl_manifest "
+                f"path={mxl_page_manifest_path} "
+                f"entries={mxl_page_manifest_summary.get('entries')} "
+                f"missing={mxl_page_manifest_summary.get('missing')} "
+                f"error={mxl_page_manifest_summary.get('error')}",
+                flush=True,
+            )
         print(
             "[DBG] mxl_info "
             f"path={mxl_meta.get('mxl_path')} "
@@ -1825,7 +1927,10 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         sheet_paths = _sorted_sheet_xml_paths(z)
         if not sheet_paths:
             raise RuntimeError("No sheet#N/sheet#N.xml found inside .omr")
-        mxl_by_sheet, mxl_sequential = _build_mxl_page_candidates(mxl_metas, len(sheet_paths))
+        if mxl_manifest_active:
+            mxl_by_sheet, mxl_sequential = {}, []
+        else:
+            mxl_by_sheet, mxl_sequential = _build_mxl_page_candidates(mxl_metas, len(sheet_paths))
 
         for page_index in range(doc.page_count):
             if page_index >= len(sheet_paths):
@@ -1880,52 +1985,108 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             mxl_page_candidate_source = "-"
             mxl_page_candidate_path = None
             page_mxl_starts: list[str] = []
+            manifest_entry: dict | None = None
+            xml_selection_source = "none"
+            xml_selection_reason = "not_selected"
+            xml_confidence_tier = "none"
+            xml_low_confidence_used = False
 
             if measure_label_mode == "staff_start":
-                if mxl_any_ok:
-                    page_mxl_starts, mxl_page_candidate_source, mxl_page_candidate_path = _select_mxl_page_starts(
-                        page_index=page_index,
-                        omr_system_count=len(system_staff_counts),
-                        by_sheet=mxl_by_sheet,
-                        sequential=mxl_sequential,
-                    )
-                    if _debug_measure_labels_enabled():
-                        print(
-                            f"[DBG] mxl_map page={page_index+1} "
-                            f"omr_systems={len(system_staff_counts)} "
-                            f"mxl_system_starts={len(page_mxl_starts)} "
-                            f"mxl_starts_sample={page_mxl_starts[:8]} "
-                            f"candidate_source={mxl_page_candidate_source} "
-                            f"candidate_path={mxl_page_candidate_path}",
-                            flush=True,
-                        )
-                    if page_mxl_starts:
-                        mxl_mapped, map_reason = _apply_mxl_staff_start_labels(
-                            staff_start_labels_pdf=staff_start_labels_pdf,
-                            system_staff_counts=system_staff_counts,
-                            mxl_page_system_starts=page_mxl_starts,
-                        )
-                        if mxl_mapped is not None:
-                            staff_start_labels_pdf = mxl_mapped
-                            staff_start_source = "mxl"
-                            mapping_status = "ok"
-                            mapping_reason = f"mxl_mapping_{map_reason}"
-                            if map_reason.startswith("ok_"):
-                                mapping_mode = map_reason[3:]
-                            else:
-                                mapping_mode = map_reason
-                        else:
+                if mxl_manifest_active:
+                    manifest_entry = mxl_page_manifest_by_page.get(page_index)
+                    if manifest_entry:
+                        page_mxl_starts = list(manifest_entry.get("system_starts") or [])
+                        mxl_page_candidate_source = "manifest"
+                        mxl_page_candidate_path = manifest_entry.get("mxl_path")
+                        xml_selection_source = str(manifest_entry.get("selection_source") or "none")
+                        xml_selection_reason = str(manifest_entry.get("selection_reason") or "manifest_entry")
+                        xml_confidence_tier = str(manifest_entry.get("confidence_tier") or "none")
+                        xml_low_confidence_used = bool(manifest_entry.get("low_confidence_used"))
+                        if manifest_entry.get("status") != "ok":
                             mapping_status = "error"
-                            mapping_reason = f"mxl_map_{map_reason}"
-                            mapping_mode = "error"
+                            mapping_reason = f"manifest_{manifest_entry.get('error') or 'entry_not_ok'}"
+                            mapping_mode = "missing"
+                        elif not page_mxl_starts:
+                            mapping_status = "error"
+                            mapping_reason = "manifest_system_starts_missing"
+                            mapping_mode = "missing"
+                        else:
+                            mxl_mapped, map_reason = _apply_mxl_staff_start_labels(
+                                staff_start_labels_pdf=staff_start_labels_pdf,
+                                system_staff_counts=system_staff_counts,
+                                mxl_page_system_starts=page_mxl_starts,
+                            )
+                            if mxl_mapped is not None:
+                                staff_start_labels_pdf = mxl_mapped
+                                staff_start_source = "mxl"
+                                mapping_status = "ok"
+                                mapping_reason = f"manifest_mapping_{map_reason}"
+                                if map_reason.startswith("ok_"):
+                                    mapping_mode = map_reason[3:]
+                                else:
+                                    mapping_mode = map_reason
+                            else:
+                                mapping_status = "error"
+                                mapping_reason = f"manifest_map_{map_reason}"
+                                mapping_mode = "error"
                     else:
                         mapping_status = "error"
-                        mapping_reason = "mxl_page_index_missing"
+                        mapping_reason = "manifest_page_missing"
                         mapping_mode = "missing"
+                        xml_selection_source = "none"
+                        xml_selection_reason = "manifest_page_missing"
                 else:
-                    mapping_status = "error"
-                    mapping_reason = f"mxl_parse_{mxl_meta.get('mxl_parse_status')}"
-                    mapping_mode = "parse_error"
+                    if mxl_any_ok:
+                        page_mxl_starts, mxl_page_candidate_source, mxl_page_candidate_path = _select_mxl_page_starts(
+                            page_index=page_index,
+                            omr_system_count=len(system_staff_counts),
+                            by_sheet=mxl_by_sheet,
+                            sequential=mxl_sequential,
+                        )
+                        if _debug_measure_labels_enabled():
+                            print(
+                                f"[DBG] mxl_map page={page_index+1} "
+                                f"omr_systems={len(system_staff_counts)} "
+                                f"mxl_system_starts={len(page_mxl_starts)} "
+                                f"mxl_starts_sample={page_mxl_starts[:8]} "
+                                f"candidate_source={mxl_page_candidate_source} "
+                                f"candidate_path={mxl_page_candidate_path}",
+                                flush=True,
+                            )
+                        if page_mxl_starts:
+                            mxl_mapped, map_reason = _apply_mxl_staff_start_labels(
+                                staff_start_labels_pdf=staff_start_labels_pdf,
+                                system_staff_counts=system_staff_counts,
+                                mxl_page_system_starts=page_mxl_starts,
+                            )
+                            if mxl_mapped is not None:
+                                staff_start_labels_pdf = mxl_mapped
+                                staff_start_source = "mxl"
+                                mapping_status = "ok"
+                                mapping_reason = f"mxl_mapping_{map_reason}"
+                                if map_reason.startswith("ok_"):
+                                    mapping_mode = map_reason[3:]
+                                else:
+                                    mapping_mode = map_reason
+                                xml_selection_source = "full_book_primary"
+                                xml_selection_reason = (
+                                    "source_sheet_match"
+                                    if mxl_page_candidate_source == "source_sheet"
+                                    else "sequential_page_match"
+                                )
+                                xml_confidence_tier = "high"
+                            else:
+                                mapping_status = "error"
+                                mapping_reason = f"mxl_map_{map_reason}"
+                                mapping_mode = "error"
+                        else:
+                            mapping_status = "error"
+                            mapping_reason = "mxl_page_index_missing"
+                            mapping_mode = "missing"
+                    else:
+                        mapping_status = "error"
+                        mapping_reason = f"mxl_parse_{mxl_meta.get('mxl_parse_status')}"
+                        mapping_mode = "parse_error"
 
                 if staff_start_source != "mxl":
                     if measure_source_policy == "mxl_with_omr_fallback" and staff_start_labels_pdf:
@@ -2041,6 +2202,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "mapping_mode": mapping_mode,
                     "mxl_page_candidate_source": mxl_page_candidate_source,
                     "mxl_page_candidate_path": mxl_page_candidate_path,
+                    "mxl_page_manifest_path": mxl_page_manifest_path or None,
+                    "mxl_page_manifest_mode": mxl_manifest_active,
+                    "mxl_page_manifest_entry": manifest_entry,
+                    "xml_selection_source": xml_selection_source,
+                    "xml_selection_reason": xml_selection_reason,
+                    "xml_confidence_tier": xml_confidence_tier,
+                    "xml_low_confidence_used": xml_low_confidence_used,
                     "omr_fallback_rows": omr_fallback_rows,
                     "assigned_labels": [t[3] for t in staff_start_labels_pdf],
                     "staff_start_candidate_count": len(staff_start_labels_pdf),
@@ -2081,6 +2249,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             "mxl_error": mxl_meta.get("mxl_error"),
             "mxl_paths": mxl_paths,
             "mxl_movements": mxl_metas,
+            "mxl_page_manifest_path": mxl_page_manifest_path or None,
+            "mxl_page_manifest_summary": mxl_page_manifest_summary,
+            "mxl_page_manifest_mode": mxl_manifest_active,
             "pages": mapping_debug,
         }
         with open(mapping_debug_path, "w", encoding="utf-8") as f:

@@ -12,6 +12,11 @@ on:
         required: false
         default: "ghcr.io/REPLACE_WITH_OWNER/audiveris-engine@sha256:REPLACE_WITH_REAL_DIGEST"
         type: string
+      enable_page_split_manifest:
+        description: "Enable strict per-page XML manifest mode (split PDF and run Audiveris per page)"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   pipeline:
@@ -68,6 +73,7 @@ jobs:
           echo "sha:  $GITHUB_SHA"
           echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
           echo "audiveris_image: ${{ inputs.audiveris_image }}"
+          echo "enable_page_split_manifest: ${{ inputs.enable_page_split_manifest }}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
 
       - name: Download input PDF
@@ -427,6 +433,265 @@ jobs:
           python -m pip install --upgrade pip
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0
 
+      - name: Build page-split XML manifest (optional strict mode)
+        if: ${{ inputs.enable_page_split_manifest }}
+        env:
+          AUDIVERIS_IMAGE: "${{ inputs.audiveris_image }}"
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/work/pages /tmp/work/audiveris_pages /tmp/work/page_logs
+
+          python - << 'PY'
+          import fitz
+          import os
+
+          src = "/tmp/work/input.pdf"
+          out_dir = "/tmp/work/pages"
+          os.makedirs(out_dir, exist_ok=True)
+
+          doc = fitz.open(src)
+          for idx in range(doc.page_count):
+              single = fitz.open()
+              single.insert_pdf(doc, from_page=idx, to_page=idx)
+              out_path = os.path.join(out_dir, f"page_{idx+1:04d}.pdf")
+              single.save(out_path)
+              single.close()
+          doc.close()
+          print(f"PAGE_SPLIT total_pages={len([p for p in os.listdir(out_dir) if p.endswith('.pdf')])}")
+          PY
+
+          run_page_omr() {
+            local image="$1"
+            local page_num="$2"
+            docker run --rm \
+              --user "$(id -u):$(id -g)" \
+              -v /tmp/work:/work \
+              -e PAGE_NUM="${page_num}" \
+              -e AUDI_IMAGE="${image}" \
+              -e AUDI_OUT_DIR="/work/audiveris_pages/page_${page_num}" \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              "${image}" \
+              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; "$AUDI_BIN" -batch -export -output "${AUDI_OUT_DIR}" "/work/pages/page_${PAGE_NUM}.pdf"'
+          }
+
+          for page_pdf in /tmp/work/pages/page_*.pdf; do
+            [[ -f "${page_pdf}" ]] || continue
+            page_num="$(basename "${page_pdf}" | sed -E 's/^page_([0-9]{4})\.pdf$/\1/')"
+            log_path="/tmp/work/page_logs/page_${page_num}.log"
+            if run_page_omr "${AUDIVERIS_IMAGE}" "${page_num}" >"${log_path}" 2>&1; then
+              exit_code=0
+            else
+              exit_code=$?
+            fi
+            echo "PAGE_XML_RUN page=$((10#${page_num})) image=${AUDIVERIS_IMAGE} exit_code=${exit_code} log=${log_path}"
+          done
+
+          python - << 'PY'
+          import glob
+          import json
+          import os
+          import re
+          import zipfile
+          import xml.etree.ElementTree as ET
+
+          MANIFEST_PATH = "/tmp/work/mxl_page_manifest.json"
+
+          def local(tag):
+              if isinstance(tag, str):
+                  return tag.split("}", 1)[-1] if "}" in tag else tag
+              return str(tag)
+
+          def iter_named(root, name):
+              out = []
+              for el in root.iter():
+                  tag = getattr(el, "tag", None)
+                  if isinstance(tag, str) and local(tag) == name:
+                      out.append(el)
+              return out
+
+          def children_named(el, name):
+              return [c for c in list(el) if local(c.tag) == name]
+
+          def truthy_attr(v):
+              if not v:
+                  return False
+              return str(v).strip().lower() in ("1", "true", "yes")
+
+          def parse_xml_member(raw):
+              try:
+                  root = ET.fromstring(raw)
+              except Exception:
+                  parts = len(re.findall(br"<\s*part(\s|>)", raw, flags=re.IGNORECASE))
+                  measures = len(re.findall(br"<\s*measure(\s|>)", raw, flags=re.IGNORECASE))
+                  return {
+                      "parse": "tagscan",
+                      "root": "unknown",
+                      "parts": parts,
+                      "measures": measures,
+                      "system_starts": [],
+                  }
+
+              parts = len(iter_named(root, "part"))
+              measures = len(iter_named(root, "measure"))
+              starts = []
+
+              if local(root.tag) == "score-partwise":
+                  score_parts = children_named(root, "part")
+                  if score_parts:
+                      ms = children_named(score_parts[0], "measure")
+                  else:
+                      ms = []
+                  if ms:
+                      starts.append((ms[0].get("number") or "").strip() or "1")
+                      for i, m in enumerate(ms[1:], start=2):
+                          label = (m.get("number") or "").strip() or str(i)
+                          is_new_system = False
+                          has_system_layout = False
+                          for pr in children_named(m, "print"):
+                              is_new_system = is_new_system or truthy_attr(pr.get("new-system")) or truthy_attr(pr.get("new-page"))
+                              if children_named(pr, "system-layout"):
+                                  has_system_layout = True
+                          if is_new_system or has_system_layout:
+                              starts.append(label)
+              return {
+                  "parse": "stdlib",
+                  "root": local(root.tag),
+                  "parts": parts,
+                  "measures": measures,
+                  "system_starts": starts,
+              }
+
+          def score_mxl(mxl_path):
+              best = None
+              try:
+                  with zipfile.ZipFile(mxl_path, "r") as z:
+                      for name in z.namelist():
+                          lname = name.lower()
+                          if name.startswith("META-INF/"):
+                              continue
+                          if not (lname.endswith(".xml") or lname.endswith(".musicxml")):
+                              continue
+                          try:
+                              raw = z.read(name)
+                          except Exception:
+                              continue
+                          scored = parse_xml_member(raw)
+                          cand = {"member": name, **scored}
+                          if best is None or (cand["measures"], cand["parts"]) > (best["measures"], best["parts"]):
+                              best = cand
+              except Exception as exc:
+                  return {
+                      "path": mxl_path,
+                      "member": None,
+                      "parse": "zip_error",
+                      "root": "zip_error",
+                      "parts": 0,
+                      "measures": 0,
+                      "system_starts": [],
+                      "error": str(exc),
+                  }
+              if best is None:
+                  return {
+                      "path": mxl_path,
+                      "member": None,
+                      "parse": "none",
+                      "root": "no_xml_members",
+                      "parts": 0,
+                      "measures": 0,
+                      "system_starts": [],
+                      "error": None,
+                  }
+              return {"path": mxl_path, **best, "error": None}
+
+          page_pdfs = sorted(glob.glob("/tmp/work/pages/page_*.pdf"))
+          entries = []
+          missing = 0
+
+          for page_pdf in page_pdfs:
+              page_num = int(re.search(r"page_(\d{4})\.pdf$", page_pdf).group(1))
+              page_idx = page_num - 1
+              out_dir = f"/tmp/work/audiveris_pages/page_{page_num:04d}"
+              candidates = sorted(glob.glob(os.path.join(out_dir, "**", "*.mxl"), recursive=True))
+              scored = [score_mxl(path) for path in candidates]
+              best = None
+              if scored:
+                  best = max(scored, key=lambda row: (row["measures"], row["parts"], row["path"], row.get("member") or ""))
+
+              if best and best["parts"] > 0 and best["measures"] > 0 and best.get("system_starts"):
+                  entry = {
+                      "page_index": page_idx,
+                      "page_number": page_num,
+                      "status": "ok",
+                      "error": None,
+                      "mxl_path": best["path"],
+                      "mxl_member": best.get("member"),
+                      "parts_count": int(best["parts"]),
+                      "measures_count": int(best["measures"]),
+                      "system_starts": list(best.get("system_starts") or []),
+                      "selection_source": "per_page_split",
+                      "selection_reason": "per_page_xml_usable",
+                      "confidence_tier": "high",
+                      "low_confidence_used": False,
+                      "retry_attempted": False,
+                      "retry_profile": "none",
+                  }
+                  print(
+                      "PAGE_XML_SELECTED "
+                      f"page={page_num} path={entry['mxl_path']} member={entry['mxl_member']} "
+                      f"parts={entry['parts_count']} measures={entry['measures_count']} "
+                      f"systems={len(entry['system_starts'])} source={entry['selection_source']}"
+                  )
+              else:
+                  reason = "no_mxl_candidates"
+                  if best:
+                      if best["parts"] <= 0 or best["measures"] <= 0:
+                          reason = "parts_or_measures_zero"
+                      elif not best.get("system_starts"):
+                          reason = "system_starts_missing"
+                  entry = {
+                      "page_index": page_idx,
+                      "page_number": page_num,
+                      "status": "missing",
+                      "error": reason,
+                      "mxl_path": best["path"] if best else None,
+                      "mxl_member": best.get("member") if best else None,
+                      "parts_count": int(best["parts"]) if best else 0,
+                      "measures_count": int(best["measures"]) if best else 0,
+                      "system_starts": list(best.get("system_starts") or []) if best else [],
+                      "selection_source": "none",
+                      "selection_reason": reason,
+                      "confidence_tier": "none",
+                      "low_confidence_used": False,
+                      "retry_attempted": False,
+                      "retry_profile": "none",
+                  }
+                  missing += 1
+                  print(
+                      "PAGE_XML_UNRESOLVED "
+                      f"page={page_num} reason={reason} path={entry['mxl_path']} "
+                      f"parts={entry['parts_count']} measures={entry['measures_count']}"
+                  )
+              entries.append(entry)
+
+          payload = {
+              "manifest_version": "page-split-v1",
+              "entries": entries,
+              "total_pages": len(entries),
+              "missing": missing,
+          }
+          with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+
+          print(
+              f"MXL_PAGE_MANIFEST path={MANIFEST_PATH} entries={len(entries)} missing={missing}"
+          )
+          PY
+
+          echo "MXL_PAGE_MANIFEST_PATH=/tmp/work/mxl_page_manifest.json" >> "$GITHUB_ENV"
+
       - name: Annotate PDF (guides + measure labels) with verbose debug
         env:
           DEBUG_GUIDES: "0"
@@ -437,6 +702,7 @@ jobs:
           MXL_SANITIZE_PREFIXES: "1"
           MXL_PATH_OVERRIDE: "${{ env.MXL_PATH_OVERRIDE }}"
           MXL_MEMBER_OVERRIDE: "${{ env.MXL_MEMBER_OVERRIDE }}"
+          MXL_PAGE_MANIFEST_PATH: "${{ env.MXL_PAGE_MANIFEST_PATH }}"
           DEBUG_MEASURE_LABELS: "1"
           DEBUG_MEASURE_MARKERS: "0"
           DEBUG_SENTINEL_TEXT: "1"
@@ -452,6 +718,7 @@ jobs:
               "mapping_mode",
               "labels_to_draw_count",
               "DEBUG_SENTINEL_TEXT",
+              "MXL_PAGE_MANIFEST_PATH",
           ]
           for m in markers:
               print(f"PARSER_MARKER {m} present={m in text}")
@@ -496,6 +763,16 @@ jobs:
               )
 
           pages = d.get("pages") or []
+          manifest_path = d.get("mxl_page_manifest_path")
+          if manifest_path:
+              manifest_summary = d.get("mxl_page_manifest_summary") or {}
+              print(f"SUMMARY manifest_path={manifest_path}")
+              print(
+                  "SUMMARY manifest "
+                  f"entries={manifest_summary.get('entries')} "
+                  f"missing={manifest_summary.get('missing')} "
+                  f"status={manifest_summary.get('status')}"
+              )
           strict_xml_pages_ok = 0
           total_pages = len(pages)
           strict_xml_missing = []
@@ -542,6 +819,8 @@ jobs:
                   f"status={status} "
                   f"reason={pg.get('mapping_reason')} "
                   f"mode={mode} "
+                  f"selection_source={pg.get('xml_selection_source')} "
+                  f"confidence={pg.get('xml_confidence_tier')} "
                   f"mxl_sys={len(pg.get('mxl_page_system_starts') or [])} "
                   f"omr_sys={len(pg.get('omr_system_staff_counts') or [])} "
                   f"assigned={len(pg.get('assigned_labels') or [])} "
@@ -577,6 +856,10 @@ jobs:
             /tmp/work/selected_mxl_member*.txt \
             /tmp/work/audiveris_smoke \
             /tmp/work/audiveris_out_try1 \
+            /tmp/work/pages \
+            /tmp/work/page_logs \
+            /tmp/work/audiveris_pages \
+            /tmp/work/mxl_page_manifest.json \
             /tmp/work/measure_mapping_debug.json \
             2>/dev/null || true
           if [[ -f /tmp/work/omr_debug_bundle.tar.gz ]]; then
@@ -598,6 +881,12 @@ jobs:
             echo "uploaded_mapping_debug=${OUTPUT_PREFIX}/measure_mapping_debug.json"
           else
             echo "WARN: /tmp/work/measure_mapping_debug.json not found"
+          fi
+          if [[ -f /tmp/work/mxl_page_manifest.json ]]; then
+            gsutil cp /tmp/work/mxl_page_manifest.json "${OUTPUT_PREFIX}/mxl_page_manifest.json"
+            echo "uploaded_manifest=${OUTPUT_PREFIX}/mxl_page_manifest.json"
+          else
+            echo "WARN: /tmp/work/mxl_page_manifest.json not found"
           fi
           if [[ -f /tmp/work/omr_debug_bundle.tar.gz ]]; then
             gsutil cp /tmp/work/omr_debug_bundle.tar.gz "${OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
