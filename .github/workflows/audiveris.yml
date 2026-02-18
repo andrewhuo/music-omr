@@ -7,22 +7,13 @@ on:
         description: "GCS URI to input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
         required: true
         type: string
-      audiveris_image:
-        description: "Pinned Audiveris image digest (ghcr.io/<owner>/audiveris-engine@sha256:...)"
-        required: false
-        default: "ghcr.io/REPLACE_WITH_OWNER/audiveris-engine@sha256:REPLACE_WITH_REAL_DIGEST"
-        type: string
-      enable_page_split_manifest:
-        description: "Enable strict per-page XML manifest mode (split PDF and run Audiveris per page)"
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
     env:
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
+      AUDIVERIS_IMAGE: "ghcr.io/${{ github.repository_owner }}/audiveris-engine@sha256:REPLACE_WITH_REAL_DIGEST"
 
     permissions:
       contents: read
@@ -72,8 +63,7 @@ jobs:
           echo "repo: $GITHUB_REPOSITORY"
           echo "sha:  $GITHUB_SHA"
           echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
-          echo "audiveris_image: ${{ inputs.audiveris_image }}"
-          echo "enable_page_split_manifest: ${{ inputs.enable_page_split_manifest }}"
+          echo "audiveris_image: ${AUDIVERIS_IMAGE}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
 
       - name: Download input PDF
@@ -88,17 +78,16 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/work
           mkdir -p /tmp/work/.cache /tmp/work/.config /tmp/work/tmp
-          AUDIVERIS_IMAGE="${{ inputs.audiveris_image }}"
           echo "WORKFLOW_SIGNATURE=engine-pin-v1"
           echo "WORKFLOW_SHA=${GITHUB_SHA}"
           echo "AUDIVERIS_IMAGE=${AUDIVERIS_IMAGE}"
 
           if [[ -z "${AUDIVERIS_IMAGE}" ]]; then
-            echo "ERROR: audiveris_image input is empty"
+            echo "ERROR: AUDIVERIS_IMAGE is empty"
             exit 1
           fi
-          if [[ "${AUDIVERIS_IMAGE}" == *"REPLACE_WITH_REAL_DIGEST"* ]] || [[ "${AUDIVERIS_IMAGE}" == *"REPLACE_WITH_OWNER"* ]]; then
-            echo "ERROR: audiveris_image is still placeholder text. Set a real GHCR digest."
+          if [[ "${AUDIVERIS_IMAGE}" == *"REPLACE_WITH_REAL_DIGEST"* ]]; then
+            echo "ERROR: audiveris_image is still placeholder text. Set a real GHCR digest in workflow env AUDIVERIS_IMAGE."
             exit 1
           fi
           if [[ "${AUDIVERIS_IMAGE}" != *@sha256:* ]]; then
@@ -433,10 +422,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0
 
-      - name: Build page-split XML manifest (optional strict mode)
-        if: ${{ inputs.enable_page_split_manifest }}
-        env:
-          AUDIVERIS_IMAGE: "${{ inputs.audiveris_image }}"
+      - name: Build page-split XML manifest (strict mode)
         run: |
           set -euo pipefail
           mkdir -p /tmp/work/pages /tmp/work/audiveris_pages /tmp/work/page_logs

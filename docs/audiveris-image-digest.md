@@ -7,4 +7,6 @@ Update this file after running `.github/workflows/build-audiveris-image.yml`.
 - Built from workflow run: `<actions run url>`
 - Date pinned: `<YYYY-MM-DD>`
 
-Use this digest in `/Users/andrew/music-omr/.github/workflows/audiveris.yml` input `audiveris_image`.
+Use this digest in `/Users/andrew/music-omr/.github/workflows/audiveris.yml` job env:
+
+- `AUDIVERIS_IMAGE: ghcr.io/<owner>/audiveris-engine@sha256:<digest>`
