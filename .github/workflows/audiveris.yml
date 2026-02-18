@@ -14,6 +14,7 @@ jobs:
     env:
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
       AUDIVERIS_IMAGE: "ghcr.io/${{ github.repository_owner }}/audiveris-engine@sha256:REPLACE_WITH_REAL_DIGEST"
+      AUDIVERIS_VERSION: "5.9.0"
 
     permissions:
       contents: read
@@ -78,26 +79,39 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/work
           mkdir -p /tmp/work/.cache /tmp/work/.config /tmp/work/tmp
+          AUDIVERIS_IMAGE_EFFECTIVE="${AUDIVERIS_IMAGE}"
+
+          # If no pinned digest is set yet, build a local image in this run.
+          if [[ "${AUDIVERIS_IMAGE_EFFECTIVE}" == *"REPLACE_WITH_REAL_DIGEST"* ]]; then
+            echo "AUDIVERIS_IMAGE_PLACEHOLDER_DETECTED building_local_image=true version=${AUDIVERIS_VERSION}"
+            docker build \
+              --file docker/audiveris/Dockerfile \
+              --build-arg AUDIVERIS_VERSION="${AUDIVERIS_VERSION}" \
+              --tag "audiveris-local:${AUDIVERIS_VERSION}" \
+              .
+            AUDIVERIS_IMAGE_EFFECTIVE="audiveris-local:${AUDIVERIS_VERSION}"
+          fi
+
           echo "WORKFLOW_SIGNATURE=engine-pin-v1"
           echo "WORKFLOW_SHA=${GITHUB_SHA}"
-          echo "AUDIVERIS_IMAGE=${AUDIVERIS_IMAGE}"
+          echo "AUDIVERIS_IMAGE=${AUDIVERIS_IMAGE_EFFECTIVE}"
 
-          if [[ -z "${AUDIVERIS_IMAGE}" ]]; then
+          if [[ -z "${AUDIVERIS_IMAGE_EFFECTIVE}" ]]; then
             echo "ERROR: AUDIVERIS_IMAGE is empty"
             exit 1
           fi
-          if [[ "${AUDIVERIS_IMAGE}" == *"REPLACE_WITH_REAL_DIGEST"* ]]; then
-            echo "ERROR: audiveris_image is still placeholder text. Set a real GHCR digest in workflow env AUDIVERIS_IMAGE."
+          if [[ "${AUDIVERIS_IMAGE_EFFECTIVE}" != audiveris-local:* && "${AUDIVERIS_IMAGE_EFFECTIVE}" != *@sha256:* ]]; then
+            echo "ERROR: audiveris_image must be pinned by digest using @sha256: (or be audiveris-local:<version>)"
             exit 1
           fi
-          if [[ "${AUDIVERIS_IMAGE}" != *@sha256:* ]]; then
-            echo "ERROR: audiveris_image must be pinned by digest using @sha256:"
-            exit 1
+          if [[ "${AUDIVERIS_IMAGE_EFFECTIVE}" == audiveris-local:* ]]; then
+            echo "PULLING_AUDIVERIS_IMAGE=skipped_local_build"
+          else
+            echo "PULLING_AUDIVERIS_IMAGE=${AUDIVERIS_IMAGE_EFFECTIVE}"
+            docker pull "${AUDIVERIS_IMAGE_EFFECTIVE}"
           fi
-          echo "PULLING_AUDIVERIS_IMAGE=${AUDIVERIS_IMAGE}"
-          docker pull "${AUDIVERIS_IMAGE}"
-          echo "AUDIVERIS_IMAGE_ID=$(docker image inspect "${AUDIVERIS_IMAGE}" --format '{{.Id}}')"
-          echo "AUDIVERIS_IMAGE_REPODIGESTS=$(docker image inspect "${AUDIVERIS_IMAGE}" --format '{{json .RepoDigests}}')"
+          echo "AUDIVERIS_IMAGE_ID=$(docker image inspect "${AUDIVERIS_IMAGE_EFFECTIVE}" --format '{{.Id}}')"
+          echo "AUDIVERIS_IMAGE_REPODIGESTS=$(docker image inspect "${AUDIVERIS_IMAGE_EFFECTIVE}" --format '{{json .RepoDigests}}')"
 
           probe_omr_version() {
             local image="$1"
@@ -324,9 +338,9 @@ jobs:
           PY
           }
 
-          probe_omr_version "${AUDIVERIS_IMAGE}"
+          probe_omr_version "${AUDIVERIS_IMAGE_EFFECTIVE}"
 
-          run_omr_smoke "${AUDIVERIS_IMAGE}" audiveris_smoke
+          run_omr_smoke "${AUDIVERIS_IMAGE_EFFECTIVE}" audiveris_smoke
           if ! check_mxl "/tmp/work/audiveris_smoke" "smoke"; then
             echo "ERROR: smoke run did not produce usable MusicXML (parts/measures > 0 required)."
             exit 1
@@ -334,7 +348,7 @@ jobs:
           echo "SMOKE_SELECTED_PATH=$(cat /tmp/work/selected_mxl_path_smoke.txt)"
           echo "SMOKE_SELECTED_MEMBER=$(cat /tmp/work/selected_mxl_member_smoke.txt)"
 
-          run_omr "${AUDIVERIS_IMAGE}" audiveris_out_try1
+          run_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" audiveris_out_try1
           SELECTED_OUT="/tmp/work/audiveris_out_try1"
           if ! check_mxl "$SELECTED_OUT" "full"; then
             echo "MusicXML export has no parts/measures after successful startup."
@@ -426,6 +440,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/work/pages /tmp/work/audiveris_pages /tmp/work/page_logs
+          AUDIVERIS_IMAGE_EFFECTIVE="${AUDIVERIS_IMAGE}"
+          if [[ "${AUDIVERIS_IMAGE_EFFECTIVE}" == *"REPLACE_WITH_REAL_DIGEST"* ]]; then
+            AUDIVERIS_IMAGE_EFFECTIVE="audiveris-local:${AUDIVERIS_VERSION}"
+          fi
 
           python - << 'PY'
           import fitz
@@ -467,12 +485,12 @@ jobs:
             [[ -f "${page_pdf}" ]] || continue
             page_num="$(basename "${page_pdf}" | sed -E 's/^page_([0-9]{4})\.pdf$/\1/')"
             log_path="/tmp/work/page_logs/page_${page_num}.log"
-            if run_page_omr "${AUDIVERIS_IMAGE}" "${page_num}" >"${log_path}" 2>&1; then
+            if run_page_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" "${page_num}" >"${log_path}" 2>&1; then
               exit_code=0
             else
               exit_code=$?
             fi
-            echo "PAGE_XML_RUN page=$((10#${page_num})) image=${AUDIVERIS_IMAGE} exit_code=${exit_code} log=${log_path}"
+            echo "PAGE_XML_RUN page=$((10#${page_num})) image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${exit_code} log=${log_path}"
           done
 
           python - << 'PY'
