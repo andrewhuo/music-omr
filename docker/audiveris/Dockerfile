@@ -17,7 +17,15 @@ RUN git clone --depth 1 --branch "${AUDIVERIS_VERSION}" https://github.com/Audiv
 RUN ./gradlew --no-daemon clean distTar
 
 RUN set -eux; \
-    dist_tar="$(find build/distributions -maxdepth 1 -type f -name '*.tar' | head -n 1)"; \
+    dist_tar=""; \
+    for dist_dir in app/build/distributions build/distributions; do \
+      if [ -d "${dist_dir}" ]; then \
+        dist_tar="$(find "${dist_dir}" -maxdepth 1 -type f -name '*.tar' | head -n 1)"; \
+      fi; \
+      if [ -n "${dist_tar}" ]; then \
+        break; \
+      fi; \
+    done; \
     test -n "${dist_tar}"; \
     mkdir -p /out; \
     tar -xf "${dist_tar}" -C /out; \
