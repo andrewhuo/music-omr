@@ -117,6 +117,7 @@ jobs:
             local image="$1"
             local required="5.9.0"
             docker run --rm \
+              --entrypoint /bin/sh \
               --user "$(id -u):$(id -g)" \
               -v /tmp/work:/work \
               -e HOME="/work" \
@@ -124,7 +125,12 @@ jobs:
               -e XDG_CONFIG_HOME="/work/.config" \
               -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
               "$image" \
-              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; "$AUDI_BIN" -help >/work/audi_help_probe.txt 2>&1 || true;'
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; "$AUDI_BIN" -help >/work/audi_help_probe.txt 2>&1 || true;'
+
+            if [[ ! -f /tmp/work/audi_help_probe.txt ]]; then
+              echo "ERROR: probe output missing /tmp/work/audi_help_probe.txt"
+              exit 1
+            fi
 
             local version_raw
             version_raw="$(grep -Eo '([0-9]+\.[0-9]+\.[0-9]+([-.:][A-Za-z0-9]+)?)' /tmp/work/audi_help_probe.txt | head -n 1 || true)"
@@ -153,6 +159,7 @@ jobs:
             local image="$1"
             local out_dir_name="$2"
             docker run --rm \
+              --entrypoint /bin/sh \
               --user "$(id -u):$(id -g)" \
               -v /tmp/work:/work \
               -e AUDI_IMAGE="${image}" \
@@ -162,13 +169,14 @@ jobs:
               -e XDG_CONFIG_HOME="/work/.config" \
               -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
               "$image" \
-              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN} HOME=${HOME} XDG_CACHE_HOME=${XDG_CACHE_HOME}"; "$AUDI_BIN" -help >/work/audi_help.txt 2>&1 || true; if grep -Eq "AccessDeniedException: /\\.cache|Loader\\.getCacheDir\\(\\).*null|ExceptionInInitializerError" /work/audi_help.txt; then echo "AUDIVERIS_PREFLIGHT_ERROR"; tail -n 120 /work/audi_help.txt || true; exit 86; fi; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" /work/input.pdf'
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN} HOME=${HOME} XDG_CACHE_HOME=${XDG_CACHE_HOME}"; "$AUDI_BIN" -help >/work/audi_help.txt 2>&1 || true; if grep -Eq "AccessDeniedException: /\\.cache|Loader\\.getCacheDir\\(\\).*null|ExceptionInInitializerError" /work/audi_help.txt; then echo "AUDIVERIS_PREFLIGHT_ERROR"; tail -n 120 /work/audi_help.txt || true; exit 86; fi; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" /work/input.pdf'
           }
 
           run_omr_smoke() {
             local image="$1"
             local out_dir_name="$2"
             docker run --rm \
+              --entrypoint /bin/sh \
               --user "$(id -u):$(id -g)" \
               -v /tmp/work:/work \
               -e AUDI_IMAGE="${image}" \
@@ -178,7 +186,7 @@ jobs:
               -e XDG_CONFIG_HOME="/work/.config" \
               -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
               "$image" \
-              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_SMOKE image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN}"; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" -sheets 1 /work/input.pdf'
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_SMOKE image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN}"; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" -sheets 1 /work/input.pdf'
           }
 
           check_mxl() {
@@ -468,6 +476,7 @@ jobs:
             local image="$1"
             local page_num="$2"
             docker run --rm \
+              --entrypoint /bin/sh \
               --user "$(id -u):$(id -g)" \
               -v /tmp/work:/work \
               -e PAGE_NUM="${page_num}" \
@@ -478,7 +487,7 @@ jobs:
               -e XDG_CONFIG_HOME="/work/.config" \
               -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
               "${image}" \
-              sh -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; "$AUDI_BIN" -batch -export -output "${AUDI_OUT_DIR}" "/work/pages/page_${PAGE_NUM}.pdf"'
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; "$AUDI_BIN" -batch -export -output "${AUDI_OUT_DIR}" "/work/pages/page_${PAGE_NUM}.pdf"'
           }
 
           for page_pdf in /tmp/work/pages/page_*.pdf; do
