@@ -304,7 +304,12 @@ jobs:
 
           out_dir = sys.argv[1]
           context = sys.argv[2]
-          mxl_candidates = sorted(glob.glob(os.path.join(out_dir, "input", "*.mxl")))
+          search_roots = [
+              os.path.join(out_dir, "*.mxl"),
+              os.path.join(out_dir, "input", "*.mxl"),
+          ]
+          mxl_candidates = sorted({path for pattern in search_roots for path in glob.glob(pattern)})
+          print(f"MXL_CHECK_SEARCH_ROOTS context={context} roots={search_roots}")
           print(f"MXL_CHECK_CONTEXT context={context} out_dir={out_dir} candidate_count={len(mxl_candidates)}")
           if not mxl_candidates:
               print(f"MXL_CHECK_FAIL context={context} reason=no_mxl_files out_dir={out_dir}")
@@ -384,12 +389,27 @@ jobs:
           fi
 
           AUDI_SELECTED_OUT="${SELECTED_OUT}"
+          OMR_PATH=""
+          if [[ -f "${AUDI_SELECTED_OUT}/input/input.omr" ]]; then
+            OMR_PATH="${AUDI_SELECTED_OUT}/input/input.omr"
+          elif [[ -f "${AUDI_SELECTED_OUT}/input.omr" ]]; then
+            OMR_PATH="${AUDI_SELECTED_OUT}/input.omr"
+          else
+            OMR_PATH="$(find "${AUDI_SELECTED_OUT}" -maxdepth 3 -type f -name "*.omr" | head -n 1 || true)"
+          fi
+          if [[ -z "${OMR_PATH}" || ! -f "${OMR_PATH}" ]]; then
+            echo "ERROR: missing .omr output under ${AUDI_SELECTED_OUT}"
+            find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f -print || true
+            exit 1
+          fi
           MXL_MEMBER_OVERRIDE="$(cat /tmp/work/selected_mxl_member.txt)"
           MXL_PATH_OVERRIDE="$(cat /tmp/work/selected_mxl_path.txt)"
           echo "AUDI_SELECTED_OUT=${AUDI_SELECTED_OUT}" >> "$GITHUB_ENV"
+          echo "AUDI_OMR_PATH=${OMR_PATH}" >> "$GITHUB_ENV"
           echo "MXL_MEMBER_OVERRIDE=${MXL_MEMBER_OVERRIDE}" >> "$GITHUB_ENV"
           echo "MXL_PATH_OVERRIDE=${MXL_PATH_OVERRIDE}" >> "$GITHUB_ENV"
           echo "AUDI_SELECTED_OUT=${AUDI_SELECTED_OUT}"
+          echo "AUDI_OMR_PATH=${OMR_PATH}"
           echo "MXL_PATH_OVERRIDE=${MXL_PATH_OVERRIDE}"
           echo "MXL_MEMBER_OVERRIDE=${MXL_MEMBER_OVERRIDE}"
 
@@ -435,7 +455,10 @@ jobs:
       - name: Validate OMR and print archive debug
         run: |
           set -euo pipefail
-          OMR="${AUDI_SELECTED_OUT}/input/input.omr"
+          OMR="${AUDI_OMR_PATH:-}"
+          if [[ -z "$OMR" ]]; then
+            OMR="${AUDI_SELECTED_OUT}/input/input.omr"
+          fi
           if [[ ! -f "$OMR" ]]; then
             echo "ERROR: missing $OMR"
             find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f -print || true
@@ -446,7 +469,7 @@ jobs:
           unzip -l "$OMR" | sed -n '1,220p'
 
           echo "Audiveris logs (tail):"
-          for f in "${AUDI_SELECTED_OUT}"/input/*.log; do
+          for f in "${AUDI_SELECTED_OUT}"/*.log "${AUDI_SELECTED_OUT}"/input/*.log; do
             [[ -f "$f" ]] || continue
             echo "--- $f (last 120 lines) ---"
             tail -n 120 "$f" || true
@@ -757,7 +780,7 @@ jobs:
           PY
           python -u parser-api/annotate_guides_from_omr.py \
             /tmp/work/input.pdf \
-            "${AUDI_SELECTED_OUT}/input/input.omr" \
+            "${AUDI_OMR_PATH}" \
             /tmp/work/annotated.pdf
           ls -lh /tmp/work/annotated.pdf
 
