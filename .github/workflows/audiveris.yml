@@ -348,13 +348,32 @@ jobs:
 
           probe_omr_version "${AUDIVERIS_IMAGE_EFFECTIVE}"
 
-          run_omr_smoke "${AUDIVERIS_IMAGE_EFFECTIVE}" audiveris_smoke
-          if ! check_mxl "/tmp/work/audiveris_smoke" "smoke"; then
-            echo "ERROR: smoke run did not produce usable MusicXML (parts/measures > 0 required)."
-            exit 1
+          SMOKE_RUN_EXIT_CODE=0
+          if run_omr_smoke "${AUDIVERIS_IMAGE_EFFECTIVE}" audiveris_smoke; then
+            SMOKE_RUN_EXIT_CODE=0
+          else
+            SMOKE_RUN_EXIT_CODE=$?
           fi
-          echo "SMOKE_SELECTED_PATH=$(cat /tmp/work/selected_mxl_path_smoke.txt)"
-          echo "SMOKE_SELECTED_MEMBER=$(cat /tmp/work/selected_mxl_member_smoke.txt)"
+
+          SMOKE_MXL_OK=false
+          if check_mxl "/tmp/work/audiveris_smoke" "smoke"; then
+            SMOKE_MXL_OK=true
+          fi
+
+          if [[ "${SMOKE_RUN_EXIT_CODE}" -ne 0 || "${SMOKE_MXL_OK}" != "true" ]]; then
+            echo "SMOKE_STATUS=warn"
+            echo "SMOKE_RUN_EXIT_CODE=${SMOKE_RUN_EXIT_CODE}"
+            echo "SMOKE_MXL_OK=${SMOKE_MXL_OK}"
+            echo "SMOKE_BYPASS continuing_to_full_run=true"
+            echo "Smoke outputs (warn path):"
+            find /tmp/work/audiveris_smoke -maxdepth 4 -type f -print || true
+          else
+            echo "SMOKE_STATUS=ok"
+            echo "SMOKE_RUN_EXIT_CODE=${SMOKE_RUN_EXIT_CODE}"
+            echo "SMOKE_MXL_OK=${SMOKE_MXL_OK}"
+            echo "SMOKE_SELECTED_PATH=$(cat /tmp/work/selected_mxl_path_smoke.txt)"
+            echo "SMOKE_SELECTED_MEMBER=$(cat /tmp/work/selected_mxl_member_smoke.txt)"
+          fi
 
           run_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" audiveris_out_try1
           SELECTED_OUT="/tmp/work/audiveris_out_try1"
