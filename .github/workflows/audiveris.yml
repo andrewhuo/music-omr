@@ -186,7 +186,7 @@ jobs:
               -e XDG_CONFIG_HOME="/work/.config" \
               -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
               "$image" \
-              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_SMOKE image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN}"; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" -sheets 1 /work/input.pdf'
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_SMOKE image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN}"; echo "AUDIVERIS_SMOKE_CMD=\"${AUDI_BIN}\" -batch -export -output \"${AUDI_OUT_DIR}\" -sheets 1 -- /work/input.pdf"; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" -sheets 1 -- /work/input.pdf'
           }
 
           check_mxl() {
