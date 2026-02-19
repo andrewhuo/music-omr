@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
-      AUDIVERIS_IMAGE: "ghcr.io/${{ github.repository_owner }}/audiveris-engine@sha256:REPLACE_WITH_REAL_DIGEST"
+      AUDIVERIS_IMAGE: "ghcr.io/andrewhuo/audiveris-engine@sha256:61c2a4a39e6f545bb9153a984247b83ace541196c4861329b295982e4cf57bed"
       AUDIVERIS_VERSION: "5.9.0"
 
     permissions:
@@ -80,17 +80,6 @@ jobs:
           mkdir -p /tmp/work
           mkdir -p /tmp/work/.cache /tmp/work/.config /tmp/work/tmp
           AUDIVERIS_IMAGE_EFFECTIVE="${AUDIVERIS_IMAGE}"
-
-          # If no pinned digest is set yet, build a local image in this run.
-          if [[ "${AUDIVERIS_IMAGE_EFFECTIVE}" == *"REPLACE_WITH_REAL_DIGEST"* ]]; then
-            echo "AUDIVERIS_IMAGE_PLACEHOLDER_DETECTED building_local_image=true version=${AUDIVERIS_VERSION}"
-            docker build \
-              --file docker/audiveris/Dockerfile \
-              --build-arg AUDIVERIS_VERSION="${AUDIVERIS_VERSION}" \
-              --tag "audiveris-local:${AUDIVERIS_VERSION}" \
-              .
-            AUDIVERIS_IMAGE_EFFECTIVE="audiveris-local:${AUDIVERIS_VERSION}"
-          fi
 
           echo "WORKFLOW_SIGNATURE=engine-pin-v1"
           echo "WORKFLOW_SHA=${GITHUB_SHA}"
@@ -491,9 +480,6 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/work/pages /tmp/work/audiveris_pages /tmp/work/page_logs
           AUDIVERIS_IMAGE_EFFECTIVE="${AUDIVERIS_IMAGE}"
-          if [[ "${AUDIVERIS_IMAGE_EFFECTIVE}" == *"REPLACE_WITH_REAL_DIGEST"* ]]; then
-            AUDIVERIS_IMAGE_EFFECTIVE="audiveris-local:${AUDIVERIS_VERSION}"
-          fi
 
           python - << 'PY'
           import fitz
