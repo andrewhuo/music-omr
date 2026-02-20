@@ -739,47 +739,96 @@ jobs:
               if target_system_count <= 0:
                   return None, "target_missing"
 
+              normalized = []
+              for row in valid_rows:
+                  starts_raw = list(row.get("system_starts") or [])
+                  nums = parse_int_labels(starts_raw)
+                  if nums is None:
+                      continue
+                  if not strictly_increasing(nums):
+                      continue
+                  normalized.append((row, nums, starts_raw))
+
+              if not normalized:
+                  return None, "no_strict_numeric_candidates"
+
               exact_rows = [
-                  row
-                  for row in valid_rows
-                  if len(row.get("system_starts") or []) == target_system_count
+                  item
+                  for item in normalized
+                  if len(item[1]) == target_system_count
               ]
               if exact_rows:
-                  chosen = max(
+                  chosen_row, chosen_nums, chosen_raw = max(
                       exact_rows,
-                      key=lambda row: (
-                          row["measures"],
-                          row["parts"],
-                          -int(row.get("movement_index") or 1),
-                          row["path"],
-                          row.get("member") or "",
+                      key=lambda item: (
+                          item[0]["measures"],
+                          item[0]["parts"],
+                          -int(item[0].get("movement_index") or 1),
+                          item[0]["path"],
+                          item[0].get("member") or "",
                       ),
                   )
                   return {
                       "kind": "single_exact",
-                      "rows": [chosen],
-                      "system_starts": list(chosen.get("system_starts") or []),
+                      "rows": [chosen_row],
+                      "system_starts": [str(n) for n in chosen_nums],
+                      "row_offsets": [0],
+                      "system_starts_raw_segments": [
+                          {
+                              "path": chosen_row.get("path"),
+                              "movement_index": int(chosen_row.get("movement_index") or 1),
+                              "system_starts": list(chosen_raw),
+                          }
+                      ],
                   }, None
 
               ordered = sorted(
-                  valid_rows,
-                  key=lambda row: (int(row.get("movement_index") or 1), row["path"]),
+                  normalized,
+                  key=lambda item: (int(item[0].get("movement_index") or 1), item[0]["path"]),
               )
               merged_rows = []
-              merged_starts = []
-              for row in ordered:
+              merged_nums = []
+              row_offsets = []
+              raw_segments = []
+              any_shift = False
+              for row, raw_nums, raw_starts in ordered:
+                  offset = 0
+                  if merged_nums:
+                      prev_end = merged_nums[-1]
+                      raw_first = raw_nums[0]
+                      if raw_first > prev_end:
+                          offset = 0
+                      elif raw_first == 1:
+                          # Deterministic reset-aware shift: keep next chunk contiguous.
+                          offset = prev_end
+                          any_shift = True
+                      else:
+                          return None, "merged_overlap_without_reset"
+
+                  shifted = [n + offset for n in raw_nums]
+                  if merged_nums and shifted[0] <= merged_nums[-1]:
+                      return None, "merged_not_strictly_increasing_after_shift"
+
                   merged_rows.append(row)
-                  merged_starts.extend(list(row.get("system_starts") or []))
-                  if len(merged_starts) == target_system_count:
-                      nums = parse_int_labels(merged_starts)
-                      if nums is None or not strictly_increasing(nums):
-                          return None, "merged_not_strictly_increasing_or_non_numeric"
+                  row_offsets.append(offset)
+                  merged_nums.extend(shifted)
+                  raw_segments.append(
+                      {
+                          "path": row.get("path"),
+                          "movement_index": int(row.get("movement_index") or 1),
+                          "system_starts": list(raw_starts),
+                      }
+                  )
+
+                  if len(merged_nums) == target_system_count:
                       return {
-                          "kind": "merge_exact",
+                          "kind": "merge_shifted_exact" if any_shift else "merge_exact",
                           "rows": list(merged_rows),
-                          "system_starts": [str(n) for n in nums],
+                          "system_starts": [str(n) for n in merged_nums],
+                          "row_offsets": list(row_offsets),
+                          "system_starts_raw_segments": list(raw_segments),
                       }, None
-                  if len(merged_starts) > target_system_count:
+                  if len(merged_nums) > target_system_count:
                       return None, "merged_system_count_exceeds_target"
 
               return None, "merged_system_count_below_target"
@@ -842,6 +891,28 @@ jobs:
                   used_paths = [row["path"] for row in used_rows]
                   used_movement_indices = [int(row.get("movement_index") or 1) for row in used_rows]
                   system_starts = list(selected["system_starts"])
+                  row_offsets = list(selected.get("row_offsets") or [0 for _ in used_rows])
+                  raw_segments = list(selected.get("system_starts_raw_segments") or [])
+                  merge_offsets = []
+                  for row, offset in zip(used_rows, row_offsets):
+                      raw_nums = parse_int_labels(list(row.get("system_starts") or [])) or []
+                      raw_first = raw_nums[0] if raw_nums else None
+                      raw_last = raw_nums[-1] if raw_nums else None
+                      shifted_first = (raw_first + int(offset)) if raw_first is not None else None
+                      shifted_last = (raw_last + int(offset)) if raw_last is not None else None
+                      print(
+                          "PAGE_XML_SHIFT "
+                          f"page={page_num} path={row.get('path')} movement={int(row.get('movement_index') or 1)} "
+                          f"offset={int(offset)} raw_first={raw_first} raw_last={raw_last} "
+                          f"shifted_first={shifted_first} shifted_last={shifted_last}"
+                      )
+                      merge_offsets.append(
+                          {
+                              "path": row.get("path"),
+                              "movement_index": int(row.get("movement_index") or 1),
+                              "offset": int(offset),
+                          }
+                      )
                   primary = used_rows[0]
                   if selected["kind"] == "single_exact":
                       selection_source = "per_page_split_single_exact"
@@ -849,6 +920,12 @@ jobs:
                       parts_count = int(primary["parts"])
                       measures_count = int(primary["measures"])
                       mxl_member = primary.get("member")
+                  elif selected["kind"] == "merge_shifted_exact":
+                      selection_source = "per_page_split_merge_shifted_exact"
+                      selection_reason = "merged_reset_shifted_exact_system_count"
+                      parts_count = max(int(row.get("parts") or 0) for row in used_rows)
+                      measures_count = sum(int(row.get("measures") or 0) for row in used_rows)
+                      mxl_member = None
                   else:
                       selection_source = "per_page_split_merge_exact"
                       selection_reason = "merged_candidates_exact_system_count"
@@ -869,6 +946,8 @@ jobs:
                       "measures_count": measures_count,
                       "system_count_target": target,
                       "system_starts": system_starts,
+                      "merge_offsets": merge_offsets,
+                      "system_starts_raw_segments": raw_segments,
                       "selection_source": selection_source,
                       "selection_reason": selection_reason,
                       "confidence_tier": "high",
@@ -914,6 +993,8 @@ jobs:
                       "measures_count": int(best.get("measures") or 0) if best else 0,
                       "system_count_target": target,
                       "system_starts": list(best.get("system_starts") or []) if best else [],
+                      "merge_offsets": [],
+                      "system_starts_raw_segments": [],
                       "selection_source": "none",
                       "selection_reason": select_error or reason,
                       "confidence_tier": "none",
