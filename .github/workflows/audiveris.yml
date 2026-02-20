@@ -15,6 +15,7 @@ jobs:
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
       AUDIVERIS_IMAGE: "ghcr.io/andrewhuo/audiveris-engine@sha256:61c2a4a39e6f545bb9153a984247b83ace541196c4861329b295982e4cf57bed"
       AUDIVERIS_VERSION: "5.9.0"
+      MEASURE_NUMBERING_POLICY: "semantic_continuous_v1"
 
     permissions:
       contents: read
@@ -545,6 +546,12 @@ jobs:
 
           MANIFEST_PATH = "/tmp/work/mxl_page_manifest.json"
           OMR_PATH = os.environ.get("AUDI_OMR_PATH", "").strip()
+          NUMBERING_POLICY = (os.environ.get("MEASURE_NUMBERING_POLICY", "semantic_continuous_v1") or "").strip() or "semantic_continuous_v1"
+          if NUMBERING_POLICY not in ("semantic_continuous_v1", "legacy_raw_starts"):
+              print(
+                  f"SEMANTIC_WARN page=- reason=invalid_numbering_policy:{NUMBERING_POLICY} fallback=semantic_continuous_v1"
+              )
+              NUMBERING_POLICY = "semantic_continuous_v1"
 
           def local(tag):
               if isinstance(tag, str):
@@ -567,6 +574,25 @@ jobs:
                   return False
               return str(v).strip().lower() in ("1", "true", "yes")
 
+          def parse_ending_number_tokens(v):
+              if not v:
+                  return []
+              out = []
+              for tok in re.split(r"[^0-9]+", str(v)):
+                  tok = tok.strip()
+                  if tok:
+                      out.append(tok)
+              return out
+
+          def parse_xml_int(v):
+              txt = (v or "").strip()
+              if not re.fullmatch(r"-?\d+", txt):
+                  return None
+              try:
+                  return int(txt)
+              except Exception:
+                  return None
+
           def parse_xml_member(raw):
               try:
                   root = ET.fromstring(raw)
@@ -579,11 +605,21 @@ jobs:
                       "parts": parts,
                       "measures": measures,
                       "system_starts": [],
+                      "measure_events": [],
+                      "pickup_detected": False,
+                      "repeat_forward_count": 0,
+                      "repeat_backward_count": 0,
+                      "ending_start_count": 0,
                   }
 
               parts = len(iter_named(root, "part"))
               measures = len(iter_named(root, "measure"))
               starts = []
+              measure_events = []
+              pickup_detected = False
+              repeat_forward_count = 0
+              repeat_backward_count = 0
+              ending_start_count = 0
 
               if local(root.tag) == "score-partwise":
                   score_parts = children_named(root, "part")
@@ -592,10 +628,14 @@ jobs:
                   else:
                       ms = []
                   if ms:
-                      starts.append((ms[0].get("number") or "").strip() or "1")
-                      for i, m in enumerate(ms[1:], start=2):
+                      for i, m in enumerate(ms, start=1):
                           label = (m.get("number") or "").strip() or str(i)
-                          is_new_system = False
+                          measure_num_int = parse_xml_int(label)
+                          implicit = truthy_attr(m.get("implicit"))
+                          if i == 1 and implicit:
+                              pickup_detected = True
+
+                          is_new_system = (i == 1)
                           has_system_layout = False
                           for pr in children_named(m, "print"):
                               is_new_system = is_new_system or truthy_attr(pr.get("new-system")) or truthy_attr(pr.get("new-page"))
@@ -603,12 +643,52 @@ jobs:
                                   has_system_layout = True
                           if is_new_system or has_system_layout:
                               starts.append(label)
+
+                          has_forward_repeat = False
+                          has_backward_repeat = False
+                          ending_numbers = []
+                          for bar in children_named(m, "barline"):
+                              for rep in children_named(bar, "repeat"):
+                                  direction = (rep.get("direction") or "").strip().lower()
+                                  if direction == "forward":
+                                      has_forward_repeat = True
+                                  elif direction == "backward":
+                                      has_backward_repeat = True
+                              for ending in children_named(bar, "ending"):
+                                  ending_type = (ending.get("type") or "").strip().lower()
+                                  if ending_type in ("start", "discontinue"):
+                                      ending_numbers.extend(parse_ending_number_tokens(ending.get("number")))
+                                  if ending_type == "start":
+                                      ending_start_count += 1
+
+                          if has_forward_repeat:
+                              repeat_forward_count += 1
+                          if has_backward_repeat:
+                              repeat_backward_count += 1
+
+                          measure_events.append(
+                              {
+                                  "measure_index": i - 1,
+                                  "label": label,
+                                  "number_int": measure_num_int,
+                                  "implicit": implicit,
+                                  "system_start": bool(is_new_system or has_system_layout),
+                                  "repeat_forward": has_forward_repeat,
+                                  "repeat_backward": has_backward_repeat,
+                                  "ending_start_numbers": ending_numbers,
+                              }
+                          )
               return {
                   "parse": "stdlib",
                   "root": local(root.tag),
                   "parts": parts,
                   "measures": measures,
                   "system_starts": starts,
+                  "measure_events": measure_events,
+                  "pickup_detected": pickup_detected,
+                  "repeat_forward_count": repeat_forward_count,
+                  "repeat_backward_count": repeat_backward_count,
+                  "ending_start_count": ending_start_count,
               }
 
           def movement_index_for_path(path):
@@ -713,6 +793,11 @@ jobs:
                       "parts": 0,
                       "measures": 0,
                       "system_starts": [],
+                      "measure_events": [],
+                      "pickup_detected": False,
+                      "repeat_forward_count": 0,
+                      "repeat_backward_count": 0,
+                      "ending_start_count": 0,
                       "error": str(exc),
                   }
               if best is None:
@@ -725,6 +810,11 @@ jobs:
                       "parts": 0,
                       "measures": 0,
                       "system_starts": [],
+                      "measure_events": [],
+                      "pickup_detected": False,
+                      "repeat_forward_count": 0,
+                      "repeat_backward_count": 0,
+                      "ending_start_count": 0,
                       "error": None,
                   }
               return {
@@ -833,6 +923,142 @@ jobs:
 
               return None, "merged_system_count_below_target"
 
+          def merge_measure_events(rows, offsets):
+              merged = []
+              for row, offset in zip(rows, offsets):
+                  row_events = list(row.get("measure_events") or [])
+                  for ev in row_events:
+                      ev_num_int = ev.get("number_int")
+                      shifted_num_int = (int(ev_num_int) + int(offset)) if ev_num_int is not None else None
+                      merged.append(
+                          {
+                              "label": str(ev.get("label") or ""),
+                              "number_int": shifted_num_int,
+                              "implicit": bool(ev.get("implicit")),
+                              "system_start": bool(ev.get("system_start")),
+                              "repeat_forward": bool(ev.get("repeat_forward")),
+                              "repeat_backward": bool(ev.get("repeat_backward")),
+                              "ending_start_numbers": list(ev.get("ending_start_numbers") or []),
+                          }
+                      )
+              return merged
+
+          def summarize_semantic_events(events):
+              pickup = bool(events and events[0].get("implicit"))
+              repeats_forward = sum(1 for ev in events if ev.get("repeat_forward"))
+              repeats_backward = sum(1 for ev in events if ev.get("repeat_backward"))
+              endings = sum(1 for ev in events if ev.get("ending_start_numbers"))
+              return {
+                  "pickup_detected": pickup,
+                  "repeat_forward_count": repeats_forward,
+                  "repeat_backward_count": repeats_backward,
+                  "ending_start_count": endings,
+              }
+
+          def estimate_page_tail_increment(raw_labels, measures_count):
+              nums = parse_int_labels(raw_labels or [])
+              if not nums:
+                  return 1
+              mc = int(measures_count or 0)
+              if mc > 0:
+                  span = nums[-1] - nums[0]
+                  est = mc - span
+                  if est > 0:
+                      return int(est)
+              if len(nums) >= 2:
+                  return max(1, nums[-1] - nums[-2])
+              return 1
+
+          def apply_semantic_numbering(entries, numbering_policy):
+              if numbering_policy == "legacy_raw_starts":
+                  for entry in entries:
+                      if entry.get("status") != "ok":
+                          entry["numbering_policy"] = "legacy_raw_starts"
+                          continue
+                      raw_starts = list(entry.get("system_starts_raw") or entry.get("system_starts") or [])
+                      entry["system_starts_semantic"] = list(raw_starts)
+                      entry["system_starts"] = list(raw_starts)
+                      entry["numbering_policy"] = "legacy_raw_starts"
+                      print(
+                          "SEMANTIC_APPLY "
+                          f"page={entry.get('page_number')} source=legacy_raw_starts "
+                          f"raw_starts={raw_starts} semantic_starts={raw_starts}"
+                      )
+                  return
+
+              global_next_start = None
+              seen_first_page = False
+              last_first_ending_value = None
+
+              for entry in sorted(entries, key=lambda e: int(e.get("page_number") or 0)):
+                  if entry.get("status") != "ok":
+                      entry["numbering_policy"] = "semantic_continuous_v1"
+                      continue
+
+                  raw_starts = list(entry.get("system_starts_raw") or entry.get("system_starts") or [])
+                  raw_nums = parse_int_labels(raw_starts)
+                  if not raw_nums:
+                      entry.setdefault("semantic_warnings", []).append("raw_system_starts_non_numeric_or_empty")
+                      entry["system_starts_semantic"] = list(raw_starts)
+                      entry["system_starts"] = list(raw_starts)
+                      entry["numbering_policy"] = "semantic_continuous_v1"
+                      print(
+                          "SEMANTIC_WARN "
+                          f"page={entry.get('page_number')} reason=raw_system_starts_non_numeric_or_empty"
+                      )
+                      print(
+                          "SEMANTIC_APPLY "
+                          f"page={entry.get('page_number')} source=semantic_continuous_v1 "
+                          f"raw_starts={raw_starts} semantic_starts={entry['system_starts_semantic']}"
+                      )
+                      continue
+
+                  deltas = [max(1, b - a) for a, b in zip(raw_nums, raw_nums[1:])]
+                  events = list(entry.get("_semantic_measure_events") or [])
+                  summary = dict(entry.get("semantic_events") or {})
+                  pickup_detected = bool(summary.get("pickup_detected"))
+                  if not seen_first_page:
+                      start_value = 0 if pickup_detected else int(raw_nums[0])
+                  else:
+                      start_value = int(global_next_start) if global_next_start is not None else int(raw_nums[0])
+
+                  semantic_nums = [start_value]
+                  for delta in deltas:
+                      semantic_nums.append(int(semantic_nums[-1]) + int(delta))
+
+                  start_events = [ev for ev in events if ev.get("system_start")]
+                  if len(start_events) != len(semantic_nums):
+                      entry.setdefault("semantic_warnings", []).append(
+                          f"system_start_event_count_mismatch:{len(start_events)}!={len(semantic_nums)}"
+                      )
+                      print(
+                          "SEMANTIC_WARN "
+                          f"page={entry.get('page_number')} reason=system_start_event_count_mismatch "
+                          f"events={len(start_events)} systems={len(semantic_nums)}"
+                      )
+                  else:
+                      for idx, ev in enumerate(start_events):
+                          ending_nums = set(str(x) for x in (ev.get("ending_start_numbers") or []))
+                          if "1" in ending_nums:
+                              last_first_ending_value = semantic_nums[idx]
+                          elif "2" in ending_nums and last_first_ending_value is not None:
+                              semantic_nums[idx] = int(last_first_ending_value)
+
+                  semantic_starts = [str(n) for n in semantic_nums]
+                  entry["system_starts_semantic"] = semantic_starts
+                  entry["system_starts"] = semantic_starts
+                  entry["numbering_policy"] = "semantic_continuous_v1"
+
+                  tail_increment = estimate_page_tail_increment(raw_starts, entry.get("measures_count"))
+                  global_next_start = int(semantic_nums[-1]) + int(tail_increment)
+                  seen_first_page = True
+
+                  print(
+                      "SEMANTIC_APPLY "
+                      f"page={entry.get('page_number')} source=semantic_continuous_v1 "
+                      f"raw_starts={raw_starts} semantic_starts={semantic_starts}"
+                  )
+
           page_pdfs = sorted(glob.glob("/tmp/work/pages/page_*.pdf"))
           entries = []
           missing = 0
@@ -913,6 +1139,15 @@ jobs:
                               "offset": int(offset),
                           }
                       )
+                  merged_events = merge_measure_events(used_rows, row_offsets)
+                  semantic_events = summarize_semantic_events(merged_events)
+                  print(
+                      "SEMANTIC_DETECT "
+                      f"page={page_num} pickup={str(semantic_events.get('pickup_detected')).lower()} "
+                      f"repeats_forward={int(semantic_events.get('repeat_forward_count') or 0)} "
+                      f"repeats_backward={int(semantic_events.get('repeat_backward_count') or 0)} "
+                      f"endings={int(semantic_events.get('ending_start_count') or 0)}"
+                  )
                   primary = used_rows[0]
                   if selected["kind"] == "single_exact":
                       selection_source = "per_page_split_single_exact"
@@ -945,9 +1180,15 @@ jobs:
                       "parts_count": parts_count,
                       "measures_count": measures_count,
                       "system_count_target": target,
+                      "system_starts_raw": list(system_starts),
+                      "system_starts_semantic": list(system_starts),
                       "system_starts": system_starts,
                       "merge_offsets": merge_offsets,
                       "system_starts_raw_segments": raw_segments,
+                      "numbering_policy": NUMBERING_POLICY,
+                      "semantic_events": semantic_events,
+                      "semantic_warnings": [],
+                      "_semantic_measure_events": merged_events,
                       "selection_source": selection_source,
                       "selection_reason": selection_reason,
                       "confidence_tier": "high",
@@ -992,9 +1233,20 @@ jobs:
                       "parts_count": int(best.get("parts") or 0) if best else 0,
                       "measures_count": int(best.get("measures") or 0) if best else 0,
                       "system_count_target": target,
+                      "system_starts_raw": list(best.get("system_starts") or []) if best else [],
+                      "system_starts_semantic": list(best.get("system_starts") or []) if best else [],
                       "system_starts": list(best.get("system_starts") or []) if best else [],
                       "merge_offsets": [],
                       "system_starts_raw_segments": [],
+                      "numbering_policy": NUMBERING_POLICY,
+                      "semantic_events": {
+                          "pickup_detected": False,
+                          "repeat_forward_count": 0,
+                          "repeat_backward_count": 0,
+                          "ending_start_count": 0,
+                      },
+                      "semantic_warnings": [],
+                      "_semantic_measure_events": [],
                       "selection_source": "none",
                       "selection_reason": select_error or reason,
                       "confidence_tier": "none",
@@ -1011,8 +1263,15 @@ jobs:
                   )
               entries.append(entry)
 
+          print(f"SEMANTIC_POLICY effective={NUMBERING_POLICY}")
+          apply_semantic_numbering(entries, NUMBERING_POLICY)
+          for entry in entries:
+              if "_semantic_measure_events" in entry:
+                  del entry["_semantic_measure_events"]
+
           payload = {
               "manifest_version": "page-split-v2",
+              "numbering_policy": NUMBERING_POLICY,
               "entries": entries,
               "total_pages": len(entries),
               "missing": missing,
