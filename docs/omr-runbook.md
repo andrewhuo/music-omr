@@ -74,6 +74,9 @@ In strict mode, if MusicXML system starts and OMR system count do not match on a
 (for example expand/compress mapping would be needed), the run now fails strict coverage
 instead of drawing repeated labels.
 
+Strict mode now first tries an exact-safe merge of per-page movement XML starts before
+failing. If exact-safe merge cannot be proven, strict still fails.
+
 Look for:
 
 - `mapping_reason=manifest_system_count_mismatch` (manifest mode)
