@@ -67,3 +67,14 @@ Download and share these step logs:
 Also share run-scoped debug bundle URI:
 
 - `gs://music-omr-bucket-777135743132/output/runs/<run_id>/omr_debug_bundle.tar.gz`
+
+## Troubleshooting note: system-count mismatch
+
+In strict mode, if MusicXML system starts and OMR system count do not match on a page
+(for example expand/compress mapping would be needed), the run now fails strict coverage
+instead of drawing repeated labels.
+
+Look for:
+
+- `mapping_reason=manifest_system_count_mismatch` (manifest mode)
+- `mapping_reason=mxl_system_count_mismatch` (full-book mode)

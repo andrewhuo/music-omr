@@ -1990,12 +1990,16 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             xml_selection_reason = "not_selected"
             xml_confidence_tier = "none"
             xml_low_confidence_used = False
+            omr_system_count = len(system_staff_counts)
+            mxl_system_count = 0
+            map_reason_raw: str | None = None
 
             if measure_label_mode == "staff_start":
                 if mxl_manifest_active:
                     manifest_entry = mxl_page_manifest_by_page.get(page_index)
                     if manifest_entry:
                         page_mxl_starts = list(manifest_entry.get("system_starts") or [])
+                        mxl_system_count = len(page_mxl_starts)
                         mxl_page_candidate_source = "manifest"
                         mxl_page_candidate_path = manifest_entry.get("mxl_path")
                         xml_selection_source = str(manifest_entry.get("selection_source") or "none")
@@ -2016,15 +2020,20 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                                 system_staff_counts=system_staff_counts,
                                 mxl_page_system_starts=page_mxl_starts,
                             )
+                            map_reason_raw = map_reason
                             if mxl_mapped is not None:
-                                staff_start_labels_pdf = mxl_mapped
-                                staff_start_source = "mxl"
-                                mapping_status = "ok"
-                                mapping_reason = f"manifest_mapping_{map_reason}"
                                 if map_reason.startswith("ok_"):
                                     mapping_mode = map_reason[3:]
                                 else:
                                     mapping_mode = map_reason
+                                if measure_source_policy == "mxl_strict" and map_reason != "ok_exact":
+                                    mapping_status = "error"
+                                    mapping_reason = "manifest_system_count_mismatch"
+                                else:
+                                    staff_start_labels_pdf = mxl_mapped
+                                    staff_start_source = "mxl"
+                                    mapping_status = "ok"
+                                    mapping_reason = f"manifest_mapping_{map_reason}"
                             else:
                                 mapping_status = "error"
                                 mapping_reason = f"manifest_map_{map_reason}"
@@ -2054,27 +2063,33 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                                 flush=True,
                             )
                         if page_mxl_starts:
+                            mxl_system_count = len(page_mxl_starts)
                             mxl_mapped, map_reason = _apply_mxl_staff_start_labels(
                                 staff_start_labels_pdf=staff_start_labels_pdf,
                                 system_staff_counts=system_staff_counts,
                                 mxl_page_system_starts=page_mxl_starts,
                             )
+                            map_reason_raw = map_reason
                             if mxl_mapped is not None:
-                                staff_start_labels_pdf = mxl_mapped
-                                staff_start_source = "mxl"
-                                mapping_status = "ok"
-                                mapping_reason = f"mxl_mapping_{map_reason}"
                                 if map_reason.startswith("ok_"):
                                     mapping_mode = map_reason[3:]
                                 else:
                                     mapping_mode = map_reason
-                                xml_selection_source = "full_book_primary"
-                                xml_selection_reason = (
-                                    "source_sheet_match"
-                                    if mxl_page_candidate_source == "source_sheet"
-                                    else "sequential_page_match"
-                                )
-                                xml_confidence_tier = "high"
+                                if measure_source_policy == "mxl_strict" and map_reason != "ok_exact":
+                                    mapping_status = "error"
+                                    mapping_reason = "mxl_system_count_mismatch"
+                                else:
+                                    staff_start_labels_pdf = mxl_mapped
+                                    staff_start_source = "mxl"
+                                    mapping_status = "ok"
+                                    mapping_reason = f"mxl_mapping_{map_reason}"
+                                    xml_selection_source = "full_book_primary"
+                                    xml_selection_reason = (
+                                        "source_sheet_match"
+                                        if mxl_page_candidate_source == "source_sheet"
+                                        else "sequential_page_match"
+                                    )
+                                    xml_confidence_tier = "high"
                             else:
                                 mapping_status = "error"
                                 mapping_reason = f"mxl_map_{map_reason}"
@@ -2195,11 +2210,14 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "mxl_members": mxl_meta.get("mxl_members"),
                     "mxl_extract_status": mxl_meta.get("mxl_extract_status"),
                     "mxl_page_system_starts": page_mxl_starts,
+                    "mxl_system_count": mxl_system_count,
                     "omr_system_staff_counts": system_staff_counts,
+                    "omr_system_count": omr_system_count,
                     "staff_start_source": staff_start_source,
                     "mapping_status": mapping_status,
                     "mapping_reason": mapping_reason,
                     "mapping_mode": mapping_mode,
+                    "map_reason_raw": map_reason_raw,
                     "mxl_page_candidate_source": mxl_page_candidate_source,
                     "mxl_page_candidate_path": mxl_page_candidate_path,
                     "mxl_page_manifest_path": mxl_page_manifest_path or None,
