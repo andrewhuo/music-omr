@@ -1058,7 +1058,19 @@ jobs:
                       )
                       continue
 
-                  deltas = [max(1, b - a) for a, b in zip(raw_nums, raw_nums[1:])]
+                  deltas = []
+                  duplicate_pair_indices = []
+                  for idx, (a, b) in enumerate(zip(raw_nums, raw_nums[1:]), start=1):
+                      if b < a:
+                          entry.setdefault("semantic_warnings", []).append(
+                              f"raw_system_start_decrease_unexpected:{a}->{b}"
+                          )
+                          delta = 0
+                      else:
+                          delta = b - a
+                      if b == a:
+                          duplicate_pair_indices.append(idx)
+                      deltas.append(int(delta))
                   events = list(entry.get("_semantic_measure_events") or [])
                   summary = dict(entry.get("semantic_events") or {})
                   pickup_detected = bool(summary.get("pickup_detected"))
@@ -1088,6 +1100,14 @@ jobs:
                               last_first_ending_value = semantic_nums[idx]
                           elif "2" in ending_nums and last_first_ending_value is not None:
                               semantic_nums[idx] = int(last_first_ending_value)
+
+                  for dup_idx in duplicate_pair_indices:
+                      print(
+                          "SEMANTIC_DUPLICATE "
+                          f"page={entry.get('page_number')} "
+                          f"raw_pair={raw_nums[dup_idx - 1]},{raw_nums[dup_idx]} "
+                          f"semantic_pair={semantic_nums[dup_idx - 1]},{semantic_nums[dup_idx]}"
+                      )
 
                   semantic_starts = [str(n) for n in semantic_nums]
                   entry["system_starts_semantic"] = semantic_starts
