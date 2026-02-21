@@ -785,6 +785,15 @@ jobs:
           def strictly_increasing(nums):
               return all(b > a for a, b in zip(nums, nums[1:]))
 
+          def is_non_decreasing(nums):
+              return all(b >= a for a, b in zip(nums, nums[1:]))
+
+          def has_strict_increase(nums):
+              return any(b > a for a, b in zip(nums, nums[1:]))
+
+          def has_duplicate_steps(nums):
+              return any(b == a for a, b in zip(nums, nums[1:]))
+
           def score_mxl(mxl_path):
               best = None
               try:
@@ -854,7 +863,9 @@ jobs:
                   nums, norm_warnings = parse_int_labels(starts_raw, allow_normalize=True)
                   if nums is None:
                       continue
-                  if not strictly_increasing(nums):
+                  if not is_non_decreasing(nums):
+                      continue
+                  if len(nums) > 1 and not has_strict_increase(nums):
                       continue
                   normalized.append((row, nums, starts_raw, norm_warnings))
 
@@ -910,7 +921,7 @@ jobs:
                   if merged_nums:
                       prev_end = merged_nums[-1]
                       raw_first = raw_nums[0]
-                      if raw_first > prev_end:
+                      if raw_first >= prev_end:
                           offset = 0
                       elif raw_first == 1:
                           # Deterministic reset-aware shift: keep next chunk contiguous.
@@ -920,8 +931,10 @@ jobs:
                           return None, "merged_overlap_without_reset"
 
                   shifted = [n + offset for n in raw_nums]
-                  if merged_nums and shifted[0] <= merged_nums[-1]:
-                      return None, "merged_not_strictly_increasing_after_shift"
+                  if merged_nums and shifted[0] < merged_nums[-1]:
+                      return None, "merged_decreasing_after_shift"
+                  if not is_non_decreasing(shifted):
+                      return None, "merged_segment_decreasing_after_shift"
 
                   merged_rows.append(row)
                   row_offsets.append(offset)
@@ -1152,6 +1165,11 @@ jobs:
                   raw_system_starts = list(selected.get("raw_system_starts") or system_starts)
                   system_starts_normalized = list(selected.get("system_starts_normalized") or system_starts)
                   normalization_warnings = list(selected.get("normalization_warnings") or [])
+                  system_nums_for_warn, _ = parse_int_labels(system_starts_normalized, allow_normalize=False)
+                  if system_nums_for_warn and has_duplicate_steps(system_nums_for_warn):
+                      dup_warn = "duplicate_system_starts_detected"
+                      if dup_warn not in normalization_warnings:
+                          normalization_warnings.append(dup_warn)
                   row_offsets = list(selected.get("row_offsets") or [0 for _ in used_rows])
                   raw_segments = list(selected.get("system_starts_raw_segments") or [])
                   normalized_count = sum(
@@ -1273,6 +1291,10 @@ jobs:
                   best_raw_starts = list(best.get("system_starts") or []) if best else []
                   best_norm_nums, best_norm_warnings = parse_int_labels(best_raw_starts, allow_normalize=True)
                   best_norm_starts = [str(n) for n in (best_norm_nums or [])]
+                  if best_norm_nums and has_duplicate_steps(best_norm_nums):
+                      dup_warn = "duplicate_system_starts_detected"
+                      if dup_warn not in best_norm_warnings:
+                          best_norm_warnings.append(dup_warn)
                   best_norm_count = sum(
                       1 for warn in best_norm_warnings if str(warn).startswith("normalized_suffix_label:")
                   )
