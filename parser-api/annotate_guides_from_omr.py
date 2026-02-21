@@ -78,6 +78,13 @@ def _measure_source_policy() -> str:
     return "mxl_strict"
 
 
+def _ending_label_mode() -> str:
+    v = os.getenv("ENDING_LABEL_MODE", "system_plus_endings").strip().lower()
+    if v == "system_only":
+        return "system_only"
+    return "system_plus_endings"
+
+
 def _mxl_parser_policy() -> str:
     v = os.getenv("MXL_PARSER_POLICY", "auto").strip().lower()
     if v in ("stdlib", "lxml_recover", "auto"):
@@ -314,6 +321,7 @@ def _load_mxl_page_manifest(path: str) -> tuple[dict[int, dict], dict]:
         normalized.setdefault("low_confidence_used", False)
         normalized.setdefault("retry_attempted", False)
         normalized.setdefault("retry_profile", "none")
+        normalized.setdefault("ending_anchors", [])
         by_page[page_index] = normalized
 
     summary["entries"] = len(by_page)
@@ -696,6 +704,87 @@ def _apply_mxl_staff_start_labels(
     if idx != len(staff_start_labels_pdf):
         return None, "staff_label_overflow"
     return out, f"ok_{map_mode}"
+
+
+def _system_start_label_positions(
+    staff_start_labels_pdf: list[tuple[float, float, float, str]],
+    system_staff_counts: list[int],
+) -> list[tuple[float, float, float] | None]:
+    positions: list[tuple[float, float, float] | None] = []
+    idx = 0
+    total = len(staff_start_labels_pdf)
+    for staff_cnt in system_staff_counts:
+        if staff_cnt <= 0:
+            positions.append(None)
+            continue
+        if idx >= total:
+            positions.append(None)
+            continue
+        x_pdf, y0_pdf, y1_pdf, _ = staff_start_labels_pdf[idx]
+        positions.append((float(x_pdf), float(y0_pdf), float(y1_pdf)))
+        idx += int(staff_cnt)
+    return positions
+
+
+def _build_ending_anchor_labels(
+    staff_start_labels_pdf: list[tuple[float, float, float, str]],
+    system_staff_counts: list[int],
+    ending_anchors: list[dict],
+) -> tuple[list[tuple[float, float, float, str]], list[dict]]:
+    if not ending_anchors or not staff_start_labels_pdf or not system_staff_counts:
+        return [], []
+
+    positions = _system_start_label_positions(staff_start_labels_pdf, system_staff_counts)
+    out: list[tuple[float, float, float, str]] = []
+    preview: list[dict] = []
+    per_system_order: dict[int, int] = {}
+
+    for anchor in ending_anchors:
+        if not isinstance(anchor, dict):
+            continue
+        try:
+            system_index = int(anchor.get("system_index"))
+        except Exception:
+            continue
+        if system_index < 0 or system_index >= len(positions):
+            continue
+        pos = positions[system_index]
+        if pos is None:
+            continue
+
+        measure_value = str(anchor.get("measure_value") or "").strip()
+        if not measure_value:
+            continue
+
+        ending_numbers = []
+        for raw_num in (anchor.get("ending_numbers") or []):
+            tok = str(raw_num).strip()
+            if tok:
+                ending_numbers.append(tok)
+        if not ending_numbers:
+            ending_numbers = [""]
+
+        x_base, y0_base, y1_base = pos
+        for ending_num in ending_numbers:
+            # Order starts at 1 so the extra ending label doesn't overlap the base system label.
+            anchor_order = int(per_system_order.get(system_index, 0)) + 1
+            per_system_order[system_index] = anchor_order
+
+            x_pdf = float(x_base) + (14.0 * float(anchor_order))
+            y0_pdf = float(y0_base) - (8.0 * float(anchor_order))
+            y1_pdf = float(y1_base) - (8.0 * float(anchor_order))
+            out.append((x_pdf, y0_pdf, y1_pdf, measure_value))
+            if len(preview) < 5:
+                preview.append(
+                    {
+                        "system_index": system_index,
+                        "ending_number": ending_num or None,
+                        "measure_value": measure_value,
+                        "anchor_order": anchor_order,
+                    }
+                )
+
+    return out, preview
 
 
 def _build_mxl_page_candidates(
@@ -1783,6 +1872,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
     write_measure_labels = _measure_labels_enabled()
     measure_label_mode = _measure_label_mode()
     measure_source_policy = _measure_source_policy()
+    ending_label_mode = _ending_label_mode()
     mapping_debug_path = os.getenv("MEASURE_MAPPING_DEBUG_PATH", "").strip()
     mapping_debug: list[dict] = []
     mxl_member_override = os.getenv("MXL_MEMBER_OVERRIDE", "").strip()
@@ -1993,11 +2083,17 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             omr_system_count = len(system_staff_counts)
             mxl_system_count = 0
             map_reason_raw: str | None = None
+            manifest_ending_anchors: list[dict] = []
+            ending_anchor_labels_pdf: list[tuple[float, float, float, str]] = []
+            ending_anchor_preview: list[dict] = []
+            ending_anchor_count = 0
+            ending_labels_drawn = 0
 
             if measure_label_mode == "staff_start":
                 if mxl_manifest_active:
                     manifest_entry = mxl_page_manifest_by_page.get(page_index)
                     if manifest_entry:
+                        manifest_ending_anchors = list(manifest_entry.get("ending_anchors") or [])
                         page_mxl_starts = list(manifest_entry.get("system_starts") or [])
                         mxl_system_count = len(page_mxl_starts)
                         mxl_page_candidate_source = "manifest"
@@ -2112,6 +2208,19 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         staff_start_labels_pdf = []
                         staff_start_source = "none"
 
+                if (
+                    ending_label_mode == "system_plus_endings"
+                    and mxl_manifest_active
+                    and staff_start_source == "mxl"
+                    and manifest_ending_anchors
+                ):
+                    ending_anchor_labels_pdf, ending_anchor_preview = _build_ending_anchor_labels(
+                        staff_start_labels_pdf=staff_start_labels_pdf,
+                        system_staff_counts=system_staff_counts,
+                        ending_anchors=manifest_ending_anchors,
+                    )
+                    ending_anchor_count = len(ending_anchor_labels_pdf)
+
             if staff_total > 0 and len(guides_pdf) < staff_total:
                 extras = _fallback_missing_staff_guides(page, guides_pdf)
                 if _debug_enabled():
@@ -2132,7 +2241,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             if write_measure_labels:
                 labels_to_draw = first_labels_pdf
                 if measure_label_mode == "staff_start":
-                    labels_to_draw = staff_start_labels_pdf
+                    labels_to_draw = list(staff_start_labels_pdf)
+                    if ending_label_mode == "system_plus_endings" and ending_anchor_labels_pdf:
+                        labels_to_draw.extend(ending_anchor_labels_pdf)
                 elif measure_label_mode == "sequential" and sequential_labels_pdf:
                     labels_to_draw = sequential_labels_pdf
 
@@ -2146,11 +2257,12 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     )
 
                 labels_to_draw_count = len(labels_to_draw)
+                base_label_count = max(0, labels_to_draw_count - ending_anchor_count)
                 draw_attempted = labels_to_draw_count > 0
                 labels_drawn = 0
                 labels_in_bounds = 0
                 label_preview: list[dict] = []
-                for (x_pdf, y0_pdf, y1_pdf, label_text) in labels_to_draw:
+                for label_idx, (x_pdf, y0_pdf, y1_pdf, label_text) in enumerate(labels_to_draw):
                     staff_h = max(1.0, y1_pdf - y0_pdf)
                     y_offset = max(8.0, 0.45 * staff_h)
                     tw = float(fitz.get_text_length(label_text, fontsize=MEASURE_TEXT_SIZE))
@@ -2177,21 +2289,31 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
                     _draw_measure_label(page, rect, x_text, y_text, label_text)
                     labels_drawn += 1
+                    if label_idx >= base_label_count:
+                        ending_labels_drawn += 1
 
                 if _debug_measure_labels_enabled():
                     print(
                         f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
                         f"staff_start_source={staff_start_source} "
                         f"mapping_status={mapping_status} mapping_reason={mapping_reason} "
-                        f"labels_to_draw={labels_to_draw_count} labels_drawn={labels_drawn} labels_in_bounds={labels_in_bounds}",
+                        f"labels_to_draw={labels_to_draw_count} labels_drawn={labels_drawn} labels_in_bounds={labels_in_bounds} "
+                        f"ending_anchor_count={ending_anchor_count} ending_labels_drawn={ending_labels_drawn}",
                         flush=True,
                     )
+                    if ending_anchor_preview:
+                        print(
+                            f"[DBG] ending_anchors page={page_index+1} preview={ending_anchor_preview}",
+                            flush=True,
+                        )
             else:
                 draw_attempted = False
                 labels_to_draw_count = 0
                 labels_drawn = 0
                 labels_in_bounds = 0
                 label_preview = []
+                ending_anchor_count = 0
+                ending_labels_drawn = 0
 
             mapping_debug.append(
                 {
@@ -2223,6 +2345,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "mxl_page_manifest_path": mxl_page_manifest_path or None,
                     "mxl_page_manifest_mode": mxl_manifest_active,
                     "mxl_page_manifest_entry": manifest_entry,
+                    "ending_label_mode": ending_label_mode,
+                    "manifest_ending_anchors": manifest_ending_anchors,
                     "xml_selection_source": xml_selection_source,
                     "xml_selection_reason": xml_selection_reason,
                     "xml_confidence_tier": xml_confidence_tier,
@@ -2234,6 +2358,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "labels_to_draw_count": labels_to_draw_count,
                     "labels_drawn": labels_drawn,
                     "labels_in_bounds": labels_in_bounds,
+                    "ending_anchor_count": ending_anchor_count,
+                    "ending_labels_drawn": ending_labels_drawn,
+                    "ending_label_preview": ending_anchor_preview,
                     "label_preview": label_preview,
                 }
             )
@@ -2248,6 +2375,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
         payload = {
             "measure_mode": measure_label_mode,
             "measure_source_policy": measure_source_policy,
+            "ending_label_mode": ending_label_mode,
             "mxl_path": mxl_meta.get("mxl_path"),
             "mxl_parse_status": mxl_meta.get("mxl_parse_status"),
             "mxl_member_path": mxl_meta.get("mxl_member_path"),

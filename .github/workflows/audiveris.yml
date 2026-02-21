@@ -1016,11 +1016,13 @@ jobs:
                   for entry in entries:
                       if entry.get("status") != "ok":
                           entry["numbering_policy"] = "legacy_raw_starts"
+                          entry["ending_anchors"] = []
                           continue
                       raw_starts = list(entry.get("system_starts_raw") or entry.get("system_starts") or [])
                       entry["system_starts_semantic"] = list(raw_starts)
                       entry["system_starts"] = list(raw_starts)
                       entry["numbering_policy"] = "legacy_raw_starts"
+                      entry["ending_anchors"] = []
                       print(
                           "SEMANTIC_APPLY "
                           f"page={entry.get('page_number')} source=legacy_raw_starts "
@@ -1035,6 +1037,7 @@ jobs:
               for entry in sorted(entries, key=lambda e: int(e.get("page_number") or 0)):
                   if entry.get("status") != "ok":
                       entry["numbering_policy"] = "semantic_continuous_v1"
+                      entry["ending_anchors"] = []
                       continue
 
                   raw_starts = list(entry.get("system_starts_raw") or entry.get("system_starts") or [])
@@ -1047,6 +1050,7 @@ jobs:
                       entry["system_starts_semantic"] = list(normalized_starts)
                       entry["system_starts"] = list(normalized_starts)
                       entry["numbering_policy"] = "semantic_continuous_v1"
+                      entry["ending_anchors"] = []
                       print(
                           "SEMANTIC_WARN "
                           f"page={entry.get('page_number')} reason=raw_system_starts_non_numeric_or_empty"
@@ -1101,6 +1105,28 @@ jobs:
                           elif "2" in ending_nums and last_first_ending_value is not None:
                               semantic_nums[idx] = int(last_first_ending_value)
 
+                  ending_anchors = []
+                  if len(start_events) == len(semantic_nums):
+                      for idx, ev in enumerate(start_events):
+                          ending_numbers = []
+                          for raw_num in (ev.get("ending_start_numbers") or []):
+                              tok = str(raw_num).strip()
+                              if tok and tok not in ending_numbers:
+                                  ending_numbers.append(tok)
+                          if not ending_numbers:
+                              continue
+                          anchor = {
+                              "system_index": idx,
+                              "ending_numbers": list(ending_numbers),
+                              "measure_value": str(semantic_nums[idx]),
+                          }
+                          ending_anchors.append(anchor)
+                          print(
+                              "SEMANTIC_ENDING_ANCHOR "
+                              f"page={entry.get('page_number')} system_index={idx} "
+                              f"ending={','.join(ending_numbers)} measure={semantic_nums[idx]}"
+                          )
+
                   for dup_idx in duplicate_pair_indices:
                       print(
                           "SEMANTIC_DUPLICATE "
@@ -1113,6 +1139,7 @@ jobs:
                   entry["system_starts_semantic"] = semantic_starts
                   entry["system_starts"] = semantic_starts
                   entry["numbering_policy"] = "semantic_continuous_v1"
+                  entry["ending_anchors"] = ending_anchors
 
                   tail_increment = estimate_page_tail_increment(normalized_starts, entry.get("measures_count"))
                   global_next_start = int(semantic_nums[-1]) + int(tail_increment)
@@ -1275,6 +1302,7 @@ jobs:
                       "semantic_events": semantic_events,
                       "semantic_warnings": [],
                       "normalization_warnings": normalization_warnings,
+                      "ending_anchors": [],
                       "_semantic_measure_events": merged_events,
                       "selection_source": selection_source,
                       "selection_reason": selection_reason,
@@ -1354,6 +1382,7 @@ jobs:
                       },
                       "semantic_warnings": [],
                       "normalization_warnings": list(best_norm_warnings),
+                      "ending_anchors": [],
                       "_semantic_measure_events": [],
                       "selection_source": "none",
                       "selection_reason": select_error or reason,
@@ -1403,6 +1432,7 @@ jobs:
           ENABLE_MEASURE_LABELS: "1"
           MEASURE_LABEL_MODE: "staff_start"
           MEASURE_SOURCE_POLICY: "mxl_strict"
+          ENDING_LABEL_MODE: "system_plus_endings"
           MXL_PARSER_POLICY: "auto"
           MXL_SANITIZE_PREFIXES: "1"
           MXL_PATH_OVERRIDE: "${{ env.MXL_PATH_OVERRIDE }}"

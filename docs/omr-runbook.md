@@ -4,6 +4,7 @@ This runbook is for day-to-day operation of:
 
 - Workflow: `Audiveris OMR + Measure Label Debug`
 - File: `/Users/andrew/Desktop/music-omr/.github/workflows/audiveris.yml`
+- API integration doc: `/Users/andrew/Desktop/music-omr/docs/omr-api.md`
 
 ## What this pipeline does
 
@@ -76,6 +77,12 @@ instead of drawing repeated labels.
 
 Strict mode now first tries an exact-safe merge of per-page movement XML starts before
 failing. If exact-safe merge cannot be proven, strict still fails.
+
+When ending anchors are present in manifest mode, rendering can add extra labels near
+system starts. Control with:
+
+- `ENDING_LABEL_MODE=system_plus_endings` (default)
+- `ENDING_LABEL_MODE=system_only` (fallback)
 
 Look for:
 
