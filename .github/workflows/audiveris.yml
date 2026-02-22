@@ -628,6 +628,7 @@ jobs:
                   else:
                       ms = []
                   if ms:
+                      current_system_index = -1
                       for i, m in enumerate(ms, start=1):
                           label = (m.get("number") or "").strip() or str(i)
                           measure_num_int = parse_xml_int(label)
@@ -643,10 +644,12 @@ jobs:
                                   has_system_layout = True
                           if is_new_system or has_system_layout:
                               starts.append(label)
+                              current_system_index += 1
 
                           has_forward_repeat = False
                           has_backward_repeat = False
                           ending_numbers = []
+                          ending_markers = []
                           for bar in children_named(m, "barline"):
                               for rep in children_named(bar, "repeat"):
                                   direction = (rep.get("direction") or "").strip().lower()
@@ -656,10 +659,18 @@ jobs:
                                       has_backward_repeat = True
                               for ending in children_named(bar, "ending"):
                                   ending_type = (ending.get("type") or "").strip().lower()
+                                  ending_tokens = parse_ending_number_tokens(ending.get("number"))
                                   if ending_type in ("start", "discontinue"):
-                                      ending_numbers.extend(parse_ending_number_tokens(ending.get("number")))
+                                      ending_numbers.extend(ending_tokens)
                                   if ending_type == "start":
                                       ending_start_count += 1
+                                  for tok in ending_tokens:
+                                      ending_markers.append(
+                                          {
+                                              "number": str(tok),
+                                              "type": str(ending_type or ""),
+                                          }
+                                      )
 
                           if has_forward_repeat:
                               repeat_forward_count += 1
@@ -671,11 +682,14 @@ jobs:
                                   "measure_index": i - 1,
                                   "label": label,
                                   "number_int": measure_num_int,
+                                  "raw_measure_number": label,
+                                  "system_index": max(0, current_system_index),
                                   "implicit": implicit,
                                   "system_start": bool(is_new_system or has_system_layout),
                                   "repeat_forward": has_forward_repeat,
                                   "repeat_backward": has_backward_repeat,
                                   "ending_start_numbers": ending_numbers,
+                                  "ending_markers": ending_markers,
                               }
                           )
               return {
@@ -972,15 +986,22 @@ jobs:
                   for ev in row_events:
                       ev_num_int = ev.get("number_int")
                       shifted_num_int = (int(ev_num_int) + int(offset)) if ev_num_int is not None else None
+                      raw_measure_number = ev.get("raw_measure_number")
+                      if shifted_num_int is not None:
+                          raw_measure_number = str(shifted_num_int)
                       merged.append(
                           {
                               "label": str(ev.get("label") or ""),
                               "number_int": shifted_num_int,
+                              "raw_measure_number": str(raw_measure_number or ""),
+                              "measure_index": int(ev.get("measure_index") or 0),
+                              "system_index": int(ev.get("system_index") or 0),
                               "implicit": bool(ev.get("implicit")),
                               "system_start": bool(ev.get("system_start")),
                               "repeat_forward": bool(ev.get("repeat_forward")),
                               "repeat_backward": bool(ev.get("repeat_backward")),
                               "ending_start_numbers": list(ev.get("ending_start_numbers") or []),
+                              "ending_markers": list(ev.get("ending_markers") or []),
                           }
                       )
               return merged
@@ -996,6 +1017,196 @@ jobs:
                   "repeat_backward_count": repeats_backward,
                   "ending_start_count": endings,
               }
+
+          def build_ending_groups(events):
+              ending_markers_present = False
+              open_variants = {}
+              intervals = []
+
+              for ev_idx, ev in enumerate(events):
+                  markers = list(ev.get("ending_markers") or [])
+                  if markers:
+                      ending_markers_present = True
+                  for marker in markers:
+                      variant = str(marker.get("number") or "").strip()
+                      marker_type = str(marker.get("type") or "").strip().lower()
+                      if not variant or marker_type not in ("start", "stop", "discontinue"):
+                          continue
+
+                      if marker_type == "start":
+                          if variant not in open_variants:
+                              open_variants[variant] = int(ev_idx)
+                      elif marker_type == "discontinue":
+                          start_idx = int(open_variants.pop(variant, ev_idx))
+                          intervals.append(
+                              {
+                                  "variant": variant,
+                                  "start_idx": start_idx,
+                                  "end_idx": int(ev_idx),
+                              }
+                          )
+                      else:  # stop
+                          start_idx = open_variants.pop(variant, None)
+                          if start_idx is not None:
+                              intervals.append(
+                                  {
+                                      "variant": variant,
+                                      "start_idx": int(start_idx),
+                                      "end_idx": int(ev_idx),
+                                  }
+                              )
+
+              if events:
+                  last_idx = len(events) - 1
+                  for variant, start_idx in open_variants.items():
+                      intervals.append(
+                          {
+                              "variant": str(variant),
+                              "start_idx": int(start_idx),
+                              "end_idx": int(last_idx),
+                          }
+                      )
+
+              if not intervals:
+                  if ending_markers_present:
+                      return [], True, "ending_markers_present_but_no_intervals"
+                  return [], False, None
+
+              grouped = {}
+              for interval in intervals:
+                  start_ev = events[int(interval["start_idx"])]
+                  start_num = start_ev.get("number_int")
+                  if start_num is None:
+                      start_num = parse_xml_int(str(start_ev.get("raw_measure_number") or ""))
+                  if start_num is None:
+                      start_num = int(interval["start_idx"]) + 1
+                  grouped.setdefault(int(start_num), []).append(interval)
+
+              groups = []
+              group_counter = 1
+              for start_num in sorted(grouped.keys()):
+                  group_intervals = sorted(
+                      grouped[start_num],
+                      key=lambda x: (int(x["start_idx"]), int(x["end_idx"]), str(x["variant"])),
+                  )
+                  variant_lengths = {}
+                  variant_start_systems = {}
+                  max_end_idx = -1
+                  max_covered_system_index = -1
+                  start_system_candidates = []
+                  for interval in group_intervals:
+                      start_idx = int(interval["start_idx"])
+                      end_idx = int(interval["end_idx"])
+                      variant = str(interval["variant"])
+                      length = max(1, end_idx - start_idx + 1)
+                      if length > int(variant_lengths.get(variant, 0)):
+                          variant_lengths[variant] = int(length)
+
+                      start_sys = int(events[start_idx].get("system_index") or 0)
+                      if variant not in variant_start_systems:
+                          variant_start_systems[variant] = start_sys
+                      start_system_candidates.append(start_sys)
+                      for ev_idx in range(start_idx, end_idx + 1):
+                          covered_sys = int(events[ev_idx].get("system_index") or 0)
+                          if covered_sys > max_covered_system_index:
+                              max_covered_system_index = covered_sys
+                      if end_idx > max_end_idx:
+                          max_end_idx = end_idx
+
+                  if not start_system_candidates:
+                      continue
+
+                  post_system_index = None
+                  seen_system_indices = sorted(
+                      {int(ev.get("system_index") or 0) for ev in events}
+                  )
+                  for sys_idx in seen_system_indices:
+                      if sys_idx > max_covered_system_index:
+                          post_system_index = int(sys_idx)
+                          break
+
+                  variant_numbers = sorted(
+                      list(variant_lengths.keys()),
+                      key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)),
+                  )
+                  longest_length = max([int(variant_lengths[v]) for v in variant_numbers] or [1])
+                  group = {
+                      "group_id": f"g{group_counter}",
+                      "start_system_index": int(min(start_system_candidates)),
+                      "variant_numbers": list(variant_numbers),
+                      "variant_lengths_measures": {str(v): int(variant_lengths[v]) for v in variant_numbers},
+                      "longest_length_measures": int(longest_length),
+                      "post_ending_system_index": post_system_index,
+                      "_variant_start_systems": [int(variant_start_systems[v]) for v in variant_numbers],
+                      "_max_covered_system_index": int(max_covered_system_index),
+                  }
+                  groups.append(group)
+                  group_counter += 1
+
+              if not groups and ending_markers_present:
+                  return [], True, "ending_markers_present_but_groups_empty"
+
+              return groups, ending_markers_present, None
+
+          def apply_longest_ending_groups(page_num, semantic_nums, ending_groups):
+              adjusted = [int(x) for x in semantic_nums]
+              unresolved = []
+
+              for group in sorted(
+                  ending_groups,
+                  key=lambda g: (int(g.get("start_system_index") or 0), str(g.get("group_id") or "")),
+              ):
+                  start_system_index = group.get("start_system_index")
+                  longest_length = int(group.get("longest_length_measures") or 0)
+                  post_system_index = group.get("post_ending_system_index")
+                  variant_numbers = list(group.get("variant_numbers") or [])
+                  variant_starts = list(group.get("_variant_start_systems") or [])
+
+                  if (
+                      start_system_index is None
+                      or int(start_system_index) < 0
+                      or int(start_system_index) >= len(adjusted)
+                      or longest_length <= 0
+                  ):
+                      unresolved.append("invalid_ending_group_geometry")
+                      continue
+
+                  start_system_index = int(start_system_index)
+                  shared_start = int(adjusted[start_system_index])
+
+                  for sys_idx in variant_starts:
+                      if 0 <= int(sys_idx) < len(adjusted):
+                          adjusted[int(sys_idx)] = shared_start
+
+                  print(
+                      "SEMANTIC_ENDING_GROUP "
+                      f"page={page_num} group_id={group.get('group_id')} "
+                      f"variants={','.join(variant_numbers)} longest={longest_length}"
+                  )
+
+                  if post_system_index is None:
+                      continue
+
+                  post_system_index = int(post_system_index)
+                  if not (0 <= post_system_index < len(adjusted)):
+                      unresolved.append("post_ending_system_index_out_of_range")
+                      continue
+
+                  target_next = int(shared_start) + int(longest_length)
+                  print(
+                      "SEMANTIC_ENDING_NEXT "
+                      f"page={page_num} post_system={post_system_index} next_measure={target_next}"
+                  )
+                  shift = int(target_next) - int(adjusted[post_system_index])
+                  if shift != 0:
+                      for idx in range(post_system_index, len(adjusted)):
+                          adjusted[idx] = int(adjusted[idx]) + int(shift)
+
+                  for idx in range(1, len(adjusted)):
+                      if int(adjusted[idx]) < int(adjusted[idx - 1]):
+                          adjusted[idx] = int(adjusted[idx - 1])
+
+              return adjusted, unresolved
 
           def estimate_page_tail_increment(raw_labels, measures_count):
               nums, _ = parse_int_labels(raw_labels or [], allow_normalize=True)
@@ -1016,12 +1227,16 @@ jobs:
                   for entry in entries:
                       if entry.get("status") != "ok":
                           entry["numbering_policy"] = "legacy_raw_starts"
+                          entry["semantic_model"] = "legacy_raw_starts"
+                          entry["ending_groups"] = []
                           entry["ending_anchors"] = []
                           continue
                       raw_starts = list(entry.get("system_starts_raw") or entry.get("system_starts") or [])
                       entry["system_starts_semantic"] = list(raw_starts)
                       entry["system_starts"] = list(raw_starts)
                       entry["numbering_policy"] = "legacy_raw_starts"
+                      entry["semantic_model"] = "legacy_raw_starts"
+                      entry["ending_groups"] = []
                       entry["ending_anchors"] = []
                       print(
                           "SEMANTIC_APPLY "
@@ -1032,14 +1247,16 @@ jobs:
 
               global_next_start = None
               seen_first_page = False
-              last_first_ending_value = None
 
               for entry in sorted(entries, key=lambda e: int(e.get("page_number") or 0)):
                   if entry.get("status") != "ok":
                       entry["numbering_policy"] = "semantic_continuous_v1"
+                      entry["semantic_model"] = "semantic_continuous_v2_longest_ending"
+                      entry["ending_groups"] = []
                       entry["ending_anchors"] = []
                       continue
 
+                  page_num = int(entry.get("page_number") or 0)
                   raw_starts = list(entry.get("system_starts_raw") or entry.get("system_starts") or [])
                   normalized_starts = list(entry.get("system_starts_normalized") or entry.get("system_starts") or [])
                   raw_nums, parse_warnings = parse_int_labels(normalized_starts, allow_normalize=False)
@@ -1050,6 +1267,8 @@ jobs:
                       entry["system_starts_semantic"] = list(normalized_starts)
                       entry["system_starts"] = list(normalized_starts)
                       entry["numbering_policy"] = "semantic_continuous_v1"
+                      entry["semantic_model"] = "semantic_continuous_v2_longest_ending"
+                      entry["ending_groups"] = []
                       entry["ending_anchors"] = []
                       print(
                           "SEMANTIC_WARN "
@@ -1083,49 +1302,27 @@ jobs:
                   else:
                       start_value = int(global_next_start) if global_next_start is not None else int(raw_nums[0])
 
-                  semantic_nums = [start_value]
+                  base_semantic_nums = [start_value]
                   for delta in deltas:
-                      semantic_nums.append(int(semantic_nums[-1]) + int(delta))
+                      base_semantic_nums.append(int(base_semantic_nums[-1]) + int(delta))
 
-                  start_events = [ev for ev in events if ev.get("system_start")]
-                  if len(start_events) != len(semantic_nums):
-                      entry.setdefault("semantic_warnings", []).append(
-                          f"system_start_event_count_mismatch:{len(start_events)}!={len(semantic_nums)}"
+                  ending_groups, ending_markers_present, ending_group_error = build_ending_groups(events)
+                  semantic_nums = list(base_semantic_nums)
+                  ending_group_unresolved = []
+                  if ending_markers_present and duplicate_pair_indices and not ending_groups:
+                      ending_group_unresolved.append("ending_markers_present_but_no_groups_for_duplicates")
+                  if ending_groups:
+                      semantic_nums, ending_group_unresolved = apply_longest_ending_groups(
+                          page_num,
+                          semantic_nums,
+                          ending_groups,
                       )
                       print(
-                          "SEMANTIC_WARN "
-                          f"page={entry.get('page_number')} reason=system_start_event_count_mismatch "
-                          f"events={len(start_events)} systems={len(semantic_nums)}"
+                          "SEMANTIC_ENDING_APPLY "
+                          f"page={page_num} raw={base_semantic_nums} normalized={semantic_nums}"
                       )
-                  else:
-                      for idx, ev in enumerate(start_events):
-                          ending_nums = set(str(x) for x in (ev.get("ending_start_numbers") or []))
-                          if "1" in ending_nums:
-                              last_first_ending_value = semantic_nums[idx]
-                          elif "2" in ending_nums and last_first_ending_value is not None:
-                              semantic_nums[idx] = int(last_first_ending_value)
-
-                  ending_anchors = []
-                  if len(start_events) == len(semantic_nums):
-                      for idx, ev in enumerate(start_events):
-                          ending_numbers = []
-                          for raw_num in (ev.get("ending_start_numbers") or []):
-                              tok = str(raw_num).strip()
-                              if tok and tok not in ending_numbers:
-                                  ending_numbers.append(tok)
-                          if not ending_numbers:
-                              continue
-                          anchor = {
-                              "system_index": idx,
-                              "ending_numbers": list(ending_numbers),
-                              "measure_value": str(semantic_nums[idx]),
-                          }
-                          ending_anchors.append(anchor)
-                          print(
-                              "SEMANTIC_ENDING_ANCHOR "
-                              f"page={entry.get('page_number')} system_index={idx} "
-                              f"ending={','.join(ending_numbers)} measure={semantic_nums[idx]}"
-                          )
+                  elif ending_markers_present and ending_group_error:
+                      ending_group_unresolved.append(str(ending_group_error))
 
                   for dup_idx in duplicate_pair_indices:
                       print(
@@ -1135,11 +1332,41 @@ jobs:
                           f"semantic_pair={semantic_nums[dup_idx - 1]},{semantic_nums[dup_idx]}"
                       )
 
+                  for idx in range(1, len(semantic_nums)):
+                      if int(semantic_nums[idx]) < int(semantic_nums[idx - 1]):
+                          semantic_nums[idx] = int(semantic_nums[idx - 1])
+
+                  cleaned_ending_groups = []
+                  for group in ending_groups:
+                      cleaned_ending_groups.append(
+                          {
+                              "group_id": str(group.get("group_id") or ""),
+                              "start_system_index": int(group.get("start_system_index") or 0),
+                              "variant_numbers": list(group.get("variant_numbers") or []),
+                              "variant_lengths_measures": dict(group.get("variant_lengths_measures") or {}),
+                              "longest_length_measures": int(group.get("longest_length_measures") or 0),
+                              "post_ending_system_index": group.get("post_ending_system_index"),
+                          }
+                      )
+
                   semantic_starts = [str(n) for n in semantic_nums]
                   entry["system_starts_semantic"] = semantic_starts
                   entry["system_starts"] = semantic_starts
                   entry["numbering_policy"] = "semantic_continuous_v1"
-                  entry["ending_anchors"] = ending_anchors
+                  entry["semantic_model"] = "semantic_continuous_v2_longest_ending"
+                  entry["ending_groups"] = cleaned_ending_groups
+                  entry["ending_anchors"] = []
+
+                  if ending_group_unresolved:
+                      warn_reason = "semantic_ending_group_unresolved"
+                      entry.setdefault("semantic_warnings", []).extend(list(ending_group_unresolved))
+                      entry["status"] = "missing"
+                      entry["error"] = warn_reason
+                      entry["selection_reason"] = warn_reason
+                      print(
+                          "SEMANTIC_WARN "
+                          f"page={entry.get('page_number')} reason={warn_reason}"
+                      )
 
                   tail_increment = estimate_page_tail_increment(normalized_starts, entry.get("measures_count"))
                   global_next_start = int(semantic_nums[-1]) + int(tail_increment)
@@ -1402,6 +1629,7 @@ jobs:
 
           print(f"SEMANTIC_POLICY effective={NUMBERING_POLICY}")
           apply_semantic_numbering(entries, NUMBERING_POLICY)
+          missing = sum(1 for entry in entries if entry.get("status") != "ok")
           for entry in entries:
               if "_semantic_measure_events" in entry:
                   del entry["_semantic_measure_events"]
@@ -1432,7 +1660,7 @@ jobs:
           ENABLE_MEASURE_LABELS: "1"
           MEASURE_LABEL_MODE: "staff_start"
           MEASURE_SOURCE_POLICY: "mxl_strict"
-          ENDING_LABEL_MODE: "system_plus_endings"
+          ENDING_LABEL_MODE: "system_only"
           MXL_PARSER_POLICY: "auto"
           MXL_SANITIZE_PREFIXES: "1"
           MXL_PATH_OVERRIDE: "${{ env.MXL_PATH_OVERRIDE }}"

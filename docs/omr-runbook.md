@@ -78,13 +78,21 @@ instead of drawing repeated labels.
 Strict mode now first tries an exact-safe merge of per-page movement XML starts before
 failing. If exact-safe merge cannot be proven, strict still fails.
 
-When ending anchors are present in manifest mode, rendering can add extra labels near
-system starts. Control with:
-
-- `ENDING_LABEL_MODE=system_plus_endings` (default)
-- `ENDING_LABEL_MODE=system_only` (fallback)
+This workflow currently runs with `ENDING_LABEL_MODE=system_only` to keep one label
+per system start. `system_plus_endings` is available only as a debug/visualization mode.
 
 Look for:
 
 - `mapping_reason=manifest_system_count_mismatch` (manifest mode)
 - `mapping_reason=mxl_system_count_mismatch` (full-book mode)
+
+## Counting policy: 1st/2nd endings
+
+Semantic numbering now uses `semantic_continuous_v2_longest_ending` in Step 13.
+
+- Alternative endings share the same starting measure number.
+- Continuation after the ending group uses the longest ending length.
+- Labels remain one per system start (left-margin style).
+
+If ending markers exist but the grouping cannot be resolved deterministically, strict mode
+marks that page as missing with `semantic_ending_group_unresolved` and the run fails.
