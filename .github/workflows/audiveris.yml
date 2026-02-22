@@ -1018,91 +1018,208 @@ jobs:
                   "ending_start_count": endings,
               }
 
-          def build_ending_groups(events):
+          def unique_preserve_order(items):
+              out = []
+              seen = set()
+              for item in items:
+                  key = str(item)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  out.append(str(item))
+              return out
+
+          def build_ending_groups(page_num, events):
               ending_markers_present = False
+              seen_stop_or_discontinue = False
               open_variants = {}
               intervals = []
+              ending_marker_rows = []
+              decision_trace = []
+
+              def emit_decision(msg):
+                  decision_trace.append(str(msg))
+                  print(f"SEMANTIC_ENDING_DECISION page={page_num} {msg}")
 
               for ev_idx, ev in enumerate(events):
                   markers = list(ev.get("ending_markers") or [])
                   if markers:
                       ending_markers_present = True
+                  raw_measure = str(ev.get("raw_measure_number") or ev.get("label") or "")
+                  system_index = int(ev.get("system_index") or 0)
+                  measure_index = int(ev.get("measure_index") or ev_idx)
                   for marker in markers:
                       variant = str(marker.get("number") or "").strip()
                       marker_type = str(marker.get("type") or "").strip().lower()
                       if not variant or marker_type not in ("start", "stop", "discontinue"):
+                          emit_decision(
+                              f"ignored_marker measure_index={measure_index} system_index={system_index} "
+                              f"type={marker_type or '<empty>'} number={variant or '<empty>'}"
+                          )
                           continue
 
+                      ending_marker_rows.append(
+                          {
+                              "measure_index": int(measure_index),
+                              "system_index": int(system_index),
+                              "raw_measure_number": str(raw_measure),
+                              "marker_type": str(marker_type),
+                              "marker_number": str(variant),
+                          }
+                      )
+                      print(
+                          "SEMANTIC_ENDING_INPUT "
+                          f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                          f"raw_measure={raw_measure or '-'} marker_type={marker_type} marker_number={variant}"
+                      )
+
+                      if marker_type in ("stop", "discontinue"):
+                          seen_stop_or_discontinue = True
+
                       if marker_type == "start":
-                          if variant not in open_variants:
+                          if variant in open_variants:
+                              emit_decision(
+                                  f"duplicate_start_ignored variant={variant} "
+                                  f"measure_index={measure_index} system_index={system_index}"
+                              )
+                          else:
                               open_variants[variant] = int(ev_idx)
-                      elif marker_type == "discontinue":
-                          start_idx = int(open_variants.pop(variant, ev_idx))
+                              print(
+                                  "SEMANTIC_ENDING_INTERVAL "
+                                  f"page={page_num} action=open variant={variant} "
+                                  f"start_measure_index={measure_index} start_system_index={system_index}"
+                              )
+                              emit_decision(
+                                  f"open_interval variant={variant} measure_index={measure_index} "
+                                  f"system_index={system_index}"
+                              )
+                      else:
+                          start_idx = open_variants.pop(variant, None)
+                          inferred_open = False
+                          if start_idx is None:
+                              start_idx = int(ev_idx)
+                              inferred_open = True
+                              emit_decision(
+                                  f"close_without_open variant={variant} type={marker_type} "
+                                  f"measure_index={measure_index}"
+                              )
+                          start_idx = int(start_idx)
+                          end_idx = int(ev_idx)
+                          start_system_index = int(events[start_idx].get("system_index") or 0)
+                          end_system_index = int(system_index)
+                          length_measures = max(1, end_idx - start_idx + 1)
                           intervals.append(
                               {
                                   "variant": variant,
-                                  "start_idx": start_idx,
-                                  "end_idx": int(ev_idx),
+                                  "start_measure_index": start_idx,
+                                  "end_measure_index": end_idx,
+                                  "start_system_index": start_system_index,
+                                  "end_system_index": end_system_index,
+                                  "length_measures": int(length_measures),
+                                  "close_type": str(marker_type),
+                                  "inferred_open": bool(inferred_open),
                               }
                           )
-                      else:  # stop
-                          start_idx = open_variants.pop(variant, None)
-                          if start_idx is not None:
-                              intervals.append(
-                                  {
-                                      "variant": variant,
-                                      "start_idx": int(start_idx),
-                                      "end_idx": int(ev_idx),
-                                  }
-                              )
+                          print(
+                              "SEMANTIC_ENDING_INTERVAL "
+                              f"page={page_num} action=close variant={variant} "
+                              f"start_measure_index={start_idx} end_measure_index={end_idx} "
+                              f"start_system_index={start_system_index} end_system_index={end_system_index} "
+                              f"length_measures={length_measures} close_type={marker_type}"
+                          )
+                          emit_decision(
+                              f"close_interval variant={variant} type={marker_type} "
+                              f"start_measure_index={start_idx} end_measure_index={end_idx}"
+                          )
 
               if events:
                   last_idx = len(events) - 1
-                  for variant, start_idx in open_variants.items():
+                  for variant, start_idx in sorted(open_variants.items(), key=lambda item: (str(item[0]), int(item[1]))):
+                      start_idx = int(start_idx)
+                      start_system_index = int(events[start_idx].get("system_index") or 0)
+                      end_system_index = int(events[last_idx].get("system_index") or 0)
+                      length_measures = max(1, last_idx - start_idx + 1)
                       intervals.append(
                           {
                               "variant": str(variant),
-                              "start_idx": int(start_idx),
-                              "end_idx": int(last_idx),
+                              "start_measure_index": int(start_idx),
+                              "end_measure_index": int(last_idx),
+                              "start_system_index": int(start_system_index),
+                              "end_system_index": int(end_system_index),
+                              "length_measures": int(length_measures),
+                              "close_type": "implicit_end_of_page",
+                              "inferred_open": False,
                           }
                       )
+                      print(
+                          "SEMANTIC_ENDING_INTERVAL "
+                          f"page={page_num} action=auto_close variant={variant} "
+                          f"start_measure_index={start_idx} end_measure_index={last_idx} "
+                          f"start_system_index={start_system_index} end_system_index={end_system_index} "
+                          f"length_measures={length_measures} close_type=implicit_end_of_page"
+                      )
+                      emit_decision(
+                          f"auto_close_end_of_page variant={variant} start_measure_index={start_idx} "
+                          f"end_measure_index={last_idx}"
+                      )
+
+              debug_info = {
+                  "version": "ending_diag_v1",
+                  "ending_markers": list(ending_marker_rows),
+                  "ending_intervals": list(intervals),
+                  "ending_groups": [],
+                  "suspicious_flags": [],
+                  "decision_trace": list(decision_trace),
+                  "has_stop_or_discontinue": bool(seen_stop_or_discontinue),
+              }
 
               if not intervals:
                   if ending_markers_present:
-                      return [], True, "ending_markers_present_but_no_intervals"
-                  return [], False, None
+                      emit_decision("ending_markers_present_but_no_intervals")
+                      debug_info["decision_trace"] = list(decision_trace)
+                      return [], True, "ending_markers_present_but_no_intervals", debug_info
+                  return [], False, None, debug_info
 
               grouped = {}
               for interval in intervals:
-                  start_ev = events[int(interval["start_idx"])]
+                  start_ev = events[int(interval["start_measure_index"])]
                   start_num = start_ev.get("number_int")
                   if start_num is None:
                       start_num = parse_xml_int(str(start_ev.get("raw_measure_number") or ""))
                   if start_num is None:
-                      start_num = int(interval["start_idx"]) + 1
+                      start_num = int(interval["start_measure_index"]) + 1
+                  interval["group_key_start_number"] = int(start_num)
                   grouped.setdefault(int(start_num), []).append(interval)
+                  emit_decision(
+                      f"group_key variant={interval.get('variant')} "
+                      f"start_measure_index={interval.get('start_measure_index')} key_start_number={start_num}"
+                  )
 
               groups = []
+              debug_groups = []
               group_counter = 1
               for start_num in sorted(grouped.keys()):
                   group_intervals = sorted(
                       grouped[start_num],
-                      key=lambda x: (int(x["start_idx"]), int(x["end_idx"]), str(x["variant"])),
+                      key=lambda x: (
+                          int(x.get("start_measure_index") or 0),
+                          int(x.get("end_measure_index") or 0),
+                          str(x.get("variant") or ""),
+                      ),
                   )
                   variant_lengths = {}
                   variant_start_systems = {}
-                  max_end_idx = -1
                   max_covered_system_index = -1
                   start_system_candidates = []
                   for interval in group_intervals:
-                      start_idx = int(interval["start_idx"])
-                      end_idx = int(interval["end_idx"])
-                      variant = str(interval["variant"])
+                      start_idx = int(interval.get("start_measure_index") or 0)
+                      end_idx = int(interval.get("end_measure_index") or start_idx)
+                      variant = str(interval.get("variant") or "")
                       length = max(1, end_idx - start_idx + 1)
                       if length > int(variant_lengths.get(variant, 0)):
                           variant_lengths[variant] = int(length)
 
-                      start_sys = int(events[start_idx].get("system_index") or 0)
+                      start_sys = int(interval.get("start_system_index") or 0)
                       if variant not in variant_start_systems:
                           variant_start_systems[variant] = start_sys
                       start_system_candidates.append(start_sys)
@@ -1110,8 +1227,6 @@ jobs:
                           covered_sys = int(events[ev_idx].get("system_index") or 0)
                           if covered_sys > max_covered_system_index:
                               max_covered_system_index = covered_sys
-                      if end_idx > max_end_idx:
-                          max_end_idx = end_idx
 
                   if not start_system_candidates:
                       continue
@@ -1132,25 +1247,68 @@ jobs:
                   longest_length = max([int(variant_lengths[v]) for v in variant_numbers] or [1])
                   group = {
                       "group_id": f"g{group_counter}",
+                      "group_key_start_number": int(start_num),
                       "start_system_index": int(min(start_system_candidates)),
                       "variant_numbers": list(variant_numbers),
+                      "variant_start_system_indices": [int(variant_start_systems[v]) for v in variant_numbers],
                       "variant_lengths_measures": {str(v): int(variant_lengths[v]) for v in variant_numbers},
+                      "max_covered_system_index": int(max_covered_system_index),
                       "longest_length_measures": int(longest_length),
                       "post_ending_system_index": post_system_index,
                       "_variant_start_systems": [int(variant_start_systems[v]) for v in variant_numbers],
                       "_max_covered_system_index": int(max_covered_system_index),
                   }
+                  variant_starts_txt = ",".join(str(int(variant_start_systems[v])) for v in variant_numbers)
+                  variant_lengths_txt = ",".join(f"{v}:{int(variant_lengths[v])}" for v in variant_numbers)
+                  print(
+                      "SEMANTIC_ENDING_GROUP_DETAIL "
+                      f"page={page_num} group_id={group['group_id']} "
+                      f"group_key_start_number={int(start_num)} variants={','.join(variant_numbers)} "
+                      f"variant_start_system_indices={variant_starts_txt or '-'} "
+                      f"variant_lengths_measures={variant_lengths_txt or '-'} "
+                      f"max_covered_system_index={int(max_covered_system_index)} "
+                      f"post_ending_system_index={post_system_index if post_system_index is not None else 'none'} "
+                      f"longest_length_measures={int(longest_length)}"
+                  )
+                  emit_decision(
+                      f"group_built group_id={group['group_id']} key_start={int(start_num)} "
+                      f"variants={','.join(variant_numbers)} longest={int(longest_length)} "
+                      f"post_system={post_system_index if post_system_index is not None else 'none'}"
+                  )
                   groups.append(group)
+                  debug_groups.append(
+                      {
+                          "group_id": str(group.get("group_id") or ""),
+                          "group_key_start_number": int(start_num),
+                          "variant_numbers": list(variant_numbers),
+                          "variant_start_system_indices": [int(variant_start_systems[v]) for v in variant_numbers],
+                          "variant_lengths_measures": {str(v): int(variant_lengths[v]) for v in variant_numbers},
+                          "max_covered_system_index": int(max_covered_system_index),
+                          "post_ending_system_index": post_system_index,
+                          "longest_length_measures": int(longest_length),
+                      }
+                  )
                   group_counter += 1
 
               if not groups and ending_markers_present:
-                  return [], True, "ending_markers_present_but_groups_empty"
+                  emit_decision("ending_markers_present_but_groups_empty")
+                  debug_info["ending_groups"] = list(debug_groups)
+                  debug_info["decision_trace"] = list(decision_trace)
+                  return [], True, "ending_markers_present_but_groups_empty", debug_info
 
-              return groups, ending_markers_present, None
+              debug_info["ending_groups"] = list(debug_groups)
+              debug_info["decision_trace"] = list(decision_trace)
+              return groups, ending_markers_present, None, debug_info
 
-          def apply_longest_ending_groups(page_num, semantic_nums, ending_groups):
+          def apply_longest_ending_groups(page_num, semantic_nums, ending_groups, decision_trace=None):
               adjusted = [int(x) for x in semantic_nums]
               unresolved = []
+              if decision_trace is None:
+                  decision_trace = []
+
+              def emit_decision(msg):
+                  decision_trace.append(str(msg))
+                  print(f"SEMANTIC_ENDING_DECISION page={page_num} {msg}")
 
               for group in sorted(
                   ending_groups,
@@ -1169,6 +1327,10 @@ jobs:
                       or longest_length <= 0
                   ):
                       unresolved.append("invalid_ending_group_geometry")
+                      emit_decision(
+                          f"invalid_group_geometry group_id={group.get('group_id')} "
+                          f"start_system_index={start_system_index} longest={longest_length}"
+                      )
                       continue
 
                   start_system_index = int(start_system_index)
@@ -1185,11 +1347,19 @@ jobs:
                   )
 
                   if post_system_index is None:
+                      emit_decision(
+                          f"no_post_system group_id={group.get('group_id')} "
+                          f"shared_start={shared_start} longest={longest_length}"
+                      )
                       continue
 
                   post_system_index = int(post_system_index)
                   if not (0 <= post_system_index < len(adjusted)):
                       unresolved.append("post_ending_system_index_out_of_range")
+                      emit_decision(
+                          f"post_system_out_of_range group_id={group.get('group_id')} "
+                          f"post_system_index={post_system_index} total_systems={len(adjusted)}"
+                      )
                       continue
 
                   target_next = int(shared_start) + int(longest_length)
@@ -1201,12 +1371,47 @@ jobs:
                   if shift != 0:
                       for idx in range(post_system_index, len(adjusted)):
                           adjusted[idx] = int(adjusted[idx]) + int(shift)
+                  emit_decision(
+                      f"apply_group_shift group_id={group.get('group_id')} "
+                      f"post_system={post_system_index} target_next={target_next} shift={shift}"
+                  )
 
                   for idx in range(1, len(adjusted)):
                       if int(adjusted[idx]) < int(adjusted[idx - 1]):
                           adjusted[idx] = int(adjusted[idx - 1])
 
               return adjusted, unresolved
+
+          def detect_ending_suspicious_flags(
+              raw_nums,
+              duplicate_pair_indices,
+              ending_markers_present,
+              ending_groups,
+              ending_debug,
+          ):
+              flags = []
+              intervals = list((ending_debug or {}).get("ending_intervals") or [])
+              variants = unique_preserve_order(
+                  [row.get("variant") for row in intervals if str(row.get("variant") or "").strip()]
+              )
+              has_stop_or_discontinue = bool((ending_debug or {}).get("has_stop_or_discontinue"))
+
+              if ending_markers_present and len(variants) <= 1:
+                  flags.append("ending_detected_but_single_variant")
+              if ending_markers_present and not has_stop_or_discontinue:
+                  flags.append("ending_detected_but_no_stop_or_discontinue")
+              if duplicate_pair_indices and ending_markers_present and len(variants) <= 1:
+                  flags.append("duplicate_system_starts_with_unresolved_variant_split")
+              if any(group.get("post_ending_system_index") is None for group in (ending_groups or [])):
+                  flags.append("post_ending_system_missing")
+              max_reasonable_length = max(8, len(raw_nums) * 3)
+              for group in ending_groups or []:
+                  longest = int(group.get("longest_length_measures") or 0)
+                  if longest > max_reasonable_length:
+                      flags.append(f"ending_length_outlier:{longest}")
+                      break
+
+              return unique_preserve_order(flags)
 
           def estimate_page_tail_increment(raw_labels, measures_count):
               nums, _ = parse_int_labels(raw_labels or [], allow_normalize=True)
@@ -1225,6 +1430,16 @@ jobs:
           def apply_semantic_numbering(entries, numbering_policy):
               if numbering_policy == "legacy_raw_starts":
                   for entry in entries:
+                      semantic_debug = entry.get("semantic_debug")
+                      if not isinstance(semantic_debug, dict):
+                          semantic_debug = {}
+                      semantic_debug.setdefault("version", "ending_diag_v1")
+                      semantic_debug.setdefault("ending_markers", [])
+                      semantic_debug.setdefault("ending_intervals", [])
+                      semantic_debug.setdefault("ending_groups", [])
+                      semantic_debug.setdefault("suspicious_flags", [])
+                      semantic_debug.setdefault("decision_trace", [])
+                      entry["semantic_debug"] = semantic_debug
                       if entry.get("status") != "ok":
                           entry["numbering_policy"] = "legacy_raw_starts"
                           entry["semantic_model"] = "legacy_raw_starts"
@@ -1249,6 +1464,17 @@ jobs:
               seen_first_page = False
 
               for entry in sorted(entries, key=lambda e: int(e.get("page_number") or 0)):
+                  semantic_debug = entry.get("semantic_debug")
+                  if not isinstance(semantic_debug, dict):
+                      semantic_debug = {}
+                  semantic_debug.setdefault("version", "ending_diag_v1")
+                  semantic_debug.setdefault("ending_markers", [])
+                  semantic_debug.setdefault("ending_intervals", [])
+                  semantic_debug.setdefault("ending_groups", [])
+                  semantic_debug.setdefault("suspicious_flags", [])
+                  semantic_debug.setdefault("decision_trace", [])
+                  entry["semantic_debug"] = semantic_debug
+
                   if entry.get("status") != "ok":
                       entry["numbering_policy"] = "semantic_continuous_v1"
                       entry["semantic_model"] = "semantic_continuous_v2_longest_ending"
@@ -1306,7 +1532,15 @@ jobs:
                   for delta in deltas:
                       base_semantic_nums.append(int(base_semantic_nums[-1]) + int(delta))
 
-                  ending_groups, ending_markers_present, ending_group_error = build_ending_groups(events)
+                  ending_groups, ending_markers_present, ending_group_error, ending_debug = build_ending_groups(
+                      page_num,
+                      events,
+                  )
+                  semantic_debug["version"] = "ending_diag_v1"
+                  semantic_debug["ending_markers"] = list(ending_debug.get("ending_markers") or [])
+                  semantic_debug["ending_intervals"] = list(ending_debug.get("ending_intervals") or [])
+                  semantic_debug["ending_groups"] = list(ending_debug.get("ending_groups") or [])
+                  semantic_debug["decision_trace"] = list(ending_debug.get("decision_trace") or [])
                   semantic_nums = list(base_semantic_nums)
                   ending_group_unresolved = []
                   if ending_markers_present and duplicate_pair_indices and not ending_groups:
@@ -1316,6 +1550,7 @@ jobs:
                           page_num,
                           semantic_nums,
                           ending_groups,
+                          semantic_debug.get("decision_trace"),
                       )
                       print(
                           "SEMANTIC_ENDING_APPLY "
@@ -1341,13 +1576,37 @@ jobs:
                       cleaned_ending_groups.append(
                           {
                               "group_id": str(group.get("group_id") or ""),
+                              "group_key_start_number": int(group.get("group_key_start_number") or 0),
                               "start_system_index": int(group.get("start_system_index") or 0),
                               "variant_numbers": list(group.get("variant_numbers") or []),
+                              "variant_start_system_indices": list(
+                                  group.get("variant_start_system_indices")
+                                  or group.get("_variant_start_systems")
+                                  or []
+                              ),
                               "variant_lengths_measures": dict(group.get("variant_lengths_measures") or {}),
+                              "max_covered_system_index": int(
+                                  group.get("max_covered_system_index")
+                                  or group.get("_max_covered_system_index")
+                                  or 0
+                              ),
                               "longest_length_measures": int(group.get("longest_length_measures") or 0),
                               "post_ending_system_index": group.get("post_ending_system_index"),
                           }
                       )
+
+                  ending_suspicious_flags = detect_ending_suspicious_flags(
+                      raw_nums=raw_nums,
+                      duplicate_pair_indices=duplicate_pair_indices,
+                      ending_markers_present=ending_markers_present,
+                      ending_groups=ending_groups,
+                      ending_debug=ending_debug,
+                  )
+                  semantic_debug["ending_groups"] = list(cleaned_ending_groups)
+                  semantic_debug["suspicious_flags"] = list(ending_suspicious_flags)
+                  for flag in ending_suspicious_flags:
+                      print(f"SEMANTIC_ENDING_SUSPECT page={page_num} flag={flag}")
+                      entry.setdefault("semantic_warnings", []).append(f"ending_suspect:{flag}")
 
                   semantic_starts = [str(n) for n in semantic_nums]
                   entry["system_starts_semantic"] = semantic_starts
@@ -1529,6 +1788,14 @@ jobs:
                       "semantic_events": semantic_events,
                       "semantic_warnings": [],
                       "normalization_warnings": normalization_warnings,
+                      "semantic_debug": {
+                          "version": "ending_diag_v1",
+                          "ending_markers": [],
+                          "ending_intervals": [],
+                          "ending_groups": [],
+                          "suspicious_flags": [],
+                          "decision_trace": [],
+                      },
                       "ending_anchors": [],
                       "_semantic_measure_events": merged_events,
                       "selection_source": selection_source,
@@ -1609,6 +1876,14 @@ jobs:
                       },
                       "semantic_warnings": [],
                       "normalization_warnings": list(best_norm_warnings),
+                      "semantic_debug": {
+                          "version": "ending_diag_v1",
+                          "ending_markers": [],
+                          "ending_intervals": [],
+                          "ending_groups": [],
+                          "suspicious_flags": [],
+                          "decision_trace": [],
+                      },
                       "ending_anchors": [],
                       "_semantic_measure_events": [],
                       "selection_source": "none",
@@ -1727,6 +2002,8 @@ jobs:
 
           pages = d.get("pages") or []
           manifest_path = d.get("mxl_page_manifest_path")
+          manifest_summary = {}
+          semantic_suspect_pages = []
           if manifest_path:
               manifest_summary = d.get("mxl_page_manifest_summary") or {}
               print(f"SUMMARY manifest_path={manifest_path}")
@@ -1736,6 +2013,27 @@ jobs:
                   f"missing={manifest_summary.get('missing')} "
                   f"status={manifest_summary.get('status')}"
               )
+              try:
+                  manifest_doc = json.load(open(manifest_path, "r", encoding="utf-8"))
+                  for entry in manifest_doc.get("entries") or []:
+                      dbg = entry.get("semantic_debug") or {}
+                      flags = [str(flag) for flag in (dbg.get("suspicious_flags") or []) if str(flag)]
+                      if not flags:
+                          continue
+                      page_no = entry.get("page_number")
+                      if page_no is None:
+                          page_no = int(entry.get("page_index", 0)) + 1
+                      semantic_suspect_pages.append((int(page_no), flags))
+              except Exception as exc:
+                  print(f"SUMMARY semantic_suspect_scan_error={exc}")
+
+              manifest_entries = int(manifest_summary.get("entries") or len(pages) or 0)
+              print(f"SUMMARY semantic_suspect_pages={len(semantic_suspect_pages)}/{manifest_entries}")
+              for page_no, flags in semantic_suspect_pages:
+                  print(
+                      "SUMMARY semantic_suspect "
+                      f"page={int(page_no)} flags={','.join(flags)}"
+                  )
           strict_xml_pages_ok = 0
           total_pages = len(pages)
           strict_xml_missing = []
