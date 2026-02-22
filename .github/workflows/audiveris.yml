@@ -593,6 +593,40 @@ jobs:
               except Exception:
                   return None
 
+          def compact_xml_snippet(el, max_len=240):
+              try:
+                  raw = ET.tostring(el, encoding="unicode")
+              except Exception:
+                  return ""
+              txt = re.sub(r"\s+", " ", str(raw or "")).strip()
+              txt = txt.replace("\n", "\\n").replace("\r", "\\r")
+              if len(txt) > max_len:
+                  return txt[: max_len - 3] + "..."
+              return txt
+
+          def detect_ending_direction_cues(texts):
+              found = []
+              patterns = [
+                  (r"\b1[\.\)]", "1_marker"),
+                  (r"\b2[\.\)]", "2_marker"),
+                  (r"\b1st\b", "1st"),
+                  (r"\b2nd\b", "2nd"),
+                  (r"\bprima\b", "prima"),
+                  (r"\bseconda\b", "seconda"),
+                  (r"\bending\b", "ending"),
+              ]
+              for raw in texts:
+                  txt = str(raw or "").strip()
+                  if not txt:
+                      continue
+                  low = txt.lower()
+                  for patt, label in patterns:
+                      if re.search(patt, low):
+                          found.append(label)
+              if not found:
+                  return []
+              return sorted({str(tok) for tok in found})
+
           def parse_xml_member(raw):
               try:
                   root = ET.fromstring(raw)
@@ -650,27 +684,52 @@ jobs:
                           has_backward_repeat = False
                           ending_numbers = []
                           ending_markers = []
+                          repeat_markers = []
+                          ending_tags = []
                           for bar in children_named(m, "barline"):
+                              bar_location = (bar.get("location") or "").strip().lower() or "unspecified"
                               for rep in children_named(bar, "repeat"):
                                   direction = (rep.get("direction") or "").strip().lower()
                                   if direction == "forward":
                                       has_forward_repeat = True
                                   elif direction == "backward":
                                       has_backward_repeat = True
+                                  repeat_markers.append(
+                                      {
+                                          "direction": str(direction or ""),
+                                          "location": str(bar_location),
+                                      }
+                                  )
                               for ending in children_named(bar, "ending"):
+                                  ending_number_raw = (ending.get("number") or "").strip()
                                   ending_type = (ending.get("type") or "").strip().lower()
-                                  ending_tokens = parse_ending_number_tokens(ending.get("number"))
+                                  ending_tokens = parse_ending_number_tokens(ending_number_raw)
                                   if ending_type in ("start", "discontinue"):
                                       ending_numbers.extend(ending_tokens)
                                   if ending_type == "start":
                                       ending_start_count += 1
+                                  ending_tags.append(
+                                      {
+                                          "number": str(ending_number_raw),
+                                          "type": str(ending_type or ""),
+                                          "location": str(bar_location),
+                                      }
+                                  )
                                   for tok in ending_tokens:
                                       ending_markers.append(
                                           {
-                                              "number": str(tok),
-                                              "type": str(ending_type or ""),
+                                          "number": str(tok),
+                                          "type": str(ending_type or ""),
                                           }
                                       )
+
+                          direction_texts = []
+                          for direction in children_named(m, "direction"):
+                              for words in iter_named(direction, "words"):
+                                  txt = " ".join(str(words.text or "").split())
+                                  if txt:
+                                      direction_texts.append(str(txt))
+                          direction_cues = detect_ending_direction_cues(direction_texts)
 
                           if has_forward_repeat:
                               repeat_forward_count += 1
@@ -690,6 +749,11 @@ jobs:
                                   "repeat_backward": has_backward_repeat,
                                   "ending_start_numbers": ending_numbers,
                                   "ending_markers": ending_markers,
+                                  "repeat_markers": repeat_markers,
+                                  "ending_tags": ending_tags,
+                                  "direction_texts": direction_texts,
+                                  "direction_text_cues": direction_cues,
+                                  "xml_snippet": compact_xml_snippet(m, max_len=240),
                               }
                           )
               return {
@@ -1002,6 +1066,13 @@ jobs:
                               "repeat_backward": bool(ev.get("repeat_backward")),
                               "ending_start_numbers": list(ev.get("ending_start_numbers") or []),
                               "ending_markers": list(ev.get("ending_markers") or []),
+                              "repeat_markers": list(ev.get("repeat_markers") or []),
+                              "ending_tags": list(ev.get("ending_tags") or []),
+                              "direction_texts": list(ev.get("direction_texts") or []),
+                              "direction_text_cues": sorted(
+                                  {str(tok) for tok in (ev.get("direction_text_cues") or []) if str(tok)}
+                              ),
+                              "xml_snippet": str(ev.get("xml_snippet") or ""),
                           }
                       )
               return merged
@@ -1029,17 +1100,198 @@ jobs:
                   out.append(str(item))
               return out
 
+          def init_semantic_debug_v2(existing=None):
+              base = existing if isinstance(existing, dict) else {}
+              base["version"] = "ending_diag_v2"
+              base.setdefault("ending_tag_census", {})
+              base.setdefault("measure_timeline", [])
+              base.setdefault("direction_text_cues", [])
+              base.setdefault("ending_markers", [])
+              base.setdefault("ending_intervals", [])
+              base.setdefault("ending_groups", [])
+              base.setdefault("grouping_audit", [])
+              base.setdefault("suspicious_flags", [])
+              base.setdefault("decision_trace", [])
+              return base
+
+          def build_page_ending_debug(page_num, events):
+              ordered_events = sorted(
+                  list(events or []),
+                  key=lambda ev: (
+                      int(ev.get("measure_index") or 0),
+                      int(ev.get("system_index") or 0),
+                      str(ev.get("raw_measure_number") or ""),
+                  ),
+              )
+              measure_timeline = []
+              direction_text_cues = []
+              ending_markers = []
+              total_ending_tags = 0
+              ending_type_counts = {}
+              ending_number_counts = {}
+              measures_with_direction_cues = 0
+              repeat_marker_count = 0
+              for ev in ordered_events:
+                  measure_index = int(ev.get("measure_index") or 0)
+                  system_index = int(ev.get("system_index") or 0)
+                  raw_measure_number = str(ev.get("raw_measure_number") or ev.get("label") or "")
+                  repeat_markers = sorted(
+                      [
+                          {
+                              "direction": str(r.get("direction") or ""),
+                              "location": str(r.get("location") or ""),
+                          }
+                          for r in (ev.get("repeat_markers") or [])
+                      ],
+                      key=lambda r: (str(r.get("location") or ""), str(r.get("direction") or "")),
+                  )
+                  ending_tags = sorted(
+                      [
+                          {
+                              "number": str(t.get("number") or ""),
+                              "type": str(t.get("type") or ""),
+                              "location": str(t.get("location") or ""),
+                          }
+                          for t in (ev.get("ending_tags") or [])
+                      ],
+                      key=lambda t: (
+                          str(t.get("location") or ""),
+                          str(t.get("type") or ""),
+                          str(t.get("number") or ""),
+                      ),
+                  )
+                  direction_texts = [str(x) for x in (ev.get("direction_texts") or []) if str(x)]
+                  direction_cues = sorted(
+                      {str(x) for x in (ev.get("direction_text_cues") or []) if str(x)}
+                  )
+                  xml_snippet = str(ev.get("xml_snippet") or "")
+                  timeline_row = {
+                      "measure_index": int(measure_index),
+                      "system_index": int(system_index),
+                      "raw_measure_number": str(raw_measure_number),
+                      "repeat_markers": list(repeat_markers),
+                      "ending_tags": list(ending_tags),
+                      "direction_text_cues": list(direction_cues),
+                      "xml_snippet": str(xml_snippet),
+                  }
+                  measure_timeline.append(timeline_row)
+
+                  ending_short = (
+                      ",".join(
+                          f"{str(t.get('number') or '-')}/{str(t.get('type') or '-')}/{str(t.get('location') or '-')}"
+                          for t in ending_tags
+                      )
+                      if ending_tags
+                      else "-"
+                  )
+                  repeat_short = (
+                      ",".join(
+                          f"{str(r.get('direction') or '-')}/{str(r.get('location') or '-')}"
+                          for r in repeat_markers
+                      )
+                      if repeat_markers
+                      else "-"
+                  )
+                  cue_short = ",".join(direction_cues) if direction_cues else "-"
+                  print(
+                      "SEMANTIC_ENDING_MEASURE "
+                      f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                      f"raw_measure={raw_measure_number or '-'} endings={ending_short} "
+                      f"repeats={repeat_short} cues={cue_short}"
+                  )
+                  repeat_marker_count += len(repeat_markers)
+                  if direction_cues:
+                      measures_with_direction_cues += 1
+                      for cue in direction_cues:
+                          cue_row = {
+                              "measure_index": int(measure_index),
+                              "system_index": int(system_index),
+                              "token": str(cue),
+                              "source": "direction_text",
+                              "text": str(direction_texts[0] if direction_texts else ""),
+                          }
+                          direction_text_cues.append(cue_row)
+                          print(
+                              "SEMANTIC_ENDING_CUE "
+                              f"page={page_num} measure_index={measure_index} token={cue} source=direction_text"
+                          )
+
+                  for tag in ending_tags:
+                      total_ending_tags += 1
+                      tag_type = str(tag.get("type") or "")
+                      ending_type_counts[tag_type] = int(ending_type_counts.get(tag_type, 0)) + 1
+                      raw_number = str(tag.get("number") or "")
+                      parsed_numbers = parse_ending_number_tokens(raw_number)
+                      if not parsed_numbers and raw_number:
+                          parsed_numbers = [raw_number]
+                      for tok in parsed_numbers:
+                          tok_str = str(tok)
+                          ending_number_counts[tok_str] = int(ending_number_counts.get(tok_str, 0)) + 1
+                      ending_markers.append(
+                          {
+                              "measure_index": int(measure_index),
+                              "system_index": int(system_index),
+                              "raw_measure_number": str(raw_measure_number),
+                              "marker_type": str(tag_type),
+                              "marker_number": str(raw_number),
+                              "location": str(tag.get("location") or ""),
+                          }
+                      )
+
+              type_summary = ",".join(
+                  f"{key}:{int(ending_type_counts[key])}" for key in sorted(ending_type_counts.keys())
+              ) or "-"
+              number_summary = ",".join(
+                  f"{key}:{int(ending_number_counts[key])}"
+                  for key in sorted(ending_number_counts.keys(), key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)))
+              ) or "-"
+              print(
+                  "SEMANTIC_ENDING_CENSUS "
+                  f"page={page_num} tags={total_ending_tags} types={type_summary} "
+                  f"numbers={number_summary} text_cues={len(direction_text_cues)} "
+                  f"measures_with_cues={measures_with_direction_cues} repeats={repeat_marker_count}"
+              )
+
+              ending_tag_census = {
+                  "total_tags": int(total_ending_tags),
+                  "types": {str(k): int(ending_type_counts[k]) for k in sorted(ending_type_counts.keys())},
+                  "numbers": {str(k): int(ending_number_counts[k]) for k in sorted(ending_number_counts.keys())},
+                  "text_cue_count": int(len(direction_text_cues)),
+                  "measures_with_text_cues": int(measures_with_direction_cues),
+                  "repeat_marker_count": int(repeat_marker_count),
+              }
+
+              return {
+                  "version": "ending_diag_v2",
+                  "ending_tag_census": ending_tag_census,
+                  "measure_timeline": measure_timeline,
+                  "direction_text_cues": direction_text_cues,
+                  "ending_markers": ending_markers,
+                  "ending_intervals": [],
+                  "ending_groups": [],
+                  "grouping_audit": [],
+                  "suspicious_flags": [],
+                  "decision_trace": [],
+              }
+
           def build_ending_groups(page_num, events):
               ending_markers_present = False
               seen_stop_or_discontinue = False
               open_variants = {}
               intervals = []
               ending_marker_rows = []
+              grouping_audit = []
               decision_trace = []
 
               def emit_decision(msg):
                   decision_trace.append(str(msg))
                   print(f"SEMANTIC_ENDING_DECISION page={page_num} {msg}")
+
+              def add_audit(action, **kwargs):
+                  row = {"action": str(action)}
+                  for key in sorted(kwargs.keys()):
+                      row[str(key)] = kwargs[key]
+                  grouping_audit.append(row)
 
               for ev_idx, ev in enumerate(events):
                   markers = list(ev.get("ending_markers") or [])
@@ -1067,6 +1319,13 @@ jobs:
                               "marker_number": str(variant),
                           }
                       )
+                      add_audit(
+                          "marker_seen",
+                          marker_number=str(variant),
+                          marker_type=str(marker_type),
+                          measure_index=int(measure_index),
+                          system_index=int(system_index),
+                      )
                       print(
                           "SEMANTIC_ENDING_INPUT "
                           f"page={page_num} measure_index={measure_index} system_index={system_index} "
@@ -1082,6 +1341,12 @@ jobs:
                                   f"duplicate_start_ignored variant={variant} "
                                   f"measure_index={measure_index} system_index={system_index}"
                               )
+                              add_audit(
+                                  "duplicate_start_ignored",
+                                  variant=str(variant),
+                                  measure_index=int(measure_index),
+                                  system_index=int(system_index),
+                              )
                           else:
                               open_variants[variant] = int(ev_idx)
                               print(
@@ -1093,6 +1358,12 @@ jobs:
                                   f"open_interval variant={variant} measure_index={measure_index} "
                                   f"system_index={system_index}"
                               )
+                              add_audit(
+                                  "open_interval",
+                                  variant=str(variant),
+                                  start_measure_index=int(measure_index),
+                                  start_system_index=int(system_index),
+                              )
                       else:
                           start_idx = open_variants.pop(variant, None)
                           inferred_open = False
@@ -1103,11 +1374,20 @@ jobs:
                                   f"close_without_open variant={variant} type={marker_type} "
                                   f"measure_index={measure_index}"
                               )
+                              add_audit(
+                                  "close_without_open",
+                                  variant=str(variant),
+                                  marker_type=str(marker_type),
+                                  measure_index=int(measure_index),
+                              )
                           start_idx = int(start_idx)
                           end_idx = int(ev_idx)
                           start_system_index = int(events[start_idx].get("system_index") or 0)
                           end_system_index = int(system_index)
                           length_measures = max(1, end_idx - start_idx + 1)
+                          close_source = (
+                              "explicit_discontinue" if marker_type == "discontinue" else "explicit_stop"
+                          )
                           intervals.append(
                               {
                                   "variant": variant,
@@ -1117,6 +1397,7 @@ jobs:
                                   "end_system_index": end_system_index,
                                   "length_measures": int(length_measures),
                                   "close_type": str(marker_type),
+                                  "close_source": str(close_source),
                                   "inferred_open": bool(inferred_open),
                               }
                           )
@@ -1130,6 +1411,17 @@ jobs:
                           emit_decision(
                               f"close_interval variant={variant} type={marker_type} "
                               f"start_measure_index={start_idx} end_measure_index={end_idx}"
+                          )
+                          add_audit(
+                              "close_interval",
+                              variant=str(variant),
+                              start_measure_index=int(start_idx),
+                              end_measure_index=int(end_idx),
+                              start_system_index=int(start_system_index),
+                              end_system_index=int(end_system_index),
+                              close_source=str(close_source),
+                              close_without_open=bool(inferred_open),
+                              length_measures=int(length_measures),
                           )
 
               if events:
@@ -1148,6 +1440,7 @@ jobs:
                               "end_system_index": int(end_system_index),
                               "length_measures": int(length_measures),
                               "close_type": "implicit_end_of_page",
+                              "close_source": "implicit_end_of_page",
                               "inferred_open": False,
                           }
                       )
@@ -1162,12 +1455,27 @@ jobs:
                           f"auto_close_end_of_page variant={variant} start_measure_index={start_idx} "
                           f"end_measure_index={last_idx}"
                       )
+                      add_audit(
+                          "auto_close_end_of_page",
+                          variant=str(variant),
+                          start_measure_index=int(start_idx),
+                          end_measure_index=int(last_idx),
+                          start_system_index=int(start_system_index),
+                          end_system_index=int(end_system_index),
+                          close_source="implicit_end_of_page",
+                          close_without_open=False,
+                          length_measures=int(length_measures),
+                      )
 
               debug_info = {
-                  "version": "ending_diag_v1",
+                  "version": "ending_diag_v2",
+                  "ending_tag_census": {},
+                  "measure_timeline": [],
+                  "direction_text_cues": [],
                   "ending_markers": list(ending_marker_rows),
                   "ending_intervals": list(intervals),
                   "ending_groups": [],
+                  "grouping_audit": list(grouping_audit),
                   "suspicious_flags": [],
                   "decision_trace": list(decision_trace),
                   "has_stop_or_discontinue": bool(seen_stop_or_discontinue),
@@ -1176,6 +1484,8 @@ jobs:
               if not intervals:
                   if ending_markers_present:
                       emit_decision("ending_markers_present_but_no_intervals")
+                      add_audit("ending_markers_present_but_no_intervals")
+                      debug_info["grouping_audit"] = list(grouping_audit)
                       debug_info["decision_trace"] = list(decision_trace)
                       return [], True, "ending_markers_present_but_no_intervals", debug_info
                   return [], False, None, debug_info
@@ -1193,6 +1503,12 @@ jobs:
                   emit_decision(
                       f"group_key variant={interval.get('variant')} "
                       f"start_measure_index={interval.get('start_measure_index')} key_start_number={start_num}"
+                  )
+                  add_audit(
+                      "group_key",
+                      variant=str(interval.get("variant") or ""),
+                      start_measure_index=int(interval.get("start_measure_index") or 0),
+                      group_key_start_number=int(start_num),
                   )
 
               groups = []
@@ -1232,12 +1548,14 @@ jobs:
                       continue
 
                   post_system_index = None
+                  post_ending_reason = "none_found_after_max_covered_system"
                   seen_system_indices = sorted(
                       {int(ev.get("system_index") or 0) for ev in events}
                   )
                   for sys_idx in seen_system_indices:
                       if sys_idx > max_covered_system_index:
                           post_system_index = int(sys_idx)
+                          post_ending_reason = "first_system_after_max_covered_system"
                           break
 
                   variant_numbers = sorted(
@@ -1255,6 +1573,7 @@ jobs:
                       "max_covered_system_index": int(max_covered_system_index),
                       "longest_length_measures": int(longest_length),
                       "post_ending_system_index": post_system_index,
+                      "post_ending_reason": str(post_ending_reason),
                       "_variant_start_systems": [int(variant_start_systems[v]) for v in variant_numbers],
                       "_max_covered_system_index": int(max_covered_system_index),
                   }
@@ -1268,12 +1587,25 @@ jobs:
                       f"variant_lengths_measures={variant_lengths_txt or '-'} "
                       f"max_covered_system_index={int(max_covered_system_index)} "
                       f"post_ending_system_index={post_system_index if post_system_index is not None else 'none'} "
-                      f"longest_length_measures={int(longest_length)}"
+                      f"longest_length_measures={int(longest_length)} "
+                      f"post_reason={post_ending_reason}"
                   )
                   emit_decision(
                       f"group_built group_id={group['group_id']} key_start={int(start_num)} "
                       f"variants={','.join(variant_numbers)} longest={int(longest_length)} "
                       f"post_system={post_system_index if post_system_index is not None else 'none'}"
+                  )
+                  add_audit(
+                      "group_built",
+                      group_id=str(group.get("group_id") or ""),
+                      group_key_start_number=int(start_num),
+                      variants=list(variant_numbers),
+                      variant_start_system_indices=[int(variant_start_systems[v]) for v in variant_numbers],
+                      variant_lengths_measures={str(v): int(variant_lengths[v]) for v in variant_numbers},
+                      longest_length_measures=int(longest_length),
+                      max_covered_system_index=int(max_covered_system_index),
+                      post_ending_system_index=post_system_index,
+                      post_ending_reason=str(post_ending_reason),
                   )
                   groups.append(group)
                   debug_groups.append(
@@ -1285,6 +1617,7 @@ jobs:
                           "variant_lengths_measures": {str(v): int(variant_lengths[v]) for v in variant_numbers},
                           "max_covered_system_index": int(max_covered_system_index),
                           "post_ending_system_index": post_system_index,
+                          "post_ending_reason": str(post_ending_reason),
                           "longest_length_measures": int(longest_length),
                       }
                   )
@@ -1292,11 +1625,14 @@ jobs:
 
               if not groups and ending_markers_present:
                   emit_decision("ending_markers_present_but_groups_empty")
+                  add_audit("ending_markers_present_but_groups_empty")
                   debug_info["ending_groups"] = list(debug_groups)
+                  debug_info["grouping_audit"] = list(grouping_audit)
                   debug_info["decision_trace"] = list(decision_trace)
                   return [], True, "ending_markers_present_but_groups_empty", debug_info
 
               debug_info["ending_groups"] = list(debug_groups)
+              debug_info["grouping_audit"] = list(grouping_audit)
               debug_info["decision_trace"] = list(decision_trace)
               return groups, ending_markers_present, None, debug_info
 
@@ -1395,6 +1731,17 @@ jobs:
                   [row.get("variant") for row in intervals if str(row.get("variant") or "").strip()]
               )
               has_stop_or_discontinue = bool((ending_debug or {}).get("has_stop_or_discontinue"))
+              direction_text_cues = list((ending_debug or {}).get("direction_text_cues") or [])
+              cue_tokens = sorted({str(row.get("token") or "").strip() for row in direction_text_cues if str(row.get("token") or "").strip()})
+              has_repeat_marker = int((ending_debug or {}).get("ending_tag_census", {}).get("repeat_marker_count") or 0) > 0
+              structured_numbers = sorted(
+                  {
+                      str(tok)
+                      for tok in ((ending_debug or {}).get("ending_tag_census", {}).get("numbers") or {}).keys()
+                      if str(tok).strip()
+                  },
+                  key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)),
+              )
 
               if ending_markers_present and len(variants) <= 1:
                   flags.append("ending_detected_but_single_variant")
@@ -1402,6 +1749,8 @@ jobs:
                   flags.append("ending_detected_but_no_stop_or_discontinue")
               if duplicate_pair_indices and ending_markers_present and len(variants) <= 1:
                   flags.append("duplicate_system_starts_with_unresolved_variant_split")
+              if duplicate_pair_indices and ending_markers_present and len(structured_numbers) == 1:
+                  flags.append("ending_marker_only_one_number_with_duplicate_system_starts")
               if any(group.get("post_ending_system_index") is None for group in (ending_groups or [])):
                   flags.append("post_ending_system_missing")
               max_reasonable_length = max(8, len(raw_nums) * 3)
@@ -1410,6 +1759,10 @@ jobs:
                   if longest > max_reasonable_length:
                       flags.append(f"ending_length_outlier:{longest}")
                       break
+              if "2_marker" in cue_tokens and "2" not in structured_numbers:
+                  flags.append("ending_variant_text_without_structured_tag")
+              if ending_markers_present and not has_stop_or_discontinue and has_repeat_marker:
+                  flags.append("ending_stop_missing_with_repeat_present")
 
               return unique_preserve_order(flags)
 
@@ -1430,15 +1783,7 @@ jobs:
           def apply_semantic_numbering(entries, numbering_policy):
               if numbering_policy == "legacy_raw_starts":
                   for entry in entries:
-                      semantic_debug = entry.get("semantic_debug")
-                      if not isinstance(semantic_debug, dict):
-                          semantic_debug = {}
-                      semantic_debug.setdefault("version", "ending_diag_v1")
-                      semantic_debug.setdefault("ending_markers", [])
-                      semantic_debug.setdefault("ending_intervals", [])
-                      semantic_debug.setdefault("ending_groups", [])
-                      semantic_debug.setdefault("suspicious_flags", [])
-                      semantic_debug.setdefault("decision_trace", [])
+                      semantic_debug = init_semantic_debug_v2(entry.get("semantic_debug"))
                       entry["semantic_debug"] = semantic_debug
                       if entry.get("status") != "ok":
                           entry["numbering_policy"] = "legacy_raw_starts"
@@ -1464,15 +1809,7 @@ jobs:
               seen_first_page = False
 
               for entry in sorted(entries, key=lambda e: int(e.get("page_number") or 0)):
-                  semantic_debug = entry.get("semantic_debug")
-                  if not isinstance(semantic_debug, dict):
-                      semantic_debug = {}
-                  semantic_debug.setdefault("version", "ending_diag_v1")
-                  semantic_debug.setdefault("ending_markers", [])
-                  semantic_debug.setdefault("ending_intervals", [])
-                  semantic_debug.setdefault("ending_groups", [])
-                  semantic_debug.setdefault("suspicious_flags", [])
-                  semantic_debug.setdefault("decision_trace", [])
+                  semantic_debug = init_semantic_debug_v2(entry.get("semantic_debug"))
                   entry["semantic_debug"] = semantic_debug
 
                   if entry.get("status") != "ok":
@@ -1485,6 +1822,19 @@ jobs:
                   page_num = int(entry.get("page_number") or 0)
                   raw_starts = list(entry.get("system_starts_raw") or entry.get("system_starts") or [])
                   normalized_starts = list(entry.get("system_starts_normalized") or entry.get("system_starts") or [])
+                  events = list(entry.get("_semantic_measure_events") or [])
+                  page_ending_debug = build_page_ending_debug(page_num, events)
+                  semantic_debug["version"] = "ending_diag_v2"
+                  semantic_debug["ending_tag_census"] = dict(page_ending_debug.get("ending_tag_census") or {})
+                  semantic_debug["measure_timeline"] = list(page_ending_debug.get("measure_timeline") or [])
+                  semantic_debug["direction_text_cues"] = list(page_ending_debug.get("direction_text_cues") or [])
+                  semantic_debug["ending_markers"] = list(page_ending_debug.get("ending_markers") or [])
+                  semantic_debug["ending_intervals"] = []
+                  semantic_debug["ending_groups"] = []
+                  semantic_debug["grouping_audit"] = []
+                  semantic_debug["suspicious_flags"] = []
+                  semantic_debug["decision_trace"] = []
+
                   raw_nums, parse_warnings = parse_int_labels(normalized_starts, allow_normalize=False)
                   if parse_warnings:
                       entry.setdefault("semantic_warnings", []).extend(parse_warnings)
@@ -1520,7 +1870,6 @@ jobs:
                       if b == a:
                           duplicate_pair_indices.append(idx)
                       deltas.append(int(delta))
-                  events = list(entry.get("_semantic_measure_events") or [])
                   summary = dict(entry.get("semantic_events") or {})
                   pickup_detected = bool(summary.get("pickup_detected"))
                   if not seen_first_page:
@@ -1536,10 +1885,12 @@ jobs:
                       page_num,
                       events,
                   )
-                  semantic_debug["version"] = "ending_diag_v1"
-                  semantic_debug["ending_markers"] = list(ending_debug.get("ending_markers") or [])
+                  semantic_debug["ending_markers"] = list(
+                      ending_debug.get("ending_markers") or semantic_debug.get("ending_markers") or []
+                  )
                   semantic_debug["ending_intervals"] = list(ending_debug.get("ending_intervals") or [])
                   semantic_debug["ending_groups"] = list(ending_debug.get("ending_groups") or [])
+                  semantic_debug["grouping_audit"] = list(ending_debug.get("grouping_audit") or [])
                   semantic_debug["decision_trace"] = list(ending_debug.get("decision_trace") or [])
                   semantic_nums = list(base_semantic_nums)
                   ending_group_unresolved = []
@@ -1592,6 +1943,7 @@ jobs:
                               ),
                               "longest_length_measures": int(group.get("longest_length_measures") or 0),
                               "post_ending_system_index": group.get("post_ending_system_index"),
+                              "post_ending_reason": str(group.get("post_ending_reason") or ""),
                           }
                       )
 
@@ -1789,10 +2141,14 @@ jobs:
                       "semantic_warnings": [],
                       "normalization_warnings": normalization_warnings,
                       "semantic_debug": {
-                          "version": "ending_diag_v1",
+                          "version": "ending_diag_v2",
+                          "ending_tag_census": {},
+                          "measure_timeline": [],
+                          "direction_text_cues": [],
                           "ending_markers": [],
                           "ending_intervals": [],
                           "ending_groups": [],
+                          "grouping_audit": [],
                           "suspicious_flags": [],
                           "decision_trace": [],
                       },
@@ -1877,10 +2233,14 @@ jobs:
                       "semantic_warnings": [],
                       "normalization_warnings": list(best_norm_warnings),
                       "semantic_debug": {
-                          "version": "ending_diag_v1",
+                          "version": "ending_diag_v2",
+                          "ending_tag_census": {},
+                          "measure_timeline": [],
+                          "direction_text_cues": [],
                           "ending_markers": [],
                           "ending_intervals": [],
                           "ending_groups": [],
+                          "grouping_audit": [],
                           "suspicious_flags": [],
                           "decision_trace": [],
                       },
@@ -2004,6 +2364,7 @@ jobs:
           manifest_path = d.get("mxl_page_manifest_path")
           manifest_summary = {}
           semantic_suspect_pages = []
+          semantic_census_rows = []
           if manifest_path:
               manifest_summary = d.get("mxl_page_manifest_summary") or {}
               print(f"SUMMARY manifest_path={manifest_path}")
@@ -2015,20 +2376,43 @@ jobs:
               )
               try:
                   manifest_doc = json.load(open(manifest_path, "r", encoding="utf-8"))
-                  for entry in manifest_doc.get("entries") or []:
+                  manifest_entries_doc = sorted(
+                      manifest_doc.get("entries") or [],
+                      key=lambda entry: int(entry.get("page_number") or (int(entry.get("page_index", 0)) + 1)),
+                  )
+                  for entry in manifest_entries_doc:
                       dbg = entry.get("semantic_debug") or {}
                       flags = [str(flag) for flag in (dbg.get("suspicious_flags") or []) if str(flag)]
-                      if not flags:
-                          continue
                       page_no = entry.get("page_number")
                       if page_no is None:
                           page_no = int(entry.get("page_index", 0)) + 1
-                      semantic_suspect_pages.append((int(page_no), flags))
+                      page_no = int(page_no)
+                      census = dbg.get("ending_tag_census") or {}
+                      numbers_map = census.get("numbers") or {}
+                      number_keys = sorted(
+                          [str(k) for k in numbers_map.keys()],
+                          key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)),
+                      )
+                      semantic_census_rows.append(
+                          (
+                              page_no,
+                              int(census.get("total_tags") or 0),
+                              ",".join(number_keys) if number_keys else "-",
+                              int(census.get("text_cue_count") or 0),
+                          )
+                      )
+                      if flags:
+                          semantic_suspect_pages.append((page_no, flags))
               except Exception as exc:
                   print(f"SUMMARY semantic_suspect_scan_error={exc}")
 
               manifest_entries = int(manifest_summary.get("entries") or len(pages) or 0)
               print(f"SUMMARY semantic_suspect_pages={len(semantic_suspect_pages)}/{manifest_entries}")
+              for page_no, total_tags, numbers_txt, cue_count in semantic_census_rows:
+                  print(
+                      "SUMMARY semantic_census "
+                      f"page={int(page_no)} tags={int(total_tags)} numbers={numbers_txt} text_cues={int(cue_count)}"
+                  )
               for page_no, flags in semantic_suspect_pages:
                   print(
                       "SUMMARY semantic_suspect "
