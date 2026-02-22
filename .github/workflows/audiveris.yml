@@ -1109,9 +1109,14 @@ jobs:
               base.setdefault("ending_markers", [])
               base.setdefault("ending_intervals", [])
               base.setdefault("ending_groups", [])
+              base.setdefault("ending_group_merge_trace", [])
               base.setdefault("grouping_audit", [])
               base.setdefault("suspicious_flags", [])
               base.setdefault("decision_trace", [])
+              base.setdefault("ending_carry_overcount", 0)
+              base.setdefault("tail_increment_raw", None)
+              base.setdefault("tail_increment_adjusted", None)
+              base.setdefault("carry_applied_to_next_page", None)
               return base
 
           def build_page_ending_debug(page_num, events):
@@ -1269,9 +1274,14 @@ jobs:
                   "ending_markers": ending_markers,
                   "ending_intervals": [],
                   "ending_groups": [],
+                  "ending_group_merge_trace": [],
                   "grouping_audit": [],
                   "suspicious_flags": [],
                   "decision_trace": [],
+                  "ending_carry_overcount": 0,
+                  "tail_increment_raw": None,
+                  "tail_increment_adjusted": None,
+                  "carry_applied_to_next_page": None,
               }
 
           def build_ending_groups(page_num, events):
@@ -1280,6 +1290,7 @@ jobs:
               open_variants = {}
               intervals = []
               ending_marker_rows = []
+              group_merge_trace = []
               grouping_audit = []
               decision_trace = []
 
@@ -1475,10 +1486,15 @@ jobs:
                   "ending_markers": list(ending_marker_rows),
                   "ending_intervals": list(intervals),
                   "ending_groups": [],
+                  "ending_group_merge_trace": list(group_merge_trace),
                   "grouping_audit": list(grouping_audit),
                   "suspicious_flags": [],
                   "decision_trace": list(decision_trace),
                   "has_stop_or_discontinue": bool(seen_stop_or_discontinue),
+                  "ending_carry_overcount": 0,
+                  "tail_increment_raw": None,
+                  "tail_increment_adjusted": None,
+                  "carry_applied_to_next_page": None,
               }
 
               if not intervals:
@@ -1527,6 +1543,8 @@ jobs:
                   variant_start_systems = {}
                   max_covered_system_index = -1
                   start_system_candidates = []
+                  min_start_measure_index = None
+                  max_end_measure_index = None
                   for interval in group_intervals:
                       start_idx = int(interval.get("start_measure_index") or 0)
                       end_idx = int(interval.get("end_measure_index") or start_idx)
@@ -1539,6 +1557,10 @@ jobs:
                       if variant not in variant_start_systems:
                           variant_start_systems[variant] = start_sys
                       start_system_candidates.append(start_sys)
+                      if min_start_measure_index is None or start_idx < min_start_measure_index:
+                          min_start_measure_index = start_idx
+                      if max_end_measure_index is None or end_idx > max_end_measure_index:
+                          max_end_measure_index = end_idx
                       for ev_idx in range(start_idx, end_idx + 1):
                           covered_sys = int(events[ev_idx].get("system_index") or 0)
                           if covered_sys > max_covered_system_index:
@@ -1576,6 +1598,8 @@ jobs:
                       "post_ending_reason": str(post_ending_reason),
                       "_variant_start_systems": [int(variant_start_systems[v]) for v in variant_numbers],
                       "_max_covered_system_index": int(max_covered_system_index),
+                      "_min_start_measure_index": int(min_start_measure_index or 0),
+                      "_max_end_measure_index": int(max_end_measure_index or 0),
                   }
                   variant_starts_txt = ",".join(str(int(variant_start_systems[v])) for v in variant_numbers)
                   variant_lengths_txt = ",".join(f"{v}:{int(variant_lengths[v])}" for v in variant_numbers)
@@ -1608,30 +1632,284 @@ jobs:
                       post_ending_reason=str(post_ending_reason),
                   )
                   groups.append(group)
-                  debug_groups.append(
-                      {
-                          "group_id": str(group.get("group_id") or ""),
-                          "group_key_start_number": int(start_num),
+                  group_counter += 1
+
+              def variant_token_to_int(token):
+                  txt = str(token or "").strip()
+                  if not re.fullmatch(r"\d+", txt):
+                      return None
+                  try:
+                      return int(txt)
+                  except Exception:
+                      return None
+
+              if groups:
+                  seen_system_indices = sorted(
+                      {int(ev.get("system_index") or 0) for ev in events}
+                  )
+                  grouped_by_start_system = {}
+                  for group in groups:
+                      start_sys = int(group.get("start_system_index") or 0)
+                      grouped_by_start_system.setdefault(start_sys, []).append(group)
+
+                  merged_groups = []
+                  merge_counter = 1
+                  for start_sys in sorted(grouped_by_start_system.keys()):
+                      cluster = sorted(
+                          grouped_by_start_system[start_sys],
+                          key=lambda g: (
+                              int(g.get("_min_start_measure_index") or 0),
+                              int(g.get("_max_end_measure_index") or 0),
+                              str(g.get("group_id") or ""),
+                          ),
+                      )
+                      if len(cluster) == 1:
+                          g = dict(cluster[0])
+                          g["group_id"] = f"g{merge_counter}"
+                          merge_counter += 1
+                          merged_groups.append(g)
+                          continue
+
+                      merge_reasons = []
+                      variant_rows = []
+                      seen_variant_tokens = set()
+                      prev_end = None
+                      for g in cluster:
+                          variants = list(g.get("variant_numbers") or [])
+                          if len(variants) != 1:
+                              merge_reasons.append("cluster_contains_non_single_variant_group")
+                              continue
+
+                          variant_token = str(variants[0] or "").strip()
+                          variant_num = variant_token_to_int(variant_token)
+                          if variant_num is None:
+                              merge_reasons.append("cluster_contains_non_numeric_variant")
+                              continue
+                          if variant_token in seen_variant_tokens:
+                              merge_reasons.append("cluster_contains_duplicate_variant_number")
+                              continue
+                          seen_variant_tokens.add(variant_token)
+
+                          start_idx = int(g.get("_min_start_measure_index") or 0)
+                          end_idx = int(g.get("_max_end_measure_index") or start_idx)
+                          if prev_end is not None and start_idx > prev_end + 1:
+                              merge_reasons.append("cluster_variant_measure_gap")
+                          if prev_end is None:
+                              prev_end = end_idx
+                          else:
+                              prev_end = max(prev_end, end_idx)
+
+                          variant_rows.append(
+                              {
+                                  "group": g,
+                                  "variant_token": variant_token,
+                                  "variant_num": int(variant_num),
+                                  "start_idx": int(start_idx),
+                                  "end_idx": int(end_idx),
+                              }
+                          )
+
+                      if merge_reasons:
+                          merge_reasons = unique_preserve_order(merge_reasons)
+                          merge_summary = {
+                              "start_system_index": int(start_sys),
+                              "candidate_group_ids": [str(g.get("group_id") or "") for g in cluster],
+                              "status": "ambiguous",
+                              "reasons": list(merge_reasons),
+                          }
+                          group_merge_trace.append(merge_summary)
+                          print(
+                              "SEMANTIC_ENDING_GROUP_MERGE "
+                              f"page={page_num} merged_groups={','.join(merge_summary['candidate_group_ids']) or '-'} "
+                              f"status=ambiguous reasons={','.join(merge_reasons)} "
+                              f"start_system_index={int(start_sys)}"
+                          )
+                          emit_decision(
+                              f"group_merge_ambiguous start_system={int(start_sys)} "
+                              f"groups={','.join(merge_summary['candidate_group_ids']) or '-'} "
+                              f"reasons={','.join(merge_reasons)}"
+                          )
+                          add_audit(
+                              "group_merge_ambiguous",
+                              start_system_index=int(start_sys),
+                              groups=list(merge_summary["candidate_group_ids"]),
+                              reasons=list(merge_reasons),
+                          )
+                          debug_info["ending_group_merge_trace"] = list(group_merge_trace)
+                          debug_info["grouping_audit"] = list(grouping_audit)
+                          debug_info["decision_trace"] = list(decision_trace)
+                          return [], True, "ambiguous_same_system_ending_groups", debug_info
+
+                      variant_rows = sorted(
+                          variant_rows,
+                          key=lambda row: (int(row.get("variant_num") or 0), int(row.get("start_idx") or 0)),
+                      )
+                      merged_variant_lengths = {}
+                      merged_variant_start_systems = {}
+                      max_covered_system_index = -1
+                      min_start_measure_index = None
+                      max_end_measure_index = None
+                      group_key_start_number = None
+                      merged_from_ids = []
+
+                      for row in variant_rows:
+                          g = row["group"]
+                          variant_token = str(row["variant_token"])
+                          merged_from_ids.append(str(g.get("group_id") or ""))
+                          group_key = int(g.get("group_key_start_number") or 0)
+                          if group_key_start_number is None or group_key < group_key_start_number:
+                              group_key_start_number = group_key
+
+                          lengths_map = dict(g.get("variant_lengths_measures") or {})
+                          for key, val in lengths_map.items():
+                              key_txt = str(key)
+                              len_val = max(1, int(val or 1))
+                              prev_len = int(merged_variant_lengths.get(key_txt, 0))
+                              if len_val > prev_len:
+                                  merged_variant_lengths[key_txt] = len_val
+
+                          for key, val in zip(
+                              list(g.get("variant_numbers") or []),
+                              list(g.get("variant_start_system_indices") or []),
+                          ):
+                              key_txt = str(key)
+                              if key_txt not in merged_variant_start_systems:
+                                  merged_variant_start_systems[key_txt] = int(val or start_sys)
+
+                          max_covered_system_index = max(
+                              int(max_covered_system_index),
+                              int(g.get("max_covered_system_index") or g.get("_max_covered_system_index") or start_sys),
+                          )
+                          row_start = int(row.get("start_idx") or 0)
+                          row_end = int(row.get("end_idx") or row_start)
+                          if min_start_measure_index is None or row_start < min_start_measure_index:
+                              min_start_measure_index = row_start
+                          if max_end_measure_index is None or row_end > max_end_measure_index:
+                              max_end_measure_index = row_end
+
+                          if variant_token not in merged_variant_lengths:
+                              merged_variant_lengths[variant_token] = max(
+                                  1, int(g.get("longest_length_measures") or 1)
+                              )
+                          if variant_token not in merged_variant_start_systems:
+                              merged_variant_start_systems[variant_token] = int(start_sys)
+
+                      variant_numbers = sorted(
+                          list(merged_variant_lengths.keys()),
+                          key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)),
+                      )
+                      longest_length = max([int(merged_variant_lengths[v]) for v in variant_numbers] or [1])
+
+                      post_system_index = None
+                      post_ending_reason = "none_found_after_max_covered_system"
+                      for sys_idx in seen_system_indices:
+                          if int(sys_idx) > int(max_covered_system_index):
+                              post_system_index = int(sys_idx)
+                              post_ending_reason = "first_system_after_max_covered_system"
+                              break
+
+                      merged_group = {
+                          "group_id": f"g{merge_counter}",
+                          "group_key_start_number": int(group_key_start_number or 0),
+                          "start_system_index": int(start_sys),
                           "variant_numbers": list(variant_numbers),
-                          "variant_start_system_indices": [int(variant_start_systems[v]) for v in variant_numbers],
-                          "variant_lengths_measures": {str(v): int(variant_lengths[v]) for v in variant_numbers},
+                          "variant_start_system_indices": [
+                              int(merged_variant_start_systems.get(v, start_sys)) for v in variant_numbers
+                          ],
+                          "variant_lengths_measures": {
+                              str(v): int(merged_variant_lengths[v]) for v in variant_numbers
+                          },
                           "max_covered_system_index": int(max_covered_system_index),
+                          "longest_length_measures": int(longest_length),
                           "post_ending_system_index": post_system_index,
                           "post_ending_reason": str(post_ending_reason),
-                          "longest_length_measures": int(longest_length),
+                          "_variant_start_systems": [
+                              int(merged_variant_start_systems.get(v, start_sys)) for v in variant_numbers
+                          ],
+                          "_max_covered_system_index": int(max_covered_system_index),
+                          "_min_start_measure_index": int(min_start_measure_index or 0),
+                          "_max_end_measure_index": int(max_end_measure_index or 0),
                       }
+                      merge_counter += 1
+                      merged_groups.append(merged_group)
+
+                      merge_summary = {
+                          "start_system_index": int(start_sys),
+                          "candidate_group_ids": list(merged_from_ids),
+                          "result_group_id": str(merged_group.get("group_id") or ""),
+                          "variant_numbers": list(variant_numbers),
+                          "status": "merged",
+                          "min_start_measure_index": int(min_start_measure_index or 0),
+                          "max_end_measure_index": int(max_end_measure_index or 0),
+                      }
+                      group_merge_trace.append(merge_summary)
+                      print(
+                          "SEMANTIC_ENDING_GROUP_MERGE "
+                          f"page={page_num} merged_groups={','.join(merged_from_ids) or '-'} "
+                          f"variants={','.join(variant_numbers) or '-'} "
+                          f"start_system_index={int(start_sys)} "
+                          f"measure_span={int(min_start_measure_index or 0)}-{int(max_end_measure_index or 0)} "
+                          f"result_group={merged_group.get('group_id')}"
+                      )
+                      emit_decision(
+                          f"group_merge_applied start_system={int(start_sys)} "
+                          f"groups={','.join(merged_from_ids) or '-'} "
+                          f"variants={','.join(variant_numbers) or '-'} "
+                          f"result_group={merged_group.get('group_id')}"
+                      )
+                      add_audit(
+                          "group_merge_applied",
+                          start_system_index=int(start_sys),
+                          groups=list(merged_from_ids),
+                          variants=list(variant_numbers),
+                          result_group=str(merged_group.get("group_id") or ""),
+                          measure_span=[int(min_start_measure_index or 0), int(max_end_measure_index or 0)],
+                      )
+
+                  groups = sorted(
+                      merged_groups,
+                      key=lambda g: (
+                          int(g.get("start_system_index") or 0),
+                          int(g.get("_min_start_measure_index") or 0),
+                          str(g.get("group_id") or ""),
+                      ),
                   )
-                  group_counter += 1
 
               if not groups and ending_markers_present:
                   emit_decision("ending_markers_present_but_groups_empty")
                   add_audit("ending_markers_present_but_groups_empty")
-                  debug_info["ending_groups"] = list(debug_groups)
+                  debug_info["ending_groups"] = []
+                  debug_info["ending_group_merge_trace"] = list(group_merge_trace)
                   debug_info["grouping_audit"] = list(grouping_audit)
                   debug_info["decision_trace"] = list(decision_trace)
                   return [], True, "ending_markers_present_but_groups_empty", debug_info
 
+              debug_groups = []
+              for group in groups:
+                  debug_groups.append(
+                      {
+                          "group_id": str(group.get("group_id") or ""),
+                          "group_key_start_number": int(group.get("group_key_start_number") or 0),
+                          "variant_numbers": list(group.get("variant_numbers") or []),
+                          "variant_start_system_indices": list(
+                              group.get("variant_start_system_indices")
+                              or group.get("_variant_start_systems")
+                              or []
+                          ),
+                          "variant_lengths_measures": dict(group.get("variant_lengths_measures") or {}),
+                          "max_covered_system_index": int(
+                              group.get("max_covered_system_index")
+                              or group.get("_max_covered_system_index")
+                              or 0
+                          ),
+                          "post_ending_system_index": group.get("post_ending_system_index"),
+                          "post_ending_reason": str(group.get("post_ending_reason") or ""),
+                          "longest_length_measures": int(group.get("longest_length_measures") or 0),
+                      }
+                  )
+
               debug_info["ending_groups"] = list(debug_groups)
+              debug_info["ending_group_merge_trace"] = list(group_merge_trace)
               debug_info["grouping_audit"] = list(grouping_audit)
               debug_info["decision_trace"] = list(decision_trace)
               return groups, ending_markers_present, None, debug_info
@@ -1831,9 +2109,14 @@ jobs:
                   semantic_debug["ending_markers"] = list(page_ending_debug.get("ending_markers") or [])
                   semantic_debug["ending_intervals"] = []
                   semantic_debug["ending_groups"] = []
+                  semantic_debug["ending_group_merge_trace"] = []
                   semantic_debug["grouping_audit"] = []
                   semantic_debug["suspicious_flags"] = []
                   semantic_debug["decision_trace"] = []
+                  semantic_debug["ending_carry_overcount"] = 0
+                  semantic_debug["tail_increment_raw"] = None
+                  semantic_debug["tail_increment_adjusted"] = None
+                  semantic_debug["carry_applied_to_next_page"] = None
 
                   raw_nums, parse_warnings = parse_int_labels(normalized_starts, allow_normalize=False)
                   if parse_warnings:
@@ -1890,6 +2173,9 @@ jobs:
                   )
                   semantic_debug["ending_intervals"] = list(ending_debug.get("ending_intervals") or [])
                   semantic_debug["ending_groups"] = list(ending_debug.get("ending_groups") or [])
+                  semantic_debug["ending_group_merge_trace"] = list(
+                      ending_debug.get("ending_group_merge_trace") or []
+                  )
                   semantic_debug["grouping_audit"] = list(ending_debug.get("grouping_audit") or [])
                   semantic_debug["decision_trace"] = list(ending_debug.get("decision_trace") or [])
                   semantic_nums = list(base_semantic_nums)
@@ -1979,8 +2265,43 @@ jobs:
                           f"page={entry.get('page_number')} reason={warn_reason}"
                       )
 
-                  tail_increment = estimate_page_tail_increment(normalized_starts, entry.get("measures_count"))
-                  global_next_start = int(semantic_nums[-1]) + int(tail_increment)
+                  tail_increment_raw = estimate_page_tail_increment(
+                      normalized_starts,
+                      entry.get("measures_count"),
+                  )
+                  ending_carry_overcount = 0
+                  for group in ending_groups:
+                      if group.get("post_ending_system_index") is not None:
+                          continue
+                      variant_lengths = dict(group.get("variant_lengths_measures") or {})
+                      lengths = [max(1, int(v or 1)) for v in variant_lengths.values()]
+                      if len(lengths) < 2:
+                          continue
+                      overcount = max(0, int(sum(lengths)) - int(max(lengths)))
+                      if overcount <= 0:
+                          continue
+                      ending_carry_overcount += int(overcount)
+                      print(
+                          "SEMANTIC_ENDING_CARRY "
+                          f"page={page_num} group_id={group.get('group_id')} "
+                          f"overcount={int(overcount)} tail_raw={int(tail_increment_raw)} "
+                          f"tail_adjusted={max(1, int(tail_increment_raw) - int(overcount))}"
+                      )
+
+                  tail_increment_adjusted = max(
+                      1,
+                      int(tail_increment_raw) - int(ending_carry_overcount),
+                  )
+                  semantic_debug["ending_carry_overcount"] = int(ending_carry_overcount)
+                  semantic_debug["tail_increment_raw"] = int(tail_increment_raw)
+                  semantic_debug["tail_increment_adjusted"] = int(tail_increment_adjusted)
+
+                  global_next_start = int(semantic_nums[-1]) + int(tail_increment_adjusted)
+                  semantic_debug["carry_applied_to_next_page"] = int(global_next_start)
+                  print(
+                      "SEMANTIC_ENDING_CARRY_APPLY "
+                      f"page={page_num} next_page_start={int(global_next_start)}"
+                  )
                   seen_first_page = True
 
                   print(
@@ -2148,9 +2469,14 @@ jobs:
                           "ending_markers": [],
                           "ending_intervals": [],
                           "ending_groups": [],
+                          "ending_group_merge_trace": [],
                           "grouping_audit": [],
                           "suspicious_flags": [],
                           "decision_trace": [],
+                          "ending_carry_overcount": 0,
+                          "tail_increment_raw": None,
+                          "tail_increment_adjusted": None,
+                          "carry_applied_to_next_page": None,
                       },
                       "ending_anchors": [],
                       "_semantic_measure_events": merged_events,
@@ -2240,9 +2566,14 @@ jobs:
                           "ending_markers": [],
                           "ending_intervals": [],
                           "ending_groups": [],
+                          "ending_group_merge_trace": [],
                           "grouping_audit": [],
                           "suspicious_flags": [],
                           "decision_trace": [],
+                          "ending_carry_overcount": 0,
+                          "tail_increment_raw": None,
+                          "tail_increment_adjusted": None,
+                          "carry_applied_to_next_page": None,
                       },
                       "ending_anchors": [],
                       "_semantic_measure_events": [],
