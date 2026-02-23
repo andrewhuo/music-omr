@@ -931,24 +931,94 @@ jobs:
                   "error": None,
               }
 
-          def select_manifest_entry(valid_rows, target_system_count):
+          def select_manifest_entry(valid_rows, target_system_count, page_number):
+              merge_debug = {
+                  "version": "merge_overlap_diag_v1",
+                  "candidates": [],
+                  "attempted_sequences": [],
+                  "step_trace": [],
+                  "reject_reasons": [],
+                  "final_select_error_detail": None,
+              }
+
+              def add_reject(reason, **meta):
+                  row = {"reason": str(reason)}
+                  for key in sorted(meta.keys()):
+                      row[str(key)] = meta[key]
+                  merge_debug["reject_reasons"].append(row)
+
+              def add_step(action, **meta):
+                  row = {"action": str(action)}
+                  for key in sorted(meta.keys()):
+                      row[str(key)] = meta[key]
+                  merge_debug["step_trace"].append(row)
+
               if target_system_count <= 0:
-                  return None, "target_missing"
+                  merge_debug["final_select_error_detail"] = "target_missing"
+                  return None, "target_missing", merge_debug
 
               normalized = []
-              for row in valid_rows:
+              candidate_rows = sorted(
+                  list(valid_rows),
+                  key=lambda row: (int(row.get("movement_index") or 1), row.get("path") or ""),
+              )
+              for row in candidate_rows:
                   starts_raw = list(row.get("system_starts") or [])
                   nums, norm_warnings = parse_int_labels(starts_raw, allow_normalize=True)
+                  candidate_info = {
+                      "path": row.get("path"),
+                      "movement_index": int(row.get("movement_index") or 1),
+                      "raw_system_starts": list(starts_raw),
+                      "normalized_system_starts": [str(n) for n in (nums or [])],
+                      "system_count": len(starts_raw),
+                      "normalization_warnings": list(norm_warnings),
+                      "status": "accepted",
+                      "reject_reason": None,
+                  }
                   if nums is None:
-                      continue
-                  if not is_non_decreasing(nums):
-                      continue
-                  if len(nums) > 1 and not has_strict_increase(nums):
-                      continue
-                  normalized.append((row, nums, starts_raw, norm_warnings))
+                      candidate_info["status"] = "rejected"
+                      candidate_info["reject_reason"] = "candidate_non_numeric_or_unparseable"
+                      add_reject(
+                          "candidate_non_numeric_or_unparseable",
+                          path=row.get("path"),
+                          movement_index=int(row.get("movement_index") or 1),
+                      )
+                  elif not is_non_decreasing(nums):
+                      candidate_info["status"] = "rejected"
+                      candidate_info["reject_reason"] = "candidate_decreasing_sequence"
+                      add_reject(
+                          "candidate_decreasing_sequence",
+                          path=row.get("path"),
+                          movement_index=int(row.get("movement_index") or 1),
+                          normalized=[str(n) for n in nums],
+                      )
+                  elif len(nums) > 1 and not has_strict_increase(nums):
+                      candidate_info["status"] = "rejected"
+                      candidate_info["reject_reason"] = "candidate_no_strict_increase"
+                      add_reject(
+                          "candidate_no_strict_increase",
+                          path=row.get("path"),
+                          movement_index=int(row.get("movement_index") or 1),
+                          normalized=[str(n) for n in nums],
+                      )
+                  else:
+                      normalized.append((row, nums, starts_raw, norm_warnings))
+
+                  merge_debug["candidates"].append(candidate_info)
+                  print(
+                      "PAGE_XML_MERGE_CANDIDATE "
+                      f"page={page_number} movement={int(row.get('movement_index') or 1)} "
+                      f"path={row.get('path')} raw={starts_raw} normalized={[str(n) for n in (nums or [])]} "
+                      f"start_count={len(starts_raw)} "
+                      f"first={((nums or [None])[0]) if nums else 'none'} "
+                      f"last={((nums or [None])[-1]) if nums else 'none'} "
+                      f"status={candidate_info['status']} "
+                      f"reason={candidate_info['reject_reason'] or 'ok'}"
+                  )
 
               if not normalized:
-                  return None, "no_strict_numeric_candidates"
+                  merge_debug["final_select_error_detail"] = "no_strict_numeric_candidates"
+                  return None, "no_strict_numeric_candidates", merge_debug
 
               exact_rows = [
                   item
@@ -966,6 +1036,14 @@ jobs:
                           item[0].get("member") or "",
                       ),
                   )
+                  merge_debug["attempted_sequences"].append(
+                      {
+                          "mode": "single_exact",
+                          "paths": [chosen_row.get("path")],
+                          "movement_indices": [int(chosen_row.get("movement_index") or 1)],
+                      }
+                  )
+                  merge_debug["final_select_error_detail"] = "none"
                   return {
                       "kind": "single_exact",
                       "rows": [chosen_row],
@@ -981,11 +1059,19 @@ jobs:
                               "system_starts": list(chosen_raw),
                           }
                       ],
-                  }, None
+                      "merge_debug": merge_debug,
+                  }, None, merge_debug
 
               ordered = sorted(
                   normalized,
                   key=lambda item: (int(item[0].get("movement_index") or 1), item[0]["path"]),
+              )
+              merge_debug["attempted_sequences"].append(
+                  {
+                      "mode": "ordered_merge",
+                      "paths": [item[0].get("path") for item in ordered],
+                      "movement_indices": [int(item[0].get("movement_index") or 1) for item in ordered],
+                  }
               )
               merged_rows = []
               merged_nums = []
@@ -995,24 +1081,141 @@ jobs:
               any_shift = False
               merged_warnings = []
               for row, raw_nums, raw_starts, row_warnings in ordered:
+                  movement_index = int(row.get("movement_index") or 1)
                   offset = 0
+                  rule = "initial"
+                  prev_end = None
+                  raw_first = raw_nums[0]
+                  raw_last = raw_nums[-1]
                   if merged_nums:
                       prev_end = merged_nums[-1]
-                      raw_first = raw_nums[0]
+                      prev_movement_index = int(merged_rows[-1].get("movement_index") or 1)
+                      if movement_index < prev_movement_index:
+                          add_step(
+                              "reject_overlap",
+                              page=int(page_number),
+                              reason="movement_order_conflict",
+                              movement_index=int(movement_index),
+                              previous_movement_index=int(prev_movement_index),
+                              path=row.get("path"),
+                          )
+                          add_reject(
+                              "movement_order_conflict",
+                              movement_index=int(movement_index),
+                              previous_movement_index=int(prev_movement_index),
+                              path=row.get("path"),
+                          )
+                          merge_debug["final_select_error_detail"] = "movement_order_conflict"
+                          return None, "merged_overlap_without_reset", merge_debug
                       if raw_first >= prev_end:
                           offset = 0
+                          rule = "direct_append"
                       elif raw_first == 1:
                           # Deterministic reset-aware shift: keep next chunk contiguous.
                           offset = prev_end
                           any_shift = True
+                          rule = "reset_shift"
                       else:
-                          return None, "merged_overlap_without_reset"
+                          add_step(
+                              "reject_overlap",
+                              page=int(page_number),
+                              reason="overlap_without_reset_start_not_one",
+                              movement_index=int(movement_index),
+                              path=row.get("path"),
+                              prev_end=int(prev_end),
+                              next_first=int(raw_first),
+                              next_last=int(raw_last),
+                              offset_candidate=0,
+                          )
+                          add_reject(
+                              "overlap_without_reset_start_not_one",
+                              movement_index=int(movement_index),
+                              path=row.get("path"),
+                              prev_end=int(prev_end),
+                              next_first=int(raw_first),
+                          )
+                          add_reject(
+                              "target_count_unreachable_after_reject",
+                              movement_index=int(movement_index),
+                              path=row.get("path"),
+                              merged_count=int(len(merged_nums)),
+                              target_count=int(target_system_count),
+                          )
+                          merge_debug["final_select_error_detail"] = "overlap_without_reset_start_not_one"
+                          return None, "merged_overlap_without_reset", merge_debug
+
+                  add_step(
+                      "merge_step",
+                      page=int(page_number),
+                      movement_index=int(movement_index),
+                      path=row.get("path"),
+                      prev_end=(int(prev_end) if prev_end is not None else None),
+                      raw_first=int(raw_first),
+                      raw_last=int(raw_last),
+                      offset_candidate=int(offset),
+                      rule=str(rule),
+                  )
+                  print(
+                      "PAGE_XML_MERGE_STEP "
+                      f"page={page_number} movement={int(movement_index)} path={row.get('path')} "
+                      f"prev_end={(int(prev_end) if prev_end is not None else 'none')} "
+                      f"next_first={int(raw_first)} next_last={int(raw_last)} "
+                      f"offset_candidate={int(offset)} rule={rule}"
+                  )
 
                   shifted = [n + offset for n in raw_nums]
                   if merged_nums and shifted[0] < merged_nums[-1]:
-                      return None, "merged_decreasing_after_shift"
+                      add_step(
+                          "reject_overlap",
+                          page=int(page_number),
+                          reason="overlap_after_shift_still_non_increasing",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          prev_end=int(merged_nums[-1]),
+                          shifted_first=int(shifted[0]),
+                          offset_candidate=int(offset),
+                      )
+                      add_reject(
+                          "overlap_after_shift_still_non_increasing",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          prev_end=int(merged_nums[-1]),
+                          shifted_first=int(shifted[0]),
+                      )
+                      add_reject(
+                          "target_count_unreachable_after_reject",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          merged_count=int(len(merged_nums)),
+                          target_count=int(target_system_count),
+                      )
+                      merge_debug["final_select_error_detail"] = "overlap_after_shift_still_non_increasing"
+                      return None, "merged_decreasing_after_shift", merge_debug
                   if not is_non_decreasing(shifted):
-                      return None, "merged_segment_decreasing_after_shift"
+                      add_step(
+                          "reject_overlap",
+                          page=int(page_number),
+                          reason="overlap_after_shift_still_non_increasing",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          shifted=[int(n) for n in shifted],
+                          offset_candidate=int(offset),
+                      )
+                      add_reject(
+                          "overlap_after_shift_still_non_increasing",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          shifted=[int(n) for n in shifted],
+                      )
+                      add_reject(
+                          "target_count_unreachable_after_reject",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          merged_count=int(len(merged_nums)),
+                          target_count=int(target_system_count),
+                      )
+                      merge_debug["final_select_error_detail"] = "overlap_after_shift_still_non_increasing"
+                      return None, "merged_segment_decreasing_after_shift", merge_debug
 
                   merged_rows.append(row)
                   row_offsets.append(offset)
@@ -1028,6 +1231,7 @@ jobs:
                   )
 
                   if len(merged_nums) == target_system_count:
+                      merge_debug["final_select_error_detail"] = "none"
                       return {
                           "kind": "merge_shifted_exact" if any_shift else "merge_exact",
                           "rows": list(merged_rows),
@@ -1037,11 +1241,19 @@ jobs:
                           "normalization_warnings": list(merged_warnings),
                           "row_offsets": list(row_offsets),
                           "system_starts_raw_segments": list(raw_segments),
-                      }, None
+                          "merge_debug": merge_debug,
+                      }, None, merge_debug
                   if len(merged_nums) > target_system_count:
-                      return None, "merged_system_count_exceeds_target"
+                      add_reject(
+                          "target_count_unreachable_after_reject",
+                          merged_count=int(len(merged_nums)),
+                          target_count=int(target_system_count),
+                      )
+                      merge_debug["final_select_error_detail"] = "target_count_unreachable_after_reject"
+                      return None, "merged_system_count_exceeds_target", merge_debug
 
-              return None, "merged_system_count_below_target"
+              merge_debug["final_select_error_detail"] = "target_count_unreachable_after_reject"
+              return None, "merged_system_count_below_target", merge_debug
 
           def merge_measure_events(rows, offsets):
               merged = []
@@ -2361,7 +2573,7 @@ jobs:
                   f"page={page_num} omr_systems={target} candidates={len(scored)} valid_candidates={len(valid)}"
               )
 
-              selected, select_error = select_manifest_entry(valid, target)
+              selected, select_error, merge_debug = select_manifest_entry(valid, target, page_num)
 
               if selected is not None:
                   used_rows = selected["rows"]
@@ -2487,6 +2699,7 @@ jobs:
                       "retry_attempted": False,
                       "retry_profile": "none",
                       "candidate_summary": candidate_summary,
+                      "merge_debug": dict(merge_debug or {}),
                   }
                   print(
                       "PAGE_XML_SELECTED "
@@ -2584,8 +2797,14 @@ jobs:
                       "retry_attempted": False,
                       "retry_profile": "none",
                       "candidate_summary": candidate_summary,
+                      "merge_debug": dict(merge_debug or {}),
                   }
                   missing += 1
+                  if merge_debug and merge_debug.get("final_select_error_detail"):
+                      print(
+                          "PAGE_XML_UNRESOLVED_DETAIL "
+                          f"page={page_num} select_error_detail={merge_debug.get('final_select_error_detail')}"
+                      )
                   print(
                       "PAGE_XML_UNRESOLVED "
                       f"page={page_num} reason={reason} target={target} "
@@ -2696,6 +2915,7 @@ jobs:
           manifest_summary = {}
           semantic_suspect_pages = []
           semantic_census_rows = []
+          manifest_select_error_detail = {}
           if manifest_path:
               manifest_summary = d.get("mxl_page_manifest_summary") or {}
               print(f"SUMMARY manifest_path={manifest_path}")
@@ -2719,6 +2939,10 @@ jobs:
                           page_no = int(entry.get("page_index", 0)) + 1
                       page_no = int(page_no)
                       census = dbg.get("ending_tag_census") or {}
+                      merge_dbg = entry.get("merge_debug") or {}
+                      detail = merge_dbg.get("final_select_error_detail")
+                      if detail is not None and str(detail).strip():
+                          manifest_select_error_detail[page_no] = str(detail)
                       numbers_map = census.get("numbers") or {}
                       number_keys = sorted(
                           [str(k) for k in numbers_map.keys()],
@@ -2780,12 +3004,14 @@ jobs:
               if source == "mxl":
                   strict_xml_pages_ok += 1
               else:
+                  page_no = int(pg.get("page_index", 0)) + 1
                   strict_xml_missing.append(
                       (
-                          int(pg.get("page_index", 0)) + 1,
+                          page_no,
                           str(pg.get("mapping_reason")),
                           str(status),
                           str(mode),
+                          str(manifest_select_error_detail.get(page_no) or ""),
                       )
                   )
 
@@ -2810,11 +3036,14 @@ jobs:
 
           print(f"SUMMARY strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}")
           if strict_xml_pages_ok != total_pages:
-              for page_no, reason, status, mode in strict_xml_missing:
-                  print(
+              for page_no, reason, status, mode, detail in strict_xml_missing:
+                  line = (
                       "SUMMARY strict_xml_missing "
                       f"page={page_no} reason={reason} status={status} mode={mode}"
                   )
+                  if detail:
+                      line += f" select_error_detail={detail}"
+                  print(line)
               raise SystemExit(
                   f"ERROR: strict XML coverage failed strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}"
               )
