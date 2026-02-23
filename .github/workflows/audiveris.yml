@@ -1110,11 +1110,11 @@ jobs:
                       if raw_first >= prev_end:
                           offset = 0
                           rule = "direct_append"
-                      elif raw_first == 1:
-                          # Deterministic reset-aware shift: keep next chunk contiguous.
-                          offset = prev_end
+                      elif raw_first in (0, 1):
+                          # Deterministic reset-aware shift for chunks that restart at 0 or 1.
+                          offset = (prev_end + 1) - raw_first
                           any_shift = True
-                          rule = "reset_shift"
+                          rule = "reset_shift_zero_or_one"
                       else:
                           add_step(
                               "reject_overlap",
@@ -1153,6 +1153,8 @@ jobs:
                       raw_first=int(raw_first),
                       raw_last=int(raw_last),
                       offset_candidate=int(offset),
+                      computed_shifted_first=int(raw_first + offset),
+                      computed_shifted_last=int(raw_last + offset),
                       rule=str(rule),
                   )
                   print(
@@ -1160,7 +1162,10 @@ jobs:
                       f"page={page_number} movement={int(movement_index)} path={row.get('path')} "
                       f"prev_end={(int(prev_end) if prev_end is not None else 'none')} "
                       f"next_first={int(raw_first)} next_last={int(raw_last)} "
-                      f"offset_candidate={int(offset)} rule={rule}"
+                      f"offset_candidate={int(offset)} "
+                      f"computed_shifted_first={int(raw_first + offset)} "
+                      f"computed_shifted_last={int(raw_last + offset)} "
+                      f"rule={rule}"
                   )
 
                   shifted = [n + offset for n in raw_nums]
