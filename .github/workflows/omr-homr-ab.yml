@@ -1,0 +1,3853 @@
+name: OMR Engine A/B (Audiveris vs Homr)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pdf_gcs_uri:
+        description: "GCS URI to input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
+        required: true
+        type: string
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    env:
+      OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output/homr-test"
+      AUDIVERIS_IMAGE: "ghcr.io/andrewhuo/audiveris-engine@sha256:61c2a4a39e6f545bb9153a984247b83ace541196c4861329b295982e4cf57bed"
+      AUDIVERIS_VERSION: "5.9.0"
+      MEASURE_NUMBERING_POLICY: "semantic_continuous_v1"
+      ENGINE_COMPARE_MODE: "audiveris_vs_homr"
+      HOMR_ENABLE: "1"
+      HOMR_TIMEOUT_SEC: "900"
+      HOMR_IMAGE: ""
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+          create_credentials_file: true
+
+      - name: Set up Google Cloud SDK (apt)
+        run: |
+          set -euo pipefail
+          if command -v gcloud >/dev/null 2>&1; then
+            gcloud --version
+            exit 0
+          fi
+          sudo apt-get update -y
+          sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
+          curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+          sudo apt-get update -y
+          sudo apt-get install -y google-cloud-cli
+          gcloud --version
+
+      - name: Configure gcloud auth for gsutil
+        run: |
+          set -euo pipefail
+          if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+            echo "ERROR: GOOGLE_APPLICATION_CREDENTIALS not set"
+            exit 1
+          fi
+          echo "GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS}"
+          echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=${GOOGLE_APPLICATION_CREDENTIALS}" >> "$GITHUB_ENV"
+          gcloud auth login --cred-file="${GOOGLE_APPLICATION_CREDENTIALS}"
+          gcloud auth list
+
+      - name: Show run context
+        run: |
+          set -euo pipefail
+          echo "repo: $GITHUB_REPOSITORY"
+          echo "sha:  $GITHUB_SHA"
+          echo "ref:  ${GITHUB_REF_NAME:-$GITHUB_REF}"
+          echo "run_id: ${GITHUB_RUN_ID}"
+          echo "run_attempt: ${GITHUB_RUN_ATTEMPT}"
+          echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
+          echo "audiveris_image: ${AUDIVERIS_IMAGE}"
+          echo "output_prefix: ${OUTPUT_PREFIX}"
+          echo "output_contract_top_level=audiveris_out.pdf,artifacts/,homr/"
+
+      - name: Download input PDF
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/work
+          gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
+          ls -lh /tmp/work/input.pdf
+
+      - name: Run Audiveris OMR
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/work
+          mkdir -p /tmp/work/.cache /tmp/work/.config /tmp/work/tmp
+          AUDIVERIS_IMAGE_EFFECTIVE="${AUDIVERIS_IMAGE}"
+
+          echo "WORKFLOW_SIGNATURE=engine-pin-v1"
+          echo "WORKFLOW_SHA=${GITHUB_SHA}"
+          echo "AUDIVERIS_IMAGE=${AUDIVERIS_IMAGE_EFFECTIVE}"
+
+          if [[ -z "${AUDIVERIS_IMAGE_EFFECTIVE}" ]]; then
+            echo "ERROR: AUDIVERIS_IMAGE is empty"
+            exit 1
+          fi
+          if [[ "${AUDIVERIS_IMAGE_EFFECTIVE}" != audiveris-local:* && "${AUDIVERIS_IMAGE_EFFECTIVE}" != *@sha256:* ]]; then
+            echo "ERROR: audiveris_image must be pinned by digest using @sha256: (or be audiveris-local:<version>)"
+            exit 1
+          fi
+          if [[ "${AUDIVERIS_IMAGE_EFFECTIVE}" == audiveris-local:* ]]; then
+            echo "PULLING_AUDIVERIS_IMAGE=skipped_local_build"
+          else
+            echo "PULLING_AUDIVERIS_IMAGE=${AUDIVERIS_IMAGE_EFFECTIVE}"
+            docker pull "${AUDIVERIS_IMAGE_EFFECTIVE}"
+          fi
+          echo "AUDIVERIS_IMAGE_ID=$(docker image inspect "${AUDIVERIS_IMAGE_EFFECTIVE}" --format '{{.Id}}')"
+          echo "AUDIVERIS_IMAGE_REPODIGESTS=$(docker image inspect "${AUDIVERIS_IMAGE_EFFECTIVE}" --format '{{json .RepoDigests}}')"
+
+          probe_omr_version() {
+            local image="$1"
+            local required="5.9.0"
+            docker run --rm \
+              --entrypoint /bin/sh \
+              --user "$(id -u):$(id -g)" \
+              -v /tmp/work:/work \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              "$image" \
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; "$AUDI_BIN" -help >/work/audi_help_probe.txt 2>&1 || true;'
+
+            if [[ ! -f /tmp/work/audi_help_probe.txt ]]; then
+              echo "ERROR: probe output missing /tmp/work/audi_help_probe.txt"
+              exit 1
+            fi
+
+            local version_raw
+            version_raw="$(grep -Eo '([0-9]+\.[0-9]+\.[0-9]+([-.:][A-Za-z0-9]+)?)' /tmp/work/audi_help_probe.txt | head -n 1 || true)"
+            local version_num
+            version_num="$(grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' /tmp/work/audi_help_probe.txt | head -n 1 || true)"
+
+            echo "AUDIVERIS_VERSION_RAW=${version_raw}"
+            echo "AUDIVERIS_VERSION_NUM=${version_num}"
+
+            if [[ -z "${version_num}" ]]; then
+              echo "ERROR: unable to detect Audiveris version from -help output"
+              tail -n 120 /tmp/work/audi_help_probe.txt || true
+              exit 1
+            fi
+            echo "AUDIVERIS_HELP_PROBE_HEAD_BEGIN"
+            sed -n '1,80p' /tmp/work/audi_help_probe.txt || true
+            echo "AUDIVERIS_HELP_PROBE_HEAD_END"
+
+            if [[ "$(printf '%s\n%s\n' "${required}" "${version_num}" | sort -V | head -n 1)" != "${required}" ]]; then
+              echo "ERROR: Audiveris version ${version_num} is below required ${required}"
+              exit 1
+            fi
+          }
+
+          run_omr() {
+            local image="$1"
+            local out_dir_name="$2"
+            docker run --rm \
+              --entrypoint /bin/sh \
+              --user "$(id -u):$(id -g)" \
+              -v /tmp/work:/work \
+              -e AUDI_IMAGE="${image}" \
+              -e AUDI_OUT_DIR="/work/${out_dir_name}" \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              "$image" \
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN} HOME=${HOME} XDG_CACHE_HOME=${XDG_CACHE_HOME}"; "$AUDI_BIN" -help >/work/audi_help.txt 2>&1 || true; if grep -Eq "AccessDeniedException: /\\.cache|Loader\\.getCacheDir\\(\\).*null|ExceptionInInitializerError" /work/audi_help.txt; then echo "AUDIVERIS_PREFLIGHT_ERROR"; tail -n 120 /work/audi_help.txt || true; exit 86; fi; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" /work/input.pdf'
+          }
+
+          run_omr_smoke() {
+            local image="$1"
+            local out_dir_name="$2"
+            docker run --rm \
+              --entrypoint /bin/sh \
+              --user "$(id -u):$(id -g)" \
+              -v /tmp/work:/work \
+              -e AUDI_IMAGE="${image}" \
+              -e AUDI_OUT_DIR="/work/${out_dir_name}" \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              "$image" \
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_SMOKE image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN}"; echo "AUDIVERIS_SMOKE_CMD=\"${AUDI_BIN}\" -batch -export -output \"${AUDI_OUT_DIR}\" -sheets 1 -- /work/input.pdf"; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" -sheets 1 -- /work/input.pdf'
+          }
+
+          check_mxl() {
+            local out_dir="$1"
+            local context="${2:-unknown}"
+            python - "$out_dir" "$context" <<'PY'
+          import glob
+          import os
+          import re
+          import sys
+          import zipfile
+          import xml.etree.ElementTree as ET
+
+          try:
+              from lxml import etree as LET  # type: ignore
+          except Exception:
+              LET = None
+
+
+          def local(tag):
+              if isinstance(tag, str):
+                  return tag.split("}", 1)[-1] if "}" in tag else tag
+              return str(tag)
+
+
+          def count_by_tagscan(raw: bytes):
+              parts = len(re.findall(br"<\s*part(\s|>)", raw, flags=re.IGNORECASE))
+              measures = len(re.findall(br"<\s*measure(\s|>)", raw, flags=re.IGNORECASE))
+              return parts, measures
+
+
+          def score_xml_member(raw: bytes):
+              try:
+                  root = ET.fromstring(raw)
+                  parts = sum(1 for el in root.iter() if local(el.tag) == "part")
+                  measures = sum(1 for el in root.iter() if local(el.tag) == "measure")
+                  return {
+                      "parse": "stdlib",
+                      "root": local(root.tag),
+                      "parts": parts,
+                      "measures": measures,
+                  }
+              except Exception:
+                  pass
+
+              if LET is not None:
+                  try:
+                      parser = LET.XMLParser(recover=True, huge_tree=True)
+                      root = LET.fromstring(raw, parser=parser)
+                      root_name = local(root.tag) if root is not None else "unknown"
+                      parts = len(root.xpath('//*[local-name()="part"]')) if root is not None else 0
+                      measures = len(root.xpath('//*[local-name()="measure"]')) if root is not None else 0
+                      return {
+                          "parse": "lxml_recover",
+                          "root": root_name,
+                          "parts": parts,
+                          "measures": measures,
+                      }
+                  except Exception:
+                      pass
+
+              parts, measures = count_by_tagscan(raw)
+              return {
+                  "parse": "tagscan",
+                  "root": "unknown",
+                  "parts": parts,
+                  "measures": measures,
+              }
+
+
+          def score_mxl(mxl_path):
+              best_member = None
+              try:
+                  with zipfile.ZipFile(mxl_path, "r") as z:
+                      for name in z.namelist():
+                          if name.startswith("META-INF/"):
+                              continue
+                          if not (name.lower().endswith(".xml") or name.lower().endswith(".musicxml")):
+                              continue
+                          try:
+                              raw = z.read(name)
+                          except Exception:
+                              continue
+                          scored = score_xml_member(raw)
+                          cand = {"member": name, **scored}
+                          if best_member is None or (cand["measures"], cand["parts"]) > (
+                              best_member["measures"],
+                              best_member["parts"],
+                          ):
+                              best_member = cand
+              except Exception as exc:
+                  return {
+                      "path": mxl_path,
+                      "member": None,
+                      "parse": "zip_error",
+                      "root": "zip_error",
+                      "parts": 0,
+                      "measures": 0,
+                      "error": str(exc),
+                  }
+
+              if best_member is None:
+                  return {
+                      "path": mxl_path,
+                      "member": None,
+                      "parse": "none",
+                      "root": "no_xml_members",
+                      "parts": 0,
+                      "measures": 0,
+                      "error": None,
+                  }
+
+              return {"path": mxl_path, **best_member, "error": None}
+
+
+          out_dir = sys.argv[1]
+          context = sys.argv[2]
+          search_roots = [
+              os.path.join(out_dir, "*.mxl"),
+              os.path.join(out_dir, "input", "*.mxl"),
+          ]
+          mxl_candidates = sorted({path for pattern in search_roots for path in glob.glob(pattern)})
+          print(f"MXL_CHECK_SEARCH_ROOTS context={context} roots={search_roots}")
+          print(f"MXL_CHECK_CONTEXT context={context} out_dir={out_dir} candidate_count={len(mxl_candidates)}")
+          if not mxl_candidates:
+              print(f"MXL_CHECK_FAIL context={context} reason=no_mxl_files out_dir={out_dir}")
+              raise SystemExit(2)
+
+          scored = [score_mxl(path) for path in mxl_candidates]
+          for row in scored:
+              err = f" error={row['error']}" if row.get("error") else ""
+              print(
+                  "MXL_CANDIDATE "
+                  f"context={context} path={row['path']} member={row['member']} parse={row['parse']} "
+                  f"root={row['root']} parts={row['parts']} measures={row['measures']}{err}"
+              )
+
+          best = max(scored, key=lambda r: (r["measures"], r["parts"]))
+          print(
+              "MXL_SELECTED "
+              f"context={context} path={best['path']} member={best['member']} parse={best['parse']} "
+              f"parts={best['parts']} measures={best['measures']}"
+          )
+
+          with open(f"/tmp/work/selected_mxl_path_{context}.txt", "w", encoding="utf-8") as f:
+              f.write(best["path"])
+          with open(f"/tmp/work/selected_mxl_member_{context}.txt", "w", encoding="utf-8") as f:
+              f.write(best["member"] or "")
+          if context == "full":
+              with open("/tmp/work/selected_mxl_path.txt", "w", encoding="utf-8") as f:
+                  f.write(best["path"])
+              with open("/tmp/work/selected_mxl_member.txt", "w", encoding="utf-8") as f:
+                  f.write(best["member"] or "")
+
+          if best["parts"] <= 0 or best["measures"] <= 0:
+              print(
+                  "MXL_CHECK_FAIL "
+                  f"context={context} reason=parts_or_measures_zero path={best['path']} "
+                  f"member={best['member']} parts={best['parts']} measures={best['measures']}"
+              )
+              raise SystemExit(1)
+          PY
+          }
+
+          probe_omr_version "${AUDIVERIS_IMAGE_EFFECTIVE}"
+
+          SMOKE_RUN_EXIT_CODE=0
+          if run_omr_smoke "${AUDIVERIS_IMAGE_EFFECTIVE}" audiveris_smoke; then
+            SMOKE_RUN_EXIT_CODE=0
+          else
+            SMOKE_RUN_EXIT_CODE=$?
+          fi
+
+          SMOKE_MXL_OK=false
+          if check_mxl "/tmp/work/audiveris_smoke" "smoke"; then
+            SMOKE_MXL_OK=true
+          fi
+
+          if [[ "${SMOKE_RUN_EXIT_CODE}" -ne 0 || "${SMOKE_MXL_OK}" != "true" ]]; then
+            echo "SMOKE_STATUS=warn"
+            echo "SMOKE_RUN_EXIT_CODE=${SMOKE_RUN_EXIT_CODE}"
+            echo "SMOKE_MXL_OK=${SMOKE_MXL_OK}"
+            echo "SMOKE_BYPASS continuing_to_full_run=true"
+            echo "Smoke outputs (warn path):"
+            find /tmp/work/audiveris_smoke -maxdepth 4 -type f -print || true
+          else
+            echo "SMOKE_STATUS=ok"
+            echo "SMOKE_RUN_EXIT_CODE=${SMOKE_RUN_EXIT_CODE}"
+            echo "SMOKE_MXL_OK=${SMOKE_MXL_OK}"
+            echo "SMOKE_SELECTED_PATH=$(cat /tmp/work/selected_mxl_path_smoke.txt)"
+            echo "SMOKE_SELECTED_MEMBER=$(cat /tmp/work/selected_mxl_member_smoke.txt)"
+          fi
+
+          run_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" audiveris_out_try1
+          SELECTED_OUT="/tmp/work/audiveris_out_try1"
+          if ! check_mxl "$SELECTED_OUT" "full"; then
+            echo "MusicXML export has no parts/measures after successful startup."
+            echo "Failing fast in xml-strict mode (no fallback image retry)."
+            exit 1
+          fi
+
+          AUDI_SELECTED_OUT="${SELECTED_OUT}"
+          OMR_PATH=""
+          if [[ -f "${AUDI_SELECTED_OUT}/input/input.omr" ]]; then
+            OMR_PATH="${AUDI_SELECTED_OUT}/input/input.omr"
+          elif [[ -f "${AUDI_SELECTED_OUT}/input.omr" ]]; then
+            OMR_PATH="${AUDI_SELECTED_OUT}/input.omr"
+          else
+            OMR_PATH="$(find "${AUDI_SELECTED_OUT}" -maxdepth 3 -type f -name "*.omr" | head -n 1 || true)"
+          fi
+          if [[ -z "${OMR_PATH}" || ! -f "${OMR_PATH}" ]]; then
+            echo "ERROR: missing .omr output under ${AUDI_SELECTED_OUT}"
+            find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f -print || true
+            exit 1
+          fi
+          MXL_MEMBER_OVERRIDE="$(cat /tmp/work/selected_mxl_member.txt)"
+          MXL_PATH_OVERRIDE="$(cat /tmp/work/selected_mxl_path.txt)"
+          echo "AUDI_SELECTED_OUT=${AUDI_SELECTED_OUT}" >> "$GITHUB_ENV"
+          echo "AUDI_OMR_PATH=${OMR_PATH}" >> "$GITHUB_ENV"
+          echo "MXL_MEMBER_OVERRIDE=${MXL_MEMBER_OVERRIDE}" >> "$GITHUB_ENV"
+          echo "MXL_PATH_OVERRIDE=${MXL_PATH_OVERRIDE}" >> "$GITHUB_ENV"
+          echo "AUDI_SELECTED_OUT=${AUDI_SELECTED_OUT}"
+          echo "AUDI_OMR_PATH=${OMR_PATH}"
+          echo "MXL_PATH_OVERRIDE=${MXL_PATH_OVERRIDE}"
+          echo "MXL_MEMBER_OVERRIDE=${MXL_MEMBER_OVERRIDE}"
+
+          echo "Audiveris outputs:"
+          find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f -print || true
+          echo "Smoke outputs:"
+          find /tmp/work/audiveris_smoke -maxdepth 4 -type f -print || true
+          echo "MusicXML candidates:"
+          ls -lh "${AUDI_SELECTED_OUT}/input" || true
+          find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f \( -name "*.mxl" -o -name "*.musicxml" -o -name "*.xml" \) -print || true
+
+      - name: MusicXML debug (member list + head)
+        run: |
+          set -euo pipefail
+          MXL="${MXL_PATH_OVERRIDE:-}"
+          MEMBER="${MXL_MEMBER_OVERRIDE:-}"
+          if [[ -z "$MXL" && -f /tmp/work/selected_mxl_path.txt ]]; then
+            MXL="$(cat /tmp/work/selected_mxl_path.txt)"
+          fi
+          if [[ -z "$MEMBER" && -f /tmp/work/selected_mxl_member.txt ]]; then
+            MEMBER="$(cat /tmp/work/selected_mxl_member.txt)"
+          fi
+          if [[ ! -f "$MXL" ]]; then
+            echo "No MXL at $MXL"
+            find "${AUDI_SELECTED_OUT:-/tmp/work}" -maxdepth 4 -type f -print || true
+            exit 0
+          fi
+          echo "=== MXL member list (xml/musicxml only) ==="
+          unzip -l "$MXL" | grep -E '\.xml$|\.musicxml$' || true
+          echo "=== Head of selected XML member ==="
+          if [[ -n "$MEMBER" ]]; then
+            echo "Selected member: $MEMBER"
+            unzip -p "$MXL" "$MEMBER" | head -n 200 || true
+          else
+            echo "No selected member found, printing first xml member."
+            FIRST_MEMBER="$(unzip -Z1 "$MXL" | grep -E '\.xml$|\.musicxml$' | head -n 1 || true)"
+            if [[ -n "$FIRST_MEMBER" ]]; then
+              echo "First member: $FIRST_MEMBER"
+              unzip -p "$MXL" "$FIRST_MEMBER" | head -n 200 || true
+            fi
+          fi
+
+      - name: Validate OMR and print archive debug
+        run: |
+          set -euo pipefail
+          OMR="${AUDI_OMR_PATH:-}"
+          if [[ -z "$OMR" ]]; then
+            OMR="${AUDI_SELECTED_OUT}/input/input.omr"
+          fi
+          if [[ ! -f "$OMR" ]]; then
+            echo "ERROR: missing $OMR"
+            find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f -print || true
+            exit 1
+          fi
+
+          echo "Top of OMR archive listing:"
+          unzip -l "$OMR" | sed -n '1,220p'
+
+          echo "Audiveris logs (tail):"
+          for f in "${AUDI_SELECTED_OUT}"/*.log "${AUDI_SELECTED_OUT}"/input/*.log; do
+            [[ -f "$f" ]] || continue
+            echo "--- $f (last 120 lines) ---"
+            tail -n 120 "$f" || true
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0
+
+      - name: Build page-split XML manifest (strict mode)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/work/pages /tmp/work/audiveris_pages /tmp/work/page_logs
+          AUDIVERIS_IMAGE_EFFECTIVE="${AUDIVERIS_IMAGE}"
+
+          python - << 'PY'
+          import fitz
+          import os
+
+          src = "/tmp/work/input.pdf"
+          out_dir = "/tmp/work/pages"
+          os.makedirs(out_dir, exist_ok=True)
+
+          doc = fitz.open(src)
+          for idx in range(doc.page_count):
+              single = fitz.open()
+              single.insert_pdf(doc, from_page=idx, to_page=idx)
+              out_path = os.path.join(out_dir, f"page_{idx+1:04d}.pdf")
+              single.save(out_path)
+              single.close()
+          doc.close()
+          print(f"PAGE_SPLIT total_pages={len([p for p in os.listdir(out_dir) if p.endswith('.pdf')])}")
+          PY
+
+          run_page_omr() {
+            local image="$1"
+            local page_num="$2"
+            docker run --rm \
+              --entrypoint /bin/sh \
+              --user "$(id -u):$(id -g)" \
+              -v /tmp/work:/work \
+              -e PAGE_NUM="${page_num}" \
+              -e AUDI_IMAGE="${image}" \
+              -e AUDI_OUT_DIR="/work/audiveris_pages/page_${page_num}" \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              "${image}" \
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; "$AUDI_BIN" -batch -export -output "${AUDI_OUT_DIR}" "/work/pages/page_${PAGE_NUM}.pdf"'
+          }
+
+          for page_pdf in /tmp/work/pages/page_*.pdf; do
+            [[ -f "${page_pdf}" ]] || continue
+            page_num="$(basename "${page_pdf}" | sed -E 's/^page_([0-9]{4})\.pdf$/\1/')"
+            log_path="/tmp/work/page_logs/page_${page_num}.log"
+            if run_page_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" "${page_num}" >"${log_path}" 2>&1; then
+              exit_code=0
+            else
+              exit_code=$?
+            fi
+            echo "PAGE_XML_RUN page=$((10#${page_num})) image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${exit_code} log=${log_path}"
+          done
+
+          python - << 'PY'
+          import glob
+          import json
+          import os
+          import re
+          import zipfile
+          import xml.etree.ElementTree as ET
+
+          MANIFEST_PATH = "/tmp/work/mxl_page_manifest.json"
+          OMR_PATH = os.environ.get("AUDI_OMR_PATH", "").strip()
+          NUMBERING_POLICY = (os.environ.get("MEASURE_NUMBERING_POLICY", "semantic_continuous_v1") or "").strip() or "semantic_continuous_v1"
+          if NUMBERING_POLICY not in ("semantic_continuous_v1", "legacy_raw_starts"):
+              print(
+                  f"SEMANTIC_WARN page=- reason=invalid_numbering_policy:{NUMBERING_POLICY} fallback=semantic_continuous_v1"
+              )
+              NUMBERING_POLICY = "semantic_continuous_v1"
+
+          def local(tag):
+              if isinstance(tag, str):
+                  return tag.split("}", 1)[-1] if "}" in tag else tag
+              return str(tag)
+
+          def iter_named(root, name):
+              out = []
+              for el in root.iter():
+                  tag = getattr(el, "tag", None)
+                  if isinstance(tag, str) and local(tag) == name:
+                      out.append(el)
+              return out
+
+          def children_named(el, name):
+              return [c for c in list(el) if local(c.tag) == name]
+
+          def truthy_attr(v):
+              if not v:
+                  return False
+              return str(v).strip().lower() in ("1", "true", "yes")
+
+          def parse_ending_number_tokens(v):
+              if not v:
+                  return []
+              out = []
+              for tok in re.split(r"[^0-9]+", str(v)):
+                  tok = tok.strip()
+                  if tok:
+                      out.append(tok)
+              return out
+
+          def parse_xml_int(v):
+              txt = (v or "").strip()
+              if not re.fullmatch(r"-?\d+", txt):
+                  return None
+              try:
+                  return int(txt)
+              except Exception:
+                  return None
+
+          def compact_xml_snippet(el, max_len=240):
+              try:
+                  raw = ET.tostring(el, encoding="unicode")
+              except Exception:
+                  return ""
+              txt = re.sub(r"\s+", " ", str(raw or "")).strip()
+              txt = txt.replace("\n", "\\n").replace("\r", "\\r")
+              if len(txt) > max_len:
+                  return txt[: max_len - 3] + "..."
+              return txt
+
+          def detect_ending_direction_cues(texts):
+              found = []
+              patterns = [
+                  (r"\b1[\.\)]", "1_marker"),
+                  (r"\b2[\.\)]", "2_marker"),
+                  (r"\b1st\b", "1st"),
+                  (r"\b2nd\b", "2nd"),
+                  (r"\bprima\b", "prima"),
+                  (r"\bseconda\b", "seconda"),
+                  (r"\bending\b", "ending"),
+              ]
+              for raw in texts:
+                  txt = str(raw or "").strip()
+                  if not txt:
+                      continue
+                  low = txt.lower()
+                  for patt, label in patterns:
+                      if re.search(patt, low):
+                          found.append(label)
+              if not found:
+                  return []
+              return sorted({str(tok) for tok in found})
+
+          def parse_xml_member(raw):
+              try:
+                  root = ET.fromstring(raw)
+              except Exception:
+                  parts = len(re.findall(br"<\s*part(\s|>)", raw, flags=re.IGNORECASE))
+                  measures = len(re.findall(br"<\s*measure(\s|>)", raw, flags=re.IGNORECASE))
+                  return {
+                      "parse": "tagscan",
+                      "root": "unknown",
+                      "parts": parts,
+                      "measures": measures,
+                      "system_starts": [],
+                      "measure_events": [],
+                      "pickup_detected": False,
+                      "repeat_forward_count": 0,
+                      "repeat_backward_count": 0,
+                      "ending_start_count": 0,
+                  }
+
+              parts = len(iter_named(root, "part"))
+              measures = len(iter_named(root, "measure"))
+              starts = []
+              measure_events = []
+              pickup_detected = False
+              repeat_forward_count = 0
+              repeat_backward_count = 0
+              ending_start_count = 0
+
+              if local(root.tag) == "score-partwise":
+                  score_parts = children_named(root, "part")
+                  if score_parts:
+                      ms = children_named(score_parts[0], "measure")
+                  else:
+                      ms = []
+                  if ms:
+                      current_system_index = -1
+                      for i, m in enumerate(ms, start=1):
+                          label = (m.get("number") or "").strip() or str(i)
+                          measure_num_int = parse_xml_int(label)
+                          implicit = truthy_attr(m.get("implicit"))
+                          if i == 1 and implicit:
+                              pickup_detected = True
+
+                          is_new_system = (i == 1)
+                          has_system_layout = False
+                          for pr in children_named(m, "print"):
+                              is_new_system = is_new_system or truthy_attr(pr.get("new-system")) or truthy_attr(pr.get("new-page"))
+                              if children_named(pr, "system-layout"):
+                                  has_system_layout = True
+                          if is_new_system or has_system_layout:
+                              starts.append(label)
+                              current_system_index += 1
+
+                          has_forward_repeat = False
+                          has_backward_repeat = False
+                          ending_numbers = []
+                          ending_markers = []
+                          repeat_markers = []
+                          ending_tags = []
+                          for bar in children_named(m, "barline"):
+                              bar_location = (bar.get("location") or "").strip().lower() or "unspecified"
+                              for rep in children_named(bar, "repeat"):
+                                  direction = (rep.get("direction") or "").strip().lower()
+                                  if direction == "forward":
+                                      has_forward_repeat = True
+                                  elif direction == "backward":
+                                      has_backward_repeat = True
+                                  repeat_markers.append(
+                                      {
+                                          "direction": str(direction or ""),
+                                          "location": str(bar_location),
+                                      }
+                                  )
+                              for ending in children_named(bar, "ending"):
+                                  ending_number_raw = (ending.get("number") or "").strip()
+                                  ending_type = (ending.get("type") or "").strip().lower()
+                                  ending_tokens = parse_ending_number_tokens(ending_number_raw)
+                                  if ending_type in ("start", "discontinue"):
+                                      ending_numbers.extend(ending_tokens)
+                                  if ending_type == "start":
+                                      ending_start_count += 1
+                                  ending_tags.append(
+                                      {
+                                          "number": str(ending_number_raw),
+                                          "type": str(ending_type or ""),
+                                          "location": str(bar_location),
+                                      }
+                                  )
+                                  for tok in ending_tokens:
+                                      ending_markers.append(
+                                          {
+                                          "number": str(tok),
+                                          "type": str(ending_type or ""),
+                                          }
+                                      )
+
+                          direction_texts = []
+                          for direction in children_named(m, "direction"):
+                              for words in iter_named(direction, "words"):
+                                  txt = " ".join(str(words.text or "").split())
+                                  if txt:
+                                      direction_texts.append(str(txt))
+                          direction_cues = detect_ending_direction_cues(direction_texts)
+
+                          if has_forward_repeat:
+                              repeat_forward_count += 1
+                          if has_backward_repeat:
+                              repeat_backward_count += 1
+
+                          measure_events.append(
+                              {
+                                  "measure_index": i - 1,
+                                  "label": label,
+                                  "number_int": measure_num_int,
+                                  "raw_measure_number": label,
+                                  "system_index": max(0, current_system_index),
+                                  "implicit": implicit,
+                                  "system_start": bool(is_new_system or has_system_layout),
+                                  "repeat_forward": has_forward_repeat,
+                                  "repeat_backward": has_backward_repeat,
+                                  "ending_start_numbers": ending_numbers,
+                                  "ending_markers": ending_markers,
+                                  "repeat_markers": repeat_markers,
+                                  "ending_tags": ending_tags,
+                                  "direction_texts": direction_texts,
+                                  "direction_text_cues": direction_cues,
+                                  "xml_snippet": compact_xml_snippet(m, max_len=240),
+                              }
+                          )
+              return {
+                  "parse": "stdlib",
+                  "root": local(root.tag),
+                  "parts": parts,
+                  "measures": measures,
+                  "system_starts": starts,
+                  "measure_events": measure_events,
+                  "pickup_detected": pickup_detected,
+                  "repeat_forward_count": repeat_forward_count,
+                  "repeat_backward_count": repeat_backward_count,
+                  "ending_start_count": ending_start_count,
+              }
+
+          def movement_index_for_path(path):
+              base = os.path.basename(path)
+              m = re.search(r"\.mvt(\d+)\.mxl$", base, flags=re.IGNORECASE)
+              if m:
+                  try:
+                      return int(m.group(1))
+                  except Exception:
+                      return 1
+              return 1
+
+          def count_omr_systems_in_sheet(raw):
+              try:
+                  root = ET.fromstring(raw)
+              except Exception:
+                  return None
+
+              pages = root.findall("page")
+              if not pages:
+                  return 0
+
+              count = 0
+              for page in pages:
+                  systems = page.findall(".//system")
+                  if not systems:
+                      systems = page.findall("system")
+                  count += len(systems)
+              return count
+
+          def load_omr_system_targets(omr_path, total_pages):
+              targets = {}
+              if not omr_path:
+                  return targets, "missing_path", "env_AUDI_OMR_PATH_empty"
+              if not os.path.exists(omr_path):
+                  return targets, "missing_file", f"omr_not_found:{omr_path}"
+
+              try:
+                  with zipfile.ZipFile(omr_path, "r") as z:
+                      names = z.namelist()
+                      for page_num in range(1, total_pages + 1):
+                          preferred = f"sheet#{page_num}/sheet#{page_num}.xml"
+                          member = None
+                          if preferred in names:
+                              member = preferred
+                          else:
+                              for name in names:
+                                  if name.endswith("/" + preferred) or name.endswith(preferred):
+                                      member = name
+                                      break
+                          if not member:
+                              continue
+                          try:
+                              raw = z.read(member)
+                          except Exception:
+                              continue
+                          systems = count_omr_systems_in_sheet(raw)
+                          if systems is None:
+                              continue
+                          targets[page_num] = int(systems)
+              except Exception as exc:
+                  return {}, "zip_error", str(exc)
+
+              return targets, ("ok" if targets else "empty"), None
+
+          def normalize_measure_label_to_int(label, allow_normalize=True):
+              txt = str(label).strip()
+              if re.fullmatch(r"-?\d+", txt):
+                  return int(txt), False, "strict_numeric"
+              if allow_normalize:
+                  m = re.match(r"^\s*([+-]?\d+)", txt)
+                  if m:
+                      try:
+                          num = int(m.group(1))
+                      except Exception:
+                          num = None
+                      if num is not None:
+                          return num, True, f"normalized_suffix_label:{txt}->{num}"
+              return None, False, f"non_numeric_unparseable:{txt or '<empty>'}"
+
+          def parse_int_labels(labels, allow_normalize=True):
+              nums = []
+              warnings = []
+              for label in labels:
+                  num, normalized, reason = normalize_measure_label_to_int(label, allow_normalize=allow_normalize)
+                  if num is None:
+                      warnings.append(reason)
+                      return None, warnings
+                  nums.append(int(num))
+                  if normalized:
+                      warnings.append(reason)
+              return nums, warnings
+
+          def strictly_increasing(nums):
+              return all(b > a for a, b in zip(nums, nums[1:]))
+
+          def is_non_decreasing(nums):
+              return all(b >= a for a, b in zip(nums, nums[1:]))
+
+          def has_strict_increase(nums):
+              return any(b > a for a, b in zip(nums, nums[1:]))
+
+          def has_duplicate_steps(nums):
+              return any(b == a for a, b in zip(nums, nums[1:]))
+
+          def score_mxl(mxl_path):
+              best = None
+              try:
+                  with zipfile.ZipFile(mxl_path, "r") as z:
+                      for name in z.namelist():
+                          lname = name.lower()
+                          if name.startswith("META-INF/"):
+                              continue
+                          if not (lname.endswith(".xml") or lname.endswith(".musicxml")):
+                              continue
+                          try:
+                              raw = z.read(name)
+                          except Exception:
+                              continue
+                          scored = parse_xml_member(raw)
+                          cand = {"member": name, **scored}
+                          if best is None or (cand["measures"], cand["parts"]) > (best["measures"], best["parts"]):
+                              best = cand
+              except Exception as exc:
+                  return {
+                      "path": mxl_path,
+                      "member": None,
+                      "parse": "zip_error",
+                      "root": "zip_error",
+                      "parts": 0,
+                      "measures": 0,
+                      "system_starts": [],
+                      "measure_events": [],
+                      "pickup_detected": False,
+                      "repeat_forward_count": 0,
+                      "repeat_backward_count": 0,
+                      "ending_start_count": 0,
+                      "error": str(exc),
+                  }
+              if best is None:
+                  return {
+                      "path": mxl_path,
+                      "movement_index": movement_index_for_path(mxl_path),
+                      "member": None,
+                      "parse": "none",
+                      "root": "no_xml_members",
+                      "parts": 0,
+                      "measures": 0,
+                      "system_starts": [],
+                      "measure_events": [],
+                      "pickup_detected": False,
+                      "repeat_forward_count": 0,
+                      "repeat_backward_count": 0,
+                      "ending_start_count": 0,
+                      "error": None,
+                  }
+              return {
+                  "path": mxl_path,
+                  "movement_index": movement_index_for_path(mxl_path),
+                  **best,
+                  "system_count": len(best.get("system_starts") or []),
+                  "error": None,
+              }
+
+          def select_manifest_entry(valid_rows, target_system_count, page_number):
+              merge_debug = {
+                  "version": "merge_overlap_diag_v1",
+                  "candidates": [],
+                  "attempted_sequences": [],
+                  "step_trace": [],
+                  "reject_reasons": [],
+                  "final_select_error_detail": None,
+              }
+
+              def add_reject(reason, **meta):
+                  row = {"reason": str(reason)}
+                  for key in sorted(meta.keys()):
+                      row[str(key)] = meta[key]
+                  merge_debug["reject_reasons"].append(row)
+
+              def add_step(action, **meta):
+                  row = {"action": str(action)}
+                  for key in sorted(meta.keys()):
+                      row[str(key)] = meta[key]
+                  merge_debug["step_trace"].append(row)
+
+              if target_system_count <= 0:
+                  merge_debug["final_select_error_detail"] = "target_missing"
+                  return None, "target_missing", merge_debug
+
+              normalized = []
+              candidate_rows = sorted(
+                  list(valid_rows),
+                  key=lambda row: (int(row.get("movement_index") or 1), row.get("path") or ""),
+              )
+              for row in candidate_rows:
+                  starts_raw = list(row.get("system_starts") or [])
+                  nums, norm_warnings = parse_int_labels(starts_raw, allow_normalize=True)
+                  candidate_info = {
+                      "path": row.get("path"),
+                      "movement_index": int(row.get("movement_index") or 1),
+                      "raw_system_starts": list(starts_raw),
+                      "normalized_system_starts": [str(n) for n in (nums or [])],
+                      "system_count": len(starts_raw),
+                      "normalization_warnings": list(norm_warnings),
+                      "status": "accepted",
+                      "reject_reason": None,
+                  }
+                  if nums is None:
+                      candidate_info["status"] = "rejected"
+                      candidate_info["reject_reason"] = "candidate_non_numeric_or_unparseable"
+                      add_reject(
+                          "candidate_non_numeric_or_unparseable",
+                          path=row.get("path"),
+                          movement_index=int(row.get("movement_index") or 1),
+                      )
+                  elif not is_non_decreasing(nums):
+                      candidate_info["status"] = "rejected"
+                      candidate_info["reject_reason"] = "candidate_decreasing_sequence"
+                      add_reject(
+                          "candidate_decreasing_sequence",
+                          path=row.get("path"),
+                          movement_index=int(row.get("movement_index") or 1),
+                          normalized=[str(n) for n in nums],
+                      )
+                  elif len(nums) > 1 and not has_strict_increase(nums):
+                      candidate_info["status"] = "rejected"
+                      candidate_info["reject_reason"] = "candidate_no_strict_increase"
+                      add_reject(
+                          "candidate_no_strict_increase",
+                          path=row.get("path"),
+                          movement_index=int(row.get("movement_index") or 1),
+                          normalized=[str(n) for n in nums],
+                      )
+                  else:
+                      normalized.append((row, nums, starts_raw, norm_warnings))
+
+                  merge_debug["candidates"].append(candidate_info)
+                  print(
+                      "PAGE_XML_MERGE_CANDIDATE "
+                      f"page={page_number} movement={int(row.get('movement_index') or 1)} "
+                      f"path={row.get('path')} raw={starts_raw} normalized={[str(n) for n in (nums or [])]} "
+                      f"start_count={len(starts_raw)} "
+                      f"first={((nums or [None])[0]) if nums else 'none'} "
+                      f"last={((nums or [None])[-1]) if nums else 'none'} "
+                      f"status={candidate_info['status']} "
+                      f"reason={candidate_info['reject_reason'] or 'ok'}"
+                  )
+
+              if not normalized:
+                  merge_debug["final_select_error_detail"] = "no_strict_numeric_candidates"
+                  return None, "no_strict_numeric_candidates", merge_debug
+
+              exact_rows = [
+                  item
+                  for item in normalized
+                  if len(item[1]) == target_system_count
+              ]
+              if exact_rows:
+                  chosen_row, chosen_nums, chosen_raw, chosen_warnings = max(
+                      exact_rows,
+                      key=lambda item: (
+                          item[0]["measures"],
+                          item[0]["parts"],
+                          -int(item[0].get("movement_index") or 1),
+                          item[0]["path"],
+                          item[0].get("member") or "",
+                      ),
+                  )
+                  merge_debug["attempted_sequences"].append(
+                      {
+                          "mode": "single_exact",
+                          "paths": [chosen_row.get("path")],
+                          "movement_indices": [int(chosen_row.get("movement_index") or 1)],
+                      }
+                  )
+                  merge_debug["final_select_error_detail"] = "none"
+                  return {
+                      "kind": "single_exact",
+                      "rows": [chosen_row],
+                      "system_starts": [str(n) for n in chosen_nums],
+                      "raw_system_starts": list(chosen_raw),
+                      "system_starts_normalized": [str(n) for n in chosen_nums],
+                      "normalization_warnings": list(chosen_warnings),
+                      "row_offsets": [0],
+                      "system_starts_raw_segments": [
+                          {
+                              "path": chosen_row.get("path"),
+                              "movement_index": int(chosen_row.get("movement_index") or 1),
+                              "system_starts": list(chosen_raw),
+                          }
+                      ],
+                      "merge_debug": merge_debug,
+                  }, None, merge_debug
+
+              ordered = sorted(
+                  normalized,
+                  key=lambda item: (int(item[0].get("movement_index") or 1), item[0]["path"]),
+              )
+              merge_debug["attempted_sequences"].append(
+                  {
+                      "mode": "ordered_merge",
+                      "paths": [item[0].get("path") for item in ordered],
+                      "movement_indices": [int(item[0].get("movement_index") or 1) for item in ordered],
+                  }
+              )
+              merged_rows = []
+              merged_nums = []
+              merged_raw_labels = []
+              row_offsets = []
+              raw_segments = []
+              any_shift = False
+              merged_warnings = []
+              for row, raw_nums, raw_starts, row_warnings in ordered:
+                  movement_index = int(row.get("movement_index") or 1)
+                  offset = 0
+                  rule = "initial"
+                  prev_end = None
+                  raw_first = raw_nums[0]
+                  raw_last = raw_nums[-1]
+                  if merged_nums:
+                      prev_end = merged_nums[-1]
+                      prev_movement_index = int(merged_rows[-1].get("movement_index") or 1)
+                      if movement_index < prev_movement_index:
+                          add_step(
+                              "reject_overlap",
+                              page=int(page_number),
+                              reason="movement_order_conflict",
+                              movement_index=int(movement_index),
+                              previous_movement_index=int(prev_movement_index),
+                              path=row.get("path"),
+                          )
+                          add_reject(
+                              "movement_order_conflict",
+                              movement_index=int(movement_index),
+                              previous_movement_index=int(prev_movement_index),
+                              path=row.get("path"),
+                          )
+                          merge_debug["final_select_error_detail"] = "movement_order_conflict"
+                          return None, "merged_overlap_without_reset", merge_debug
+                      if raw_first >= prev_end:
+                          offset = 0
+                          rule = "direct_append"
+                      elif raw_first in (0, 1):
+                          # Deterministic reset-aware shift for chunks that restart at 0 or 1.
+                          offset = (prev_end + 1) - raw_first
+                          any_shift = True
+                          rule = "reset_shift_zero_or_one"
+                      else:
+                          add_step(
+                              "reject_overlap",
+                              page=int(page_number),
+                              reason="overlap_without_reset_start_not_one",
+                              movement_index=int(movement_index),
+                              path=row.get("path"),
+                              prev_end=int(prev_end),
+                              next_first=int(raw_first),
+                              next_last=int(raw_last),
+                              offset_candidate=0,
+                          )
+                          add_reject(
+                              "overlap_without_reset_start_not_one",
+                              movement_index=int(movement_index),
+                              path=row.get("path"),
+                              prev_end=int(prev_end),
+                              next_first=int(raw_first),
+                          )
+                          add_reject(
+                              "target_count_unreachable_after_reject",
+                              movement_index=int(movement_index),
+                              path=row.get("path"),
+                              merged_count=int(len(merged_nums)),
+                              target_count=int(target_system_count),
+                          )
+                          merge_debug["final_select_error_detail"] = "overlap_without_reset_start_not_one"
+                          return None, "merged_overlap_without_reset", merge_debug
+
+                  add_step(
+                      "merge_step",
+                      page=int(page_number),
+                      movement_index=int(movement_index),
+                      path=row.get("path"),
+                      prev_end=(int(prev_end) if prev_end is not None else None),
+                      raw_first=int(raw_first),
+                      raw_last=int(raw_last),
+                      offset_candidate=int(offset),
+                      computed_shifted_first=int(raw_first + offset),
+                      computed_shifted_last=int(raw_last + offset),
+                      rule=str(rule),
+                  )
+                  print(
+                      "PAGE_XML_MERGE_STEP "
+                      f"page={page_number} movement={int(movement_index)} path={row.get('path')} "
+                      f"prev_end={(int(prev_end) if prev_end is not None else 'none')} "
+                      f"next_first={int(raw_first)} next_last={int(raw_last)} "
+                      f"offset_candidate={int(offset)} "
+                      f"computed_shifted_first={int(raw_first + offset)} "
+                      f"computed_shifted_last={int(raw_last + offset)} "
+                      f"rule={rule}"
+                  )
+
+                  shifted = [n + offset for n in raw_nums]
+                  if merged_nums and shifted[0] < merged_nums[-1]:
+                      add_step(
+                          "reject_overlap",
+                          page=int(page_number),
+                          reason="overlap_after_shift_still_non_increasing",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          prev_end=int(merged_nums[-1]),
+                          shifted_first=int(shifted[0]),
+                          offset_candidate=int(offset),
+                      )
+                      add_reject(
+                          "overlap_after_shift_still_non_increasing",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          prev_end=int(merged_nums[-1]),
+                          shifted_first=int(shifted[0]),
+                      )
+                      add_reject(
+                          "target_count_unreachable_after_reject",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          merged_count=int(len(merged_nums)),
+                          target_count=int(target_system_count),
+                      )
+                      merge_debug["final_select_error_detail"] = "overlap_after_shift_still_non_increasing"
+                      return None, "merged_decreasing_after_shift", merge_debug
+                  if not is_non_decreasing(shifted):
+                      add_step(
+                          "reject_overlap",
+                          page=int(page_number),
+                          reason="overlap_after_shift_still_non_increasing",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          shifted=[int(n) for n in shifted],
+                          offset_candidate=int(offset),
+                      )
+                      add_reject(
+                          "overlap_after_shift_still_non_increasing",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          shifted=[int(n) for n in shifted],
+                      )
+                      add_reject(
+                          "target_count_unreachable_after_reject",
+                          movement_index=int(movement_index),
+                          path=row.get("path"),
+                          merged_count=int(len(merged_nums)),
+                          target_count=int(target_system_count),
+                      )
+                      merge_debug["final_select_error_detail"] = "overlap_after_shift_still_non_increasing"
+                      return None, "merged_segment_decreasing_after_shift", merge_debug
+
+                  merged_rows.append(row)
+                  row_offsets.append(offset)
+                  merged_nums.extend(shifted)
+                  merged_raw_labels.extend(list(raw_starts))
+                  merged_warnings.extend(list(row_warnings))
+                  raw_segments.append(
+                      {
+                          "path": row.get("path"),
+                          "movement_index": int(row.get("movement_index") or 1),
+                          "system_starts": list(raw_starts),
+                      }
+                  )
+
+                  if len(merged_nums) == target_system_count:
+                      merge_debug["final_select_error_detail"] = "none"
+                      return {
+                          "kind": "merge_shifted_exact" if any_shift else "merge_exact",
+                          "rows": list(merged_rows),
+                          "system_starts": [str(n) for n in merged_nums],
+                          "raw_system_starts": [str(x) for x in merged_raw_labels],
+                          "system_starts_normalized": [str(n) for n in merged_nums],
+                          "normalization_warnings": list(merged_warnings),
+                          "row_offsets": list(row_offsets),
+                          "system_starts_raw_segments": list(raw_segments),
+                          "merge_debug": merge_debug,
+                      }, None, merge_debug
+                  if len(merged_nums) > target_system_count:
+                      add_reject(
+                          "target_count_unreachable_after_reject",
+                          merged_count=int(len(merged_nums)),
+                          target_count=int(target_system_count),
+                      )
+                      merge_debug["final_select_error_detail"] = "target_count_unreachable_after_reject"
+                      return None, "merged_system_count_exceeds_target", merge_debug
+
+              merge_debug["final_select_error_detail"] = "target_count_unreachable_after_reject"
+              return None, "merged_system_count_below_target", merge_debug
+
+          def merge_measure_events(rows, offsets):
+              merged = []
+              for row, offset in zip(rows, offsets):
+                  row_events = list(row.get("measure_events") or [])
+                  for ev in row_events:
+                      ev_num_int = ev.get("number_int")
+                      shifted_num_int = (int(ev_num_int) + int(offset)) if ev_num_int is not None else None
+                      raw_measure_number = ev.get("raw_measure_number")
+                      if shifted_num_int is not None:
+                          raw_measure_number = str(shifted_num_int)
+                      merged.append(
+                          {
+                              "label": str(ev.get("label") or ""),
+                              "number_int": shifted_num_int,
+                              "raw_measure_number": str(raw_measure_number or ""),
+                              "measure_index": int(ev.get("measure_index") or 0),
+                              "system_index": int(ev.get("system_index") or 0),
+                              "implicit": bool(ev.get("implicit")),
+                              "system_start": bool(ev.get("system_start")),
+                              "repeat_forward": bool(ev.get("repeat_forward")),
+                              "repeat_backward": bool(ev.get("repeat_backward")),
+                              "ending_start_numbers": list(ev.get("ending_start_numbers") or []),
+                              "ending_markers": list(ev.get("ending_markers") or []),
+                              "repeat_markers": list(ev.get("repeat_markers") or []),
+                              "ending_tags": list(ev.get("ending_tags") or []),
+                              "direction_texts": list(ev.get("direction_texts") or []),
+                              "direction_text_cues": sorted(
+                                  {str(tok) for tok in (ev.get("direction_text_cues") or []) if str(tok)}
+                              ),
+                              "xml_snippet": str(ev.get("xml_snippet") or ""),
+                          }
+                      )
+              return merged
+
+          def summarize_semantic_events(events):
+              pickup = bool(events and events[0].get("implicit"))
+              repeats_forward = sum(1 for ev in events if ev.get("repeat_forward"))
+              repeats_backward = sum(1 for ev in events if ev.get("repeat_backward"))
+              endings = sum(1 for ev in events if ev.get("ending_start_numbers"))
+              return {
+                  "pickup_detected": pickup,
+                  "repeat_forward_count": repeats_forward,
+                  "repeat_backward_count": repeats_backward,
+                  "ending_start_count": endings,
+              }
+
+          def unique_preserve_order(items):
+              out = []
+              seen = set()
+              for item in items:
+                  key = str(item)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  out.append(str(item))
+              return out
+
+          def init_semantic_debug_v2(existing=None):
+              base = existing if isinstance(existing, dict) else {}
+              base["version"] = "ending_diag_v2"
+              base.setdefault("ending_tag_census", {})
+              base.setdefault("measure_timeline", [])
+              base.setdefault("direction_text_cues", [])
+              base.setdefault("ending_markers", [])
+              base.setdefault("ending_intervals", [])
+              base.setdefault("ending_groups", [])
+              base.setdefault("ending_group_merge_trace", [])
+              base.setdefault("grouping_audit", [])
+              base.setdefault("suspicious_flags", [])
+              base.setdefault("decision_trace", [])
+              base.setdefault("ending_carry_overcount", 0)
+              base.setdefault("tail_increment_raw", None)
+              base.setdefault("tail_increment_adjusted", None)
+              base.setdefault("carry_applied_to_next_page", None)
+              return base
+
+          def build_page_ending_debug(page_num, events):
+              ordered_events = sorted(
+                  list(events or []),
+                  key=lambda ev: (
+                      int(ev.get("measure_index") or 0),
+                      int(ev.get("system_index") or 0),
+                      str(ev.get("raw_measure_number") or ""),
+                  ),
+              )
+              measure_timeline = []
+              direction_text_cues = []
+              ending_markers = []
+              total_ending_tags = 0
+              ending_type_counts = {}
+              ending_number_counts = {}
+              measures_with_direction_cues = 0
+              repeat_marker_count = 0
+              for ev in ordered_events:
+                  measure_index = int(ev.get("measure_index") or 0)
+                  system_index = int(ev.get("system_index") or 0)
+                  raw_measure_number = str(ev.get("raw_measure_number") or ev.get("label") or "")
+                  repeat_markers = sorted(
+                      [
+                          {
+                              "direction": str(r.get("direction") or ""),
+                              "location": str(r.get("location") or ""),
+                          }
+                          for r in (ev.get("repeat_markers") or [])
+                      ],
+                      key=lambda r: (str(r.get("location") or ""), str(r.get("direction") or "")),
+                  )
+                  ending_tags = sorted(
+                      [
+                          {
+                              "number": str(t.get("number") or ""),
+                              "type": str(t.get("type") or ""),
+                              "location": str(t.get("location") or ""),
+                          }
+                          for t in (ev.get("ending_tags") or [])
+                      ],
+                      key=lambda t: (
+                          str(t.get("location") or ""),
+                          str(t.get("type") or ""),
+                          str(t.get("number") or ""),
+                      ),
+                  )
+                  direction_texts = [str(x) for x in (ev.get("direction_texts") or []) if str(x)]
+                  direction_cues = sorted(
+                      {str(x) for x in (ev.get("direction_text_cues") or []) if str(x)}
+                  )
+                  xml_snippet = str(ev.get("xml_snippet") or "")
+                  timeline_row = {
+                      "measure_index": int(measure_index),
+                      "system_index": int(system_index),
+                      "raw_measure_number": str(raw_measure_number),
+                      "repeat_markers": list(repeat_markers),
+                      "ending_tags": list(ending_tags),
+                      "direction_text_cues": list(direction_cues),
+                      "xml_snippet": str(xml_snippet),
+                  }
+                  measure_timeline.append(timeline_row)
+
+                  ending_short = (
+                      ",".join(
+                          f"{str(t.get('number') or '-')}/{str(t.get('type') or '-')}/{str(t.get('location') or '-')}"
+                          for t in ending_tags
+                      )
+                      if ending_tags
+                      else "-"
+                  )
+                  repeat_short = (
+                      ",".join(
+                          f"{str(r.get('direction') or '-')}/{str(r.get('location') or '-')}"
+                          for r in repeat_markers
+                      )
+                      if repeat_markers
+                      else "-"
+                  )
+                  cue_short = ",".join(direction_cues) if direction_cues else "-"
+                  print(
+                      "SEMANTIC_ENDING_MEASURE "
+                      f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                      f"raw_measure={raw_measure_number or '-'} endings={ending_short} "
+                      f"repeats={repeat_short} cues={cue_short}"
+                  )
+                  repeat_marker_count += len(repeat_markers)
+                  if direction_cues:
+                      measures_with_direction_cues += 1
+                      for cue in direction_cues:
+                          cue_row = {
+                              "measure_index": int(measure_index),
+                              "system_index": int(system_index),
+                              "token": str(cue),
+                              "source": "direction_text",
+                              "text": str(direction_texts[0] if direction_texts else ""),
+                          }
+                          direction_text_cues.append(cue_row)
+                          print(
+                              "SEMANTIC_ENDING_CUE "
+                              f"page={page_num} measure_index={measure_index} token={cue} source=direction_text"
+                          )
+
+                  for tag in ending_tags:
+                      total_ending_tags += 1
+                      tag_type = str(tag.get("type") or "")
+                      ending_type_counts[tag_type] = int(ending_type_counts.get(tag_type, 0)) + 1
+                      raw_number = str(tag.get("number") or "")
+                      parsed_numbers = parse_ending_number_tokens(raw_number)
+                      if not parsed_numbers and raw_number:
+                          parsed_numbers = [raw_number]
+                      for tok in parsed_numbers:
+                          tok_str = str(tok)
+                          ending_number_counts[tok_str] = int(ending_number_counts.get(tok_str, 0)) + 1
+                      ending_markers.append(
+                          {
+                              "measure_index": int(measure_index),
+                              "system_index": int(system_index),
+                              "raw_measure_number": str(raw_measure_number),
+                              "marker_type": str(tag_type),
+                              "marker_number": str(raw_number),
+                              "location": str(tag.get("location") or ""),
+                          }
+                      )
+
+              type_summary = ",".join(
+                  f"{key}:{int(ending_type_counts[key])}" for key in sorted(ending_type_counts.keys())
+              ) or "-"
+              number_summary = ",".join(
+                  f"{key}:{int(ending_number_counts[key])}"
+                  for key in sorted(ending_number_counts.keys(), key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)))
+              ) or "-"
+              print(
+                  "SEMANTIC_ENDING_CENSUS "
+                  f"page={page_num} tags={total_ending_tags} types={type_summary} "
+                  f"numbers={number_summary} text_cues={len(direction_text_cues)} "
+                  f"measures_with_cues={measures_with_direction_cues} repeats={repeat_marker_count}"
+              )
+
+              ending_tag_census = {
+                  "total_tags": int(total_ending_tags),
+                  "types": {str(k): int(ending_type_counts[k]) for k in sorted(ending_type_counts.keys())},
+                  "numbers": {str(k): int(ending_number_counts[k]) for k in sorted(ending_number_counts.keys())},
+                  "text_cue_count": int(len(direction_text_cues)),
+                  "measures_with_text_cues": int(measures_with_direction_cues),
+                  "repeat_marker_count": int(repeat_marker_count),
+              }
+
+              return {
+                  "version": "ending_diag_v2",
+                  "ending_tag_census": ending_tag_census,
+                  "measure_timeline": measure_timeline,
+                  "direction_text_cues": direction_text_cues,
+                  "ending_markers": ending_markers,
+                  "ending_intervals": [],
+                  "ending_groups": [],
+                  "ending_group_merge_trace": [],
+                  "grouping_audit": [],
+                  "suspicious_flags": [],
+                  "decision_trace": [],
+                  "ending_carry_overcount": 0,
+                  "tail_increment_raw": None,
+                  "tail_increment_adjusted": None,
+                  "carry_applied_to_next_page": None,
+              }
+
+          def build_ending_groups(page_num, events):
+              ending_markers_present = False
+              seen_stop_or_discontinue = False
+              open_variants = {}
+              intervals = []
+              ending_marker_rows = []
+              group_merge_trace = []
+              grouping_audit = []
+              decision_trace = []
+
+              def emit_decision(msg):
+                  decision_trace.append(str(msg))
+                  print(f"SEMANTIC_ENDING_DECISION page={page_num} {msg}")
+
+              def add_audit(action, **kwargs):
+                  row = {"action": str(action)}
+                  for key in sorted(kwargs.keys()):
+                      row[str(key)] = kwargs[key]
+                  grouping_audit.append(row)
+
+              for ev_idx, ev in enumerate(events):
+                  markers = list(ev.get("ending_markers") or [])
+                  if markers:
+                      ending_markers_present = True
+                  raw_measure = str(ev.get("raw_measure_number") or ev.get("label") or "")
+                  system_index = int(ev.get("system_index") or 0)
+                  measure_index = int(ev.get("measure_index") or ev_idx)
+                  for marker in markers:
+                      variant = str(marker.get("number") or "").strip()
+                      marker_type = str(marker.get("type") or "").strip().lower()
+                      if not variant or marker_type not in ("start", "stop", "discontinue"):
+                          emit_decision(
+                              f"ignored_marker measure_index={measure_index} system_index={system_index} "
+                              f"type={marker_type or '<empty>'} number={variant or '<empty>'}"
+                          )
+                          continue
+
+                      ending_marker_rows.append(
+                          {
+                              "measure_index": int(measure_index),
+                              "system_index": int(system_index),
+                              "raw_measure_number": str(raw_measure),
+                              "marker_type": str(marker_type),
+                              "marker_number": str(variant),
+                          }
+                      )
+                      add_audit(
+                          "marker_seen",
+                          marker_number=str(variant),
+                          marker_type=str(marker_type),
+                          measure_index=int(measure_index),
+                          system_index=int(system_index),
+                      )
+                      print(
+                          "SEMANTIC_ENDING_INPUT "
+                          f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                          f"raw_measure={raw_measure or '-'} marker_type={marker_type} marker_number={variant}"
+                      )
+
+                      if marker_type in ("stop", "discontinue"):
+                          seen_stop_or_discontinue = True
+
+                      if marker_type == "start":
+                          if variant in open_variants:
+                              emit_decision(
+                                  f"duplicate_start_ignored variant={variant} "
+                                  f"measure_index={measure_index} system_index={system_index}"
+                              )
+                              add_audit(
+                                  "duplicate_start_ignored",
+                                  variant=str(variant),
+                                  measure_index=int(measure_index),
+                                  system_index=int(system_index),
+                              )
+                          else:
+                              open_variants[variant] = int(ev_idx)
+                              print(
+                                  "SEMANTIC_ENDING_INTERVAL "
+                                  f"page={page_num} action=open variant={variant} "
+                                  f"start_measure_index={measure_index} start_system_index={system_index}"
+                              )
+                              emit_decision(
+                                  f"open_interval variant={variant} measure_index={measure_index} "
+                                  f"system_index={system_index}"
+                              )
+                              add_audit(
+                                  "open_interval",
+                                  variant=str(variant),
+                                  start_measure_index=int(measure_index),
+                                  start_system_index=int(system_index),
+                              )
+                      else:
+                          start_idx = open_variants.pop(variant, None)
+                          inferred_open = False
+                          if start_idx is None:
+                              start_idx = int(ev_idx)
+                              inferred_open = True
+                              emit_decision(
+                                  f"close_without_open variant={variant} type={marker_type} "
+                                  f"measure_index={measure_index}"
+                              )
+                              add_audit(
+                                  "close_without_open",
+                                  variant=str(variant),
+                                  marker_type=str(marker_type),
+                                  measure_index=int(measure_index),
+                              )
+                          start_idx = int(start_idx)
+                          end_idx = int(ev_idx)
+                          start_system_index = int(events[start_idx].get("system_index") or 0)
+                          end_system_index = int(system_index)
+                          length_measures = max(1, end_idx - start_idx + 1)
+                          close_source = (
+                              "explicit_discontinue" if marker_type == "discontinue" else "explicit_stop"
+                          )
+                          intervals.append(
+                              {
+                                  "variant": variant,
+                                  "start_measure_index": start_idx,
+                                  "end_measure_index": end_idx,
+                                  "start_system_index": start_system_index,
+                                  "end_system_index": end_system_index,
+                                  "length_measures": int(length_measures),
+                                  "close_type": str(marker_type),
+                                  "close_source": str(close_source),
+                                  "inferred_open": bool(inferred_open),
+                              }
+                          )
+                          print(
+                              "SEMANTIC_ENDING_INTERVAL "
+                              f"page={page_num} action=close variant={variant} "
+                              f"start_measure_index={start_idx} end_measure_index={end_idx} "
+                              f"start_system_index={start_system_index} end_system_index={end_system_index} "
+                              f"length_measures={length_measures} close_type={marker_type}"
+                          )
+                          emit_decision(
+                              f"close_interval variant={variant} type={marker_type} "
+                              f"start_measure_index={start_idx} end_measure_index={end_idx}"
+                          )
+                          add_audit(
+                              "close_interval",
+                              variant=str(variant),
+                              start_measure_index=int(start_idx),
+                              end_measure_index=int(end_idx),
+                              start_system_index=int(start_system_index),
+                              end_system_index=int(end_system_index),
+                              close_source=str(close_source),
+                              close_without_open=bool(inferred_open),
+                              length_measures=int(length_measures),
+                          )
+
+              if events:
+                  last_idx = len(events) - 1
+                  for variant, start_idx in sorted(open_variants.items(), key=lambda item: (str(item[0]), int(item[1]))):
+                      start_idx = int(start_idx)
+                      start_system_index = int(events[start_idx].get("system_index") or 0)
+                      end_system_index = int(events[last_idx].get("system_index") or 0)
+                      length_measures = max(1, last_idx - start_idx + 1)
+                      intervals.append(
+                          {
+                              "variant": str(variant),
+                              "start_measure_index": int(start_idx),
+                              "end_measure_index": int(last_idx),
+                              "start_system_index": int(start_system_index),
+                              "end_system_index": int(end_system_index),
+                              "length_measures": int(length_measures),
+                              "close_type": "implicit_end_of_page",
+                              "close_source": "implicit_end_of_page",
+                              "inferred_open": False,
+                          }
+                      )
+                      print(
+                          "SEMANTIC_ENDING_INTERVAL "
+                          f"page={page_num} action=auto_close variant={variant} "
+                          f"start_measure_index={start_idx} end_measure_index={last_idx} "
+                          f"start_system_index={start_system_index} end_system_index={end_system_index} "
+                          f"length_measures={length_measures} close_type=implicit_end_of_page"
+                      )
+                      emit_decision(
+                          f"auto_close_end_of_page variant={variant} start_measure_index={start_idx} "
+                          f"end_measure_index={last_idx}"
+                      )
+                      add_audit(
+                          "auto_close_end_of_page",
+                          variant=str(variant),
+                          start_measure_index=int(start_idx),
+                          end_measure_index=int(last_idx),
+                          start_system_index=int(start_system_index),
+                          end_system_index=int(end_system_index),
+                          close_source="implicit_end_of_page",
+                          close_without_open=False,
+                          length_measures=int(length_measures),
+                      )
+
+              debug_info = {
+                  "version": "ending_diag_v2",
+                  "ending_tag_census": {},
+                  "measure_timeline": [],
+                  "direction_text_cues": [],
+                  "ending_markers": list(ending_marker_rows),
+                  "ending_intervals": list(intervals),
+                  "ending_groups": [],
+                  "ending_group_merge_trace": list(group_merge_trace),
+                  "grouping_audit": list(grouping_audit),
+                  "suspicious_flags": [],
+                  "decision_trace": list(decision_trace),
+                  "has_stop_or_discontinue": bool(seen_stop_or_discontinue),
+                  "ending_carry_overcount": 0,
+                  "tail_increment_raw": None,
+                  "tail_increment_adjusted": None,
+                  "carry_applied_to_next_page": None,
+              }
+
+              if not intervals:
+                  if ending_markers_present:
+                      emit_decision("ending_markers_present_but_no_intervals")
+                      add_audit("ending_markers_present_but_no_intervals")
+                      debug_info["grouping_audit"] = list(grouping_audit)
+                      debug_info["decision_trace"] = list(decision_trace)
+                      return [], True, "ending_markers_present_but_no_intervals", debug_info
+                  return [], False, None, debug_info
+
+              grouped = {}
+              for interval in intervals:
+                  start_ev = events[int(interval["start_measure_index"])]
+                  start_num = start_ev.get("number_int")
+                  if start_num is None:
+                      start_num = parse_xml_int(str(start_ev.get("raw_measure_number") or ""))
+                  if start_num is None:
+                      start_num = int(interval["start_measure_index"]) + 1
+                  interval["group_key_start_number"] = int(start_num)
+                  grouped.setdefault(int(start_num), []).append(interval)
+                  emit_decision(
+                      f"group_key variant={interval.get('variant')} "
+                      f"start_measure_index={interval.get('start_measure_index')} key_start_number={start_num}"
+                  )
+                  add_audit(
+                      "group_key",
+                      variant=str(interval.get("variant") or ""),
+                      start_measure_index=int(interval.get("start_measure_index") or 0),
+                      group_key_start_number=int(start_num),
+                  )
+
+              groups = []
+              debug_groups = []
+              group_counter = 1
+              for start_num in sorted(grouped.keys()):
+                  group_intervals = sorted(
+                      grouped[start_num],
+                      key=lambda x: (
+                          int(x.get("start_measure_index") or 0),
+                          int(x.get("end_measure_index") or 0),
+                          str(x.get("variant") or ""),
+                      ),
+                  )
+                  variant_lengths = {}
+                  variant_start_systems = {}
+                  max_covered_system_index = -1
+                  start_system_candidates = []
+                  min_start_measure_index = None
+                  max_end_measure_index = None
+                  for interval in group_intervals:
+                      start_idx = int(interval.get("start_measure_index") or 0)
+                      end_idx = int(interval.get("end_measure_index") or start_idx)
+                      variant = str(interval.get("variant") or "")
+                      length = max(1, end_idx - start_idx + 1)
+                      if length > int(variant_lengths.get(variant, 0)):
+                          variant_lengths[variant] = int(length)
+
+                      start_sys = int(interval.get("start_system_index") or 0)
+                      if variant not in variant_start_systems:
+                          variant_start_systems[variant] = start_sys
+                      start_system_candidates.append(start_sys)
+                      if min_start_measure_index is None or start_idx < min_start_measure_index:
+                          min_start_measure_index = start_idx
+                      if max_end_measure_index is None or end_idx > max_end_measure_index:
+                          max_end_measure_index = end_idx
+                      for ev_idx in range(start_idx, end_idx + 1):
+                          covered_sys = int(events[ev_idx].get("system_index") or 0)
+                          if covered_sys > max_covered_system_index:
+                              max_covered_system_index = covered_sys
+
+                  if not start_system_candidates:
+                      continue
+
+                  post_system_index = None
+                  post_ending_reason = "none_found_after_max_covered_system"
+                  seen_system_indices = sorted(
+                      {int(ev.get("system_index") or 0) for ev in events}
+                  )
+                  for sys_idx in seen_system_indices:
+                      if sys_idx > max_covered_system_index:
+                          post_system_index = int(sys_idx)
+                          post_ending_reason = "first_system_after_max_covered_system"
+                          break
+
+                  variant_numbers = sorted(
+                      list(variant_lengths.keys()),
+                      key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)),
+                  )
+                  longest_length = max([int(variant_lengths[v]) for v in variant_numbers] or [1])
+                  group = {
+                      "group_id": f"g{group_counter}",
+                      "group_key_start_number": int(start_num),
+                      "start_system_index": int(min(start_system_candidates)),
+                      "variant_numbers": list(variant_numbers),
+                      "variant_start_system_indices": [int(variant_start_systems[v]) for v in variant_numbers],
+                      "variant_lengths_measures": {str(v): int(variant_lengths[v]) for v in variant_numbers},
+                      "max_covered_system_index": int(max_covered_system_index),
+                      "longest_length_measures": int(longest_length),
+                      "post_ending_system_index": post_system_index,
+                      "post_ending_reason": str(post_ending_reason),
+                      "_variant_start_systems": [int(variant_start_systems[v]) for v in variant_numbers],
+                      "_max_covered_system_index": int(max_covered_system_index),
+                      "_min_start_measure_index": int(min_start_measure_index or 0),
+                      "_max_end_measure_index": int(max_end_measure_index or 0),
+                  }
+                  variant_starts_txt = ",".join(str(int(variant_start_systems[v])) for v in variant_numbers)
+                  variant_lengths_txt = ",".join(f"{v}:{int(variant_lengths[v])}" for v in variant_numbers)
+                  print(
+                      "SEMANTIC_ENDING_GROUP_DETAIL "
+                      f"page={page_num} group_id={group['group_id']} "
+                      f"group_key_start_number={int(start_num)} variants={','.join(variant_numbers)} "
+                      f"variant_start_system_indices={variant_starts_txt or '-'} "
+                      f"variant_lengths_measures={variant_lengths_txt or '-'} "
+                      f"max_covered_system_index={int(max_covered_system_index)} "
+                      f"post_ending_system_index={post_system_index if post_system_index is not None else 'none'} "
+                      f"longest_length_measures={int(longest_length)} "
+                      f"post_reason={post_ending_reason}"
+                  )
+                  emit_decision(
+                      f"group_built group_id={group['group_id']} key_start={int(start_num)} "
+                      f"variants={','.join(variant_numbers)} longest={int(longest_length)} "
+                      f"post_system={post_system_index if post_system_index is not None else 'none'}"
+                  )
+                  add_audit(
+                      "group_built",
+                      group_id=str(group.get("group_id") or ""),
+                      group_key_start_number=int(start_num),
+                      variants=list(variant_numbers),
+                      variant_start_system_indices=[int(variant_start_systems[v]) for v in variant_numbers],
+                      variant_lengths_measures={str(v): int(variant_lengths[v]) for v in variant_numbers},
+                      longest_length_measures=int(longest_length),
+                      max_covered_system_index=int(max_covered_system_index),
+                      post_ending_system_index=post_system_index,
+                      post_ending_reason=str(post_ending_reason),
+                  )
+                  groups.append(group)
+                  group_counter += 1
+
+              def variant_token_to_int(token):
+                  txt = str(token or "").strip()
+                  if not re.fullmatch(r"\d+", txt):
+                      return None
+                  try:
+                      return int(txt)
+                  except Exception:
+                      return None
+
+              if groups:
+                  seen_system_indices = sorted(
+                      {int(ev.get("system_index") or 0) for ev in events}
+                  )
+                  grouped_by_start_system = {}
+                  for group in groups:
+                      start_sys = int(group.get("start_system_index") or 0)
+                      grouped_by_start_system.setdefault(start_sys, []).append(group)
+
+                  merged_groups = []
+                  merge_counter = 1
+                  for start_sys in sorted(grouped_by_start_system.keys()):
+                      cluster = sorted(
+                          grouped_by_start_system[start_sys],
+                          key=lambda g: (
+                              int(g.get("_min_start_measure_index") or 0),
+                              int(g.get("_max_end_measure_index") or 0),
+                              str(g.get("group_id") or ""),
+                          ),
+                      )
+                      if len(cluster) == 1:
+                          g = dict(cluster[0])
+                          g["group_id"] = f"g{merge_counter}"
+                          merge_counter += 1
+                          merged_groups.append(g)
+                          continue
+
+                      merge_reasons = []
+                      variant_rows = []
+                      seen_variant_tokens = set()
+                      prev_end = None
+                      for g in cluster:
+                          variants = list(g.get("variant_numbers") or [])
+                          if len(variants) != 1:
+                              merge_reasons.append("cluster_contains_non_single_variant_group")
+                              continue
+
+                          variant_token = str(variants[0] or "").strip()
+                          variant_num = variant_token_to_int(variant_token)
+                          if variant_num is None:
+                              merge_reasons.append("cluster_contains_non_numeric_variant")
+                              continue
+                          if variant_token in seen_variant_tokens:
+                              merge_reasons.append("cluster_contains_duplicate_variant_number")
+                              continue
+                          seen_variant_tokens.add(variant_token)
+
+                          start_idx = int(g.get("_min_start_measure_index") or 0)
+                          end_idx = int(g.get("_max_end_measure_index") or start_idx)
+                          if prev_end is not None and start_idx > prev_end + 1:
+                              merge_reasons.append("cluster_variant_measure_gap")
+                          if prev_end is None:
+                              prev_end = end_idx
+                          else:
+                              prev_end = max(prev_end, end_idx)
+
+                          variant_rows.append(
+                              {
+                                  "group": g,
+                                  "variant_token": variant_token,
+                                  "variant_num": int(variant_num),
+                                  "start_idx": int(start_idx),
+                                  "end_idx": int(end_idx),
+                              }
+                          )
+
+                      if merge_reasons:
+                          merge_reasons = unique_preserve_order(merge_reasons)
+                          merge_summary = {
+                              "start_system_index": int(start_sys),
+                              "candidate_group_ids": [str(g.get("group_id") or "") for g in cluster],
+                              "status": "ambiguous",
+                              "reasons": list(merge_reasons),
+                          }
+                          group_merge_trace.append(merge_summary)
+                          print(
+                              "SEMANTIC_ENDING_GROUP_MERGE "
+                              f"page={page_num} merged_groups={','.join(merge_summary['candidate_group_ids']) or '-'} "
+                              f"status=ambiguous reasons={','.join(merge_reasons)} "
+                              f"start_system_index={int(start_sys)}"
+                          )
+                          emit_decision(
+                              f"group_merge_ambiguous start_system={int(start_sys)} "
+                              f"groups={','.join(merge_summary['candidate_group_ids']) or '-'} "
+                              f"reasons={','.join(merge_reasons)}"
+                          )
+                          add_audit(
+                              "group_merge_ambiguous",
+                              start_system_index=int(start_sys),
+                              groups=list(merge_summary["candidate_group_ids"]),
+                              reasons=list(merge_reasons),
+                          )
+                          debug_info["ending_group_merge_trace"] = list(group_merge_trace)
+                          debug_info["grouping_audit"] = list(grouping_audit)
+                          debug_info["decision_trace"] = list(decision_trace)
+                          return [], True, "ambiguous_same_system_ending_groups", debug_info
+
+                      variant_rows = sorted(
+                          variant_rows,
+                          key=lambda row: (int(row.get("variant_num") or 0), int(row.get("start_idx") or 0)),
+                      )
+                      merged_variant_lengths = {}
+                      merged_variant_start_systems = {}
+                      max_covered_system_index = -1
+                      min_start_measure_index = None
+                      max_end_measure_index = None
+                      group_key_start_number = None
+                      merged_from_ids = []
+
+                      for row in variant_rows:
+                          g = row["group"]
+                          variant_token = str(row["variant_token"])
+                          merged_from_ids.append(str(g.get("group_id") or ""))
+                          group_key = int(g.get("group_key_start_number") or 0)
+                          if group_key_start_number is None or group_key < group_key_start_number:
+                              group_key_start_number = group_key
+
+                          lengths_map = dict(g.get("variant_lengths_measures") or {})
+                          for key, val in lengths_map.items():
+                              key_txt = str(key)
+                              len_val = max(1, int(val or 1))
+                              prev_len = int(merged_variant_lengths.get(key_txt, 0))
+                              if len_val > prev_len:
+                                  merged_variant_lengths[key_txt] = len_val
+
+                          for key, val in zip(
+                              list(g.get("variant_numbers") or []),
+                              list(g.get("variant_start_system_indices") or []),
+                          ):
+                              key_txt = str(key)
+                              if key_txt not in merged_variant_start_systems:
+                                  merged_variant_start_systems[key_txt] = int(val or start_sys)
+
+                          max_covered_system_index = max(
+                              int(max_covered_system_index),
+                              int(g.get("max_covered_system_index") or g.get("_max_covered_system_index") or start_sys),
+                          )
+                          row_start = int(row.get("start_idx") or 0)
+                          row_end = int(row.get("end_idx") or row_start)
+                          if min_start_measure_index is None or row_start < min_start_measure_index:
+                              min_start_measure_index = row_start
+                          if max_end_measure_index is None or row_end > max_end_measure_index:
+                              max_end_measure_index = row_end
+
+                          if variant_token not in merged_variant_lengths:
+                              merged_variant_lengths[variant_token] = max(
+                                  1, int(g.get("longest_length_measures") or 1)
+                              )
+                          if variant_token not in merged_variant_start_systems:
+                              merged_variant_start_systems[variant_token] = int(start_sys)
+
+                      variant_numbers = sorted(
+                          list(merged_variant_lengths.keys()),
+                          key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)),
+                      )
+                      longest_length = max([int(merged_variant_lengths[v]) for v in variant_numbers] or [1])
+
+                      post_system_index = None
+                      post_ending_reason = "none_found_after_max_covered_system"
+                      for sys_idx in seen_system_indices:
+                          if int(sys_idx) > int(max_covered_system_index):
+                              post_system_index = int(sys_idx)
+                              post_ending_reason = "first_system_after_max_covered_system"
+                              break
+
+                      merged_group = {
+                          "group_id": f"g{merge_counter}",
+                          "group_key_start_number": int(group_key_start_number or 0),
+                          "start_system_index": int(start_sys),
+                          "variant_numbers": list(variant_numbers),
+                          "variant_start_system_indices": [
+                              int(merged_variant_start_systems.get(v, start_sys)) for v in variant_numbers
+                          ],
+                          "variant_lengths_measures": {
+                              str(v): int(merged_variant_lengths[v]) for v in variant_numbers
+                          },
+                          "max_covered_system_index": int(max_covered_system_index),
+                          "longest_length_measures": int(longest_length),
+                          "post_ending_system_index": post_system_index,
+                          "post_ending_reason": str(post_ending_reason),
+                          "_variant_start_systems": [
+                              int(merged_variant_start_systems.get(v, start_sys)) for v in variant_numbers
+                          ],
+                          "_max_covered_system_index": int(max_covered_system_index),
+                          "_min_start_measure_index": int(min_start_measure_index or 0),
+                          "_max_end_measure_index": int(max_end_measure_index or 0),
+                      }
+                      merge_counter += 1
+                      merged_groups.append(merged_group)
+
+                      merge_summary = {
+                          "start_system_index": int(start_sys),
+                          "candidate_group_ids": list(merged_from_ids),
+                          "result_group_id": str(merged_group.get("group_id") or ""),
+                          "variant_numbers": list(variant_numbers),
+                          "status": "merged",
+                          "min_start_measure_index": int(min_start_measure_index or 0),
+                          "max_end_measure_index": int(max_end_measure_index or 0),
+                      }
+                      group_merge_trace.append(merge_summary)
+                      print(
+                          "SEMANTIC_ENDING_GROUP_MERGE "
+                          f"page={page_num} merged_groups={','.join(merged_from_ids) or '-'} "
+                          f"variants={','.join(variant_numbers) or '-'} "
+                          f"start_system_index={int(start_sys)} "
+                          f"measure_span={int(min_start_measure_index or 0)}-{int(max_end_measure_index or 0)} "
+                          f"result_group={merged_group.get('group_id')}"
+                      )
+                      emit_decision(
+                          f"group_merge_applied start_system={int(start_sys)} "
+                          f"groups={','.join(merged_from_ids) or '-'} "
+                          f"variants={','.join(variant_numbers) or '-'} "
+                          f"result_group={merged_group.get('group_id')}"
+                      )
+                      add_audit(
+                          "group_merge_applied",
+                          start_system_index=int(start_sys),
+                          groups=list(merged_from_ids),
+                          variants=list(variant_numbers),
+                          result_group=str(merged_group.get("group_id") or ""),
+                          measure_span=[int(min_start_measure_index or 0), int(max_end_measure_index or 0)],
+                      )
+
+                  groups = sorted(
+                      merged_groups,
+                      key=lambda g: (
+                          int(g.get("start_system_index") or 0),
+                          int(g.get("_min_start_measure_index") or 0),
+                          str(g.get("group_id") or ""),
+                      ),
+                  )
+
+              if not groups and ending_markers_present:
+                  emit_decision("ending_markers_present_but_groups_empty")
+                  add_audit("ending_markers_present_but_groups_empty")
+                  debug_info["ending_groups"] = []
+                  debug_info["ending_group_merge_trace"] = list(group_merge_trace)
+                  debug_info["grouping_audit"] = list(grouping_audit)
+                  debug_info["decision_trace"] = list(decision_trace)
+                  return [], True, "ending_markers_present_but_groups_empty", debug_info
+
+              debug_groups = []
+              for group in groups:
+                  debug_groups.append(
+                      {
+                          "group_id": str(group.get("group_id") or ""),
+                          "group_key_start_number": int(group.get("group_key_start_number") or 0),
+                          "variant_numbers": list(group.get("variant_numbers") or []),
+                          "variant_start_system_indices": list(
+                              group.get("variant_start_system_indices")
+                              or group.get("_variant_start_systems")
+                              or []
+                          ),
+                          "variant_lengths_measures": dict(group.get("variant_lengths_measures") or {}),
+                          "max_covered_system_index": int(
+                              group.get("max_covered_system_index")
+                              or group.get("_max_covered_system_index")
+                              or 0
+                          ),
+                          "post_ending_system_index": group.get("post_ending_system_index"),
+                          "post_ending_reason": str(group.get("post_ending_reason") or ""),
+                          "longest_length_measures": int(group.get("longest_length_measures") or 0),
+                      }
+                  )
+
+              debug_info["ending_groups"] = list(debug_groups)
+              debug_info["ending_group_merge_trace"] = list(group_merge_trace)
+              debug_info["grouping_audit"] = list(grouping_audit)
+              debug_info["decision_trace"] = list(decision_trace)
+              return groups, ending_markers_present, None, debug_info
+
+          def apply_longest_ending_groups(page_num, semantic_nums, ending_groups, decision_trace=None):
+              adjusted = [int(x) for x in semantic_nums]
+              unresolved = []
+              if decision_trace is None:
+                  decision_trace = []
+
+              def emit_decision(msg):
+                  decision_trace.append(str(msg))
+                  print(f"SEMANTIC_ENDING_DECISION page={page_num} {msg}")
+
+              for group in sorted(
+                  ending_groups,
+                  key=lambda g: (int(g.get("start_system_index") or 0), str(g.get("group_id") or "")),
+              ):
+                  start_system_index = group.get("start_system_index")
+                  longest_length = int(group.get("longest_length_measures") or 0)
+                  post_system_index = group.get("post_ending_system_index")
+                  variant_numbers = list(group.get("variant_numbers") or [])
+                  variant_starts = list(group.get("_variant_start_systems") or [])
+
+                  if (
+                      start_system_index is None
+                      or int(start_system_index) < 0
+                      or int(start_system_index) >= len(adjusted)
+                      or longest_length <= 0
+                  ):
+                      unresolved.append("invalid_ending_group_geometry")
+                      emit_decision(
+                          f"invalid_group_geometry group_id={group.get('group_id')} "
+                          f"start_system_index={start_system_index} longest={longest_length}"
+                      )
+                      continue
+
+                  start_system_index = int(start_system_index)
+                  shared_start = int(adjusted[start_system_index])
+
+                  for sys_idx in variant_starts:
+                      if 0 <= int(sys_idx) < len(adjusted):
+                          adjusted[int(sys_idx)] = shared_start
+
+                  print(
+                      "SEMANTIC_ENDING_GROUP "
+                      f"page={page_num} group_id={group.get('group_id')} "
+                      f"variants={','.join(variant_numbers)} longest={longest_length}"
+                  )
+
+                  if post_system_index is None:
+                      emit_decision(
+                          f"no_post_system group_id={group.get('group_id')} "
+                          f"shared_start={shared_start} longest={longest_length}"
+                      )
+                      continue
+
+                  post_system_index = int(post_system_index)
+                  if not (0 <= post_system_index < len(adjusted)):
+                      unresolved.append("post_ending_system_index_out_of_range")
+                      emit_decision(
+                          f"post_system_out_of_range group_id={group.get('group_id')} "
+                          f"post_system_index={post_system_index} total_systems={len(adjusted)}"
+                      )
+                      continue
+
+                  target_next = int(shared_start) + int(longest_length)
+                  print(
+                      "SEMANTIC_ENDING_NEXT "
+                      f"page={page_num} post_system={post_system_index} next_measure={target_next}"
+                  )
+                  shift = int(target_next) - int(adjusted[post_system_index])
+                  if shift != 0:
+                      for idx in range(post_system_index, len(adjusted)):
+                          adjusted[idx] = int(adjusted[idx]) + int(shift)
+                  emit_decision(
+                      f"apply_group_shift group_id={group.get('group_id')} "
+                      f"post_system={post_system_index} target_next={target_next} shift={shift}"
+                  )
+
+                  for idx in range(1, len(adjusted)):
+                      if int(adjusted[idx]) < int(adjusted[idx - 1]):
+                          adjusted[idx] = int(adjusted[idx - 1])
+
+              return adjusted, unresolved
+
+          def detect_ending_suspicious_flags(
+              raw_nums,
+              duplicate_pair_indices,
+              ending_markers_present,
+              ending_groups,
+              ending_debug,
+          ):
+              flags = []
+              intervals = list((ending_debug or {}).get("ending_intervals") or [])
+              variants = unique_preserve_order(
+                  [row.get("variant") for row in intervals if str(row.get("variant") or "").strip()]
+              )
+              has_stop_or_discontinue = bool((ending_debug or {}).get("has_stop_or_discontinue"))
+              direction_text_cues = list((ending_debug or {}).get("direction_text_cues") or [])
+              cue_tokens = sorted({str(row.get("token") or "").strip() for row in direction_text_cues if str(row.get("token") or "").strip()})
+              has_repeat_marker = int((ending_debug or {}).get("ending_tag_census", {}).get("repeat_marker_count") or 0) > 0
+              structured_numbers = sorted(
+                  {
+                      str(tok)
+                      for tok in ((ending_debug or {}).get("ending_tag_census", {}).get("numbers") or {}).keys()
+                      if str(tok).strip()
+                  },
+                  key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)),
+              )
+
+              if ending_markers_present and len(variants) <= 1:
+                  flags.append("ending_detected_but_single_variant")
+              if ending_markers_present and not has_stop_or_discontinue:
+                  flags.append("ending_detected_but_no_stop_or_discontinue")
+              if duplicate_pair_indices and ending_markers_present and len(variants) <= 1:
+                  flags.append("duplicate_system_starts_with_unresolved_variant_split")
+              if duplicate_pair_indices and ending_markers_present and len(structured_numbers) == 1:
+                  flags.append("ending_marker_only_one_number_with_duplicate_system_starts")
+              if any(group.get("post_ending_system_index") is None for group in (ending_groups or [])):
+                  flags.append("post_ending_system_missing")
+              max_reasonable_length = max(8, len(raw_nums) * 3)
+              for group in ending_groups or []:
+                  longest = int(group.get("longest_length_measures") or 0)
+                  if longest > max_reasonable_length:
+                      flags.append(f"ending_length_outlier:{longest}")
+                      break
+              if "2_marker" in cue_tokens and "2" not in structured_numbers:
+                  flags.append("ending_variant_text_without_structured_tag")
+              if ending_markers_present and not has_stop_or_discontinue and has_repeat_marker:
+                  flags.append("ending_stop_missing_with_repeat_present")
+
+              return unique_preserve_order(flags)
+
+          def estimate_page_tail_increment(raw_labels, measures_count):
+              nums, _ = parse_int_labels(raw_labels or [], allow_normalize=True)
+              if not nums:
+                  return 1
+              mc = int(measures_count or 0)
+              if mc > 0:
+                  span = nums[-1] - nums[0]
+                  est = mc - span
+                  if est > 0:
+                      return int(est)
+              if len(nums) >= 2:
+                  return max(1, nums[-1] - nums[-2])
+              return 1
+
+          def apply_semantic_numbering(entries, numbering_policy):
+              if numbering_policy == "legacy_raw_starts":
+                  for entry in entries:
+                      semantic_debug = init_semantic_debug_v2(entry.get("semantic_debug"))
+                      entry["semantic_debug"] = semantic_debug
+                      if entry.get("status") != "ok":
+                          entry["numbering_policy"] = "legacy_raw_starts"
+                          entry["semantic_model"] = "legacy_raw_starts"
+                          entry["ending_groups"] = []
+                          entry["ending_anchors"] = []
+                          continue
+                      raw_starts = list(entry.get("system_starts_raw") or entry.get("system_starts") or [])
+                      entry["system_starts_semantic"] = list(raw_starts)
+                      entry["system_starts"] = list(raw_starts)
+                      entry["numbering_policy"] = "legacy_raw_starts"
+                      entry["semantic_model"] = "legacy_raw_starts"
+                      entry["ending_groups"] = []
+                      entry["ending_anchors"] = []
+                      print(
+                          "SEMANTIC_APPLY "
+                          f"page={entry.get('page_number')} source=legacy_raw_starts "
+                          f"raw_starts={raw_starts} semantic_starts={raw_starts}"
+                      )
+                  return
+
+              global_next_start = None
+              seen_first_page = False
+
+              for entry in sorted(entries, key=lambda e: int(e.get("page_number") or 0)):
+                  semantic_debug = init_semantic_debug_v2(entry.get("semantic_debug"))
+                  entry["semantic_debug"] = semantic_debug
+
+                  if entry.get("status") != "ok":
+                      entry["numbering_policy"] = "semantic_continuous_v1"
+                      entry["semantic_model"] = "semantic_continuous_v2_longest_ending"
+                      entry["ending_groups"] = []
+                      entry["ending_anchors"] = []
+                      continue
+
+                  page_num = int(entry.get("page_number") or 0)
+                  raw_starts = list(entry.get("system_starts_raw") or entry.get("system_starts") or [])
+                  normalized_starts = list(entry.get("system_starts_normalized") or entry.get("system_starts") or [])
+                  events = list(entry.get("_semantic_measure_events") or [])
+                  page_ending_debug = build_page_ending_debug(page_num, events)
+                  semantic_debug["version"] = "ending_diag_v2"
+                  semantic_debug["ending_tag_census"] = dict(page_ending_debug.get("ending_tag_census") or {})
+                  semantic_debug["measure_timeline"] = list(page_ending_debug.get("measure_timeline") or [])
+                  semantic_debug["direction_text_cues"] = list(page_ending_debug.get("direction_text_cues") or [])
+                  semantic_debug["ending_markers"] = list(page_ending_debug.get("ending_markers") or [])
+                  semantic_debug["ending_intervals"] = []
+                  semantic_debug["ending_groups"] = []
+                  semantic_debug["ending_group_merge_trace"] = []
+                  semantic_debug["grouping_audit"] = []
+                  semantic_debug["suspicious_flags"] = []
+                  semantic_debug["decision_trace"] = []
+                  semantic_debug["ending_carry_overcount"] = 0
+                  semantic_debug["tail_increment_raw"] = None
+                  semantic_debug["tail_increment_adjusted"] = None
+                  semantic_debug["carry_applied_to_next_page"] = None
+
+                  raw_nums, parse_warnings = parse_int_labels(normalized_starts, allow_normalize=False)
+                  if parse_warnings:
+                      entry.setdefault("semantic_warnings", []).extend(parse_warnings)
+                  if not raw_nums:
+                      entry.setdefault("semantic_warnings", []).append("raw_system_starts_non_numeric_or_empty")
+                      entry["system_starts_semantic"] = list(normalized_starts)
+                      entry["system_starts"] = list(normalized_starts)
+                      entry["numbering_policy"] = "semantic_continuous_v1"
+                      entry["semantic_model"] = "semantic_continuous_v2_longest_ending"
+                      entry["ending_groups"] = []
+                      entry["ending_anchors"] = []
+                      print(
+                          "SEMANTIC_WARN "
+                          f"page={entry.get('page_number')} reason=raw_system_starts_non_numeric_or_empty"
+                      )
+                      print(
+                          "SEMANTIC_APPLY "
+                          f"page={entry.get('page_number')} source=semantic_continuous_v1 "
+                          f"raw_starts={raw_starts} semantic_starts={entry['system_starts_semantic']}"
+                      )
+                      continue
+
+                  deltas = []
+                  duplicate_pair_indices = []
+                  for idx, (a, b) in enumerate(zip(raw_nums, raw_nums[1:]), start=1):
+                      if b < a:
+                          entry.setdefault("semantic_warnings", []).append(
+                              f"raw_system_start_decrease_unexpected:{a}->{b}"
+                          )
+                          delta = 0
+                      else:
+                          delta = b - a
+                      if b == a:
+                          duplicate_pair_indices.append(idx)
+                      deltas.append(int(delta))
+                  summary = dict(entry.get("semantic_events") or {})
+                  pickup_detected = bool(summary.get("pickup_detected"))
+                  if not seen_first_page:
+                      start_value = 0 if pickup_detected else int(raw_nums[0])
+                  else:
+                      start_value = int(global_next_start) if global_next_start is not None else int(raw_nums[0])
+
+                  base_semantic_nums = [start_value]
+                  for delta in deltas:
+                      base_semantic_nums.append(int(base_semantic_nums[-1]) + int(delta))
+
+                  ending_groups, ending_markers_present, ending_group_error, ending_debug = build_ending_groups(
+                      page_num,
+                      events,
+                  )
+                  semantic_debug["ending_markers"] = list(
+                      ending_debug.get("ending_markers") or semantic_debug.get("ending_markers") or []
+                  )
+                  semantic_debug["ending_intervals"] = list(ending_debug.get("ending_intervals") or [])
+                  semantic_debug["ending_groups"] = list(ending_debug.get("ending_groups") or [])
+                  semantic_debug["ending_group_merge_trace"] = list(
+                      ending_debug.get("ending_group_merge_trace") or []
+                  )
+                  semantic_debug["grouping_audit"] = list(ending_debug.get("grouping_audit") or [])
+                  semantic_debug["decision_trace"] = list(ending_debug.get("decision_trace") or [])
+                  semantic_nums = list(base_semantic_nums)
+                  ending_group_unresolved = []
+                  if ending_markers_present and duplicate_pair_indices and not ending_groups:
+                      ending_group_unresolved.append("ending_markers_present_but_no_groups_for_duplicates")
+                  if ending_groups:
+                      semantic_nums, ending_group_unresolved = apply_longest_ending_groups(
+                          page_num,
+                          semantic_nums,
+                          ending_groups,
+                          semantic_debug.get("decision_trace"),
+                      )
+                      print(
+                          "SEMANTIC_ENDING_APPLY "
+                          f"page={page_num} raw={base_semantic_nums} normalized={semantic_nums}"
+                      )
+                  elif ending_markers_present and ending_group_error:
+                      ending_group_unresolved.append(str(ending_group_error))
+
+                  for dup_idx in duplicate_pair_indices:
+                      print(
+                          "SEMANTIC_DUPLICATE "
+                          f"page={entry.get('page_number')} "
+                          f"raw_pair={raw_nums[dup_idx - 1]},{raw_nums[dup_idx]} "
+                          f"semantic_pair={semantic_nums[dup_idx - 1]},{semantic_nums[dup_idx]}"
+                      )
+
+                  for idx in range(1, len(semantic_nums)):
+                      if int(semantic_nums[idx]) < int(semantic_nums[idx - 1]):
+                          semantic_nums[idx] = int(semantic_nums[idx - 1])
+
+                  cleaned_ending_groups = []
+                  for group in ending_groups:
+                      cleaned_ending_groups.append(
+                          {
+                              "group_id": str(group.get("group_id") or ""),
+                              "group_key_start_number": int(group.get("group_key_start_number") or 0),
+                              "start_system_index": int(group.get("start_system_index") or 0),
+                              "variant_numbers": list(group.get("variant_numbers") or []),
+                              "variant_start_system_indices": list(
+                                  group.get("variant_start_system_indices")
+                                  or group.get("_variant_start_systems")
+                                  or []
+                              ),
+                              "variant_lengths_measures": dict(group.get("variant_lengths_measures") or {}),
+                              "max_covered_system_index": int(
+                                  group.get("max_covered_system_index")
+                                  or group.get("_max_covered_system_index")
+                                  or 0
+                              ),
+                              "longest_length_measures": int(group.get("longest_length_measures") or 0),
+                              "post_ending_system_index": group.get("post_ending_system_index"),
+                              "post_ending_reason": str(group.get("post_ending_reason") or ""),
+                          }
+                      )
+
+                  ending_suspicious_flags = detect_ending_suspicious_flags(
+                      raw_nums=raw_nums,
+                      duplicate_pair_indices=duplicate_pair_indices,
+                      ending_markers_present=ending_markers_present,
+                      ending_groups=ending_groups,
+                      ending_debug=ending_debug,
+                  )
+                  semantic_debug["ending_groups"] = list(cleaned_ending_groups)
+                  semantic_debug["suspicious_flags"] = list(ending_suspicious_flags)
+                  for flag in ending_suspicious_flags:
+                      print(f"SEMANTIC_ENDING_SUSPECT page={page_num} flag={flag}")
+                      entry.setdefault("semantic_warnings", []).append(f"ending_suspect:{flag}")
+
+                  semantic_starts = [str(n) for n in semantic_nums]
+                  entry["system_starts_semantic"] = semantic_starts
+                  entry["system_starts"] = semantic_starts
+                  entry["numbering_policy"] = "semantic_continuous_v1"
+                  entry["semantic_model"] = "semantic_continuous_v2_longest_ending"
+                  entry["ending_groups"] = cleaned_ending_groups
+                  entry["ending_anchors"] = []
+
+                  if ending_group_unresolved:
+                      warn_reason = "semantic_ending_group_unresolved"
+                      entry.setdefault("semantic_warnings", []).extend(list(ending_group_unresolved))
+                      entry["status"] = "missing"
+                      entry["error"] = warn_reason
+                      entry["selection_reason"] = warn_reason
+                      print(
+                          "SEMANTIC_WARN "
+                          f"page={entry.get('page_number')} reason={warn_reason}"
+                      )
+
+                  tail_increment_raw = estimate_page_tail_increment(
+                      normalized_starts,
+                      entry.get("measures_count"),
+                  )
+                  ending_carry_overcount = 0
+                  for group in ending_groups:
+                      if group.get("post_ending_system_index") is not None:
+                          continue
+                      variant_lengths = dict(group.get("variant_lengths_measures") or {})
+                      lengths = [max(1, int(v or 1)) for v in variant_lengths.values()]
+                      if len(lengths) < 2:
+                          continue
+                      overcount = max(0, int(sum(lengths)) - int(max(lengths)))
+                      if overcount <= 0:
+                          continue
+                      ending_carry_overcount += int(overcount)
+                      print(
+                          "SEMANTIC_ENDING_CARRY "
+                          f"page={page_num} group_id={group.get('group_id')} "
+                          f"overcount={int(overcount)} tail_raw={int(tail_increment_raw)} "
+                          f"tail_adjusted={max(1, int(tail_increment_raw) - int(overcount))}"
+                      )
+
+                  tail_increment_adjusted = max(
+                      1,
+                      int(tail_increment_raw) - int(ending_carry_overcount),
+                  )
+                  semantic_debug["ending_carry_overcount"] = int(ending_carry_overcount)
+                  semantic_debug["tail_increment_raw"] = int(tail_increment_raw)
+                  semantic_debug["tail_increment_adjusted"] = int(tail_increment_adjusted)
+
+                  global_next_start = int(semantic_nums[-1]) + int(tail_increment_adjusted)
+                  semantic_debug["carry_applied_to_next_page"] = int(global_next_start)
+                  print(
+                      "SEMANTIC_ENDING_CARRY_APPLY "
+                      f"page={page_num} next_page_start={int(global_next_start)}"
+                  )
+                  seen_first_page = True
+
+                  print(
+                      "SEMANTIC_APPLY "
+                      f"page={entry.get('page_number')} source=semantic_continuous_v1 "
+                      f"raw_starts={raw_starts} semantic_starts={semantic_starts}"
+                  )
+
+          page_pdfs = sorted(glob.glob("/tmp/work/pages/page_*.pdf"))
+          entries = []
+          missing = 0
+          omr_targets, omr_target_status, omr_target_error = load_omr_system_targets(OMR_PATH, len(page_pdfs))
+
+          print(
+              "PAGE_XML_TARGETS "
+              f"omr_path={OMR_PATH or '-'} status={omr_target_status} "
+              f"error={omr_target_error} pages={len(omr_targets)}"
+          )
+
+          for page_pdf in page_pdfs:
+              page_num = int(re.search(r"page_(\d{4})\.pdf$", page_pdf).group(1))
+              page_idx = page_num - 1
+              out_dir = f"/tmp/work/audiveris_pages/page_{page_num:04d}"
+              candidates = sorted(glob.glob(os.path.join(out_dir, "**", "*.mxl"), recursive=True))
+              scored = [score_mxl(path) for path in candidates]
+              candidate_summary = []
+              for row in scored:
+                  candidate_summary.append(
+                      {
+                          "path": row.get("path"),
+                          "movement_index": int(row.get("movement_index") or 1),
+                          "member": row.get("member"),
+                          "parts": int(row.get("parts") or 0),
+                          "measures": int(row.get("measures") or 0),
+                          "systems": len(row.get("system_starts") or []),
+                          "parse": row.get("parse"),
+                          "error": row.get("error"),
+                      }
+                  )
+                  print(
+                      "PAGE_XML_CANDIDATE "
+                      f"page={page_num} path={row.get('path')} movement={int(row.get('movement_index') or 1)} "
+                      f"systems={len(row.get('system_starts') or [])} parts={int(row.get('parts') or 0)} "
+                      f"measures={int(row.get('measures') or 0)} member={row.get('member')}"
+                  )
+
+              valid = [
+                  row
+                  for row in scored
+                  if int(row.get("parts") or 0) > 0
+                  and int(row.get("measures") or 0) > 0
+                  and len(row.get("system_starts") or []) > 0
+              ]
+              target = int(omr_targets.get(page_num) or 0)
+              print(
+                  "PAGE_XML_TARGET "
+                  f"page={page_num} omr_systems={target} candidates={len(scored)} valid_candidates={len(valid)}"
+              )
+
+              selected, select_error, merge_debug = select_manifest_entry(valid, target, page_num)
+
+              if selected is not None:
+                  used_rows = selected["rows"]
+                  used_paths = [row["path"] for row in used_rows]
+                  used_movement_indices = [int(row.get("movement_index") or 1) for row in used_rows]
+                  system_starts = list(selected["system_starts"])
+                  raw_system_starts = list(selected.get("raw_system_starts") or system_starts)
+                  system_starts_normalized = list(selected.get("system_starts_normalized") or system_starts)
+                  normalization_warnings = list(selected.get("normalization_warnings") or [])
+                  system_nums_for_warn, _ = parse_int_labels(system_starts_normalized, allow_normalize=False)
+                  if system_nums_for_warn and has_duplicate_steps(system_nums_for_warn):
+                      dup_warn = "duplicate_system_starts_detected"
+                      if dup_warn not in normalization_warnings:
+                          normalization_warnings.append(dup_warn)
+                  row_offsets = list(selected.get("row_offsets") or [0 for _ in used_rows])
+                  raw_segments = list(selected.get("system_starts_raw_segments") or [])
+                  normalized_count = sum(
+                      1 for warn in normalization_warnings if str(warn).startswith("normalized_suffix_label:")
+                  )
+                  print(
+                      "PAGE_XML_NORMALIZE "
+                      f"page={page_num} raw={raw_system_starts} normalized={system_starts_normalized} "
+                      f"normalized_count={normalized_count}"
+                  )
+                  for warn in normalization_warnings:
+                      print(f"PAGE_XML_NORMALIZE_WARN page={page_num} reason={warn}")
+                  merge_offsets = []
+                  for row, offset in zip(used_rows, row_offsets):
+                      raw_nums, _ = parse_int_labels(list(row.get("system_starts") or []), allow_normalize=True)
+                      raw_nums = raw_nums or []
+                      raw_first = raw_nums[0] if raw_nums else None
+                      raw_last = raw_nums[-1] if raw_nums else None
+                      shifted_first = (raw_first + int(offset)) if raw_first is not None else None
+                      shifted_last = (raw_last + int(offset)) if raw_last is not None else None
+                      print(
+                          "PAGE_XML_SHIFT "
+                          f"page={page_num} path={row.get('path')} movement={int(row.get('movement_index') or 1)} "
+                          f"offset={int(offset)} raw_first={raw_first} raw_last={raw_last} "
+                          f"shifted_first={shifted_first} shifted_last={shifted_last}"
+                      )
+                      merge_offsets.append(
+                          {
+                              "path": row.get("path"),
+                              "movement_index": int(row.get("movement_index") or 1),
+                              "offset": int(offset),
+                          }
+                      )
+                  merged_events = merge_measure_events(used_rows, row_offsets)
+                  semantic_events = summarize_semantic_events(merged_events)
+                  semantic_events["ending_label_normalized_count"] = int(normalized_count)
+                  print(
+                      "SEMANTIC_DETECT "
+                      f"page={page_num} pickup={str(semantic_events.get('pickup_detected')).lower()} "
+                      f"repeats_forward={int(semantic_events.get('repeat_forward_count') or 0)} "
+                      f"repeats_backward={int(semantic_events.get('repeat_backward_count') or 0)} "
+                      f"endings={int(semantic_events.get('ending_start_count') or 0)}"
+                  )
+                  primary = used_rows[0]
+                  if selected["kind"] == "single_exact":
+                      selection_source = "per_page_split_single_exact"
+                      selection_reason = "single_candidate_exact_system_count"
+                      parts_count = int(primary["parts"])
+                      measures_count = int(primary["measures"])
+                      mxl_member = primary.get("member")
+                  elif selected["kind"] == "merge_shifted_exact":
+                      selection_source = "per_page_split_merge_shifted_exact"
+                      selection_reason = "merged_reset_shifted_exact_system_count"
+                      parts_count = max(int(row.get("parts") or 0) for row in used_rows)
+                      measures_count = sum(int(row.get("measures") or 0) for row in used_rows)
+                      mxl_member = None
+                  else:
+                      selection_source = "per_page_split_merge_exact"
+                      selection_reason = "merged_candidates_exact_system_count"
+                      parts_count = max(int(row.get("parts") or 0) for row in used_rows)
+                      measures_count = sum(int(row.get("measures") or 0) for row in used_rows)
+                      mxl_member = None
+
+                  entry = {
+                      "page_index": page_idx,
+                      "page_number": page_num,
+                      "status": "ok",
+                      "error": None,
+                      "mxl_path": primary["path"],
+                      "mxl_paths": used_paths,
+                      "mxl_member": mxl_member,
+                      "movement_indices": used_movement_indices,
+                      "parts_count": parts_count,
+                      "measures_count": measures_count,
+                      "system_count_target": target,
+                      "system_starts_raw": list(raw_system_starts),
+                      "system_starts_normalized": list(system_starts_normalized),
+                      "system_starts_semantic": list(system_starts_normalized),
+                      "system_starts": list(system_starts_normalized),
+                      "merge_offsets": merge_offsets,
+                      "system_starts_raw_segments": raw_segments,
+                      "numbering_policy": NUMBERING_POLICY,
+                      "semantic_events": semantic_events,
+                      "semantic_warnings": [],
+                      "normalization_warnings": normalization_warnings,
+                      "semantic_debug": {
+                          "version": "ending_diag_v2",
+                          "ending_tag_census": {},
+                          "measure_timeline": [],
+                          "direction_text_cues": [],
+                          "ending_markers": [],
+                          "ending_intervals": [],
+                          "ending_groups": [],
+                          "ending_group_merge_trace": [],
+                          "grouping_audit": [],
+                          "suspicious_flags": [],
+                          "decision_trace": [],
+                          "ending_carry_overcount": 0,
+                          "tail_increment_raw": None,
+                          "tail_increment_adjusted": None,
+                          "carry_applied_to_next_page": None,
+                      },
+                      "ending_anchors": [],
+                      "_semantic_measure_events": merged_events,
+                      "selection_source": selection_source,
+                      "selection_reason": selection_reason,
+                      "confidence_tier": "high",
+                      "low_confidence_used": False,
+                      "retry_attempted": False,
+                      "retry_profile": "none",
+                      "candidate_summary": candidate_summary,
+                      "merge_debug": dict(merge_debug or {}),
+                  }
+                  print(
+                      "PAGE_XML_SELECTED "
+                      f"page={page_num} source={selection_source} systems={len(system_starts)} "
+                      f"target={target} paths={used_paths}"
+                  )
+              else:
+                  if not scored:
+                      reason = "no_mxl_candidates"
+                  elif target <= 0:
+                      reason = "omr_system_target_missing"
+                  elif not valid:
+                      reason = "parts_or_measures_or_system_starts_invalid"
+                  else:
+                      reason = "system_count_mismatch"
+
+                  best = max(
+                      scored,
+                      key=lambda row: (
+                          int(row.get("measures") or 0),
+                          int(row.get("parts") or 0),
+                          row.get("path") or "",
+                          row.get("member") or "",
+                      ),
+                  ) if scored else None
+                  best_raw_starts = list(best.get("system_starts") or []) if best else []
+                  best_norm_nums, best_norm_warnings = parse_int_labels(best_raw_starts, allow_normalize=True)
+                  best_norm_starts = [str(n) for n in (best_norm_nums or [])]
+                  if best_norm_nums and has_duplicate_steps(best_norm_nums):
+                      dup_warn = "duplicate_system_starts_detected"
+                      if dup_warn not in best_norm_warnings:
+                          best_norm_warnings.append(dup_warn)
+                  best_norm_count = sum(
+                      1 for warn in best_norm_warnings if str(warn).startswith("normalized_suffix_label:")
+                  )
+                  if best or best_norm_warnings:
+                      print(
+                          "PAGE_XML_NORMALIZE "
+                          f"page={page_num} raw={best_raw_starts} normalized={best_norm_starts} "
+                          f"normalized_count={best_norm_count}"
+                      )
+                  for warn in best_norm_warnings:
+                      print(f"PAGE_XML_NORMALIZE_WARN page={page_num} reason={warn}")
+                  entry = {
+                      "page_index": page_idx,
+                      "page_number": page_num,
+                      "status": "missing",
+                      "error": reason,
+                      "mxl_path": best.get("path") if best else None,
+                      "mxl_paths": [row.get("path") for row in scored],
+                      "mxl_member": best.get("member") if best else None,
+                      "movement_indices": [int(row.get("movement_index") or 1) for row in scored],
+                      "parts_count": int(best.get("parts") or 0) if best else 0,
+                      "measures_count": int(best.get("measures") or 0) if best else 0,
+                      "system_count_target": target,
+                      "system_starts_raw": best_raw_starts,
+                      "system_starts_normalized": best_norm_starts,
+                      "system_starts_semantic": best_norm_starts,
+                      "system_starts": best_norm_starts,
+                      "merge_offsets": [],
+                      "system_starts_raw_segments": [],
+                      "numbering_policy": NUMBERING_POLICY,
+                      "semantic_events": {
+                          "pickup_detected": False,
+                          "repeat_forward_count": 0,
+                          "repeat_backward_count": 0,
+                          "ending_start_count": 0,
+                          "ending_label_normalized_count": int(best_norm_count),
+                      },
+                      "semantic_warnings": [],
+                      "normalization_warnings": list(best_norm_warnings),
+                      "semantic_debug": {
+                          "version": "ending_diag_v2",
+                          "ending_tag_census": {},
+                          "measure_timeline": [],
+                          "direction_text_cues": [],
+                          "ending_markers": [],
+                          "ending_intervals": [],
+                          "ending_groups": [],
+                          "ending_group_merge_trace": [],
+                          "grouping_audit": [],
+                          "suspicious_flags": [],
+                          "decision_trace": [],
+                          "ending_carry_overcount": 0,
+                          "tail_increment_raw": None,
+                          "tail_increment_adjusted": None,
+                          "carry_applied_to_next_page": None,
+                      },
+                      "ending_anchors": [],
+                      "_semantic_measure_events": [],
+                      "selection_source": "none",
+                      "selection_reason": select_error or reason,
+                      "confidence_tier": "none",
+                      "low_confidence_used": False,
+                      "retry_attempted": False,
+                      "retry_profile": "none",
+                      "candidate_summary": candidate_summary,
+                      "merge_debug": dict(merge_debug or {}),
+                  }
+                  missing += 1
+                  if merge_debug and merge_debug.get("final_select_error_detail"):
+                      print(
+                          "PAGE_XML_UNRESOLVED_DETAIL "
+                          f"page={page_num} select_error_detail={merge_debug.get('final_select_error_detail')}"
+                      )
+                  print(
+                      "PAGE_XML_UNRESOLVED "
+                      f"page={page_num} reason={reason} target={target} "
+                      f"valid_candidates={len(valid)} select_error={select_error}"
+                  )
+              entries.append(entry)
+
+          print(f"SEMANTIC_POLICY effective={NUMBERING_POLICY}")
+          apply_semantic_numbering(entries, NUMBERING_POLICY)
+          missing = sum(1 for entry in entries if entry.get("status") != "ok")
+          for entry in entries:
+              if "_semantic_measure_events" in entry:
+                  del entry["_semantic_measure_events"]
+
+          payload = {
+              "manifest_version": "page-split-v2",
+              "numbering_policy": NUMBERING_POLICY,
+              "entries": entries,
+              "total_pages": len(entries),
+              "missing": missing,
+              "omr_system_targets": omr_targets,
+              "omr_system_targets_status": omr_target_status,
+              "omr_system_targets_error": omr_target_error,
+          }
+          with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+
+          print(
+              f"MXL_PAGE_MANIFEST path={MANIFEST_PATH} entries={len(entries)} missing={missing}"
+          )
+          PY
+
+          echo "MXL_PAGE_MANIFEST_PATH=/tmp/work/mxl_page_manifest.json" >> "$GITHUB_ENV"
+
+      - name: Annotate PDF (guides + measure labels) with verbose debug
+        env:
+          DEBUG_GUIDES: "0"
+          ENABLE_MEASURE_LABELS: "1"
+          MEASURE_LABEL_MODE: "staff_start"
+          MEASURE_SOURCE_POLICY: "mxl_strict"
+          ENDING_LABEL_MODE: "system_only"
+          MXL_PARSER_POLICY: "auto"
+          MXL_SANITIZE_PREFIXES: "1"
+          MXL_PATH_OVERRIDE: "${{ env.MXL_PATH_OVERRIDE }}"
+          MXL_MEMBER_OVERRIDE: "${{ env.MXL_MEMBER_OVERRIDE }}"
+          MXL_PAGE_MANIFEST_PATH: "${{ env.MXL_PAGE_MANIFEST_PATH }}"
+          DEBUG_MEASURE_LABELS: "1"
+          DEBUG_MEASURE_MARKERS: "0"
+          DEBUG_SENTINEL_TEXT: "1"
+          MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"
+        run: |
+          set -euo pipefail
+          echo "PARSER_SHA=$(git rev-parse --short HEAD)"
+          python - << 'PY'
+          p = "parser-api/annotate_guides_from_omr.py"
+          text = open(p, "r", encoding="utf-8").read()
+          markers = [
+              "mxl_movement",
+              "mapping_mode",
+              "labels_to_draw_count",
+              "DEBUG_SENTINEL_TEXT",
+              "MXL_PAGE_MANIFEST_PATH",
+          ]
+          for m in markers:
+              print(f"PARSER_MARKER {m} present={m in text}")
+          PY
+          python -u parser-api/annotate_guides_from_omr.py \
+            /tmp/work/input.pdf \
+            "${AUDI_OMR_PATH}" \
+            /tmp/work/annotated.pdf
+          ls -lh /tmp/work/annotated.pdf
+
+      - name: Sanity-check output PDF
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import fitz
+
+          in_doc = fitz.open('/tmp/work/input.pdf')
+          out_doc = fitz.open('/tmp/work/annotated.pdf')
+          print('input_pages=', in_doc.page_count)
+          print('output_pages=', out_doc.page_count)
+          if in_doc.page_count != out_doc.page_count:
+            raise SystemExit('ERROR: output page count mismatch')
+          PY
+
+      - name: Mapping debug summary
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json
+
+          p = "/tmp/work/measure_mapping_debug.json"
+          d = json.load(open(p, "r", encoding="utf-8"))
+          print("SUMMARY mxl_path=", d.get("mxl_path"))
+          print("SUMMARY mxl_paths=", d.get("mxl_paths"))
+          movements = d.get("mxl_movements") or []
+          for i, m in enumerate(movements, start=1):
+              print(
+                  f"SUMMARY movement#{i} path={m.get('mxl_path')} "
+                  f"status={m.get('mxl_parse_status')} pages={m.get('mxl_pages')} "
+                  f"member={m.get('mxl_member_path')} "
+                  f"source_sheets={m.get('mxl_source_sheet_numbers')}"
+              )
+
+          pages = d.get("pages") or []
+          manifest_path = d.get("mxl_page_manifest_path")
+          manifest_summary = {}
+          semantic_suspect_pages = []
+          semantic_census_rows = []
+          manifest_select_error_detail = {}
+          if manifest_path:
+              manifest_summary = d.get("mxl_page_manifest_summary") or {}
+              print(f"SUMMARY manifest_path={manifest_path}")
+              print(
+                  "SUMMARY manifest "
+                  f"entries={manifest_summary.get('entries')} "
+                  f"missing={manifest_summary.get('missing')} "
+                  f"status={manifest_summary.get('status')}"
+              )
+              try:
+                  manifest_doc = json.load(open(manifest_path, "r", encoding="utf-8"))
+                  manifest_entries_doc = sorted(
+                      manifest_doc.get("entries") or [],
+                      key=lambda entry: int(entry.get("page_number") or (int(entry.get("page_index", 0)) + 1)),
+                  )
+                  for entry in manifest_entries_doc:
+                      dbg = entry.get("semantic_debug") or {}
+                      flags = [str(flag) for flag in (dbg.get("suspicious_flags") or []) if str(flag)]
+                      page_no = entry.get("page_number")
+                      if page_no is None:
+                          page_no = int(entry.get("page_index", 0)) + 1
+                      page_no = int(page_no)
+                      census = dbg.get("ending_tag_census") or {}
+                      merge_dbg = entry.get("merge_debug") or {}
+                      detail = merge_dbg.get("final_select_error_detail")
+                      if detail is not None and str(detail).strip():
+                          manifest_select_error_detail[page_no] = str(detail)
+                      numbers_map = census.get("numbers") or {}
+                      number_keys = sorted(
+                          [str(k) for k in numbers_map.keys()],
+                          key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)),
+                      )
+                      semantic_census_rows.append(
+                          (
+                              page_no,
+                              int(census.get("total_tags") or 0),
+                              ",".join(number_keys) if number_keys else "-",
+                              int(census.get("text_cue_count") or 0),
+                          )
+                      )
+                      if flags:
+                          semantic_suspect_pages.append((page_no, flags))
+              except Exception as exc:
+                  print(f"SUMMARY semantic_suspect_scan_error={exc}")
+
+              manifest_entries = int(manifest_summary.get("entries") or len(pages) or 0)
+              print(f"SUMMARY semantic_suspect_pages={len(semantic_suspect_pages)}/{manifest_entries}")
+              for page_no, total_tags, numbers_txt, cue_count in semantic_census_rows:
+                  print(
+                      "SUMMARY semantic_census "
+                      f"page={int(page_no)} tags={int(total_tags)} numbers={numbers_txt} text_cues={int(cue_count)}"
+                  )
+              for page_no, flags in semantic_suspect_pages:
+                  print(
+                      "SUMMARY semantic_suspect "
+                      f"page={int(page_no)} flags={','.join(flags)}"
+                  )
+          strict_xml_pages_ok = 0
+          total_pages = len(pages)
+          strict_xml_missing = []
+          for pg in pages:
+              source = pg.get("staff_start_source")
+              status = pg.get("mapping_status")
+              mode = pg.get("mapping_mode")
+              draw_attempted = bool(pg.get("draw_attempted"))
+              labels_to_draw = int(pg.get("labels_to_draw_count") or 0)
+              labels_drawn = int(pg.get("labels_drawn") or 0)
+              labels_in_bounds = int(pg.get("labels_in_bounds") or 0)
+
+              if source != "mxl":
+                  if mode == "missing":
+                      failure_class = "NO_XML_COVERAGE"
+                  elif status == "error":
+                      failure_class = "MAP_EMPTY"
+                  else:
+                      failure_class = "MAP_NOT_MXL"
+              elif labels_to_draw == 0:
+                  failure_class = "DRAW_EMPTY"
+              elif labels_drawn == 0:
+                  failure_class = "DRAW_ZERO"
+              elif labels_in_bounds == 0:
+                  failure_class = "DRAW_OFFPAGE"
+              else:
+                  failure_class = "DRAW_OK"
+
+              if source == "mxl":
+                  strict_xml_pages_ok += 1
+              else:
+                  page_no = int(pg.get("page_index", 0)) + 1
+                  strict_xml_missing.append(
+                      (
+                          page_no,
+                          str(pg.get("mapping_reason")),
+                          str(status),
+                          str(mode),
+                          str(manifest_select_error_detail.get(page_no) or ""),
+                      )
+                  )
+
+              print(
+                  f"SUMMARY page={pg.get('page_index', 0)+1} "
+                  f"source={source} "
+                  f"status={status} "
+                  f"reason={pg.get('mapping_reason')} "
+                  f"mode={mode} "
+                  f"selection_source={pg.get('xml_selection_source')} "
+                  f"confidence={pg.get('xml_confidence_tier')} "
+                  f"mxl_sys={len(pg.get('mxl_page_system_starts') or [])} "
+                  f"omr_sys={len(pg.get('omr_system_staff_counts') or [])} "
+                  f"assigned={len(pg.get('assigned_labels') or [])} "
+                  f"candidates={pg.get('staff_start_candidate_count')} "
+                  f"draw_attempted={draw_attempted} "
+                  f"labels_to_draw={labels_to_draw} "
+                  f"labels_drawn={labels_drawn} "
+                  f"labels_in_bounds={labels_in_bounds} "
+                  f"failure_class={failure_class}"
+              )
+
+          print(f"SUMMARY strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}")
+          if strict_xml_pages_ok != total_pages:
+              for page_no, reason, status, mode, detail in strict_xml_missing:
+                  line = (
+                      "SUMMARY strict_xml_missing "
+                      f"page={page_no} reason={reason} status={status} mode={mode}"
+                  )
+                  if detail:
+                      line += f" select_error_detail={detail}"
+                  print(line)
+              raise SystemExit(
+                  f"ERROR: strict XML coverage failed strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}"
+              )
+          PY
+
+      - name: Bundle debug artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f /tmp/work/omr_debug_bundle.tar.gz
+          tar -czf /tmp/work/omr_debug_bundle.tar.gz \
+            /tmp/work/audi_help_probe.txt \
+            /tmp/work/audi_help.txt \
+            /tmp/work/selected_mxl_path*.txt \
+            /tmp/work/selected_mxl_member*.txt \
+            /tmp/work/audiveris_smoke \
+            /tmp/work/audiveris_out_try1 \
+            /tmp/work/pages \
+            /tmp/work/page_logs \
+            /tmp/work/audiveris_pages \
+            /tmp/work/mxl_page_manifest.json \
+            /tmp/work/measure_mapping_debug.json \
+            2>/dev/null || true
+          if [[ -f /tmp/work/omr_debug_bundle.tar.gz ]]; then
+            ls -lh /tmp/work/omr_debug_bundle.tar.gz
+          fi
+
+      - name: Clear previous Homr test outputs
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "HOMR_TEST_CLEANUP prefix=${OUTPUT_PREFIX}"
+          set +e
+          gsutil -m rm -r "${OUTPUT_PREFIX}/**" >/tmp/work/homr_cleanup.log 2>&1
+          cleanup_status=$?
+          set -e
+          if [[ ${cleanup_status} -eq 0 ]]; then
+            echo "HOMR_TEST_CLEANUP cleared=1"
+          elif grep -qE "No URLs matched|no objects" /tmp/work/homr_cleanup.log; then
+            echo "HOMR_TEST_CLEANUP empty_prefix=1"
+          else
+            echo "HOMR_TEST_CLEANUP_WARN status=${cleanup_status}"
+            sed -n '1,120p' /tmp/work/homr_cleanup.log || true
+          fi
+
+      - name: Upload control artifacts (flat layout)
+        if: always()
+        run: |
+          set -euo pipefail
+          ARTIFACTS_PREFIX="${OUTPUT_PREFIX}/artifacts"
+          RUN_REF="${GITHUB_REF_NAME:-$GITHUB_REF}"
+          echo "RUN_SUMMARY run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT} ref=${RUN_REF} sha=${GITHUB_SHA}"
+          echo "RUN_SUMMARY output_prefix=${OUTPUT_PREFIX}"
+          echo "RUN_SUMMARY artifacts_prefix=${ARTIFACTS_PREFIX}"
+
+          uploaded_count=0
+          missing_count=0
+
+          if [[ -f /tmp/work/annotated.pdf ]]; then
+            gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/audiveris_out.pdf"
+            echo "uploaded_audiveris_out=${OUTPUT_PREFIX}/audiveris_out.pdf"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/annotated.pdf not found"
+            missing_count=$((missing_count + 1))
+          fi
+          if [[ -f /tmp/work/measure_mapping_debug.json ]]; then
+            gsutil cp /tmp/work/measure_mapping_debug.json "${ARTIFACTS_PREFIX}/measure_mapping_debug.json"
+            echo "uploaded_artifact_mapping_debug=${ARTIFACTS_PREFIX}/measure_mapping_debug.json"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/measure_mapping_debug.json not found"
+            missing_count=$((missing_count + 1))
+          fi
+          if [[ -f /tmp/work/mxl_page_manifest.json ]]; then
+            gsutil cp /tmp/work/mxl_page_manifest.json "${ARTIFACTS_PREFIX}/mxl_page_manifest.json"
+            echo "uploaded_artifact_manifest=${ARTIFACTS_PREFIX}/mxl_page_manifest.json"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/mxl_page_manifest.json not found"
+            missing_count=$((missing_count + 1))
+          fi
+          if [[ -f /tmp/work/omr_debug_bundle.tar.gz ]]; then
+            gsutil cp /tmp/work/omr_debug_bundle.tar.gz "${ARTIFACTS_PREFIX}/omr_debug_bundle.tar.gz"
+            echo "uploaded_artifact_debug_bundle=${ARTIFACTS_PREFIX}/omr_debug_bundle.tar.gz"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/omr_debug_bundle.tar.gz not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          echo "${uploaded_count}" > /tmp/work/control_upload_count.txt
+          echo "${missing_count}" > /tmp/work/control_missing_count.txt
+          echo "CONTROL_UPLOAD_COMPLETE uploaded_files=${uploaded_count}"
+
+      - name: Set up Homr dependencies (experimental)
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ "${HOMR_ENABLE}" != "1" ]]; then
+            echo "HOMR_SETUP skipped HOMR_ENABLE=${HOMR_ENABLE}"
+            exit 0
+          fi
+
+          if python -m pip show homr >/dev/null 2>&1; then
+            echo "HOMR_SETUP already_installed"
+          else
+            if python -m pip install homr; then
+              echo "HOMR_SETUP install=ok"
+            else
+              echo "HOMR_SETUP install=failed"
+            fi
+          fi
+
+          if command -v homr >/dev/null 2>&1; then
+            echo "HOMR_SETUP cli=$(command -v homr)"
+          else
+            echo "HOMR_SETUP cli=missing"
+          fi
+          python - << 'PY'
+          try:
+              import homr  # type: ignore
+              print("HOMR_SETUP python_import=ok")
+          except Exception as exc:
+              print(f"HOMR_SETUP python_import=failed error={exc}")
+          PY
+
+      - name: Run Homr per page (experimental)
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/work/homr_pages /tmp/work/homr_logs
+          if [[ "${HOMR_ENABLE}" != "1" ]]; then
+            echo "HOMR_RUN skipped HOMR_ENABLE=${HOMR_ENABLE}"
+            exit 0
+          fi
+          if compgen -G "/tmp/work/pages/page_*.pdf" >/dev/null; then
+            :
+          else
+            echo "HOMR_RUN skipped reason=missing_split_pages"
+            exit 0
+          fi
+
+          python - << 'PY'
+          import fitz
+          import glob
+          import os
+
+          for pdf_path in sorted(glob.glob("/tmp/work/pages/page_*.pdf")):
+              page_num = os.path.basename(pdf_path)[5:9]
+              out_dir = f"/tmp/work/homr_pages/page_{page_num}"
+              os.makedirs(out_dir, exist_ok=True)
+              png_path = os.path.join(out_dir, "input.png")
+              doc = fitz.open(pdf_path)
+              page = doc[0]
+              pix = page.get_pixmap(dpi=300, alpha=False)
+              pix.save(png_path)
+              doc.close()
+              print(f"HOMR_PAGE_IMAGE page={int(page_num)} png={png_path}")
+          PY
+
+          run_homr_page() {
+            local page_num="$1"
+            local out_dir="/tmp/work/homr_pages/page_${page_num}"
+            local png_path="${out_dir}/input.png"
+            local log_path="/tmp/work/homr_logs/page_${page_num}.log"
+            local exit_code=0
+
+            if [[ -n "${HOMR_IMAGE:-}" ]]; then
+              if timeout "${HOMR_TIMEOUT_SEC}" docker run --rm \
+                --user "$(id -u):$(id -g)" \
+                -v /tmp/work:/work \
+                "${HOMR_IMAGE}" \
+                sh -lc "cd /work/homr_pages/page_${page_num} && homr input.png" >"${log_path}" 2>&1; then
+                exit_code=0
+              else
+                exit_code=$?
+              fi
+            elif command -v homr >/dev/null 2>&1; then
+              if (cd "${out_dir}" && timeout "${HOMR_TIMEOUT_SEC}" homr input.png) >"${log_path}" 2>&1; then
+                exit_code=0
+              else
+                exit_code=$?
+              fi
+            elif python -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("homr") else 1)' >/dev/null 2>&1; then
+              if (cd "${out_dir}" && timeout "${HOMR_TIMEOUT_SEC}" python -m homr input.png) >"${log_path}" 2>&1; then
+                exit_code=0
+              else
+                exit_code=$?
+              fi
+            else
+              exit_code=127
+              echo "homr executable/module not available" >"${log_path}"
+            fi
+
+            local xml_count
+            xml_count="$(find "${out_dir}" -maxdepth 3 -type f \( -iname "*.musicxml" -o -iname "*.xml" -o -iname "*.mxl" \) | wc -l | tr -d '[:space:]')"
+            echo "HOMR_PAGE_RUN page=$((10#${page_num})) exit_code=${exit_code} outputs=${xml_count} log=${log_path}"
+          }
+
+          for page_png in /tmp/work/homr_pages/page_*/input.png; do
+            [[ -f "${page_png}" ]] || continue
+            page_num="$(basename "$(dirname "${page_png}")" | sed -E 's/^page_([0-9]{4})$/\1/')"
+            run_homr_page "${page_num}"
+          done
+
+      - name: Build Homr page manifest (experimental)
+        if: always()
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import glob
+          import json
+          import os
+          import re
+          import zipfile
+          import xml.etree.ElementTree as ET
+
+          MANIFEST_PATH = "/tmp/work/mxl_page_manifest_homr.json"
+          OMR_PATH = os.environ.get("AUDI_OMR_PATH", "").strip()
+          ENABLED = os.environ.get("HOMR_ENABLE", "0").strip() == "1"
+
+          def local(tag):
+              if isinstance(tag, str):
+                  return tag.split("}", 1)[-1] if "}" in tag else tag
+              return str(tag)
+
+          def children_named(el, name):
+              return [c for c in list(el) if local(c.tag) == name]
+
+          def truthy_attr(v):
+              if not v:
+                  return False
+              return str(v).strip().lower() in ("1", "true", "yes")
+
+          def parse_xml_int(v):
+              txt = (v or "").strip()
+              if not re.fullmatch(r"-?\d+", txt):
+                  return None
+              try:
+                  return int(txt)
+              except Exception:
+                  return None
+
+          def count_omr_systems_in_sheet(raw):
+              try:
+                  root = ET.fromstring(raw)
+              except Exception:
+                  return None
+              pages = root.findall("page")
+              if not pages:
+                  return 0
+              count = 0
+              for page in pages:
+                  systems = page.findall(".//system")
+                  if not systems:
+                      systems = page.findall("system")
+                  count += len(systems)
+              return count
+
+          def load_omr_targets(omr_path, total_pages):
+              targets = {}
+              if not omr_path:
+                  return targets, "missing_path", "env_AUDI_OMR_PATH_empty"
+              if not os.path.exists(omr_path):
+                  return targets, "missing_file", f"omr_not_found:{omr_path}"
+              try:
+                  with zipfile.ZipFile(omr_path, "r") as z:
+                      names = z.namelist()
+                      for page_num in range(1, total_pages + 1):
+                          preferred = f"sheet#{page_num}/sheet#{page_num}.xml"
+                          member = None
+                          if preferred in names:
+                              member = preferred
+                          else:
+                              for name in names:
+                                  if name.endswith("/" + preferred) or name.endswith(preferred):
+                                      member = name
+                                      break
+                          if not member:
+                              continue
+                          try:
+                              raw = z.read(member)
+                          except Exception:
+                              continue
+                          systems = count_omr_systems_in_sheet(raw)
+                          if systems is None:
+                              continue
+                          targets[page_num] = int(systems)
+              except Exception as exc:
+                  return {}, "zip_error", str(exc)
+              return targets, ("ok" if targets else "empty"), None
+
+          def parse_musicxml_root(root):
+              parts = [el for el in list(root) if local(el.tag) == "part"]
+              if parts:
+                  measures = children_named(parts[0], "measure")
+                  part_count = len(parts)
+              else:
+                  measures = [el for el in root.iter() if local(el.tag) == "measure"]
+                  part_count = len([el for el in root.iter() if local(el.tag) == "part"])
+
+              if not measures:
+                  return {
+                      "parts": part_count,
+                      "measures": 0,
+                      "system_starts": [],
+                      "ending_tag_count": 0,
+                      "member": None,
+                  }
+
+              starts = []
+              ending_tag_count = 0
+              for i, measure in enumerate(measures, start=1):
+                  label = (measure.get("number") or "").strip() or str(i)
+                  is_new_system = (i == 1)
+                  has_layout = False
+                  for pr in children_named(measure, "print"):
+                      is_new_system = is_new_system or truthy_attr(pr.get("new-system")) or truthy_attr(pr.get("new-page"))
+                      if children_named(pr, "system-layout"):
+                          has_layout = True
+                  if is_new_system or has_layout:
+                      starts.append(label)
+                  for bar in children_named(measure, "barline"):
+                      ending_tag_count += len(children_named(bar, "ending"))
+
+              return {
+                  "parts": part_count,
+                  "measures": len(measures),
+                  "system_starts": starts,
+                  "ending_tag_count": ending_tag_count,
+                  "member": None,
+              }
+
+          def parse_xml_bytes(raw):
+              try:
+                  root = ET.fromstring(raw)
+              except Exception:
+                  return None
+              return parse_musicxml_root(root)
+
+          def score_candidate(path):
+              lower = path.lower()
+              if lower.endswith(".mxl"):
+                  try:
+                      with zipfile.ZipFile(path, "r") as z:
+                          best = None
+                          for name in z.namelist():
+                              lname = name.lower()
+                              if name.startswith("META-INF/"):
+                                  continue
+                              if not (lname.endswith(".xml") or lname.endswith(".musicxml")):
+                                  continue
+                              try:
+                                  parsed = parse_xml_bytes(z.read(name))
+                              except Exception:
+                                  continue
+                              if not parsed:
+                                  continue
+                              parsed["member"] = name
+                              if best is None or (parsed["measures"], parsed["parts"]) > (best["measures"], best["parts"]):
+                                  best = parsed
+                          if best is None:
+                              return None
+                          return {"path": path, **best}
+                  except Exception:
+                      return None
+              try:
+                  with open(path, "rb") as f:
+                      raw = f.read()
+              except Exception:
+                  return None
+              parsed = parse_xml_bytes(raw)
+              if not parsed:
+                  return None
+              parsed["member"] = os.path.basename(path)
+              return {"path": path, **parsed}
+
+          page_numbers = []
+          for page_pdf in sorted(glob.glob("/tmp/work/pages/page_*.pdf")):
+              m = re.search(r"page_(\d{4})\.pdf$", os.path.basename(page_pdf))
+              if m:
+                  page_numbers.append(int(m.group(1)))
+          total_pages = len(page_numbers)
+          omr_targets, omr_status, omr_error = load_omr_targets(OMR_PATH, total_pages)
+
+          entries = []
+          missing = 0
+          for page_num in page_numbers:
+              page_idx = page_num - 1
+              page_dir = f"/tmp/work/homr_pages/page_{page_num:04d}"
+              candidates = sorted(
+                  glob.glob(os.path.join(page_dir, "*.musicxml"))
+                  + glob.glob(os.path.join(page_dir, "*.xml"))
+                  + glob.glob(os.path.join(page_dir, "*.mxl"))
+              )
+              scored = []
+              for cand in candidates:
+                  parsed = score_candidate(cand)
+                  if not parsed:
+                      continue
+                  system_count = len(parsed.get("system_starts") or [])
+                  scored.append(
+                      {
+                          **parsed,
+                          "system_count": system_count,
+                      }
+                  )
+                  print(
+                      "HOMR_XML_CANDIDATE "
+                      f"page={page_num} path={cand} systems={system_count} "
+                      f"parts={parsed.get('parts')} measures={parsed.get('measures')} member={parsed.get('member')}"
+                  )
+
+              target = int(omr_targets.get(page_num) or 0)
+              best = None
+              if scored:
+                  scored.sort(
+                      key=lambda row: (
+                          1 if target > 0 and int(row.get("system_count") or 0) == target else 0,
+                          int(row.get("measures") or 0),
+                          int(row.get("parts") or 0),
+                          row.get("path") or "",
+                      ),
+                      reverse=True,
+                  )
+                  best = scored[0]
+
+              if not ENABLED:
+                  status = "missing"
+                  error = "homr_disabled"
+                  selection_source = "none"
+              elif best is None:
+                  status = "missing"
+                  error = "no_homr_xml"
+                  selection_source = "none"
+              else:
+                  starts = [str(v) for v in (best.get("system_starts") or [])]
+                  if target > 0 and len(starts) == target:
+                      status = "ok"
+                      error = None
+                      selection_source = "homr_page_single_exact"
+                  else:
+                      status = "missing"
+                      error = "homr_system_count_mismatch"
+                      selection_source = "none"
+
+              if best is None:
+                  starts = []
+                  ending_tag_count = 0
+                  parts_count = 0
+                  measures_count = 0
+                  mxl_path = None
+                  mxl_member = None
+              else:
+                  starts = [str(v) for v in (best.get("system_starts") or [])]
+                  ending_tag_count = int(best.get("ending_tag_count") or 0)
+                  parts_count = int(best.get("parts") or 0)
+                  measures_count = int(best.get("measures") or 0)
+                  mxl_path = best.get("path")
+                  mxl_member = best.get("member")
+
+              entry = {
+                  "page_index": page_idx,
+                  "page_number": page_num,
+                  "status": status,
+                  "error": error,
+                  "mxl_path": mxl_path,
+                  "mxl_member": mxl_member,
+                  "parts_count": parts_count,
+                  "measures_count": measures_count,
+                  "system_starts": starts,
+                  "system_starts_raw": starts,
+                  "system_starts_semantic": starts,
+                  "selection_source": selection_source,
+                  "selection_reason": "homr_page_selection",
+                  "confidence_tier": "high" if status == "ok" else "none",
+                  "low_confidence_used": False,
+                  "retry_attempted": False,
+                  "retry_profile": "none",
+                  "ending_anchors": [],
+                  "semantic_debug": {
+                      "version": "homr_ab_v1",
+                      "ending_tag_census": {
+                          "total_tags": ending_tag_count,
+                          "numbers": {},
+                          "text_cue_count": 0,
+                      },
+                      "suspicious_flags": [],
+                  },
+              }
+              if status != "ok":
+                  missing += 1
+              entries.append(entry)
+              print(
+                  "HOMR_XML_SELECTED "
+                  f"page={page_num} status={status} target={target} systems={len(starts)} "
+                  f"path={mxl_path} error={error}"
+              )
+
+          payload = {
+              "manifest_version": "page-split-homr-v1",
+              "engine": "homr",
+              "numbering_policy": "homr_raw",
+              "entries": entries,
+              "total_pages": len(entries),
+              "missing": missing,
+              "omr_system_targets": omr_targets,
+              "omr_system_targets_status": omr_status,
+              "omr_system_targets_error": omr_error,
+          }
+          with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+
+          print(f"HOMR_PAGE_MANIFEST path={MANIFEST_PATH} entries={len(entries)} missing={missing}")
+          PY
+          echo "MXL_PAGE_MANIFEST_HOMR_PATH=/tmp/work/mxl_page_manifest_homr.json" >> "$GITHUB_ENV"
+
+      - name: Annotate PDF with Homr manifest (experimental, non-gating)
+        if: always()
+        env:
+          DEBUG_GUIDES: "0"
+          ENABLE_MEASURE_LABELS: "1"
+          MEASURE_LABEL_MODE: "staff_start"
+          MEASURE_SOURCE_POLICY: "mxl_strict"
+          ENDING_LABEL_MODE: "system_only"
+          MXL_PARSER_POLICY: "auto"
+          MXL_SANITIZE_PREFIXES: "1"
+          MXL_PAGE_MANIFEST_PATH: "/tmp/work/mxl_page_manifest_homr.json"
+          DEBUG_MEASURE_LABELS: "1"
+          DEBUG_MEASURE_MARKERS: "0"
+          DEBUG_SENTINEL_TEXT: "1"
+          MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug_homr.json"
+        run: |
+          set -euo pipefail
+          if [[ "${HOMR_ENABLE}" != "1" ]]; then
+            echo "HOMR_ANNOTATE skipped HOMR_ENABLE=${HOMR_ENABLE}"
+            exit 0
+          fi
+          if [[ ! -f /tmp/work/mxl_page_manifest_homr.json ]]; then
+            echo "HOMR_ANNOTATE skipped reason=missing_manifest"
+            exit 0
+          fi
+          if [[ -z "${AUDI_OMR_PATH:-}" || ! -f "${AUDI_OMR_PATH}" ]]; then
+            echo "HOMR_ANNOTATE skipped reason=missing_omr_path"
+            exit 0
+          fi
+          set +e
+          python -u parser-api/annotate_guides_from_omr.py \
+            /tmp/work/input.pdf \
+            "${AUDI_OMR_PATH}" \
+            /tmp/work/annotated_homr.pdf
+          exit_code=$?
+          set -e
+          echo "HOMR_ANNOTATE exit_code=${exit_code}"
+          if [[ -f /tmp/work/annotated_homr.pdf ]]; then
+            ls -lh /tmp/work/annotated_homr.pdf
+          fi
+
+      - name: Homr mapping debug summary (non-gating)
+        if: always()
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json
+          import os
+
+          p = "/tmp/work/measure_mapping_debug_homr.json"
+          if not os.path.exists(p):
+              print("HOMR_SUMMARY missing_mapping_debug=1")
+              raise SystemExit(0)
+
+          d = json.load(open(p, "r", encoding="utf-8"))
+          pages = d.get("pages") or []
+          strict_ok = 0
+          for pg in pages:
+              if str(pg.get("staff_start_source")) == "mxl":
+                  strict_ok += 1
+          print(f"HOMR_SUMMARY strict_xml_pages_ok={strict_ok}/{len(pages)}")
+          for pg in pages:
+              print(
+                  "HOMR_SUMMARY_PAGE "
+                  f"page={int(pg.get('page_index', 0)) + 1} "
+                  f"source={pg.get('staff_start_source')} "
+                  f"status={pg.get('mapping_status')} "
+                  f"reason={pg.get('mapping_reason')} "
+                  f"mode={pg.get('mapping_mode')} "
+                  f"labels={pg.get('labels_drawn')}/{pg.get('labels_to_draw_count')}"
+              )
+          PY
+
+      - name: Engine compare summary (Audiveris vs Homr)
+        if: always()
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json
+          import os
+
+          CONTROL_DEBUG = "/tmp/work/measure_mapping_debug.json"
+          HOMR_DEBUG = "/tmp/work/measure_mapping_debug_homr.json"
+          CONTROL_MANIFEST = "/tmp/work/mxl_page_manifest.json"
+          HOMR_MANIFEST = "/tmp/work/mxl_page_manifest_homr.json"
+          OUT = "/tmp/work/engine_compare_summary.json"
+
+          def load_json(path):
+              if not os.path.exists(path):
+                  return None
+              try:
+                  return json.load(open(path, "r", encoding="utf-8"))
+              except Exception:
+                  return None
+
+          def strict_coverage(debug_doc):
+              if not isinstance(debug_doc, dict):
+                  return {"ok": 0, "total": 0}
+              pages = debug_doc.get("pages") or []
+              ok = 0
+              for pg in pages:
+                  if str(pg.get("staff_start_source")) == "mxl":
+                      ok += 1
+              return {"ok": int(ok), "total": int(len(pages))}
+
+          def ending_tag_presence(manifest_doc):
+              out = {}
+              if not isinstance(manifest_doc, dict):
+                  return out
+              for entry in manifest_doc.get("entries") or []:
+                  if not isinstance(entry, dict):
+                      continue
+                  page = entry.get("page_number")
+                  if page is None:
+                      page = int(entry.get("page_index", 0)) + 1
+                  try:
+                      page = int(page)
+                  except Exception:
+                      continue
+                  census = (entry.get("semantic_debug") or {}).get("ending_tag_census") or {}
+                  total_tags = int(census.get("total_tags") or 0)
+                  out[page] = total_tags
+              return out
+
+          def assigned_labels_by_page(debug_doc):
+              out = {}
+              if not isinstance(debug_doc, dict):
+                  return out
+              for pg in debug_doc.get("pages") or []:
+                  page = int(pg.get("page_index", 0)) + 1
+                  out[page] = [str(v) for v in (pg.get("assigned_labels") or [])]
+              return out
+
+          control_debug = load_json(CONTROL_DEBUG)
+          homr_debug = load_json(HOMR_DEBUG)
+          control_manifest = load_json(CONTROL_MANIFEST)
+          homr_manifest = load_json(HOMR_MANIFEST)
+
+          control_cov = strict_coverage(control_debug)
+          homr_cov = strict_coverage(homr_debug)
+
+          control_labels = assigned_labels_by_page(control_debug)
+          homr_labels = assigned_labels_by_page(homr_debug)
+          mismatch_pages = []
+          for page in sorted(set(control_labels.keys()) | set(homr_labels.keys())):
+              if control_labels.get(page) != homr_labels.get(page):
+                  mismatch_pages.append(int(page))
+
+          summary = {
+              "compare_mode": os.environ.get("ENGINE_COMPARE_MODE", "audiveris_vs_homr"),
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "ref": os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF"),
+              "sha": os.environ.get("GITHUB_SHA"),
+              "audiveris": {
+                  "strict_xml_pages_ok": control_cov["ok"],
+                  "total_pages": control_cov["total"],
+                  "ending_tags_per_page": ending_tag_presence(control_manifest),
+              },
+              "homr": {
+                  "strict_xml_pages_ok": homr_cov["ok"],
+                  "total_pages": homr_cov["total"],
+                  "ending_tags_per_page": ending_tag_presence(homr_manifest),
+              },
+              "mismatch_pages": mismatch_pages,
+          }
+
+          with open(OUT, "w", encoding="utf-8") as f:
+              json.dump(summary, f, indent=2)
+
+          print(
+              "ENGINE_COMPARE "
+              f"audiveris={control_cov['ok']}/{control_cov['total']} "
+              f"homr={homr_cov['ok']}/{homr_cov['total']} "
+              f"mismatch_pages={mismatch_pages}"
+          )
+          print(f"ENGINE_COMPARE summary_path={OUT}")
+          PY
+
+      - name: Upload Homr experimental artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          ARTIFACTS_PREFIX="${OUTPUT_PREFIX}/artifacts"
+          HOMR_PREFIX="${OUTPUT_PREFIX}/homr"
+          RUN_REF="${GITHUB_REF_NAME:-$GITHUB_REF}"
+          control_uploaded=0
+          control_missing=0
+          if [[ -f /tmp/work/control_upload_count.txt ]]; then
+            control_uploaded="$(cat /tmp/work/control_upload_count.txt)"
+          fi
+          if [[ -f /tmp/work/control_missing_count.txt ]]; then
+            control_missing="$(cat /tmp/work/control_missing_count.txt)"
+          fi
+          uploaded_count=0
+          missing_count=0
+
+          echo "RUN_SUMMARY run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT} ref=${RUN_REF} sha=${GITHUB_SHA}"
+          echo "RUN_SUMMARY output_prefix=${OUTPUT_PREFIX}"
+          echo "RUN_SUMMARY artifacts_prefix=${ARTIFACTS_PREFIX}"
+          echo "RUN_SUMMARY homr_prefix=${HOMR_PREFIX}"
+
+          if [[ -f /tmp/work/annotated_homr.pdf ]]; then
+            gsutil cp /tmp/work/annotated_homr.pdf "${HOMR_PREFIX}/homr_out.pdf"
+            echo "uploaded_homr_out=${HOMR_PREFIX}/homr_out.pdf"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/annotated_homr.pdf not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          if [[ -f /tmp/work/measure_mapping_debug_homr.json ]]; then
+            gsutil cp /tmp/work/measure_mapping_debug_homr.json "${HOMR_PREFIX}/measure_mapping_debug.json"
+            echo "uploaded_homr_mapping_debug=${HOMR_PREFIX}/measure_mapping_debug.json"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/measure_mapping_debug_homr.json not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          if [[ -f /tmp/work/mxl_page_manifest_homr.json ]]; then
+            gsutil cp /tmp/work/mxl_page_manifest_homr.json "${HOMR_PREFIX}/mxl_page_manifest.json"
+            echo "uploaded_homr_manifest=${HOMR_PREFIX}/mxl_page_manifest.json"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/mxl_page_manifest_homr.json not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          if [[ -f /tmp/work/engine_compare_summary.json ]]; then
+            gsutil cp /tmp/work/engine_compare_summary.json "${ARTIFACTS_PREFIX}/engine_compare_summary.json"
+            echo "uploaded_artifact_engine_compare=${ARTIFACTS_PREFIX}/engine_compare_summary.json"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/engine_compare_summary.json not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          rm -f /tmp/work/homr_debug_bundle.tar.gz
+          tar -czf /tmp/work/homr_debug_bundle.tar.gz \
+            /tmp/work/homr_logs \
+            /tmp/work/homr_pages \
+            /tmp/work/mxl_page_manifest_homr.json \
+            /tmp/work/measure_mapping_debug_homr.json \
+            /tmp/work/engine_compare_summary.json \
+            2>/dev/null || true
+          if [[ -f /tmp/work/homr_debug_bundle.tar.gz ]]; then
+            gsutil cp /tmp/work/homr_debug_bundle.tar.gz "${HOMR_PREFIX}/homr_debug_bundle.tar.gz"
+            echo "uploaded_homr_debug_bundle=${HOMR_PREFIX}/homr_debug_bundle.tar.gz"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/homr_debug_bundle.tar.gz not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          python - << 'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          run_ref = os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF")
+          payload = {
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "ref": run_ref,
+              "sha": os.environ.get("GITHUB_SHA"),
+              "output_prefix": os.environ.get("OUTPUT_PREFIX"),
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+          }
+          with open("/tmp/work/run_info.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+          print("RUN_INFO local_path=/tmp/work/run_info.json")
+          PY
+          gsutil cp /tmp/work/run_info.json "${ARTIFACTS_PREFIX}/run_info.json"
+          echo "uploaded_artifact_run_info=${ARTIFACTS_PREFIX}/run_info.json"
+          uploaded_count=$((uploaded_count + 1))
+
+          total_uploaded=$((control_uploaded + uploaded_count))
+          total_missing=$((control_missing + missing_count))
+          echo "HOMR_TEST_UPLOAD_COMPLETE uploaded_files=${total_uploaded} control_files=${control_uploaded} homr_files=${uploaded_count}"
+          echo "OUTPUT_LAYOUT_OK top_level=audiveris_out.pdf,artifacts/,homr/ uploaded=${total_uploaded} missing=${total_missing}"
