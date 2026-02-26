@@ -29,20 +29,17 @@ Base prefix:
 
 - `gs://music-omr-bucket-777135743132/output`
 
-Run-scoped prefix (for traceability):
+Top-level objects (exact):
 
-- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/`
+- `gs://music-omr-bucket-777135743132/output/audiveris_out.pdf`
+- `gs://music-omr-bucket-777135743132/output/artifacts/`
 
-Artifacts written per run:
+Artifacts folder contents:
 
-- `annotated.pdf`
-- `measure_mapping_debug.json`
-- `mxl_page_manifest.json`
-- `omr_debug_bundle.tar.gz`
-
-Latest convenience copy:
-
-- `gs://music-omr-bucket-777135743132/output/annotated.pdf`
+- `gs://music-omr-bucket-777135743132/output/artifacts/measure_mapping_debug.json`
+- `gs://music-omr-bucket-777135743132/output/artifacts/mxl_page_manifest.json`
+- `gs://music-omr-bucket-777135743132/output/artifacts/omr_debug_bundle.tar.gz`
+- `gs://music-omr-bucket-777135743132/output/artifacts/run_info.json`
 
 ## Success criteria
 
@@ -65,9 +62,9 @@ Download and share these step logs:
 - `16_Mapping debug summary.txt`
 - `18_Upload outputs and debug artifacts.txt`
 
-Also share run-scoped debug bundle URI:
+Also share debug bundle URI:
 
-- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/omr_debug_bundle.tar.gz`
+- `gs://music-omr-bucket-777135743132/output/artifacts/omr_debug_bundle.tar.gz`
 
 ## Troubleshooting note: system-count mismatch
 

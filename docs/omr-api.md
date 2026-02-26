@@ -31,11 +31,11 @@ Response (202):
   "status_url": "/api/omr/jobs/<job_id>",
   "run_url": "https://github.com/...",
   "artifacts": {
-    "annotated_pdf": "gs://.../output/runs/<run_id>/annotated.pdf",
-    "measure_mapping_debug": "gs://.../output/runs/<run_id>/measure_mapping_debug.json",
-    "mxl_page_manifest": "gs://.../output/runs/<run_id>/mxl_page_manifest.json",
-    "omr_debug_bundle": "gs://.../output/runs/<run_id>/omr_debug_bundle.tar.gz",
-    "latest_annotated_pdf": "gs://.../output/annotated.pdf"
+    "annotated_pdf": "gs://.../output/audiveris_out.pdf",
+    "measure_mapping_debug": "gs://.../output/artifacts/measure_mapping_debug.json",
+    "mxl_page_manifest": "gs://.../output/artifacts/mxl_page_manifest.json",
+    "omr_debug_bundle": "gs://.../output/artifacts/omr_debug_bundle.tar.gz",
+    "run_info": "gs://.../output/artifacts/run_info.json"
   }
 }
 ```
@@ -58,11 +58,11 @@ Response (200):
   "updated_at": "ISO-8601",
   "run_url": "https://github.com/...",
   "artifacts": {
-    "annotated_pdf": "gs://.../output/runs/<run_id>/annotated.pdf",
-    "measure_mapping_debug": "gs://.../output/runs/<run_id>/measure_mapping_debug.json",
-    "mxl_page_manifest": "gs://.../output/runs/<run_id>/mxl_page_manifest.json",
-    "omr_debug_bundle": "gs://.../output/runs/<run_id>/omr_debug_bundle.tar.gz",
-    "latest_annotated_pdf": "gs://.../output/annotated.pdf"
+    "annotated_pdf": "gs://.../output/audiveris_out.pdf",
+    "measure_mapping_debug": "gs://.../output/artifacts/measure_mapping_debug.json",
+    "mxl_page_manifest": "gs://.../output/artifacts/mxl_page_manifest.json",
+    "omr_debug_bundle": "gs://.../output/artifacts/omr_debug_bundle.tar.gz",
+    "run_info": "gs://.../output/artifacts/run_info.json"
   }
 }
 ```

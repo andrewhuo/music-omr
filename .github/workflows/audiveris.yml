@@ -62,7 +62,6 @@ jobs:
       - name: Show run context
         run: |
           set -euo pipefail
-          RUN_OUTPUT_PREFIX="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}"
           echo "repo: $GITHUB_REPOSITORY"
           echo "sha:  $GITHUB_SHA"
           echo "ref:  ${GITHUB_REF_NAME:-$GITHUB_REF}"
@@ -71,7 +70,7 @@ jobs:
           echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
           echo "audiveris_image: ${AUDIVERIS_IMAGE}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
-          echo "run_output_prefix: ${RUN_OUTPUT_PREFIX}"
+          echo "output_contract_top_level=audiveris_out.pdf,artifacts/"
 
       - name: Download input PDF
         run: |
@@ -3076,63 +3075,93 @@ jobs:
             ls -lh /tmp/work/omr_debug_bundle.tar.gz
           fi
 
-      - name: Upload outputs and debug artifacts
+      - name: Clear previous Audiveris outputs
         if: always()
         run: |
           set -euo pipefail
-          RUN_OUTPUT_PREFIX="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}"
+          echo "AUDIVERIS_OUTPUT_CLEANUP prefix=${OUTPUT_PREFIX}"
+          set +e
+          gsutil -m rm -r "${OUTPUT_PREFIX}/**" >/tmp/work/audiveris_cleanup.log 2>&1
+          cleanup_status=$?
+          set -e
+          if [[ ${cleanup_status} -eq 0 ]]; then
+            echo "AUDIVERIS_OUTPUT_CLEANUP cleared=1"
+          elif grep -qE "No URLs matched|no objects" /tmp/work/audiveris_cleanup.log; then
+            echo "AUDIVERIS_OUTPUT_CLEANUP empty_prefix=1"
+          else
+            echo "AUDIVERIS_OUTPUT_CLEANUP_WARN status=${cleanup_status}"
+            sed -n '1,120p' /tmp/work/audiveris_cleanup.log || true
+          fi
+
+      - name: Upload outputs and debug artifacts (flat layout)
+        if: always()
+        run: |
+          set -euo pipefail
+          ARTIFACTS_PREFIX="${OUTPUT_PREFIX}/artifacts"
           RUN_REF="${GITHUB_REF_NAME:-$GITHUB_REF}"
+
+          uploaded_count=0
+          missing_count=0
+
           echo "RUN_SUMMARY run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT} ref=${RUN_REF} sha=${GITHUB_SHA}"
           echo "RUN_SUMMARY output_prefix=${OUTPUT_PREFIX}"
-          echo "RUN_SUMMARY run_output_prefix=${RUN_OUTPUT_PREFIX}"
+          echo "RUN_SUMMARY artifacts_prefix=${ARTIFACTS_PREFIX}"
 
           if [[ -f /tmp/work/annotated.pdf ]]; then
-            gsutil cp /tmp/work/annotated.pdf "${RUN_OUTPUT_PREFIX}/annotated.pdf"
-            echo "uploaded_run_annotated=${RUN_OUTPUT_PREFIX}/annotated.pdf"
-            gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
-            echo "uploaded_latest=${OUTPUT_PREFIX}/annotated.pdf"
-            echo "RUN_SUMMARY artifact_annotated_run=${RUN_OUTPUT_PREFIX}/annotated.pdf"
-            echo "RUN_SUMMARY artifact_annotated_latest=${OUTPUT_PREFIX}/annotated.pdf"
+            gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/audiveris_out.pdf"
+            echo "uploaded_audiveris_out=${OUTPUT_PREFIX}/audiveris_out.pdf"
+            uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/annotated.pdf not found"
-            echo "RUN_SUMMARY artifact_annotated_run=missing"
-            echo "RUN_SUMMARY artifact_annotated_latest=missing"
-          fi
-          if [[ -f /tmp/work/measure_mapping_debug.json ]]; then
-            gsutil cp /tmp/work/measure_mapping_debug.json "${RUN_OUTPUT_PREFIX}/measure_mapping_debug.json"
-            gsutil cp /tmp/work/measure_mapping_debug.json "${OUTPUT_PREFIX}/measure_mapping_debug.json"
-            echo "uploaded_mapping_debug=${OUTPUT_PREFIX}/measure_mapping_debug.json"
-            echo "uploaded_run_mapping_debug=${RUN_OUTPUT_PREFIX}/measure_mapping_debug.json"
-            echo "RUN_SUMMARY artifact_mapping_debug=${RUN_OUTPUT_PREFIX}/measure_mapping_debug.json"
-            echo "RUN_SUMMARY artifact_mapping_debug_latest=${OUTPUT_PREFIX}/measure_mapping_debug.json"
-          else
-            echo "WARN: /tmp/work/measure_mapping_debug.json not found"
-            echo "RUN_SUMMARY artifact_mapping_debug=missing"
-            echo "RUN_SUMMARY artifact_mapping_debug_latest=missing"
-          fi
-          if [[ -f /tmp/work/mxl_page_manifest.json ]]; then
-            gsutil cp /tmp/work/mxl_page_manifest.json "${RUN_OUTPUT_PREFIX}/mxl_page_manifest.json"
-            gsutil cp /tmp/work/mxl_page_manifest.json "${OUTPUT_PREFIX}/mxl_page_manifest.json"
-            echo "uploaded_manifest=${OUTPUT_PREFIX}/mxl_page_manifest.json"
-            echo "uploaded_run_manifest=${RUN_OUTPUT_PREFIX}/mxl_page_manifest.json"
-            echo "RUN_SUMMARY artifact_manifest=${RUN_OUTPUT_PREFIX}/mxl_page_manifest.json"
-            echo "RUN_SUMMARY artifact_manifest_latest=${OUTPUT_PREFIX}/mxl_page_manifest.json"
-          else
-            echo "WARN: /tmp/work/mxl_page_manifest.json not found"
-            echo "RUN_SUMMARY artifact_manifest=missing"
-            echo "RUN_SUMMARY artifact_manifest_latest=missing"
-          fi
-          if [[ -f /tmp/work/omr_debug_bundle.tar.gz ]]; then
-            gsutil cp /tmp/work/omr_debug_bundle.tar.gz "${RUN_OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            gsutil cp /tmp/work/omr_debug_bundle.tar.gz "${OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            echo "uploaded_debug_bundle=${OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            echo "uploaded_run_debug_bundle=${RUN_OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            echo "RUN_SUMMARY artifact_debug_bundle=${RUN_OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            echo "RUN_SUMMARY artifact_debug_bundle_latest=${OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-          else
-            echo "WARN: /tmp/work/omr_debug_bundle.tar.gz not found"
-            echo "RUN_SUMMARY artifact_debug_bundle=missing"
-            echo "RUN_SUMMARY artifact_debug_bundle_latest=missing"
+            missing_count=$((missing_count + 1))
           fi
 
-          echo "Upload complete"
+          if [[ -f /tmp/work/measure_mapping_debug.json ]]; then
+            gsutil cp /tmp/work/measure_mapping_debug.json "${ARTIFACTS_PREFIX}/measure_mapping_debug.json"
+            echo "uploaded_artifact_mapping_debug=${ARTIFACTS_PREFIX}/measure_mapping_debug.json"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/measure_mapping_debug.json not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          if [[ -f /tmp/work/mxl_page_manifest.json ]]; then
+            gsutil cp /tmp/work/mxl_page_manifest.json "${ARTIFACTS_PREFIX}/mxl_page_manifest.json"
+            echo "uploaded_artifact_manifest=${ARTIFACTS_PREFIX}/mxl_page_manifest.json"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/mxl_page_manifest.json not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          if [[ -f /tmp/work/omr_debug_bundle.tar.gz ]]; then
+            gsutil cp /tmp/work/omr_debug_bundle.tar.gz "${ARTIFACTS_PREFIX}/omr_debug_bundle.tar.gz"
+            echo "uploaded_artifact_debug_bundle=${ARTIFACTS_PREFIX}/omr_debug_bundle.tar.gz"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/omr_debug_bundle.tar.gz not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          python - << 'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          payload = {
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "ref": os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF"),
+              "sha": os.environ.get("GITHUB_SHA"),
+              "output_prefix": os.environ.get("OUTPUT_PREFIX"),
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+          }
+          with open("/tmp/work/run_info.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+          print("RUN_INFO local_path=/tmp/work/run_info.json")
+          PY
+          gsutil cp /tmp/work/run_info.json "${ARTIFACTS_PREFIX}/run_info.json"
+          echo "uploaded_artifact_run_info=${ARTIFACTS_PREFIX}/run_info.json"
+          uploaded_count=$((uploaded_count + 1))
+
+          echo "OUTPUT_LAYOUT_OK top_level=audiveris_out.pdf,artifacts/ uploaded=${uploaded_count} missing=${missing_count}"

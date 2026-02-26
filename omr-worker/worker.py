@@ -156,13 +156,12 @@ def _discover_run_id(dispatched_at: datetime, expected_sha: str | None) -> int |
 
 
 def _artifact_uris_for_run(run_id: int) -> dict[str, str]:
-    run_prefix = f"{OUTPUT_PREFIX}/runs/{run_id}"
     return {
-        "annotated_pdf": f"{run_prefix}/annotated.pdf",
-        "measure_mapping_debug": f"{run_prefix}/measure_mapping_debug.json",
-        "mxl_page_manifest": f"{run_prefix}/mxl_page_manifest.json",
-        "omr_debug_bundle": f"{run_prefix}/omr_debug_bundle.tar.gz",
-        "latest_annotated_pdf": f"{OUTPUT_PREFIX}/annotated.pdf",
+        "annotated_pdf": f"{OUTPUT_PREFIX}/audiveris_out.pdf",
+        "measure_mapping_debug": f"{OUTPUT_PREFIX}/artifacts/measure_mapping_debug.json",
+        "mxl_page_manifest": f"{OUTPUT_PREFIX}/artifacts/mxl_page_manifest.json",
+        "omr_debug_bundle": f"{OUTPUT_PREFIX}/artifacts/omr_debug_bundle.tar.gz",
+        "run_info": f"{OUTPUT_PREFIX}/artifacts/run_info.json",
     }
 
 
