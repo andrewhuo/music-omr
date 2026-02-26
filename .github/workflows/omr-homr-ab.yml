@@ -12,7 +12,7 @@ jobs:
   pipeline:
     runs-on: ubuntu-latest
     env:
-      OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output/homr-ab"
+      OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output/homr-test"
       AUDIVERIS_IMAGE: "ghcr.io/andrewhuo/audiveris-engine@sha256:61c2a4a39e6f545bb9153a984247b83ace541196c4861329b295982e4cf57bed"
       AUDIVERIS_VERSION: "5.9.0"
       MEASURE_NUMBERING_POLICY: "semantic_continuous_v1"
@@ -66,7 +66,7 @@ jobs:
       - name: Show run context
         run: |
           set -euo pipefail
-          RUN_OUTPUT_PREFIX="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}"
+          LATEST_OUTPUT_PREFIX="${OUTPUT_PREFIX}/latest"
           echo "repo: $GITHUB_REPOSITORY"
           echo "sha:  $GITHUB_SHA"
           echo "ref:  ${GITHUB_REF_NAME:-$GITHUB_REF}"
@@ -75,7 +75,7 @@ jobs:
           echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
           echo "audiveris_image: ${AUDIVERIS_IMAGE}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
-          echo "run_output_prefix: ${RUN_OUTPUT_PREFIX}"
+          echo "latest_output_prefix: ${LATEST_OUTPUT_PREFIX}"
 
       - name: Download input PDF
         run: |
@@ -3080,66 +3080,68 @@ jobs:
             ls -lh /tmp/work/omr_debug_bundle.tar.gz
           fi
 
-      - name: Upload outputs and debug artifacts
+      - name: Clear previous Homr test outputs
         if: always()
         run: |
           set -euo pipefail
-          RUN_OUTPUT_PREFIX="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}"
+          echo "HOMR_TEST_CLEANUP prefix=${OUTPUT_PREFIX}"
+          set +e
+          gsutil -m rm -r "${OUTPUT_PREFIX}/**" >/tmp/work/homr_cleanup.log 2>&1
+          cleanup_status=$?
+          set -e
+          if [[ ${cleanup_status} -eq 0 ]]; then
+            echo "HOMR_TEST_CLEANUP cleared=1"
+          elif grep -qE "No URLs matched|no objects" /tmp/work/homr_cleanup.log; then
+            echo "HOMR_TEST_CLEANUP empty_prefix=1"
+          else
+            echo "HOMR_TEST_CLEANUP_WARN status=${cleanup_status}"
+            sed -n '1,120p' /tmp/work/homr_cleanup.log || true
+          fi
+
+      - name: Upload control artifacts (latest only)
+        if: always()
+        run: |
+          set -euo pipefail
+          LATEST_OUTPUT_PREFIX="${OUTPUT_PREFIX}/latest"
+          CONTROL_PREFIX="${LATEST_OUTPUT_PREFIX}/control"
           RUN_REF="${GITHUB_REF_NAME:-$GITHUB_REF}"
           echo "RUN_SUMMARY run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT} ref=${RUN_REF} sha=${GITHUB_SHA}"
           echo "RUN_SUMMARY output_prefix=${OUTPUT_PREFIX}"
-          echo "RUN_SUMMARY run_output_prefix=${RUN_OUTPUT_PREFIX}"
+          echo "RUN_SUMMARY latest_output_prefix=${LATEST_OUTPUT_PREFIX}"
+
+          uploaded_count=0
 
           if [[ -f /tmp/work/annotated.pdf ]]; then
-            gsutil cp /tmp/work/annotated.pdf "${RUN_OUTPUT_PREFIX}/annotated.pdf"
-            echo "uploaded_run_annotated=${RUN_OUTPUT_PREFIX}/annotated.pdf"
-            gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/annotated.pdf"
-            echo "uploaded_latest=${OUTPUT_PREFIX}/annotated.pdf"
-            echo "RUN_SUMMARY artifact_annotated_run=${RUN_OUTPUT_PREFIX}/annotated.pdf"
-            echo "RUN_SUMMARY artifact_annotated_latest=${OUTPUT_PREFIX}/annotated.pdf"
+            gsutil cp /tmp/work/annotated.pdf "${CONTROL_PREFIX}/annotated.pdf"
+            echo "uploaded_control_annotated=${CONTROL_PREFIX}/annotated.pdf"
+            uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/annotated.pdf not found"
-            echo "RUN_SUMMARY artifact_annotated_run=missing"
-            echo "RUN_SUMMARY artifact_annotated_latest=missing"
           fi
           if [[ -f /tmp/work/measure_mapping_debug.json ]]; then
-            gsutil cp /tmp/work/measure_mapping_debug.json "${RUN_OUTPUT_PREFIX}/measure_mapping_debug.json"
-            gsutil cp /tmp/work/measure_mapping_debug.json "${OUTPUT_PREFIX}/measure_mapping_debug.json"
-            echo "uploaded_mapping_debug=${OUTPUT_PREFIX}/measure_mapping_debug.json"
-            echo "uploaded_run_mapping_debug=${RUN_OUTPUT_PREFIX}/measure_mapping_debug.json"
-            echo "RUN_SUMMARY artifact_mapping_debug=${RUN_OUTPUT_PREFIX}/measure_mapping_debug.json"
-            echo "RUN_SUMMARY artifact_mapping_debug_latest=${OUTPUT_PREFIX}/measure_mapping_debug.json"
+            gsutil cp /tmp/work/measure_mapping_debug.json "${CONTROL_PREFIX}/measure_mapping_debug.json"
+            echo "uploaded_control_mapping_debug=${CONTROL_PREFIX}/measure_mapping_debug.json"
+            uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/measure_mapping_debug.json not found"
-            echo "RUN_SUMMARY artifact_mapping_debug=missing"
-            echo "RUN_SUMMARY artifact_mapping_debug_latest=missing"
           fi
           if [[ -f /tmp/work/mxl_page_manifest.json ]]; then
-            gsutil cp /tmp/work/mxl_page_manifest.json "${RUN_OUTPUT_PREFIX}/mxl_page_manifest.json"
-            gsutil cp /tmp/work/mxl_page_manifest.json "${OUTPUT_PREFIX}/mxl_page_manifest.json"
-            echo "uploaded_manifest=${OUTPUT_PREFIX}/mxl_page_manifest.json"
-            echo "uploaded_run_manifest=${RUN_OUTPUT_PREFIX}/mxl_page_manifest.json"
-            echo "RUN_SUMMARY artifact_manifest=${RUN_OUTPUT_PREFIX}/mxl_page_manifest.json"
-            echo "RUN_SUMMARY artifact_manifest_latest=${OUTPUT_PREFIX}/mxl_page_manifest.json"
+            gsutil cp /tmp/work/mxl_page_manifest.json "${CONTROL_PREFIX}/mxl_page_manifest.json"
+            echo "uploaded_control_manifest=${CONTROL_PREFIX}/mxl_page_manifest.json"
+            uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/mxl_page_manifest.json not found"
-            echo "RUN_SUMMARY artifact_manifest=missing"
-            echo "RUN_SUMMARY artifact_manifest_latest=missing"
           fi
           if [[ -f /tmp/work/omr_debug_bundle.tar.gz ]]; then
-            gsutil cp /tmp/work/omr_debug_bundle.tar.gz "${RUN_OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            gsutil cp /tmp/work/omr_debug_bundle.tar.gz "${OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            echo "uploaded_debug_bundle=${OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            echo "uploaded_run_debug_bundle=${RUN_OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            echo "RUN_SUMMARY artifact_debug_bundle=${RUN_OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
-            echo "RUN_SUMMARY artifact_debug_bundle_latest=${OUTPUT_PREFIX}/omr_debug_bundle.tar.gz"
+            gsutil cp /tmp/work/omr_debug_bundle.tar.gz "${CONTROL_PREFIX}/omr_debug_bundle.tar.gz"
+            echo "uploaded_control_debug_bundle=${CONTROL_PREFIX}/omr_debug_bundle.tar.gz"
+            uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/omr_debug_bundle.tar.gz not found"
-            echo "RUN_SUMMARY artifact_debug_bundle=missing"
-            echo "RUN_SUMMARY artifact_debug_bundle_latest=missing"
           fi
 
-          echo "Upload complete"
+          echo "${uploaded_count}" > /tmp/work/control_upload_count.txt
+          echo "CONTROL_UPLOAD_COMPLETE uploaded_files=${uploaded_count}"
 
       - name: Set up Homr dependencies (experimental)
         if: always()
@@ -3747,12 +3749,23 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          RUN_OUTPUT_PREFIX="${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}"
-          HOMR_PREFIX="${RUN_OUTPUT_PREFIX}/homr"
+          LATEST_OUTPUT_PREFIX="${OUTPUT_PREFIX}/latest"
+          HOMR_PREFIX="${LATEST_OUTPUT_PREFIX}/homr"
+          RUN_REF="${GITHUB_REF_NAME:-$GITHUB_REF}"
+          control_uploaded=0
+          if [[ -f /tmp/work/control_upload_count.txt ]]; then
+            control_uploaded="$(cat /tmp/work/control_upload_count.txt)"
+          fi
+          uploaded_count=0
+
+          echo "RUN_SUMMARY run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT} ref=${RUN_REF} sha=${GITHUB_SHA}"
+          echo "RUN_SUMMARY output_prefix=${OUTPUT_PREFIX}"
+          echo "RUN_SUMMARY latest_output_prefix=${LATEST_OUTPUT_PREFIX}"
 
           if [[ -f /tmp/work/annotated_homr.pdf ]]; then
             gsutil cp /tmp/work/annotated_homr.pdf "${HOMR_PREFIX}/annotated.pdf"
             echo "uploaded_homr_annotated=${HOMR_PREFIX}/annotated.pdf"
+            uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/annotated_homr.pdf not found"
           fi
@@ -3760,6 +3773,7 @@ jobs:
           if [[ -f /tmp/work/measure_mapping_debug_homr.json ]]; then
             gsutil cp /tmp/work/measure_mapping_debug_homr.json "${HOMR_PREFIX}/measure_mapping_debug.json"
             echo "uploaded_homr_mapping_debug=${HOMR_PREFIX}/measure_mapping_debug.json"
+            uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/measure_mapping_debug_homr.json not found"
           fi
@@ -3767,14 +3781,15 @@ jobs:
           if [[ -f /tmp/work/mxl_page_manifest_homr.json ]]; then
             gsutil cp /tmp/work/mxl_page_manifest_homr.json "${HOMR_PREFIX}/mxl_page_manifest.json"
             echo "uploaded_homr_manifest=${HOMR_PREFIX}/mxl_page_manifest.json"
+            uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/mxl_page_manifest_homr.json not found"
           fi
 
           if [[ -f /tmp/work/engine_compare_summary.json ]]; then
-            gsutil cp /tmp/work/engine_compare_summary.json "${RUN_OUTPUT_PREFIX}/engine_compare_summary.json"
-            gsutil cp /tmp/work/engine_compare_summary.json "${HOMR_PREFIX}/engine_compare_summary.json"
-            echo "uploaded_engine_compare=${RUN_OUTPUT_PREFIX}/engine_compare_summary.json"
+            gsutil cp /tmp/work/engine_compare_summary.json "${LATEST_OUTPUT_PREFIX}/engine_compare_summary.json"
+            echo "uploaded_engine_compare=${LATEST_OUTPUT_PREFIX}/engine_compare_summary.json"
+            uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/engine_compare_summary.json not found"
           fi
@@ -3790,4 +3805,29 @@ jobs:
           if [[ -f /tmp/work/homr_debug_bundle.tar.gz ]]; then
             gsutil cp /tmp/work/homr_debug_bundle.tar.gz "${HOMR_PREFIX}/homr_debug_bundle.tar.gz"
             echo "uploaded_homr_debug_bundle=${HOMR_PREFIX}/homr_debug_bundle.tar.gz"
+            uploaded_count=$((uploaded_count + 1))
           fi
+
+          python - << 'PY'
+          import json
+          import os
+
+          run_ref = os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF")
+          payload = {
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "ref": run_ref,
+              "sha": os.environ.get("GITHUB_SHA"),
+              "output_prefix": os.environ.get("OUTPUT_PREFIX"),
+              "latest_prefix": f"{os.environ.get('OUTPUT_PREFIX')}/latest",
+          }
+          with open("/tmp/work/run_info.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+          print("RUN_INFO local_path=/tmp/work/run_info.json")
+          PY
+          gsutil cp /tmp/work/run_info.json "${LATEST_OUTPUT_PREFIX}/run_info.json"
+          echo "uploaded_run_info=${LATEST_OUTPUT_PREFIX}/run_info.json"
+          uploaded_count=$((uploaded_count + 1))
+
+          total_uploaded=$((control_uploaded + uploaded_count))
+          echo "HOMR_TEST_UPLOAD_COMPLETE uploaded_files=${total_uploaded} control_files=${control_uploaded} homr_files=${uploaded_count}"

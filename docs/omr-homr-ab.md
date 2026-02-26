@@ -35,16 +35,22 @@ Environment variables in the experiment workflow:
 
 ## Artifact paths
 
-Run-scoped only (no production latest overwrite):
+Latest-only layout (old Homr test outputs are cleared each run):
 
-- Control artifacts: `gs://music-omr-bucket-777135743132/output/homr-ab/runs/<run_id>/...`
+- Base prefix: `gs://music-omr-bucket-777135743132/output/homr-test/latest/`
+- Control artifacts:
+  - `.../control/annotated.pdf`
+  - `.../control/measure_mapping_debug.json`
+  - `.../control/mxl_page_manifest.json`
+  - `.../control/omr_debug_bundle.tar.gz`
 - Homr artifacts:
-  - `.../runs/<run_id>/homr/annotated.pdf`
-  - `.../runs/<run_id>/homr/measure_mapping_debug.json`
-  - `.../runs/<run_id>/homr/mxl_page_manifest.json`
-  - `.../runs/<run_id>/homr/homr_debug_bundle.tar.gz`
-- Compare summary:
-  - `.../runs/<run_id>/engine_compare_summary.json`
+  - `.../homr/annotated.pdf`
+  - `.../homr/measure_mapping_debug.json`
+  - `.../homr/mxl_page_manifest.json`
+  - `.../homr/homr_debug_bundle.tar.gz`
+- Compare + run metadata:
+  - `.../engine_compare_summary.json`
+  - `.../run_info.json`
 
 ## Notes
 
