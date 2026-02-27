@@ -16,6 +16,14 @@ jobs:
       AUDIVERIS_IMAGE: "ghcr.io/andrewhuo/audiveris-engine@sha256:61c2a4a39e6f545bb9153a984247b83ace541196c4861329b295982e4cf57bed"
       AUDIVERIS_VERSION: "5.9.0"
       MEASURE_NUMBERING_POLICY: "semantic_continuous_v1"
+      MULTIREST_WARN_ONLY: "0"
+      MULTIREST_DEBUG_PAGE_FILTER: ""
+      MULTIREST_ROI_EXPAND_X: "1.0"
+      MULTIREST_ROI_EXPAND_Y: "1.0"
+      MULTIREST_TEXT_SCORE_MIN: "20"
+      MULTIREST_TEXT_MARGIN_MIN: "7"
+      MULTIREST_OCR_CONF_MIN: "60"
+      MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE: "6"
 
     permissions:
       contents: read
@@ -561,16 +569,91 @@ jobs:
           PAGE_PDF_DIR = "/tmp/work/pages"
           MULTIREST_MAX_COUNT = 64
           MULTIREST_MIN_COUNT = 2
-          MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE = 6
-          MULTIREST_TEXT_SCORE_MIN = 20.0
-          MULTIREST_TEXT_MARGIN_MIN = 7.0
-          MULTIREST_OCR_CONF_MIN = 60.0
+
+          def parse_env_float(name, default):
+              raw = (os.environ.get(name, "") or "").strip()
+              if raw == "":
+                  return float(default)
+              try:
+                  return float(raw)
+              except Exception:
+                  print(
+                      f"SEMANTIC_WARN page=- reason=invalid_env_{name.lower()}:{raw} fallback={default}"
+                  )
+                  return float(default)
+
+          def parse_env_int(name, default):
+              raw = (os.environ.get(name, "") or "").strip()
+              if raw == "":
+                  return int(default)
+              try:
+                  return int(raw)
+              except Exception:
+                  print(
+                      f"SEMANTIC_WARN page=- reason=invalid_env_{name.lower()}:{raw} fallback={default}"
+                  )
+                  return int(default)
+
+          def parse_env_bool(name, default=False):
+              raw = (os.environ.get(name, "") or "").strip().lower()
+              if raw == "":
+                  return bool(default)
+              if raw in ("1", "true", "yes", "on"):
+                  return True
+              if raw in ("0", "false", "no", "off"):
+                  return False
+              print(
+                  f"SEMANTIC_WARN page=- reason=invalid_env_{name.lower()}:{raw} fallback={int(bool(default))}"
+              )
+              return bool(default)
+
+          def parse_page_filter_env(raw):
+              txt = (raw or "").strip()
+              if not txt:
+                  return set()
+              out = set()
+              for tok in txt.split(","):
+                  token = tok.strip()
+                  if not token:
+                      continue
+                  if not re.fullmatch(r"\d+", token):
+                      print(
+                          f"SEMANTIC_WARN page=- reason=invalid_multirest_debug_page_filter_token:{token}"
+                      )
+                      continue
+                  out.add(int(token))
+              return out
+
+          MULTIREST_WARN_ONLY = parse_env_bool("MULTIREST_WARN_ONLY", False)
+          MULTIREST_DEBUG_PAGE_FILTER_RAW = (
+              os.environ.get("MULTIREST_DEBUG_PAGE_FILTER", "") or ""
+          ).strip()
+          MULTIREST_DEBUG_PAGE_FILTER = parse_page_filter_env(MULTIREST_DEBUG_PAGE_FILTER_RAW)
+          MULTIREST_ROI_EXPAND_X = max(0.1, parse_env_float("MULTIREST_ROI_EXPAND_X", 1.0))
+          MULTIREST_ROI_EXPAND_Y = max(0.1, parse_env_float("MULTIREST_ROI_EXPAND_Y", 1.0))
+          MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE = max(
+              0, parse_env_int("MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE", 6)
+          )
+          MULTIREST_TEXT_SCORE_MIN = parse_env_float("MULTIREST_TEXT_SCORE_MIN", 20.0)
+          MULTIREST_TEXT_MARGIN_MIN = parse_env_float("MULTIREST_TEXT_MARGIN_MIN", 7.0)
+          MULTIREST_OCR_CONF_MIN = parse_env_float("MULTIREST_OCR_CONF_MIN", 60.0)
           NUMBERING_POLICY = (os.environ.get("MEASURE_NUMBERING_POLICY", "semantic_continuous_v1") or "").strip() or "semantic_continuous_v1"
           if NUMBERING_POLICY not in ("semantic_continuous_v1", "legacy_raw_starts"):
               print(
                   f"SEMANTIC_WARN page=- reason=invalid_numbering_policy:{NUMBERING_POLICY} fallback=semantic_continuous_v1"
               )
               NUMBERING_POLICY = "semantic_continuous_v1"
+          print(
+              "SEMANTIC_MULTIREST_CONFIG "
+              f"warn_only={int(MULTIREST_WARN_ONLY)} "
+              f"page_filter={sorted(MULTIREST_DEBUG_PAGE_FILTER)} "
+              f"roi_expand_x={MULTIREST_ROI_EXPAND_X:.2f} "
+              f"roi_expand_y={MULTIREST_ROI_EXPAND_Y:.2f} "
+              f"text_score_min={MULTIREST_TEXT_SCORE_MIN:.2f} "
+              f"text_margin_min={MULTIREST_TEXT_MARGIN_MIN:.2f} "
+              f"ocr_conf_min={MULTIREST_OCR_CONF_MIN:.2f} "
+              f"ocr_max_attempts_per_page={MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE}"
+          )
 
           def to_float(v):
               try:
@@ -1002,6 +1085,65 @@ jobs:
                   return None, "ocr_conf_below_threshold"
               return best, None
 
+          def map_multirest_reason(raw_reason):
+              reason = str(raw_reason or "").strip()
+              if not reason:
+                  return "ocr_no_numeric_token"
+              if reason in {
+                  "geometry_unavailable",
+                  "no_multirest_box_for_system",
+                  "invalid_roi",
+                  "no_numeric_text_in_roi",
+                  "text_score_below_threshold",
+                  "text_score_ambiguous",
+                  "ocr_no_numeric_token",
+                  "ocr_conf_below_threshold",
+                  "text_ocr_conflict",
+                  "ocr_attempt_cap_reached",
+              }:
+                  return reason
+              if reason.startswith("geometry_unavailable"):
+                  return "geometry_unavailable"
+              if reason.startswith("no_multirest_box_for_system"):
+                  return "no_multirest_box_for_system"
+              if reason.startswith("invalid_roi"):
+                  return "invalid_roi"
+              if reason.startswith("no_numeric_text_in_roi"):
+                  return "no_numeric_text_in_roi"
+              if reason.startswith("text_score_below_threshold"):
+                  return "text_score_below_threshold"
+              if reason.startswith("text_score_ambiguous"):
+                  return "text_score_ambiguous"
+              if reason.startswith("ocr_conf_below_threshold"):
+                  return "ocr_conf_below_threshold"
+              if reason.startswith("text_ocr_conflict"):
+                  return "text_ocr_conflict"
+              if reason.startswith("ocr_attempt_cap_reached"):
+                  return "ocr_attempt_cap_reached"
+              if reason.startswith("ocr_no_numeric_token"):
+                  return "ocr_no_numeric_token"
+              if reason.startswith("ocr_"):
+                  if "conf_below_threshold" in reason:
+                      return "ocr_conf_below_threshold"
+                  return "ocr_no_numeric_token"
+              if reason.startswith("page_pdf_") or reason.startswith("missing_page_split_omr"):
+                  return "geometry_unavailable"
+              if reason.startswith("sheet_xml_not_found") or reason.startswith("omr_geometry_error"):
+                  return "geometry_unavailable"
+              return "ocr_no_numeric_token"
+
+          def format_text_candidates_for_log(candidates, limit=3):
+              out = []
+              for row in list(candidates or [])[: max(0, int(limit))]:
+                  bbox = list(row.get("bbox") or [0, 0, 0, 0])
+                  if len(bbox) < 4:
+                      bbox = [0, 0, 0, 0]
+                  out.append(
+                      f"{int(row.get('value') or 0)}:{float(row.get('score') or 0.0):.2f}:"
+                      f"{float(bbox[0]):.1f},{float(bbox[1]):.1f},{float(bbox[2]):.1f},{float(bbox[3]):.1f}"
+                  )
+              return "[" + ";".join(out) + "]"
+
           def recover_multirest_for_entry(entry, page_warning_map):
               page_num = int(entry.get("page_number") or 0)
               events = list(entry.get("_semantic_measure_events") or [])
@@ -1010,8 +1152,10 @@ jobs:
               semantic_debug["multirest_targets"] = []
               semantic_debug["multirest_recovered"] = []
               semantic_debug["multirest_unresolved"] = []
+              semantic_debug["multirest_unresolved_reason_counts"] = {}
               semantic_debug["multirest_recovery_source_counts"] = {"pdf_text": 0, "ocr": 0}
               semantic_debug["multirest_roi_trace"] = []
+              semantic_debug["multirest_recovery_skipped_by_filter"] = False
               warning_measures = list(page_warning_map.get(page_num) or [])
               semantic_debug["multirest_missing_from_audiveris_log_count"] = int(len(warning_measures))
               semantic_debug["multirest_missing_from_audiveris_log_measures"] = list(warning_measures)
@@ -1032,34 +1176,67 @@ jobs:
               if not targets:
                   return
 
+              if MULTIREST_DEBUG_PAGE_FILTER and page_num not in MULTIREST_DEBUG_PAGE_FILTER:
+                  semantic_debug["multirest_recovery_skipped_by_filter"] = True
+                  print(
+                      "SEMANTIC_MULTIREST_FILTER_SKIP "
+                      f"page={page_num} recovery_skipped_by_filter=true"
+                  )
+                  return
+
+              unresolved = []
+              recovered = []
+              source_counts = {"pdf_text": 0, "ocr": 0}
+              roi_trace = []
+
+              def add_unresolved(pair, reason, detail=""):
+                  reason_code = map_multirest_reason(reason)
+                  row = dict(pair or {})
+                  row["reason"] = str(reason_code)
+                  if detail:
+                      row["detail"] = str(detail)
+                  unresolved.append(row)
+                  print(
+                      "SEMANTIC_MULTIREST_UNRESOLVED_DETAIL "
+                      f"page={page_num} measure_index={int(pair.get('measure_index') or 0)} "
+                      f"system_index={int(pair.get('system_index') or 0)} reason={reason_code}"
+                  )
+
               geometry, geom_error = load_page_split_multirest_geometry(page_num, entry)
               if geometry is None:
-                  unresolved = []
                   for target in targets:
-                      unresolved.append({**target, "reason": f"geometry_unavailable:{geom_error}"})
-                  semantic_debug["multirest_unresolved"] = unresolved
-                  entry["status"] = "missing"
-                  entry["error"] = "semantic_multirest_unresolved"
-                  entry["selection_reason"] = "semantic_multirest_unresolved"
-                  print(
-                      "SEMANTIC_WARN "
-                      f"page={page_num} reason=semantic_multirest_unresolved detail={geom_error}"
-                  )
+                      add_unresolved(target, "geometry_unavailable", geom_error or "")
+                  semantic_debug["multirest_unresolved"] = list(unresolved)
+                  semantic_debug["multirest_unresolved_reason_counts"] = {
+                      k: sum(1 for row in unresolved if str(row.get("reason")) == k)
+                      for k in sorted({str(row.get("reason")) for row in unresolved})
+                  }
+                  if MULTIREST_WARN_ONLY:
+                      print(
+                          "SEMANTIC_MULTIREST_WARN_ONLY "
+                          f"page={page_num} unresolved={len(unresolved)}"
+                      )
+                  else:
+                      entry["status"] = "missing"
+                      entry["error"] = "semantic_multirest_unresolved"
+                      entry["selection_reason"] = "semantic_multirest_unresolved"
+                      print(
+                          "SEMANTIC_WARN "
+                          f"page={page_num} reason=semantic_multirest_unresolved detail={geom_error}"
+                      )
                   return
 
               pic_w = to_float(geometry.get("picture_width"))
               pic_h = to_float(geometry.get("picture_height"))
               boxes_by_system = dict(geometry.get("boxes_by_system") or {})
               paired, unmatched = pair_targets_with_boxes(targets, boxes_by_system)
-              unresolved = list(unmatched)
-              recovered = []
-              source_counts = {"pdf_text": 0, "ocr": 0}
-              roi_trace = []
+              for row in unmatched:
+                  add_unresolved(row, "no_multirest_box_for_system")
 
               pdf_path = os.path.join(PAGE_PDF_DIR, f"page_{page_num:04d}.pdf")
               if not os.path.exists(pdf_path):
                   for pair in paired:
-                      unresolved.append({**pair, "reason": "page_pdf_missing"})
+                      add_unresolved(pair, "geometry_unavailable", "page_pdf_missing")
                   paired = []
               page_doc = None
               page_obj = None
@@ -1069,7 +1246,7 @@ jobs:
                       page_obj = page_doc[0]
                   except Exception as exc:
                       for pair in paired:
-                          unresolved.append({**pair, "reason": f"page_pdf_open_error:{exc}"})
+                          add_unresolved(pair, "geometry_unavailable", f"page_pdf_open_error:{exc}")
                       paired = []
 
               attempts_by_page = 0
@@ -1085,16 +1262,16 @@ jobs:
                       y = float(box.get("y") or 0.0)
                       w = max(1.0, float(box.get("w") or 1.0))
                       h = max(1.0, float(box.get("h") or 1.0))
-                      rx0_img = x - (0.6 * w)
-                      rx1_img = x + (1.6 * w)
-                      ry0_img = y - (2.2 * h)
-                      ry1_img = y - (0.1 * h)
+                      rx0_img = x - (0.6 * w * MULTIREST_ROI_EXPAND_X)
+                      rx1_img = x + (1.6 * w * MULTIREST_ROI_EXPAND_X)
+                      ry0_img = y - (2.2 * h * MULTIREST_ROI_EXPAND_Y)
+                      ry1_img = y - (0.1 * h * MULTIREST_ROI_EXPAND_Y)
                       rx0 = clamp(rx0_img * sx, 0.0, page_w)
                       rx1 = clamp(rx1_img * sx, 0.0, page_w)
                       ry0 = clamp(ry0_img * sy, 0.0, page_h)
                       ry1 = clamp(ry1_img * sy, 0.0, page_h)
                       if rx1 <= rx0 or ry1 <= ry0:
-                          unresolved.append({**pair, "reason": "invalid_roi"})
+                          add_unresolved(pair, "invalid_roi")
                           continue
                       roi = fitz.Rect(rx0, ry0, rx1, ry1)
                       target_center_x = float((x + 0.5 * w) * sx)
@@ -1116,6 +1293,11 @@ jobs:
                       )
 
                       text_candidates = text_candidates_for_roi(page_obj, roi, target_center_x, target_center_y)
+                      print(
+                          "SEMANTIC_MULTIREST_TEXT_CANDIDATES "
+                          f"page={page_num} measure_index={pair.get('measure_index')} "
+                          f"candidates={format_text_candidates_for_log(text_candidates, limit=3)}"
+                      )
                       top_text, text_reason = pick_text_candidate(text_candidates)
                       if top_text is not None:
                           value = int(top_text.get("value"))
@@ -1143,13 +1325,36 @@ jobs:
                           continue
 
                       if attempts_by_page >= MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE:
-                          unresolved.append({**pair, "reason": "ocr_attempt_cap_reached"})
+                          add_unresolved(pair, "ocr_attempt_cap_reached")
                           continue
                       attempts_by_page += 1
+
                       top_ocr, ocr_reason = ocr_candidate_for_roi(page_obj, roi)
                       if top_ocr is None:
-                          unresolved.append({**pair, "reason": f"ocr_unresolved:{ocr_reason or text_reason or 'unknown'}"})
+                          print(
+                              "SEMANTIC_MULTIREST_OCR_CANDIDATE "
+                              f"page={page_num} measure_index={pair.get('measure_index')} "
+                              f"value=none conf=na raw=- reason={ocr_reason or text_reason or 'unknown'}"
+                          )
+                          preferred_reason = ocr_reason or text_reason or "ocr_no_numeric_token"
+                          if preferred_reason not in (
+                              "no_numeric_text_in_roi",
+                              "text_score_below_threshold",
+                              "text_score_ambiguous",
+                              "ocr_no_numeric_token",
+                              "ocr_conf_below_threshold",
+                          ):
+                              preferred_reason = text_reason or preferred_reason
+                          add_unresolved(pair, preferred_reason)
                           continue
+
+                      print(
+                          "SEMANTIC_MULTIREST_OCR_CANDIDATE "
+                          f"page={page_num} measure_index={pair.get('measure_index')} "
+                          f"value={int(top_ocr.get('value') or 0)} "
+                          f"conf={float(top_ocr.get('conf') or 0.0):.2f} "
+                          f"raw={top_ocr.get('raw') or '-'}"
+                      )
 
                       if text_candidates:
                           text_best_value = int(text_candidates[0].get("value"))
@@ -1161,7 +1366,7 @@ jobs:
                                   f"system_index={pair.get('system_index')} "
                                   f"text={text_best_value} ocr={ocr_value}"
                               )
-                              unresolved.append({**pair, "reason": "text_ocr_conflict"})
+                              add_unresolved(pair, "text_ocr_conflict")
                               continue
 
                       value = int(top_ocr.get("value"))
@@ -1190,20 +1395,34 @@ jobs:
               if page_doc is not None:
                   page_doc.close()
 
+              reason_counts = {}
+              for row in unresolved:
+                  reason = str(row.get("reason") or "")
+                  reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+
               semantic_debug["multirest_recovered"] = list(recovered)
               semantic_debug["multirest_unresolved"] = list(unresolved)
+              semantic_debug["multirest_unresolved_reason_counts"] = {
+                  key: int(reason_counts[key]) for key in sorted(reason_counts.keys())
+              }
               semantic_debug["multirest_recovery_source_counts"] = dict(source_counts)
               semantic_debug["multirest_roi_trace"] = list(roi_trace)
               entry["_semantic_measure_events"] = events
 
               if unresolved:
-                  entry["status"] = "missing"
-                  entry["error"] = "semantic_multirest_unresolved"
-                  entry["selection_reason"] = "semantic_multirest_unresolved"
-                  print(
-                      "SEMANTIC_WARN "
-                      f"page={page_num} reason=semantic_multirest_unresolved count={len(unresolved)}"
-                  )
+                  if MULTIREST_WARN_ONLY:
+                      print(
+                          "SEMANTIC_MULTIREST_WARN_ONLY "
+                          f"page={page_num} unresolved={len(unresolved)}"
+                      )
+                  else:
+                      entry["status"] = "missing"
+                      entry["error"] = "semantic_multirest_unresolved"
+                      entry["selection_reason"] = "semantic_multirest_unresolved"
+                      print(
+                          "SEMANTIC_WARN "
+                          f"page={page_num} reason=semantic_multirest_unresolved count={len(unresolved)}"
+                      )
 
           def parse_xml_member(raw):
               try:
@@ -2001,8 +2220,10 @@ jobs:
               base.setdefault("multirest_targets", [])
               base.setdefault("multirest_recovered", [])
               base.setdefault("multirest_unresolved", [])
+              base.setdefault("multirest_unresolved_reason_counts", {})
               base.setdefault("multirest_recovery_source_counts", {"pdf_text": 0, "ocr": 0})
               base.setdefault("multirest_roi_trace", [])
+              base.setdefault("multirest_recovery_skipped_by_filter", False)
               base.setdefault("multirest_missing_from_audiveris_log_count", 0)
               base.setdefault("multirest_missing_from_audiveris_log_measures", [])
               base.setdefault("multirest_log_source", "")
@@ -3528,6 +3749,17 @@ jobs:
                           "multiple_rest_detected_count": 0,
                           "multiple_rest_missing_count": 0,
                           "multiple_rest_total_span_added": 0,
+                          "multirest_recovery_version": "v1_hybrid",
+                          "multirest_targets": [],
+                          "multirest_recovered": [],
+                          "multirest_unresolved": [],
+                          "multirest_unresolved_reason_counts": {},
+                          "multirest_recovery_source_counts": {"pdf_text": 0, "ocr": 0},
+                          "multirest_roi_trace": [],
+                          "multirest_recovery_skipped_by_filter": False,
+                          "multirest_missing_from_audiveris_log_count": 0,
+                          "multirest_missing_from_audiveris_log_measures": [],
+                          "multirest_log_source": "",
                       },
                       "ending_anchors": [],
                       "_semantic_measure_events": merged_events,
@@ -3632,6 +3864,17 @@ jobs:
                           "multiple_rest_detected_count": 0,
                           "multiple_rest_missing_count": 0,
                           "multiple_rest_total_span_added": 0,
+                          "multirest_recovery_version": "v1_hybrid",
+                          "multirest_targets": [],
+                          "multirest_recovered": [],
+                          "multirest_unresolved": [],
+                          "multirest_unresolved_reason_counts": {},
+                          "multirest_recovery_source_counts": {"pdf_text": 0, "ocr": 0},
+                          "multirest_roi_trace": [],
+                          "multirest_recovery_skipped_by_filter": False,
+                          "multirest_missing_from_audiveris_log_count": 0,
+                          "multirest_missing_from_audiveris_log_measures": [],
+                          "multirest_log_source": "",
                       },
                       "ending_anchors": [],
                       "_semantic_measure_events": [],
@@ -3744,6 +3987,7 @@ jobs:
           set -euo pipefail
           python - << 'PY'
           import json
+          import os
 
           p = "/tmp/work/measure_mapping_debug.json"
           d = json.load(open(p, "r", encoding="utf-8"))
@@ -3764,7 +4008,18 @@ jobs:
           semantic_suspect_pages = []
           semantic_census_rows = []
           semantic_multirest_issue_pages = []
+          semantic_multirest_recovery_rows = []
+          multirest_total_targets = 0
+          multirest_total_recovered = 0
+          multirest_total_unresolved = 0
           manifest_select_error_detail = {}
+          multirest_warn_only = (
+              (os.environ.get("MULTIREST_WARN_ONLY", "0") or "0").strip().lower()
+          )
+          if multirest_warn_only in ("1", "true", "yes", "on"):
+              multirest_warn_only = "1"
+          else:
+              multirest_warn_only = "0"
           if manifest_path:
               manifest_summary = d.get("mxl_page_manifest_summary") or {}
               print(f"SUMMARY manifest_path={manifest_path}")
@@ -3808,6 +4063,21 @@ jobs:
                       if flags:
                           semantic_suspect_pages.append((page_no, flags))
                       mr_unresolved = list(dbg.get("multirest_unresolved") or [])
+                      mr_targets = list(dbg.get("multirest_targets") or [])
+                      mr_recovered = list(dbg.get("multirest_recovered") or [])
+                      mr_reason_counts = dict(dbg.get("multirest_unresolved_reason_counts") or {})
+                      multirest_total_targets += int(len(mr_targets))
+                      multirest_total_recovered += int(len(mr_recovered))
+                      multirest_total_unresolved += int(len(mr_unresolved))
+                      semantic_multirest_recovery_rows.append(
+                          (
+                              page_no,
+                              int(len(mr_targets)),
+                              int(len(mr_recovered)),
+                              int(len(mr_unresolved)),
+                              dict(mr_reason_counts),
+                          )
+                      )
                       if mr_unresolved:
                           semantic_multirest_issue_pages.append((page_no, len(mr_unresolved)))
               except Exception as exc:
@@ -3834,6 +4104,26 @@ jobs:
                       "SUMMARY semantic_multirest_unresolved "
                       f"page={int(page_no)} count={int(unresolved_count)}"
                   )
+              print(
+                  "SUMMARY semantic_multirest_recovery_total "
+                  f"targets={int(multirest_total_targets)} "
+                  f"recovered={int(multirest_total_recovered)} "
+                  f"unresolved={int(multirest_total_unresolved)}"
+              )
+              for page_no, targets_count, recovered_count, unresolved_count, reason_counts in semantic_multirest_recovery_rows:
+                  reasons_txt = ",".join(
+                      f"{str(k)}:{int(reason_counts[k])}"
+                      for k in sorted(reason_counts.keys())
+                  ) if reason_counts else "-"
+                  print(
+                      "SUMMARY semantic_multirest_recovery "
+                      f"page={int(page_no)} "
+                      f"targets={int(targets_count)} "
+                      f"recovered={int(recovered_count)} "
+                      f"unresolved={int(unresolved_count)} "
+                      f"reasons={reasons_txt}"
+                  )
+          print(f"SUMMARY semantic_multirest_warn_only={multirest_warn_only}")
           strict_xml_pages_ok = 0
           total_pages = len(pages)
           strict_xml_missing = []
