@@ -644,6 +644,8 @@ jobs:
                       "repeat_forward_count": 0,
                       "repeat_backward_count": 0,
                       "ending_start_count": 0,
+                      "multiple_rest_detected_count": 0,
+                      "multiple_rest_missing_count": 0,
                   }
 
               parts = len(iter_named(root, "part"))
@@ -654,6 +656,8 @@ jobs:
               repeat_forward_count = 0
               repeat_backward_count = 0
               ending_start_count = 0
+              multiple_rest_detected_count = 0
+              multiple_rest_missing_count = 0
 
               if local(root.tag) == "score-partwise":
                   score_parts = children_named(root, "part")
@@ -669,6 +673,37 @@ jobs:
                           implicit = truthy_attr(m.get("implicit"))
                           if i == 1 and implicit:
                               pickup_detected = True
+
+                          multiple_rest_present = False
+                          multiple_rest_count = None
+                          multiple_rest_raw = ""
+                          for attrs in children_named(m, "attributes"):
+                              for mstyle in children_named(attrs, "measure-style"):
+                                  for mrest in children_named(mstyle, "multiple-rest"):
+                                      multiple_rest_present = True
+                                      raw_count = " ".join("".join(mrest.itertext()).split()).strip()
+                                      multiple_rest_raw = str(raw_count or "")
+                                      parsed_count = parse_xml_int(raw_count)
+                                      if parsed_count is not None and parsed_count > 0:
+                                          multiple_rest_count = int(parsed_count)
+                                      break
+                                  if multiple_rest_present:
+                                      break
+                              if multiple_rest_present:
+                                  break
+                          multiple_rest_missing_count_flag = bool(
+                              multiple_rest_present and multiple_rest_count is None
+                          )
+                          if multiple_rest_present:
+                              multiple_rest_detected_count += 1
+                          if multiple_rest_missing_count_flag:
+                              multiple_rest_missing_count += 1
+                          logical_span = int(multiple_rest_count) if multiple_rest_count is not None else 1
+                          logical_span_source = (
+                              "multiple_rest"
+                              if multiple_rest_count is not None
+                              else ("multiple_rest_missing" if multiple_rest_present else "default_1")
+                          )
 
                           is_new_system = (i == 1)
                           has_system_layout = False
@@ -754,6 +789,16 @@ jobs:
                                   "direction_texts": direction_texts,
                                   "direction_text_cues": direction_cues,
                                   "xml_snippet": compact_xml_snippet(m, max_len=240),
+                                  "multiple_rest_present": bool(multiple_rest_present),
+                                  "multiple_rest_count": (
+                                      int(multiple_rest_count) if multiple_rest_count is not None else None
+                                  ),
+                                  "multiple_rest_raw": str(multiple_rest_raw),
+                                  "multiple_rest_missing_count_flag": bool(
+                                      multiple_rest_missing_count_flag
+                                  ),
+                                  "logical_span": int(max(1, logical_span)),
+                                  "logical_span_source": str(logical_span_source),
                               }
                           )
               return {
@@ -767,6 +812,8 @@ jobs:
                   "repeat_forward_count": repeat_forward_count,
                   "repeat_backward_count": repeat_backward_count,
                   "ending_start_count": ending_start_count,
+                  "multiple_rest_detected_count": int(multiple_rest_detected_count),
+                  "multiple_rest_missing_count": int(multiple_rest_missing_count),
               }
 
           def movement_index_for_path(path):
@@ -1262,21 +1309,43 @@ jobs:
 
           def merge_measure_events(rows, offsets):
               merged = []
+              system_index_base = 0
+              measure_index_base = 0
               for row, offset in zip(rows, offsets):
-                  row_events = list(row.get("measure_events") or [])
-                  for ev in row_events:
+                  row_events = sorted(
+                      list(row.get("measure_events") or []),
+                      key=lambda ev: (
+                          int(ev.get("measure_index") or 0),
+                          int(ev.get("system_index") or 0),
+                          str(ev.get("raw_measure_number") or ev.get("label") or ""),
+                      ),
+                  )
+                  for row_local_idx, ev in enumerate(row_events):
                       ev_num_int = ev.get("number_int")
                       shifted_num_int = (int(ev_num_int) + int(offset)) if ev_num_int is not None else None
                       raw_measure_number = ev.get("raw_measure_number")
                       if shifted_num_int is not None:
                           raw_measure_number = str(shifted_num_int)
+                      logical_span = ev.get("logical_span")
+                      try:
+                          logical_span = int(logical_span) if logical_span is not None else 1
+                      except Exception:
+                          logical_span = 1
+                      logical_span = max(1, int(logical_span))
+                      multiple_rest_count = ev.get("multiple_rest_count")
+                      try:
+                          multiple_rest_count = (
+                              int(multiple_rest_count) if multiple_rest_count is not None else None
+                          )
+                      except Exception:
+                          multiple_rest_count = None
                       merged.append(
                           {
                               "label": str(ev.get("label") or ""),
                               "number_int": shifted_num_int,
                               "raw_measure_number": str(raw_measure_number or ""),
-                              "measure_index": int(ev.get("measure_index") or 0),
-                              "system_index": int(ev.get("system_index") or 0),
+                              "measure_index": int(measure_index_base + row_local_idx),
+                              "system_index": int(system_index_base + int(ev.get("system_index") or 0)),
                               "implicit": bool(ev.get("implicit")),
                               "system_start": bool(ev.get("system_start")),
                               "repeat_forward": bool(ev.get("repeat_forward")),
@@ -1290,8 +1359,18 @@ jobs:
                                   {str(tok) for tok in (ev.get("direction_text_cues") or []) if str(tok)}
                               ),
                               "xml_snippet": str(ev.get("xml_snippet") or ""),
+                              "multiple_rest_present": bool(ev.get("multiple_rest_present")),
+                              "multiple_rest_count": multiple_rest_count,
+                              "multiple_rest_raw": str(ev.get("multiple_rest_raw") or ""),
+                              "multiple_rest_missing_count_flag": bool(
+                                  ev.get("multiple_rest_missing_count_flag")
+                              ),
+                              "logical_span": int(logical_span),
+                              "logical_span_source": str(ev.get("logical_span_source") or "default_1"),
                           }
                       )
+                  measure_index_base += int(len(row_events))
+                  system_index_base += int(len(row.get("system_starts") or []))
               return merged
 
           def summarize_semantic_events(events):
@@ -1333,7 +1412,13 @@ jobs:
               base.setdefault("ending_carry_overcount", 0)
               base.setdefault("tail_increment_raw", None)
               base.setdefault("tail_increment_adjusted", None)
+              base.setdefault("tail_span_from_events", None)
               base.setdefault("carry_applied_to_next_page", None)
+              base.setdefault("multirest_policy", "strict_fail_on_missing_count")
+              base.setdefault("measure_span_events", [])
+              base.setdefault("multiple_rest_detected_count", 0)
+              base.setdefault("multiple_rest_missing_count", 0)
+              base.setdefault("multiple_rest_total_span_added", 0)
               return base
 
           def build_page_ending_debug(page_num, events):
@@ -1346,6 +1431,7 @@ jobs:
                   ),
               )
               measure_timeline = []
+              measure_span_events = []
               direction_text_cues = []
               ending_markers = []
               total_ending_tags = 0
@@ -1353,10 +1439,30 @@ jobs:
               ending_number_counts = {}
               measures_with_direction_cues = 0
               repeat_marker_count = 0
+              multiple_rest_detected_count = 0
+              multiple_rest_missing_count = 0
+              multiple_rest_total_span_added = 0
               for ev in ordered_events:
                   measure_index = int(ev.get("measure_index") or 0)
                   system_index = int(ev.get("system_index") or 0)
                   raw_measure_number = str(ev.get("raw_measure_number") or ev.get("label") or "")
+                  multiple_rest_present = bool(ev.get("multiple_rest_present"))
+                  multiple_rest_missing_count_flag = bool(ev.get("multiple_rest_missing_count_flag"))
+                  multiple_rest_raw = str(ev.get("multiple_rest_raw") or "")
+                  multiple_rest_count = ev.get("multiple_rest_count")
+                  try:
+                      multiple_rest_count = (
+                          int(multiple_rest_count) if multiple_rest_count is not None else None
+                      )
+                  except Exception:
+                      multiple_rest_count = None
+                  logical_span = ev.get("logical_span")
+                  try:
+                      logical_span = int(logical_span) if logical_span is not None else 1
+                  except Exception:
+                      logical_span = 1
+                  logical_span = max(1, int(logical_span))
+                  logical_span_source = str(ev.get("logical_span_source") or "default_1")
                   repeat_markers = sorted(
                       [
                           {
@@ -1395,8 +1501,26 @@ jobs:
                       "ending_tags": list(ending_tags),
                       "direction_text_cues": list(direction_cues),
                       "xml_snippet": str(xml_snippet),
+                      "multiple_rest_present": bool(multiple_rest_present),
+                      "multiple_rest_count": multiple_rest_count,
+                      "multiple_rest_raw": str(multiple_rest_raw),
+                      "multiple_rest_missing_count_flag": bool(multiple_rest_missing_count_flag),
+                      "logical_span": int(logical_span),
+                      "logical_span_source": str(logical_span_source),
                   }
                   measure_timeline.append(timeline_row)
+                  measure_span_events.append(
+                      {
+                          "measure_index": int(measure_index),
+                          "system_index": int(system_index),
+                          "raw_measure_number": str(raw_measure_number),
+                          "logical_span": int(logical_span),
+                          "span_source": str(logical_span_source),
+                          "multiple_rest_count": multiple_rest_count,
+                          "multiple_rest_raw": str(multiple_rest_raw),
+                          "multiple_rest_missing_count_flag": bool(multiple_rest_missing_count_flag),
+                      }
+                  )
 
                   ending_short = (
                       ",".join(
@@ -1421,6 +1545,24 @@ jobs:
                       f"raw_measure={raw_measure_number or '-'} endings={ending_short} "
                       f"repeats={repeat_short} cues={cue_short}"
                   )
+                  if multiple_rest_present:
+                      multiple_rest_detected_count += 1
+                      multiple_rest_total_span_added += max(0, int(logical_span) - 1)
+                      print(
+                          "SEMANTIC_MULTIREST "
+                          f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                          f"raw_measure={raw_measure_number or '-'} "
+                          f"count={(multiple_rest_count if multiple_rest_count is not None else 'missing')} "
+                          f"span={int(logical_span)} source={logical_span_source}"
+                      )
+                  if multiple_rest_missing_count_flag:
+                      multiple_rest_missing_count += 1
+                      print(
+                          "SEMANTIC_MULTIREST_WARN "
+                          f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                          f"raw_measure={raw_measure_number or '-'} reason=missing_count "
+                          f"raw={multiple_rest_raw or '<empty>'}"
+                      )
                   repeat_marker_count += len(repeat_markers)
                   if direction_cues:
                       measures_with_direction_cues += 1
@@ -1498,7 +1640,13 @@ jobs:
                   "ending_carry_overcount": 0,
                   "tail_increment_raw": None,
                   "tail_increment_adjusted": None,
+                  "tail_span_from_events": None,
                   "carry_applied_to_next_page": None,
+                  "multirest_policy": "strict_fail_on_missing_count",
+                  "measure_span_events": list(measure_span_events),
+                  "multiple_rest_detected_count": int(multiple_rest_detected_count),
+                  "multiple_rest_missing_count": int(multiple_rest_missing_count),
+                  "multiple_rest_total_span_added": int(multiple_rest_total_span_added),
               }
 
           def build_ending_groups(page_num, events):
@@ -2261,6 +2409,42 @@ jobs:
 
               return unique_preserve_order(flags)
 
+          def logical_span_for_event(ev):
+              raw = ev.get("logical_span")
+              try:
+                  span = int(raw) if raw is not None else 1
+              except Exception:
+                  span = 1
+              return max(1, int(span))
+
+          def compute_system_multirest_extra(events, system_count):
+              if system_count <= 0:
+                  return []
+              extras = [0 for _ in range(system_count)]
+              for ev in sorted(
+                  list(events or []),
+                  key=lambda row: (
+                      int(row.get("measure_index") or 0),
+                      int(row.get("system_index") or 0),
+                      str(row.get("raw_measure_number") or ""),
+                  ),
+              ):
+                  try:
+                      system_idx = int(ev.get("system_index") or 0)
+                  except Exception:
+                      continue
+                  if system_idx < 0 or system_idx >= system_count:
+                      continue
+                  raw_count = ev.get("multiple_rest_count")
+                  try:
+                      count = int(raw_count) if raw_count is not None else None
+                  except Exception:
+                      count = None
+                  if count is None or count <= 1:
+                      continue
+                  extras[system_idx] += int(count - 1)
+              return extras
+
           def estimate_page_tail_increment(raw_labels, measures_count):
               nums, _ = parse_int_labels(raw_labels or [], allow_normalize=True)
               if not nums:
@@ -2333,7 +2517,21 @@ jobs:
                   semantic_debug["ending_carry_overcount"] = 0
                   semantic_debug["tail_increment_raw"] = None
                   semantic_debug["tail_increment_adjusted"] = None
+                  semantic_debug["tail_span_from_events"] = None
                   semantic_debug["carry_applied_to_next_page"] = None
+                  semantic_debug["multirest_policy"] = "strict_fail_on_missing_count"
+                  semantic_debug["measure_span_events"] = list(
+                      page_ending_debug.get("measure_span_events") or []
+                  )
+                  semantic_debug["multiple_rest_detected_count"] = int(
+                      page_ending_debug.get("multiple_rest_detected_count") or 0
+                  )
+                  semantic_debug["multiple_rest_missing_count"] = int(
+                      page_ending_debug.get("multiple_rest_missing_count") or 0
+                  )
+                  semantic_debug["multiple_rest_total_span_added"] = int(
+                      page_ending_debug.get("multiple_rest_total_span_added") or 0
+                  )
 
                   raw_nums, parse_warnings = parse_int_labels(normalized_starts, allow_normalize=False)
                   if parse_warnings:
@@ -2357,7 +2555,7 @@ jobs:
                       )
                       continue
 
-                  deltas = []
+                  raw_deltas = []
                   duplicate_pair_indices = []
                   for idx, (a, b) in enumerate(zip(raw_nums, raw_nums[1:]), start=1):
                       if b < a:
@@ -2369,7 +2567,30 @@ jobs:
                           delta = b - a
                       if b == a:
                           duplicate_pair_indices.append(idx)
-                      deltas.append(int(delta))
+                      raw_deltas.append(int(delta))
+
+                  system_multirest_extra = compute_system_multirest_extra(events, len(raw_nums))
+                  deltas = []
+                  for idx, raw_delta in enumerate(raw_deltas):
+                      extra = int(system_multirest_extra[idx]) if idx < len(system_multirest_extra) else 0
+                      deltas.append(int(raw_delta) + int(extra))
+
+                  multiple_rest_missing_count = int(
+                      page_ending_debug.get("multiple_rest_missing_count") or 0
+                  )
+                  if multiple_rest_missing_count > 0:
+                      warn_reason = "semantic_multirest_missing_count"
+                      entry.setdefault("semantic_warnings", []).append(
+                          f"{warn_reason}:{multiple_rest_missing_count}"
+                      )
+                      entry["status"] = "missing"
+                      entry["error"] = warn_reason
+                      entry["selection_reason"] = warn_reason
+                      print(
+                          "SEMANTIC_WARN "
+                          f"page={entry.get('page_number')} reason={warn_reason} "
+                          f"count={multiple_rest_missing_count}"
+                      )
                   summary = dict(entry.get("semantic_events") or {})
                   pickup_detected = bool(summary.get("pickup_detected"))
                   if not seen_first_page:
@@ -2482,9 +2703,28 @@ jobs:
                           f"page={entry.get('page_number')} reason={warn_reason}"
                       )
 
+                  if entry.get("status") != "ok":
+                      print(
+                          "SEMANTIC_APPLY "
+                          f"page={entry.get('page_number')} source=semantic_continuous_v1 "
+                          f"raw_starts={raw_starts} semantic_starts={semantic_starts} "
+                          f"status={entry.get('status')}"
+                      )
+                      continue
+
                   tail_increment_raw = estimate_page_tail_increment(
                       normalized_starts,
                       entry.get("measures_count"),
+                  )
+                  tail_multirest_extra = (
+                      int(system_multirest_extra[-1]) if system_multirest_extra else 0
+                  )
+                  tail_increment_raw = int(tail_increment_raw) + int(tail_multirest_extra)
+                  semantic_debug["tail_span_from_events"] = int(tail_increment_raw)
+                  print(
+                      "SEMANTIC_TAIL_SPAN "
+                      f"page={page_num} span={int(tail_increment_raw)} "
+                      f"multirest_extra={int(tail_multirest_extra)}"
                   )
                   ending_carry_overcount = 0
                   for group in ending_groups:
@@ -2682,6 +2922,7 @@ jobs:
                           "version": "ending_diag_v2",
                           "ending_tag_census": {},
                           "measure_timeline": [],
+                          "measure_span_events": [],
                           "direction_text_cues": [],
                           "ending_markers": [],
                           "ending_intervals": [],
@@ -2693,7 +2934,12 @@ jobs:
                           "ending_carry_overcount": 0,
                           "tail_increment_raw": None,
                           "tail_increment_adjusted": None,
+                          "tail_span_from_events": None,
                           "carry_applied_to_next_page": None,
+                          "multirest_policy": "strict_fail_on_missing_count",
+                          "multiple_rest_detected_count": 0,
+                          "multiple_rest_missing_count": 0,
+                          "multiple_rest_total_span_added": 0,
                       },
                       "ending_anchors": [],
                       "_semantic_measure_events": merged_events,
@@ -2780,6 +3026,7 @@ jobs:
                           "version": "ending_diag_v2",
                           "ending_tag_census": {},
                           "measure_timeline": [],
+                          "measure_span_events": [],
                           "direction_text_cues": [],
                           "ending_markers": [],
                           "ending_intervals": [],
@@ -2791,7 +3038,12 @@ jobs:
                           "ending_carry_overcount": 0,
                           "tail_increment_raw": None,
                           "tail_increment_adjusted": None,
+                          "tail_span_from_events": None,
                           "carry_applied_to_next_page": None,
+                          "multirest_policy": "strict_fail_on_missing_count",
+                          "multiple_rest_detected_count": 0,
+                          "multiple_rest_missing_count": 0,
+                          "multiple_rest_total_span_added": 0,
                       },
                       "ending_anchors": [],
                       "_semantic_measure_events": [],
