@@ -37,6 +37,14 @@ on:
         options:
           - full_recovery
           - roi_only_debug
+      multirest_anchor_mode:
+        description: "Multi-rest anchor mode"
+        required: false
+        default: "measure_stack_v1"
+        type: choice
+        options:
+          - measure_stack_v1
+          - legacy_inter_pairing
 
 jobs:
   pipeline:
@@ -50,6 +58,7 @@ jobs:
       MULTIREST_DEBUG_PAGE_FILTER: "${{ inputs.multirest_debug_page_filter || '1,4,6,7' }}"
       MULTIREST_PROFILE: "${{ inputs.multirest_profile || 'wide_roi' }}"
       MULTIREST_STAGE_MODE: "${{ inputs.multirest_stage_mode || 'full_recovery' }}"
+      MULTIREST_ANCHOR_MODE: "${{ inputs.multirest_anchor_mode || 'measure_stack_v1' }}"
       MULTIREST_ROI_EXPAND_X: ""
       MULTIREST_ROI_EXPAND_Y: ""
       MULTIREST_TEXT_SCORE_MIN: ""
@@ -113,6 +122,7 @@ jobs:
           echo "multirest_debug_page_filter: ${{ inputs.multirest_debug_page_filter }}"
           echo "multirest_profile: ${{ inputs.multirest_profile }}"
           echo "multirest_stage_mode: ${{ inputs.multirest_stage_mode }}"
+          echo "multirest_anchor_mode: ${{ inputs.multirest_anchor_mode }}"
           echo "audiveris_image: ${AUDIVERIS_IMAGE}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
           echo "run_output_prefix: ${RUN_OUTPUT_PREFIX}"
@@ -672,6 +682,16 @@ jobs:
               )
               MULTIREST_STAGE_MODE = "full_recovery"
           MULTIREST_ROI_ONLY_DEBUG = MULTIREST_STAGE_MODE == "roi_only_debug"
+          MULTIREST_ANCHOR_MODE = (
+              os.environ.get("MULTIREST_ANCHOR_MODE", "measure_stack_v1") or ""
+          ).strip().lower()
+          if MULTIREST_ANCHOR_MODE not in ("measure_stack_v1", "legacy_inter_pairing"):
+              print(
+                  "SEMANTIC_WARN page=- "
+                  f"reason=invalid_multirest_anchor_mode:{MULTIREST_ANCHOR_MODE} "
+                  "fallback=measure_stack_v1"
+              )
+              MULTIREST_ANCHOR_MODE = "measure_stack_v1"
           profile_defaults = {
               "base": {
                   "roi_expand_x": 1.0,
@@ -728,6 +748,7 @@ jobs:
               "SEMANTIC_MULTIREST_CONFIG "
               f"profile={MULTIREST_PROFILE} "
               f"stage_mode={MULTIREST_STAGE_MODE} "
+              f"anchor_mode={MULTIREST_ANCHOR_MODE} "
               f"warn_only={int(MULTIREST_WARN_ONLY)} "
               f"page_filter={sorted(MULTIREST_DEBUG_PAGE_FILTER)} "
               f"roi_expand_x={MULTIREST_ROI_EXPAND_X:.2f} "
@@ -868,26 +889,28 @@ jobs:
                   return float(x), float(y), float(w), float(h)
               return None
 
-          def extract_multirest_boxes_from_sheet(raw):
-              try:
-                  root = ET.fromstring(raw)
-              except Exception:
-                  return {"picture_width": None, "picture_height": None, "boxes_by_system": {}}
-
+          def extract_picture_and_systems(root):
               picture = root.find("picture")
               pic_w = to_float(picture.get("width")) if picture is not None else None
               pic_h = to_float(picture.get("height")) if picture is not None else None
-
               pages = root.findall("page")
               if not pages:
                   pages = [root]
-
               systems = []
               for page in pages:
                   sys_nodes = page.findall(".//system")
                   if not sys_nodes:
                       sys_nodes = page.findall("system")
                   systems.extend(sys_nodes)
+              return pic_w, pic_h, systems
+
+          def extract_multirest_boxes_from_sheet(raw):
+              try:
+                  root = ET.fromstring(raw)
+              except Exception:
+                  return {"picture_width": None, "picture_height": None, "boxes_by_system": {}}
+
+              pic_w, pic_h, systems = extract_picture_and_systems(root)
 
               boxes_by_system = {}
               for system_index, system in enumerate(systems):
@@ -939,6 +962,72 @@ jobs:
                   "boxes_by_system": boxes_by_system,
               }
 
+          def extract_measure_anchor_candidates_from_sheet(raw):
+              try:
+                  root = ET.fromstring(raw)
+              except Exception:
+                  return {"picture_width": None, "picture_height": None, "anchors_by_system": {}}
+
+              pic_w, pic_h, systems = extract_picture_and_systems(root)
+              anchors_by_system = {}
+              candidate_paths = (".//stack", ".//measureStack", ".//measure")
+              id_fields = ("id", "stack-id", "number", "measure-id", "index")
+
+              for system_index, system in enumerate(systems):
+                  raw_rows = []
+                  seen_nodes = set()
+                  for path in candidate_paths:
+                      for node in system.findall(path):
+                          node_key = id(node)
+                          if node_key in seen_nodes:
+                              continue
+                          seen_nodes.add(node_key)
+                          bounds = parse_bounds_from_inter(node)
+                          if bounds is None:
+                              continue
+                          x, y, w, h = bounds
+                          if w <= 0 or h <= 0:
+                              continue
+                          id_like = ""
+                          for field in id_fields:
+                              val = (node.get(field) or "").strip()
+                              if val:
+                                  id_like = val
+                                  break
+                          raw_rows.append(
+                              {
+                                  "system_index": int(system_index),
+                                  "x": float(x),
+                                  "y": float(y),
+                                  "w": float(w),
+                                  "h": float(h),
+                                  "id_like": str(id_like),
+                                  "source_path": str(path),
+                                  "tag": str(local(getattr(node, "tag", ""))),
+                              }
+                          )
+                  if not raw_rows:
+                      continue
+                  ordered = sorted(
+                      raw_rows,
+                      key=lambda r: (
+                          float(r["x"]),
+                          float(r["y"]),
+                          float(r["w"]),
+                          float(r["h"]),
+                          str(r.get("id_like") or ""),
+                      ),
+                  )
+                  for idx, row in enumerate(ordered):
+                      row["stack_order_in_system"] = int(idx)
+                  anchors_by_system[int(system_index)] = ordered
+
+              return {
+                  "picture_width": pic_w,
+                  "picture_height": pic_h,
+                  "anchors_by_system": anchors_by_system,
+              }
+
           def find_page_split_omr_path(page_num, entry):
               page_prefix = f"page_{int(page_num):04d}"
               candidates = []
@@ -977,7 +1066,18 @@ jobs:
                       if member is None:
                           return None, "sheet_xml_not_found"
                       raw = z.read(member)
-                      geom = extract_multirest_boxes_from_sheet(raw)
+                      geom_boxes = extract_multirest_boxes_from_sheet(raw)
+                      geom_anchors = extract_measure_anchor_candidates_from_sheet(raw)
+                      geom = {
+                          "picture_width": geom_boxes.get("picture_width")
+                          if geom_boxes.get("picture_width") is not None
+                          else geom_anchors.get("picture_width"),
+                          "picture_height": geom_boxes.get("picture_height")
+                          if geom_boxes.get("picture_height") is not None
+                          else geom_anchors.get("picture_height"),
+                          "boxes_by_system": dict(geom_boxes.get("boxes_by_system") or {}),
+                          "anchors_by_system": dict(geom_anchors.get("anchors_by_system") or {}),
+                      }
                       geom["omr_path"] = omr_path
                       geom["omr_member"] = member
                       return geom, None
@@ -1002,6 +1102,13 @@ jobs:
                       int(pair[1].get("measure_index") or 0),
                   ),
               )
+              measure_order_by_event = {}
+              local_counter = {}
+              for event_idx, ev in ordered:
+                  system_index = int(ev.get("system_index") or 0)
+                  local_pos = int(local_counter.get(system_index, 0))
+                  measure_order_by_event[int(event_idx)] = int(local_pos)
+                  local_counter[system_index] = int(local_pos) + 1
               targets = []
               for event_idx, ev in ordered:
                   if not bool(ev.get("multiple_rest_present")):
@@ -1029,6 +1136,7 @@ jobs:
                       "system_index": int(ev.get("system_index") or 0),
                       "raw_measure_number": str(ev.get("raw_measure_number") or ev.get("label") or ""),
                       "existing_count": count_val,
+                      "measure_order_in_system": int(measure_order_by_event.get(int(event_idx), 0)),
                       "reasons": list(dict.fromkeys(str(r) for r in reasons)),
                   }
                   targets.append(target)
@@ -1051,8 +1159,214 @@ jobs:
                       continue
                   box = dict(boxes[cur])
                   next_idx_by_system[system_index] = cur + 1
-                  paired.append({**target, "box": box})
+                  paired.append(
+                      {
+                          **target,
+                          "box": box,
+                          "anchor_rule": "legacy",
+                          "anchor_id": str(box.get("shape_hint") or ""),
+                      }
+                  )
               return paired, unmatched
+
+          def id_like_to_int(raw):
+              txt = str(raw or "").strip()
+              if not txt:
+                  return None
+              parsed = parse_xml_int(txt)
+              if parsed is not None:
+                  return int(parsed)
+              m = re.search(r"-?\d+", txt)
+              if not m:
+                  return None
+              try:
+                  return int(m.group(0))
+              except Exception:
+                  return None
+
+          def pair_targets_with_measure_anchors(page_num, targets, anchors_by_system, warning_measure_numbers):
+              paired = []
+              unmatched = []
+              used_ord_by_system = {}
+              warning_set = set(int(v) for v in (warning_measure_numbers or []))
+              rule_counts = {"rule_a": 0, "rule_b": 0, "rule_c": 0}
+              candidates_debug = []
+              selected_debug = []
+              unresolved_debug = []
+
+              ordered_targets = sorted(
+                  list(targets or []),
+                  key=lambda t: (
+                      int(t.get("system_index") or 0),
+                      int(t.get("measure_index") or 0),
+                  ),
+              )
+              for target in ordered_targets:
+                  system_index = int(target.get("system_index") or 0)
+                  all_rows = list((anchors_by_system or {}).get(system_index) or [])
+                  used = set(int(v) for v in (used_ord_by_system.get(system_index) or set()))
+                  available = [
+                      dict(row)
+                      for row in sorted(
+                          all_rows,
+                          key=lambda r: (
+                              int(r.get("stack_order_in_system") or 0),
+                              float(r.get("x") or 0.0),
+                          ),
+                      )
+                      if int(row.get("stack_order_in_system") or 0) not in used
+                  ]
+                  target_candidate_rows = []
+                  for row in available:
+                      cand = {
+                          "system_index": int(system_index),
+                          "stack_order_in_system": int(row.get("stack_order_in_system") or 0),
+                          "id_like": str(row.get("id_like") or ""),
+                          "x": float(row.get("x") or 0.0),
+                          "y": float(row.get("y") or 0.0),
+                          "w": float(row.get("w") or 0.0),
+                          "h": float(row.get("h") or 0.0),
+                      }
+                      target_candidate_rows.append(cand)
+                      print(
+                          "SEMANTIC_MULTIREST_ANCHOR_CANDIDATE "
+                          f"page={page_num} system={system_index} "
+                          f"id_like={cand['id_like'] or '-'} "
+                          f"stack_order={cand['stack_order_in_system']} "
+                          f"x={cand['x']:.2f} y={cand['y']:.2f} w={cand['w']:.2f} h={cand['h']:.2f}"
+                      )
+                  candidates_debug.append(
+                      {
+                          "measure_index": int(target.get("measure_index") or 0),
+                          "system_index": int(system_index),
+                          "raw_measure_number": str(target.get("raw_measure_number") or ""),
+                          "candidates": target_candidate_rows,
+                      }
+                  )
+
+                  if not available:
+                      reason = "measure_anchor_not_found"
+                      unresolved = {**target, "reason": reason, "detail": "no_available_candidates_in_system"}
+                      unmatched.append(unresolved)
+                      unresolved_debug.append(dict(unresolved))
+                      print(
+                          "SEMANTIC_MULTIREST_ANCHOR_FAIL "
+                          f"page={page_num} measure_index={int(target.get('measure_index') or 0)} "
+                          f"system_index={system_index} reason={reason}"
+                      )
+                      continue
+
+                  raw_measure_int = id_like_to_int(target.get("raw_measure_number"))
+                  rule_a = []
+                  if raw_measure_int is not None:
+                      for row in available:
+                          cand_int = id_like_to_int(row.get("id_like"))
+                          if cand_int is not None and int(cand_int) == int(raw_measure_int):
+                              rule_a.append(row)
+                  if len(rule_a) == 1:
+                      chosen = dict(rule_a[0])
+                      chosen_rule = "A"
+                  elif len(rule_a) > 1:
+                      reason = "measure_anchor_ambiguous"
+                      unresolved = {**target, "reason": reason, "detail": "rule_a_multiple_candidates"}
+                      unmatched.append(unresolved)
+                      unresolved_debug.append(dict(unresolved))
+                      print(
+                          "SEMANTIC_MULTIREST_ANCHOR_FAIL "
+                          f"page={page_num} measure_index={int(target.get('measure_index') or 0)} "
+                          f"system_index={system_index} reason={reason}"
+                      )
+                      continue
+                  else:
+                      rule_b = []
+                      if warning_set:
+                          for row in available:
+                              cand_int = id_like_to_int(row.get("id_like"))
+                              if cand_int is not None and int(cand_int) in warning_set:
+                                  rule_b.append(row)
+                      if len(rule_b) == 1:
+                          chosen = dict(rule_b[0])
+                          chosen_rule = "B"
+                      elif len(rule_b) > 1:
+                          reason = "measure_anchor_ambiguous"
+                          unresolved = {**target, "reason": reason, "detail": "rule_b_multiple_candidates"}
+                          unmatched.append(unresolved)
+                          unresolved_debug.append(dict(unresolved))
+                          print(
+                              "SEMANTIC_MULTIREST_ANCHOR_FAIL "
+                              f"page={page_num} measure_index={int(target.get('measure_index') or 0)} "
+                              f"system_index={system_index} reason={reason}"
+                          )
+                          continue
+                      else:
+                          desired_ord = int(target.get("measure_order_in_system") or 0)
+                          if desired_ord < 0 or desired_ord >= len(available):
+                              reason = "measure_anchor_not_found"
+                              unresolved = {
+                                  **target,
+                                  "reason": reason,
+                                  "detail": f"rule_c_ordinal_out_of_range:{desired_ord}/{len(available)}",
+                              }
+                              unmatched.append(unresolved)
+                              unresolved_debug.append(dict(unresolved))
+                              print(
+                                  "SEMANTIC_MULTIREST_ANCHOR_FAIL "
+                                  f"page={page_num} measure_index={int(target.get('measure_index') or 0)} "
+                                  f"system_index={system_index} reason={reason}"
+                              )
+                              continue
+                          chosen = dict(available[int(desired_ord)])
+                          chosen_rule = "C"
+
+                  x = float(chosen.get("x") or 0.0)
+                  y = float(chosen.get("y") or 0.0)
+                  w = float(chosen.get("w") or 0.0)
+                  h = float(chosen.get("h") or 0.0)
+                  if w <= 0 or h <= 0:
+                      reason = "measure_anchor_invalid_bounds"
+                      unresolved = {**target, "reason": reason}
+                      unmatched.append(unresolved)
+                      unresolved_debug.append(dict(unresolved))
+                      print(
+                          "SEMANTIC_MULTIREST_ANCHOR_FAIL "
+                          f"page={page_num} measure_index={int(target.get('measure_index') or 0)} "
+                          f"system_index={system_index} reason={reason}"
+                      )
+                      continue
+
+                  chosen_ord = int(chosen.get("stack_order_in_system") or 0)
+                  used_ord_by_system.setdefault(system_index, set()).add(chosen_ord)
+                  rule_key = f"rule_{str(chosen_rule).lower()}"
+                  if rule_key in rule_counts:
+                      rule_counts[rule_key] = int(rule_counts.get(rule_key) or 0) + 1
+                  anchor_id = str(chosen.get("id_like") or "")
+                  print(
+                      "SEMANTIC_MULTIREST_ANCHOR_SELECT "
+                      f"page={page_num} measure_index={int(target.get('measure_index') or 0)} "
+                      f"system_index={system_index} rule={chosen_rule} anchor_id={anchor_id or '-'}"
+                  )
+                  selected_row = {
+                      "measure_index": int(target.get("measure_index") or 0),
+                      "system_index": int(system_index),
+                      "rule": str(chosen_rule),
+                      "anchor_id": str(anchor_id),
+                      "stack_order_in_system": int(chosen_ord),
+                      "x": float(x),
+                      "y": float(y),
+                      "w": float(w),
+                      "h": float(h),
+                  }
+                  selected_debug.append(dict(selected_row))
+                  paired.append(
+                      {
+                          **target,
+                          "box": selected_row,
+                          "anchor_rule": str(chosen_rule),
+                          "anchor_id": str(anchor_id),
+                      }
+                  )
+
+              return paired, unmatched, candidates_debug, selected_debug, unresolved_debug, rule_counts
 
           def extract_numeric_token(value):
               txt = str(value or "").strip()
@@ -1336,6 +1650,9 @@ jobs:
               allowed = {
                   "geometry_unavailable",
                   "no_multirest_box_for_system",
+                  "measure_anchor_not_found",
+                  "measure_anchor_invalid_bounds",
+                  "measure_anchor_ambiguous",
                   "invalid_roi",
                   "no_numeric_text_in_roi",
                   "text_score_below_threshold",
@@ -1356,6 +1673,12 @@ jobs:
                   return "geometry_unavailable"
               if reason.startswith("no_multirest_box_for_system"):
                   return "no_multirest_box_for_system"
+              if reason.startswith("measure_anchor_not_found"):
+                  return "measure_anchor_not_found"
+              if reason.startswith("measure_anchor_invalid_bounds"):
+                  return "measure_anchor_invalid_bounds"
+              if reason.startswith("measure_anchor_ambiguous"):
+                  return "measure_anchor_ambiguous"
               if reason.startswith("invalid_roi"):
                   return "invalid_roi"
               if reason.startswith("candidate_ambiguous"):
@@ -1385,12 +1708,19 @@ jobs:
                   )
               return "[" + ";".join(out) + "]"
 
-          def build_roi_attempts(x, y, w, h, sx, sy):
-              profiles = [
-                  ("above_tight", 0.6, 1.6, 2.2, 0.1),
-                  ("above_wide", 1.0, 2.0, 2.6, 0.05),
-                  ("above_extra_high", 1.1, 2.1, 3.1, 0.15),
-              ]
+          def build_roi_attempts(x, y, w, h, sx, sy, anchor_mode):
+              if str(anchor_mode) == "measure_stack_v1":
+                  profiles = [
+                      ("above_tight", 0.15, 1.15, 1.60, 0.05),
+                      ("above_wide", 0.35, 1.35, 2.10, 0.02),
+                      ("above_extra_high", 0.40, 1.40, 2.60, 0.10),
+                  ]
+              else:
+                  profiles = [
+                      ("above_tight", 0.6, 1.6, 2.2, 0.1),
+                      ("above_wide", 1.0, 2.0, 2.6, 0.05),
+                      ("above_extra_high", 1.1, 2.1, 3.1, 0.15),
+                  ]
               out = []
               for name, left_m, right_m, up_m, down_m in profiles:
                   rx0 = (x - (left_m * w * MULTIREST_ROI_EXPAND_X)) * sx
@@ -1414,6 +1744,11 @@ jobs:
               semantic_debug["multirest_recovery_skipped_by_filter"] = False
               semantic_debug["multirest_stage_mode"] = str(MULTIREST_STAGE_MODE)
               semantic_debug["multirest_recovery_skipped_by_stage_mode"] = False
+              semantic_debug["multirest_anchor_mode"] = str(MULTIREST_ANCHOR_MODE)
+              semantic_debug["multirest_anchor_candidates"] = []
+              semantic_debug["multirest_anchor_selected"] = []
+              semantic_debug["multirest_anchor_unresolved"] = []
+              semantic_debug["multirest_anchor_source_counts"] = {"rule_a": 0, "rule_b": 0, "rule_c": 0}
               semantic_debug["multirest_attempt_count"] = 0
               warning_measures = list(page_warning_map.get(page_num) or [])
               semantic_debug["multirest_missing_from_audiveris_log_count"] = int(len(warning_measures))
@@ -1499,9 +1834,49 @@ jobs:
               pic_w = to_float(geometry.get("picture_width"))
               pic_h = to_float(geometry.get("picture_height"))
               boxes_by_system = dict(geometry.get("boxes_by_system") or {})
-              paired, unmatched = pair_targets_with_boxes(targets, boxes_by_system)
-              for row in unmatched:
-                  add_unresolved(row, "no_multirest_box_for_system")
+              anchors_by_system = dict(geometry.get("anchors_by_system") or {})
+              if MULTIREST_ANCHOR_MODE == "measure_stack_v1":
+                  (
+                      paired,
+                      unmatched,
+                      anchor_candidates,
+                      anchor_selected,
+                      anchor_unresolved,
+                      anchor_rule_counts,
+                  ) = pair_targets_with_measure_anchors(
+                      page_num=page_num,
+                      targets=targets,
+                      anchors_by_system=anchors_by_system,
+                      warning_measure_numbers=warning_measures,
+                  )
+                  semantic_debug["multirest_anchor_candidates"] = list(anchor_candidates)
+                  semantic_debug["multirest_anchor_selected"] = list(anchor_selected)
+                  semantic_debug["multirest_anchor_unresolved"] = list(anchor_unresolved)
+                  semantic_debug["multirest_anchor_source_counts"] = {
+                      "rule_a": int(anchor_rule_counts.get("rule_a") or 0),
+                      "rule_b": int(anchor_rule_counts.get("rule_b") or 0),
+                      "rule_c": int(anchor_rule_counts.get("rule_c") or 0),
+                  }
+                  for row in unmatched:
+                      add_unresolved(row, str(row.get("reason") or "measure_anchor_not_found"), str(row.get("detail") or ""))
+              else:
+                  paired, unmatched = pair_targets_with_boxes(targets, boxes_by_system)
+                  semantic_debug["multirest_anchor_selected"] = [
+                      {
+                          "measure_index": int(row.get("measure_index") or 0),
+                          "system_index": int(row.get("system_index") or 0),
+                          "rule": "legacy",
+                          "anchor_id": str(row.get("anchor_id") or ""),
+                          "x": float((row.get("box") or {}).get("x") or 0.0),
+                          "y": float((row.get("box") or {}).get("y") or 0.0),
+                          "w": float((row.get("box") or {}).get("w") or 0.0),
+                          "h": float((row.get("box") or {}).get("h") or 0.0),
+                      }
+                      for row in list(paired or [])
+                  ]
+                  semantic_debug["multirest_anchor_source_counts"] = {"rule_a": 0, "rule_b": 0, "rule_c": 0}
+                  for row in unmatched:
+                      add_unresolved(row, "no_multirest_box_for_system")
 
               pdf_path = os.path.join(PAGE_PDF_DIR, f"page_{page_num:04d}.pdf")
               if not os.path.exists(pdf_path):
@@ -1542,6 +1917,8 @@ jobs:
                       target_trace = {
                           "measure_index": measure_index,
                           "system_index": system_index,
+                          "anchor_rule": str(pair.get("anchor_rule") or ""),
+                          "anchor_id": str(pair.get("anchor_id") or ""),
                           "attempts": [],
                       }
                       resolved = False
@@ -1549,7 +1926,9 @@ jobs:
                       best_pool = []
                       ocr_snippets = []
 
-                      for roi_name, rx0, ry0, rx1, ry1 in build_roi_attempts(x, y, w, h, sx, sy):
+                      for roi_name, rx0, ry0, rx1, ry1 in build_roi_attempts(
+                          x, y, w, h, sx, sy, MULTIREST_ANCHOR_MODE
+                      ):
                           if resolved:
                               break
                           rx0 = clamp(rx0, 0.0, page_w)
@@ -1564,6 +1943,8 @@ jobs:
                               "measure_index": measure_index,
                               "system_index": system_index,
                               "roi_name": str(roi_name),
+                              "anchor_rule": str(pair.get("anchor_rule") or ""),
+                              "anchor_id": str(pair.get("anchor_id") or ""),
                               "x0": float(roi.x0),
                               "y0": float(roi.y0),
                               "x1": float(roi.x1),
@@ -2622,11 +3003,16 @@ jobs:
               base.setdefault("multiple_rest_total_span_added", 0)
               base.setdefault("multirest_recovery_version", "v2_tuned_profiles")
               base.setdefault("multirest_stage_mode", "full_recovery")
+              base.setdefault("multirest_anchor_mode", "measure_stack_v1")
               base.setdefault("multirest_targets", [])
               base.setdefault("multirest_recovered", [])
               base.setdefault("multirest_unresolved", [])
               base.setdefault("multirest_unresolved_reason_counts", {})
               base.setdefault("multirest_recovery_source_counts", {"text_words": 0, "text_chars": 0, "ocr": 0})
+              base.setdefault("multirest_anchor_candidates", [])
+              base.setdefault("multirest_anchor_selected", [])
+              base.setdefault("multirest_anchor_unresolved", [])
+              base.setdefault("multirest_anchor_source_counts", {"rule_a": 0, "rule_b": 0, "rule_c": 0})
               base.setdefault("multirest_roi_trace", [])
               base.setdefault("multirest_recovery_skipped_by_filter", False)
               base.setdefault("multirest_recovery_skipped_by_stage_mode", False)
@@ -4158,11 +4544,16 @@ jobs:
                           "multiple_rest_total_span_added": 0,
                           "multirest_recovery_version": "v2_tuned_profiles",
                           "multirest_stage_mode": str(MULTIREST_STAGE_MODE),
+                          "multirest_anchor_mode": str(MULTIREST_ANCHOR_MODE),
                           "multirest_targets": [],
                           "multirest_recovered": [],
                           "multirest_unresolved": [],
                           "multirest_unresolved_reason_counts": {},
                           "multirest_recovery_source_counts": {"text_words": 0, "text_chars": 0, "ocr": 0},
+                          "multirest_anchor_candidates": [],
+                          "multirest_anchor_selected": [],
+                          "multirest_anchor_unresolved": [],
+                          "multirest_anchor_source_counts": {"rule_a": 0, "rule_b": 0, "rule_c": 0},
                           "multirest_roi_trace": [],
                           "multirest_recovery_skipped_by_filter": False,
                           "multirest_recovery_skipped_by_stage_mode": False,
@@ -4276,11 +4667,16 @@ jobs:
                           "multiple_rest_total_span_added": 0,
                           "multirest_recovery_version": "v2_tuned_profiles",
                           "multirest_stage_mode": str(MULTIREST_STAGE_MODE),
+                          "multirest_anchor_mode": str(MULTIREST_ANCHOR_MODE),
                           "multirest_targets": [],
                           "multirest_recovered": [],
                           "multirest_unresolved": [],
                           "multirest_unresolved_reason_counts": {},
                           "multirest_recovery_source_counts": {"text_words": 0, "text_chars": 0, "ocr": 0},
+                          "multirest_anchor_candidates": [],
+                          "multirest_anchor_selected": [],
+                          "multirest_anchor_unresolved": [],
+                          "multirest_anchor_source_counts": {"rule_a": 0, "rule_b": 0, "rule_c": 0},
                           "multirest_roi_trace": [],
                           "multirest_recovery_skipped_by_filter": False,
                           "multirest_recovery_skipped_by_stage_mode": False,
@@ -4441,9 +4837,42 @@ jobs:
               page = doc[page_idx]
               sem_dbg = entry.get("semantic_debug") or {}
               targets = list(sem_dbg.get("multirest_targets") or [])
+              anchor_rows = list(sem_dbg.get("multirest_anchor_selected") or [])
               roi_rows = list(sem_dbg.get("multirest_roi_trace") or [])
               targets_total += int(len(targets))
               boxes_total += int(len(roi_rows))
+              for row in anchor_rows:
+                  ax = float(row.get("x") or 0.0)
+                  ay = float(row.get("y") or 0.0)
+                  aw = float(row.get("w") or 0.0)
+                  ah = float(row.get("h") or 0.0)
+                  if aw <= 0.0 or ah <= 0.0:
+                      continue
+                  rect = fitz.Rect(ax, ay, ax + aw, ay + ah)
+                  page.draw_rect(rect, color=(0.0, 0.70, 0.0), width=1.0, overlay=True)
+                  measure_index = int(row.get("measure_index") or 0)
+                  system_index = int(row.get("system_index") or 0)
+                  rule = str(row.get("rule") or "-")
+                  label = f"ANCHOR p{page_num} m{measure_index} s{system_index} rule={rule}"
+                  label_x = ax + 1.0
+                  label_y = ay - 3.0
+                  if label_y < 6.0:
+                      label_y = ay + ah + 8.0
+                  page.insert_text((label_x, label_y), label, fontsize=5.0, color=(0.0, 0.70, 0.0), overlay=True)
+                  flat_rows.append(
+                      {
+                          "row_type": "anchor",
+                          "page_number": int(page_num),
+                          "measure_index": int(measure_index),
+                          "system_index": int(system_index),
+                          "anchor_rule": str(rule),
+                          "anchor_id": str(row.get("anchor_id") or ""),
+                          "x0": float(ax),
+                          "y0": float(ay),
+                          "x1": float(ax + aw),
+                          "y1": float(ay + ah),
+                      }
+                  )
               for row in roi_rows:
                   x0 = float(row.get("x0") or 0.0)
                   y0 = float(row.get("y0") or 0.0)
@@ -4465,6 +4894,7 @@ jobs:
                   page.insert_text((label_x, label_y), label, fontsize=5.0, color=color, overlay=True)
                   flat_rows.append(
                       {
+                          "row_type": "roi",
                           "page_number": int(page_num),
                           "measure_index": int(measure_index),
                           "system_index": int(system_index),
@@ -4527,6 +4957,10 @@ jobs:
           multirest_total_unresolved = 0
           multirest_total_attempts = 0
           multirest_method_totals = {"text_words": 0, "text_chars": 0, "ocr": 0}
+          multirest_anchor_total_targets = 0
+          multirest_anchor_total_anchored = 0
+          multirest_anchor_total_unresolved = 0
+          multirest_anchor_rule_totals = {"rule_a": 0, "rule_b": 0, "rule_c": 0}
           multirest_roi_targets_total = 0
           multirest_roi_boxes_total = 0
           multirest_roi_boxes_by_page = {}
@@ -4541,6 +4975,13 @@ jobs:
           )
           if multirest_stage_mode not in ("full_recovery", "roi_only_debug"):
               multirest_stage_mode = "full_recovery"
+          multirest_anchor_mode = (
+              (os.environ.get("MULTIREST_ANCHOR_MODE", "measure_stack_v1") or "measure_stack_v1")
+              .strip()
+              .lower()
+          )
+          if multirest_anchor_mode not in ("measure_stack_v1", "legacy_inter_pairing"):
+              multirest_anchor_mode = "measure_stack_v1"
           if multirest_warn_only in ("1", "true", "yes", "on"):
               multirest_warn_only = "1"
           else:
@@ -4592,8 +5033,14 @@ jobs:
                       mr_recovered = list(dbg.get("multirest_recovered") or [])
                       mr_reason_counts = dict(dbg.get("multirest_unresolved_reason_counts") or {})
                       mr_source_counts = dict(dbg.get("multirest_recovery_source_counts") or {})
+                      mr_anchor_selected = list(dbg.get("multirest_anchor_selected") or [])
+                      mr_anchor_unresolved = list(dbg.get("multirest_anchor_unresolved") or [])
+                      mr_anchor_rules = dict(dbg.get("multirest_anchor_source_counts") or {})
                       mr_attempt_count = int(dbg.get("multirest_attempt_count") or 0)
                       mr_roi_rows = list(dbg.get("multirest_roi_trace") or [])
+                      multirest_anchor_total_targets += int(len(mr_targets))
+                      multirest_anchor_total_anchored += int(len(mr_anchor_selected))
+                      multirest_anchor_total_unresolved += int(len(mr_anchor_unresolved))
                       multirest_total_targets += int(len(mr_targets))
                       multirest_total_recovered += int(len(mr_recovered))
                       multirest_total_unresolved += int(len(mr_unresolved))
@@ -4601,6 +5048,8 @@ jobs:
                       multirest_roi_targets_total += int(len(mr_targets))
                       multirest_roi_boxes_total += int(len(mr_roi_rows))
                       multirest_roi_boxes_by_page[int(page_no)] = int(len(mr_roi_rows))
+                      for key in multirest_anchor_rule_totals.keys():
+                          multirest_anchor_rule_totals[key] += int(mr_anchor_rules.get(key) or 0)
                       for key in multirest_method_totals.keys():
                           multirest_method_totals[key] += int(mr_source_counts.get(key) or 0)
                       semantic_multirest_recovery_rows.append(
@@ -4647,6 +5096,19 @@ jobs:
                   f"unresolved={int(multirest_total_unresolved)}"
               )
               print(f"SUMMARY semantic_multirest_stage_mode={multirest_stage_mode}")
+              print(f"SUMMARY semantic_multirest_anchor_mode={multirest_anchor_mode}")
+              print(
+                  "SUMMARY semantic_multirest_anchor_total "
+                  f"targets={int(multirest_anchor_total_targets)} "
+                  f"anchored={int(multirest_anchor_total_anchored)} "
+                  f"unresolved={int(multirest_anchor_total_unresolved)}"
+              )
+              print(
+                  "SUMMARY semantic_multirest_anchor_rules "
+                  f"rule_a={int(multirest_anchor_rule_totals['rule_a'])} "
+                  f"rule_b={int(multirest_anchor_rule_totals['rule_b'])} "
+                  f"rule_c={int(multirest_anchor_rule_totals['rule_c'])}"
+              )
               print(
                   "SUMMARY semantic_multirest_roi_targets_total="
                   f"{int(multirest_roi_targets_total)}"
@@ -4688,6 +5150,9 @@ jobs:
                   )
           else:
               print(f"SUMMARY semantic_multirest_stage_mode={multirest_stage_mode}")
+              print(f"SUMMARY semantic_multirest_anchor_mode={multirest_anchor_mode}")
+              print("SUMMARY semantic_multirest_anchor_total targets=0 anchored=0 unresolved=0")
+              print("SUMMARY semantic_multirest_anchor_rules rule_a=0 rule_b=0 rule_c=0")
               print("SUMMARY semantic_multirest_roi_targets_total=0")
               print("SUMMARY semantic_multirest_roi_boxes_total=0")
 
