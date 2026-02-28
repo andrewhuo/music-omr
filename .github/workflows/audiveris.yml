@@ -29,6 +29,14 @@ on:
           - base
           - wide_roi
           - aggressive
+      multirest_stage_mode:
+        description: "Multi-rest stage mode"
+        required: false
+        default: "full_recovery"
+        type: choice
+        options:
+          - full_recovery
+          - roi_only_debug
 
 jobs:
   pipeline:
@@ -41,6 +49,7 @@ jobs:
       MULTIREST_WARN_ONLY: "${{ inputs.multirest_warn_only || '1' }}"
       MULTIREST_DEBUG_PAGE_FILTER: "${{ inputs.multirest_debug_page_filter || '1,4,6,7' }}"
       MULTIREST_PROFILE: "${{ inputs.multirest_profile || 'wide_roi' }}"
+      MULTIREST_STAGE_MODE: "${{ inputs.multirest_stage_mode || 'full_recovery' }}"
       MULTIREST_ROI_EXPAND_X: ""
       MULTIREST_ROI_EXPAND_Y: ""
       MULTIREST_TEXT_SCORE_MIN: ""
@@ -103,6 +112,7 @@ jobs:
           echo "multirest_warn_only: ${{ inputs.multirest_warn_only }}"
           echo "multirest_debug_page_filter: ${{ inputs.multirest_debug_page_filter }}"
           echo "multirest_profile: ${{ inputs.multirest_profile }}"
+          echo "multirest_stage_mode: ${{ inputs.multirest_stage_mode }}"
           echo "audiveris_image: ${AUDIVERIS_IMAGE}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
           echo "run_output_prefix: ${RUN_OUTPUT_PREFIX}"
@@ -651,6 +661,17 @@ jobs:
               return out
 
           MULTIREST_PROFILE = (os.environ.get("MULTIREST_PROFILE", "wide_roi") or "").strip().lower()
+          MULTIREST_STAGE_MODE = (
+              os.environ.get("MULTIREST_STAGE_MODE", "full_recovery") or ""
+          ).strip().lower()
+          if MULTIREST_STAGE_MODE not in ("full_recovery", "roi_only_debug"):
+              print(
+                  "SEMANTIC_WARN page=- "
+                  f"reason=invalid_multirest_stage_mode:{MULTIREST_STAGE_MODE} "
+                  "fallback=full_recovery"
+              )
+              MULTIREST_STAGE_MODE = "full_recovery"
+          MULTIREST_ROI_ONLY_DEBUG = MULTIREST_STAGE_MODE == "roi_only_debug"
           profile_defaults = {
               "base": {
                   "roi_expand_x": 1.0,
@@ -706,6 +727,7 @@ jobs:
           print(
               "SEMANTIC_MULTIREST_CONFIG "
               f"profile={MULTIREST_PROFILE} "
+              f"stage_mode={MULTIREST_STAGE_MODE} "
               f"warn_only={int(MULTIREST_WARN_ONLY)} "
               f"page_filter={sorted(MULTIREST_DEBUG_PAGE_FILTER)} "
               f"roi_expand_x={MULTIREST_ROI_EXPAND_X:.2f} "
@@ -1390,6 +1412,8 @@ jobs:
               semantic_debug["multirest_recovery_source_counts"] = {"text_words": 0, "text_chars": 0, "ocr": 0}
               semantic_debug["multirest_roi_trace"] = []
               semantic_debug["multirest_recovery_skipped_by_filter"] = False
+              semantic_debug["multirest_stage_mode"] = str(MULTIREST_STAGE_MODE)
+              semantic_debug["multirest_recovery_skipped_by_stage_mode"] = False
               semantic_debug["multirest_attempt_count"] = 0
               warning_measures = list(page_warning_map.get(page_num) or [])
               semantic_debug["multirest_missing_from_audiveris_log_count"] = int(len(warning_measures))
@@ -1410,6 +1434,15 @@ jobs:
                   )
               if not targets:
                   return
+
+              enforce_multirest_strict = (not MULTIREST_WARN_ONLY) and (not MULTIREST_ROI_ONLY_DEBUG)
+
+              if MULTIREST_ROI_ONLY_DEBUG:
+                  semantic_debug["multirest_recovery_skipped_by_stage_mode"] = True
+                  print(
+                      "SEMANTIC_MULTIREST_STAGE "
+                      f"page={page_num} mode=roi_only_debug action=skip_recovery_after_step3"
+                  )
 
               if MULTIREST_DEBUG_PAGE_FILTER and page_num not in MULTIREST_DEBUG_PAGE_FILTER:
                   semantic_debug["multirest_recovery_skipped_by_filter"] = True
@@ -1448,7 +1481,7 @@ jobs:
                       k: sum(1 for row in unresolved if str(row.get("reason")) == k)
                       for k in sorted({str(row.get("reason")) for row in unresolved})
                   }
-                  if MULTIREST_WARN_ONLY:
+                  if MULTIREST_WARN_ONLY or MULTIREST_ROI_ONLY_DEBUG:
                       print(
                           "SEMANTIC_MULTIREST_WARN_ONLY "
                           f"page={page_num} unresolved={len(unresolved)}"
@@ -1550,6 +1583,15 @@ jobs:
                                   roi_pix.save(roi_path)
                               except Exception:
                                   pass
+                          if MULTIREST_ROI_ONLY_DEBUG:
+                              target_trace["attempts"].append(
+                                  {
+                                      "roi_name": str(roi_name),
+                                      "selected": None,
+                                      "selected_reason": "stage_mode_skip_after_step3",
+                                  }
+                              )
+                              continue
                           if roi_gray is None:
                               continue
 
@@ -1723,6 +1765,9 @@ jobs:
                               }
                           )
 
+                      if MULTIREST_ROI_ONLY_DEBUG:
+                          continue
+
                       if not resolved:
                           add_unresolved(pair, unresolved_reason or "no_numeric_candidates")
                           # forensic files for unresolved targets
@@ -1769,7 +1814,7 @@ jobs:
               entry["_semantic_measure_events"] = events
 
               if unresolved:
-                  if MULTIREST_WARN_ONLY:
+                  if not enforce_multirest_strict:
                       print(
                           "SEMANTIC_MULTIREST_WARN_ONLY "
                           f"page={page_num} unresolved={len(unresolved)}"
@@ -2576,6 +2621,7 @@ jobs:
               base.setdefault("multiple_rest_missing_count", 0)
               base.setdefault("multiple_rest_total_span_added", 0)
               base.setdefault("multirest_recovery_version", "v2_tuned_profiles")
+              base.setdefault("multirest_stage_mode", "full_recovery")
               base.setdefault("multirest_targets", [])
               base.setdefault("multirest_recovered", [])
               base.setdefault("multirest_unresolved", [])
@@ -2583,6 +2629,7 @@ jobs:
               base.setdefault("multirest_recovery_source_counts", {"text_words": 0, "text_chars": 0, "ocr": 0})
               base.setdefault("multirest_roi_trace", [])
               base.setdefault("multirest_recovery_skipped_by_filter", False)
+              base.setdefault("multirest_recovery_skipped_by_stage_mode", False)
               base.setdefault("multirest_attempt_count", 0)
               base.setdefault("multirest_missing_from_audiveris_log_count", 0)
               base.setdefault("multirest_missing_from_audiveris_log_measures", [])
@@ -4110,6 +4157,7 @@ jobs:
                           "multiple_rest_missing_count": 0,
                           "multiple_rest_total_span_added": 0,
                           "multirest_recovery_version": "v2_tuned_profiles",
+                          "multirest_stage_mode": str(MULTIREST_STAGE_MODE),
                           "multirest_targets": [],
                           "multirest_recovered": [],
                           "multirest_unresolved": [],
@@ -4117,6 +4165,7 @@ jobs:
                           "multirest_recovery_source_counts": {"text_words": 0, "text_chars": 0, "ocr": 0},
                           "multirest_roi_trace": [],
                           "multirest_recovery_skipped_by_filter": False,
+                          "multirest_recovery_skipped_by_stage_mode": False,
                           "multirest_attempt_count": 0,
                           "multirest_missing_from_audiveris_log_count": 0,
                           "multirest_missing_from_audiveris_log_measures": [],
@@ -4226,6 +4275,7 @@ jobs:
                           "multiple_rest_missing_count": 0,
                           "multiple_rest_total_span_added": 0,
                           "multirest_recovery_version": "v2_tuned_profiles",
+                          "multirest_stage_mode": str(MULTIREST_STAGE_MODE),
                           "multirest_targets": [],
                           "multirest_recovered": [],
                           "multirest_unresolved": [],
@@ -4233,6 +4283,7 @@ jobs:
                           "multirest_recovery_source_counts": {"text_words": 0, "text_chars": 0, "ocr": 0},
                           "multirest_roi_trace": [],
                           "multirest_recovery_skipped_by_filter": False,
+                          "multirest_recovery_skipped_by_stage_mode": False,
                           "multirest_attempt_count": 0,
                           "multirest_missing_from_audiveris_log_count": 0,
                           "multirest_missing_from_audiveris_log_measures": [],
@@ -4344,6 +4395,106 @@ jobs:
             raise SystemExit('ERROR: output page count mismatch')
           PY
 
+      - name: Build multi-rest ROI debug overlay PDF
+        if: always()
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json
+          import os
+          import fitz
+
+          annotated_path = "/tmp/work/annotated.pdf"
+          manifest_path = "/tmp/work/mxl_page_manifest.json"
+          out_pdf_path = "/tmp/work/annotated_multirest_roi_debug.pdf"
+          out_json_path = "/tmp/work/multirest_roi_debug.json"
+
+          if not os.path.exists(annotated_path):
+              print("MULTIREST_ROI_DEBUG overlay_skipped=annotated_missing")
+              raise SystemExit(0)
+          if not os.path.exists(manifest_path):
+              print("MULTIREST_ROI_DEBUG overlay_skipped=manifest_missing")
+              raise SystemExit(0)
+
+          try:
+              manifest = json.load(open(manifest_path, "r", encoding="utf-8"))
+          except Exception as exc:
+              print(f"MULTIREST_ROI_DEBUG overlay_skipped=manifest_parse_error:{exc}")
+              raise SystemExit(0)
+
+          entries = list(manifest.get("entries") or [])
+          doc = fitz.open(annotated_path)
+          color_map = {
+              "above_tight": (1.0, 0.0, 0.0),
+              "above_wide": (1.0, 0.55, 0.0),
+              "above_extra_high": (0.0, 0.35, 1.0),
+          }
+          flat_rows = []
+          targets_total = 0
+          boxes_total = 0
+
+          for entry in entries:
+              page_num = int(entry.get("page_number") or (int(entry.get("page_index") or 0) + 1))
+              page_idx = page_num - 1
+              if page_idx < 0 or page_idx >= doc.page_count:
+                  continue
+              page = doc[page_idx]
+              sem_dbg = entry.get("semantic_debug") or {}
+              targets = list(sem_dbg.get("multirest_targets") or [])
+              roi_rows = list(sem_dbg.get("multirest_roi_trace") or [])
+              targets_total += int(len(targets))
+              boxes_total += int(len(roi_rows))
+              for row in roi_rows:
+                  x0 = float(row.get("x0") or 0.0)
+                  y0 = float(row.get("y0") or 0.0)
+                  x1 = float(row.get("x1") or 0.0)
+                  y1 = float(row.get("y1") or 0.0)
+                  if x1 <= x0 or y1 <= y0:
+                      continue
+                  roi_name = str(row.get("roi_name") or "")
+                  measure_index = int(row.get("measure_index") or 0)
+                  system_index = int(row.get("system_index") or 0)
+                  color = color_map.get(roi_name, (0.6, 0.2, 0.9))
+                  rect = fitz.Rect(x0, y0, x1, y1)
+                  page.draw_rect(rect, color=color, width=0.8, overlay=True)
+                  label = f"MR p{page_num} m{measure_index} s{system_index} {roi_name}"
+                  label_x = x0 + 1.0
+                  label_y = y0 - 2.0
+                  if label_y < 6.0:
+                      label_y = y1 + 7.0
+                  page.insert_text((label_x, label_y), label, fontsize=5.0, color=color, overlay=True)
+                  flat_rows.append(
+                      {
+                          "page_number": int(page_num),
+                          "measure_index": int(measure_index),
+                          "system_index": int(system_index),
+                          "roi_name": str(roi_name),
+                          "x0": float(x0),
+                          "y0": float(y0),
+                          "x1": float(x1),
+                          "y1": float(y1),
+                      }
+                  )
+
+          doc.save(out_pdf_path)
+          doc.close()
+          with open(out_json_path, "w", encoding="utf-8") as f:
+              json.dump(
+                  {
+                      "targets_total": int(targets_total),
+                      "boxes_total": int(boxes_total),
+                      "rows": flat_rows,
+                  },
+                  f,
+                  indent=2,
+              )
+          print(
+              "MULTIREST_ROI_DEBUG "
+              f"overlay_pdf={out_pdf_path} roi_json={out_json_path} "
+              f"targets_total={targets_total} boxes_total={boxes_total}"
+          )
+          PY
+
       - name: Mapping debug summary
         run: |
           set -euo pipefail
@@ -4376,10 +4527,20 @@ jobs:
           multirest_total_unresolved = 0
           multirest_total_attempts = 0
           multirest_method_totals = {"text_words": 0, "text_chars": 0, "ocr": 0}
+          multirest_roi_targets_total = 0
+          multirest_roi_boxes_total = 0
+          multirest_roi_boxes_by_page = {}
           manifest_select_error_detail = {}
           multirest_warn_only = (
               (os.environ.get("MULTIREST_WARN_ONLY", "0") or "0").strip().lower()
           )
+          multirest_stage_mode = (
+              (os.environ.get("MULTIREST_STAGE_MODE", "full_recovery") or "full_recovery")
+              .strip()
+              .lower()
+          )
+          if multirest_stage_mode not in ("full_recovery", "roi_only_debug"):
+              multirest_stage_mode = "full_recovery"
           if multirest_warn_only in ("1", "true", "yes", "on"):
               multirest_warn_only = "1"
           else:
@@ -4432,10 +4593,14 @@ jobs:
                       mr_reason_counts = dict(dbg.get("multirest_unresolved_reason_counts") or {})
                       mr_source_counts = dict(dbg.get("multirest_recovery_source_counts") or {})
                       mr_attempt_count = int(dbg.get("multirest_attempt_count") or 0)
+                      mr_roi_rows = list(dbg.get("multirest_roi_trace") or [])
                       multirest_total_targets += int(len(mr_targets))
                       multirest_total_recovered += int(len(mr_recovered))
                       multirest_total_unresolved += int(len(mr_unresolved))
                       multirest_total_attempts += int(mr_attempt_count)
+                      multirest_roi_targets_total += int(len(mr_targets))
+                      multirest_roi_boxes_total += int(len(mr_roi_rows))
+                      multirest_roi_boxes_by_page[int(page_no)] = int(len(mr_roi_rows))
                       for key in multirest_method_totals.keys():
                           multirest_method_totals[key] += int(mr_source_counts.get(key) or 0)
                       semantic_multirest_recovery_rows.append(
@@ -4481,6 +4646,20 @@ jobs:
                   f"recovered={int(multirest_total_recovered)} "
                   f"unresolved={int(multirest_total_unresolved)}"
               )
+              print(f"SUMMARY semantic_multirest_stage_mode={multirest_stage_mode}")
+              print(
+                  "SUMMARY semantic_multirest_roi_targets_total="
+                  f"{int(multirest_roi_targets_total)}"
+              )
+              print(
+                  "SUMMARY semantic_multirest_roi_boxes_total="
+                  f"{int(multirest_roi_boxes_total)}"
+              )
+              for page_no in sorted(multirest_roi_boxes_by_page.keys()):
+                  print(
+                      "SUMMARY semantic_multirest_roi_boxes "
+                      f"page={int(page_no)} count={int(multirest_roi_boxes_by_page[page_no])}"
+                  )
               print(
                   "SUMMARY semantic_multirest_attempts_total "
                   f"attempts={int(multirest_total_attempts)} "
@@ -4507,6 +4686,13 @@ jobs:
                       f"methods={source_txt} "
                       f"reasons={reasons_txt}"
                   )
+          else:
+              print(f"SUMMARY semantic_multirest_stage_mode={multirest_stage_mode}")
+              print("SUMMARY semantic_multirest_roi_targets_total=0")
+              print("SUMMARY semantic_multirest_roi_boxes_total=0")
+
+          if multirest_stage_mode == "roi_only_debug":
+              print("SUMMARY semantic_multirest_recovery_skipped_by_stage_mode=1")
           print(f"SUMMARY semantic_multirest_warn_only={multirest_warn_only}")
           strict_xml_pages_ok = 0
           total_pages = len(pages)
@@ -4600,6 +4786,8 @@ jobs:
             /tmp/work/page_logs \
             /tmp/work/audiveris_pages \
             /tmp/work/multirest_debug \
+            /tmp/work/annotated_multirest_roi_debug.pdf \
+            /tmp/work/multirest_roi_debug.json \
             /tmp/work/mxl_page_manifest.json \
             /tmp/work/measure_mapping_debug.json \
             2>/dev/null || true
@@ -4664,6 +4852,28 @@ jobs:
             echo "WARN: /tmp/work/omr_debug_bundle.tar.gz not found"
             echo "RUN_SUMMARY artifact_debug_bundle=missing"
             echo "RUN_SUMMARY artifact_debug_bundle_latest=missing"
+          fi
+
+          if [[ -f /tmp/work/annotated_multirest_roi_debug.pdf ]]; then
+            gsutil cp /tmp/work/annotated_multirest_roi_debug.pdf "${RUN_OUTPUT_PREFIX}/annotated_multirest_roi_debug.pdf"
+            gsutil cp /tmp/work/annotated_multirest_roi_debug.pdf "${OUTPUT_PREFIX}/annotated_multirest_roi_debug.pdf"
+            echo "RUN_SUMMARY artifact_multirest_roi_debug=${RUN_OUTPUT_PREFIX}/annotated_multirest_roi_debug.pdf"
+            echo "RUN_SUMMARY artifact_multirest_roi_debug_latest=${OUTPUT_PREFIX}/annotated_multirest_roi_debug.pdf"
+          else
+            echo "WARN: /tmp/work/annotated_multirest_roi_debug.pdf not found"
+            echo "RUN_SUMMARY artifact_multirest_roi_debug=missing"
+            echo "RUN_SUMMARY artifact_multirest_roi_debug_latest=missing"
+          fi
+
+          if [[ -f /tmp/work/multirest_roi_debug.json ]]; then
+            gsutil cp /tmp/work/multirest_roi_debug.json "${RUN_OUTPUT_PREFIX}/multirest_roi_debug.json"
+            gsutil cp /tmp/work/multirest_roi_debug.json "${OUTPUT_PREFIX}/multirest_roi_debug.json"
+            echo "RUN_SUMMARY artifact_multirest_roi_json=${RUN_OUTPUT_PREFIX}/multirest_roi_debug.json"
+            echo "RUN_SUMMARY artifact_multirest_roi_json_latest=${OUTPUT_PREFIX}/multirest_roi_debug.json"
+          else
+            echo "WARN: /tmp/work/multirest_roi_debug.json not found"
+            echo "RUN_SUMMARY artifact_multirest_roi_json=missing"
+            echo "RUN_SUMMARY artifact_multirest_roi_json_latest=missing"
           fi
 
           echo "Upload complete"
