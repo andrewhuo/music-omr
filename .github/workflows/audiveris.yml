@@ -7,44 +7,6 @@ on:
         description: "GCS URI to input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
         required: true
         type: string
-      multirest_warn_only:
-        description: "Multi-rest unresolved handling: 1=warn only, 0=strict fail"
-        required: false
-        default: "1"
-        type: choice
-        options:
-          - "1"
-          - "0"
-      multirest_debug_page_filter:
-        description: "Comma-separated pages for multi-rest tuning (empty = all pages)"
-        required: false
-        default: "1,4,6,7"
-        type: string
-      multirest_profile:
-        description: "Multi-rest tuning profile"
-        required: false
-        default: "wide_roi"
-        type: choice
-        options:
-          - base
-          - wide_roi
-          - aggressive
-      multirest_stage_mode:
-        description: "Multi-rest stage mode"
-        required: false
-        default: "full_recovery"
-        type: choice
-        options:
-          - full_recovery
-          - roi_only_debug
-      multirest_anchor_mode:
-        description: "Multi-rest anchor mode"
-        required: false
-        default: "measure_stack_v1"
-        type: choice
-        options:
-          - measure_stack_v1
-          - legacy_inter_pairing
 
 jobs:
   pipeline:
@@ -54,11 +16,11 @@ jobs:
       AUDIVERIS_IMAGE: "ghcr.io/andrewhuo/audiveris-engine@sha256:61c2a4a39e6f545bb9153a984247b83ace541196c4861329b295982e4cf57bed"
       AUDIVERIS_VERSION: "5.9.0"
       MEASURE_NUMBERING_POLICY: "semantic_continuous_v1"
-      MULTIREST_WARN_ONLY: "${{ inputs.multirest_warn_only || '1' }}"
-      MULTIREST_DEBUG_PAGE_FILTER: "${{ inputs.multirest_debug_page_filter || '1,4,6,7' }}"
-      MULTIREST_PROFILE: "${{ inputs.multirest_profile || 'wide_roi' }}"
-      MULTIREST_STAGE_MODE: "${{ inputs.multirest_stage_mode || 'full_recovery' }}"
-      MULTIREST_ANCHOR_MODE: "${{ inputs.multirest_anchor_mode || 'measure_stack_v1' }}"
+      MULTIREST_WARN_ONLY: "1"
+      MULTIREST_DEBUG_PAGE_FILTER: ""
+      MULTIREST_PROFILE: "wide_roi"
+      MULTIREST_STAGE_MODE: "full_recovery"
+      MULTIREST_ANCHOR_MODE: "measure_stack_v1"
       MULTIREST_ROI_EXPAND_X: ""
       MULTIREST_ROI_EXPAND_Y: ""
       MULTIREST_TEXT_SCORE_MIN: ""
@@ -118,11 +80,11 @@ jobs:
           echo "run_id: ${GITHUB_RUN_ID}"
           echo "run_attempt: ${GITHUB_RUN_ATTEMPT}"
           echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
-          echo "multirest_warn_only: ${{ inputs.multirest_warn_only }}"
-          echo "multirest_debug_page_filter: ${{ inputs.multirest_debug_page_filter }}"
-          echo "multirest_profile: ${{ inputs.multirest_profile }}"
-          echo "multirest_stage_mode: ${{ inputs.multirest_stage_mode }}"
-          echo "multirest_anchor_mode: ${{ inputs.multirest_anchor_mode }}"
+          echo "multirest_warn_only: ${MULTIREST_WARN_ONLY}"
+          echo "multirest_debug_page_filter: ${MULTIREST_DEBUG_PAGE_FILTER}"
+          echo "multirest_profile: ${MULTIREST_PROFILE}"
+          echo "multirest_stage_mode: ${MULTIREST_STAGE_MODE}"
+          echo "multirest_anchor_mode: ${MULTIREST_ANCHOR_MODE}"
           echo "audiveris_image: ${AUDIVERIS_IMAGE}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
           echo "run_output_prefix: ${RUN_OUTPUT_PREFIX}"
@@ -881,12 +843,53 @@ jobs:
                   h = to_float(b.get("h"))
                   if None not in (x, y, w, h) and w > 0 and h > 0:
                       return float(x), float(y), float(w), float(h)
-              x = to_float(el.get("x"))
-              y = to_float(el.get("y"))
-              w = to_float(el.get("w"))
-              h = to_float(el.get("h"))
-              if None not in (x, y, w, h) and w > 0 and h > 0:
-                  return float(x), float(y), float(w), float(h)
+              attr_sets = [
+                  ("x", "y", "w", "h"),
+                  ("x", "y", "width", "height"),
+              ]
+              for xk, yk, wk, hk in attr_sets:
+                  x = to_float(el.get(xk))
+                  y = to_float(el.get(yk))
+                  w = to_float(el.get(wk))
+                  h = to_float(el.get(hk))
+                  if None not in (x, y, w, h) and w > 0 and h > 0:
+                      return float(x), float(y), float(w), float(h)
+              l = to_float(el.get("left"))
+              t = to_float(el.get("top"))
+              r = to_float(el.get("right"))
+              b = to_float(el.get("bottom"))
+              if None not in (l, t, r, b) and r > l and b > t:
+                  return float(l), float(t), float(r - l), float(b - t)
+
+              child_vals = {}
+              for key in ("left", "top", "right", "bottom", "x", "y", "w", "h", "width", "height"):
+                  nodes = children_named(el, key)
+                  if not nodes:
+                      continue
+                  txt = "".join("".join(nodes[0].itertext()).split()).strip()
+                  if txt != "":
+                      child_vals[key] = to_float(txt)
+              if all(child_vals.get(k) is not None for k in ("x", "y", "w", "h")):
+                  x = float(child_vals["x"])
+                  y = float(child_vals["y"])
+                  w = float(child_vals["w"])
+                  h = float(child_vals["h"])
+                  if w > 0 and h > 0:
+                      return x, y, w, h
+              if all(child_vals.get(k) is not None for k in ("x", "y", "width", "height")):
+                  x = float(child_vals["x"])
+                  y = float(child_vals["y"])
+                  w = float(child_vals["width"])
+                  h = float(child_vals["height"])
+                  if w > 0 and h > 0:
+                      return x, y, w, h
+              if all(child_vals.get(k) is not None for k in ("left", "top", "right", "bottom")):
+                  l = float(child_vals["left"])
+                  t = float(child_vals["top"])
+                  r = float(child_vals["right"])
+                  b = float(child_vals["bottom"])
+                  if r > l and b > t:
+                      return l, t, r - l, b - t
               return None
 
           def extract_picture_and_systems(root):
@@ -970,42 +973,44 @@ jobs:
 
               pic_w, pic_h, systems = extract_picture_and_systems(root)
               anchors_by_system = {}
-              candidate_paths = (".//stack", ".//measureStack", ".//measure")
+              candidate_tags = {"stack", "measurestack", "measure-stack", "measure"}
               id_fields = ("id", "stack-id", "number", "measure-id", "index")
 
               for system_index, system in enumerate(systems):
                   raw_rows = []
                   seen_nodes = set()
-                  for path in candidate_paths:
-                      for node in system.findall(path):
-                          node_key = id(node)
-                          if node_key in seen_nodes:
-                              continue
-                          seen_nodes.add(node_key)
-                          bounds = parse_bounds_from_inter(node)
-                          if bounds is None:
-                              continue
-                          x, y, w, h = bounds
-                          if w <= 0 or h <= 0:
-                              continue
-                          id_like = ""
-                          for field in id_fields:
-                              val = (node.get(field) or "").strip()
-                              if val:
-                                  id_like = val
-                                  break
-                          raw_rows.append(
-                              {
-                                  "system_index": int(system_index),
-                                  "x": float(x),
-                                  "y": float(y),
-                                  "w": float(w),
-                                  "h": float(h),
-                                  "id_like": str(id_like),
-                                  "source_path": str(path),
-                                  "tag": str(local(getattr(node, "tag", ""))),
-                              }
-                          )
+                  for node in system.iter():
+                      tag_name = str(local(getattr(node, "tag", ""))).strip().lower()
+                      if tag_name not in candidate_tags:
+                          continue
+                      node_key = id(node)
+                      if node_key in seen_nodes:
+                          continue
+                      seen_nodes.add(node_key)
+                      bounds = parse_bounds_from_inter(node)
+                      if bounds is None:
+                          continue
+                      x, y, w, h = bounds
+                      if w <= 0 or h <= 0:
+                          continue
+                      id_like = ""
+                      for field in id_fields:
+                          val = (node.get(field) or "").strip()
+                          if val:
+                              id_like = val
+                              break
+                      raw_rows.append(
+                          {
+                              "system_index": int(system_index),
+                              "x": float(x),
+                              "y": float(y),
+                              "w": float(w),
+                              "h": float(h),
+                              "id_like": str(id_like),
+                              "source_path": str(tag_name),
+                              "tag": str(local(getattr(node, "tag", ""))),
+                          }
+                      )
                   if not raw_rows:
                       continue
                   ordered = sorted(
@@ -1857,6 +1862,32 @@ jobs:
                       "rule_b": int(anchor_rule_counts.get("rule_b") or 0),
                       "rule_c": int(anchor_rule_counts.get("rule_c") or 0),
                   }
+                  total_anchor_candidates = sum(
+                      len(list(row.get("candidates") or []))
+                      for row in list(anchor_candidates or [])
+                  )
+                  if (not paired) and int(total_anchor_candidates) == 0 and (MULTIREST_ROI_ONLY_DEBUG or MULTIREST_WARN_ONLY):
+                      print(
+                          "SEMANTIC_WARN "
+                          f"page={page_num} reason=measure_anchor_empty_fallback_legacy"
+                      )
+                      paired, unmatched = pair_targets_with_boxes(targets, boxes_by_system)
+                      semantic_debug["multirest_anchor_mode"] = "legacy_inter_pairing_fallback"
+                      semantic_debug["multirest_anchor_selected"] = [
+                          {
+                              "measure_index": int(row.get("measure_index") or 0),
+                              "system_index": int(row.get("system_index") or 0),
+                              "rule": "legacy",
+                              "anchor_id": str(row.get("anchor_id") or ""),
+                              "x": float((row.get("box") or {}).get("x") or 0.0),
+                              "y": float((row.get("box") or {}).get("y") or 0.0),
+                              "w": float((row.get("box") or {}).get("w") or 0.0),
+                              "h": float((row.get("box") or {}).get("h") or 0.0),
+                          }
+                          for row in list(paired or [])
+                      ]
+                      semantic_debug["multirest_anchor_unresolved"] = []
+                      semantic_debug["multirest_anchor_source_counts"] = {"rule_a": 0, "rule_b": 0, "rule_c": 0}
                   for row in unmatched:
                       add_unresolved(row, str(row.get("reason") or "measure_anchor_not_found"), str(row.get("detail") or ""))
               else:
