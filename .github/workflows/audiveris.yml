@@ -720,6 +720,9 @@ jobs:
               f"ocr_conf_min={MULTIREST_OCR_CONF_MIN:.2f} "
               f"ocr_max_attempts_per_page={MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE}"
           )
+          MULTIREST_SCAN_REST_SCORE_MIN = 0.46
+          MULTIREST_SCAN_REST_SCORE_MIN_HINT = 0.30
+          MULTIREST_SCAN_OCR_REST_GATE = 0.52
 
           def to_float(v):
               try:
@@ -1099,6 +1102,7 @@ jobs:
               return None
 
           def build_multirest_targets(events, warning_measure_numbers):
+              # Multi-rest V3: scan all measures; Audiveris hints are support signals, not gates.
               warning_set = set(int(x) for x in (warning_measure_numbers or []))
               ordered = sorted(
                   list(enumerate(events or [])),
@@ -1114,27 +1118,27 @@ jobs:
                   local_pos = int(local_counter.get(system_index, 0))
                   measure_order_by_event[int(event_idx)] = int(local_pos)
                   local_counter[system_index] = int(local_pos) + 1
+
               targets = []
               for event_idx, ev in ordered:
-                  if not bool(ev.get("multiple_rest_present")):
-                      continue
-                  reasons = []
                   count_raw = ev.get("multiple_rest_count")
                   try:
                       count_val = int(count_raw) if count_raw is not None else None
                   except Exception:
                       count_val = None
-                  if count_val is None:
-                      reasons.append("count_missing")
-                  elif count_val <= 1:
-                      reasons.append("count_leq_1")
-                  if bool(ev.get("multiple_rest_missing_count_flag")):
-                      reasons.append("missing_count_flag")
                   measure_num_int = parse_measure_number_int(ev)
+                  hint_reasons = []
+                  if bool(ev.get("multiple_rest_present")):
+                      hint_reasons.append("xml_multiple_rest_present")
+                  if bool(ev.get("multiple_rest_missing_count_flag")):
+                      hint_reasons.append("xml_missing_count_flag")
+                  if count_val is None:
+                      hint_reasons.append("count_missing_or_unset")
+                  elif count_val <= 1:
+                      hint_reasons.append("count_leq_1")
                   if measure_num_int is not None and measure_num_int in warning_set:
-                      reasons.append("audiveris_log_default_1")
-                  if not reasons:
-                      continue
+                      hint_reasons.append("audiveris_log_default_1")
+
                   target = {
                       "event_idx": int(event_idx),
                       "measure_index": int(ev.get("measure_index") or 0),
@@ -1142,7 +1146,8 @@ jobs:
                       "raw_measure_number": str(ev.get("raw_measure_number") or ev.get("label") or ""),
                       "existing_count": count_val,
                       "measure_order_in_system": int(measure_order_by_event.get(int(event_idx), 0)),
-                      "reasons": list(dict.fromkeys(str(r) for r in reasons)),
+                      "reasons": list(dict.fromkeys(str(r) for r in hint_reasons)),
+                      "is_hint_target": bool(hint_reasons),
                   }
                   targets.append(target)
               return targets
@@ -1373,6 +1378,126 @@ jobs:
 
               return paired, unmatched, candidates_debug, selected_debug, unresolved_debug, rule_counts
 
+          def pair_scan_targets_with_measure_anchors(page_num, targets, anchors_by_system):
+              # Deterministic measure-order pairing for scan-all mode.
+              paired = []
+              unmatched = []
+              candidates_debug = []
+              selected_debug = []
+              unresolved_debug = []
+              rule_counts = {"rule_a": 0, "rule_b": 0, "rule_c": 0}
+
+              targets_by_system = {}
+              for target in list(targets or []):
+                  system_index = int(target.get("system_index") or 0)
+                  targets_by_system.setdefault(system_index, []).append(dict(target))
+
+              for system_index in sorted(targets_by_system.keys()):
+                  sys_targets = sorted(
+                      list(targets_by_system.get(system_index) or []),
+                      key=lambda t: (
+                          int(t.get("measure_order_in_system") or 0),
+                          int(t.get("measure_index") or 0),
+                          int(t.get("event_idx") or 0),
+                      ),
+                  )
+                  anchors = sorted(
+                      list((anchors_by_system or {}).get(system_index) or []),
+                      key=lambda r: (
+                          int(r.get("stack_order_in_system") or 0),
+                          float(r.get("x") or 0.0),
+                      ),
+                  )
+
+                  for target in sys_targets:
+                      target_candidate_rows = [
+                          {
+                              "system_index": int(system_index),
+                              "stack_order_in_system": int(row.get("stack_order_in_system") or 0),
+                              "id_like": str(row.get("id_like") or ""),
+                              "x": float(row.get("x") or 0.0),
+                              "y": float(row.get("y") or 0.0),
+                              "w": float(row.get("w") or 0.0),
+                              "h": float(row.get("h") or 0.0),
+                          }
+                          for row in anchors
+                      ]
+                      candidates_debug.append(
+                          {
+                              "measure_index": int(target.get("measure_index") or 0),
+                              "system_index": int(system_index),
+                              "raw_measure_number": str(target.get("raw_measure_number") or ""),
+                              "candidates": target_candidate_rows,
+                          }
+                      )
+
+                      desired_ord = int(target.get("measure_order_in_system") or 0)
+                      if desired_ord < 0 or desired_ord >= len(anchors):
+                          reason = "measure_anchor_not_found"
+                          unresolved = {
+                              **target,
+                              "reason": reason,
+                              "detail": f"scan_ordinal_out_of_range:{desired_ord}/{len(anchors)}",
+                          }
+                          unresolved_debug.append(dict(unresolved))
+                          unmatched.append(unresolved)
+                          if bool(target.get("is_hint_target")):
+                              print(
+                                  "SEMANTIC_MULTIREST_ANCHOR_FAIL "
+                                  f"page={page_num} measure_index={int(target.get('measure_index') or 0)} "
+                                  f"system_index={system_index} reason={reason}"
+                              )
+                          continue
+
+                      chosen = dict(anchors[int(desired_ord)])
+                      x = float(chosen.get("x") or 0.0)
+                      y = float(chosen.get("y") or 0.0)
+                      w = float(chosen.get("w") or 0.0)
+                      h = float(chosen.get("h") or 0.0)
+                      if w <= 0 or h <= 0:
+                          reason = "measure_anchor_invalid_bounds"
+                          unresolved = {**target, "reason": reason}
+                          unresolved_debug.append(dict(unresolved))
+                          unmatched.append(unresolved)
+                          if bool(target.get("is_hint_target")):
+                              print(
+                                  "SEMANTIC_MULTIREST_ANCHOR_FAIL "
+                                  f"page={page_num} measure_index={int(target.get('measure_index') or 0)} "
+                                  f"system_index={system_index} reason={reason}"
+                              )
+                          continue
+
+                      anchor_id = str(chosen.get("id_like") or "")
+                      selected_row = {
+                          "measure_index": int(target.get("measure_index") or 0),
+                          "system_index": int(system_index),
+                          "rule": "C",
+                          "anchor_id": str(anchor_id),
+                          "stack_order_in_system": int(chosen.get("stack_order_in_system") or desired_ord),
+                          "x": float(x),
+                          "y": float(y),
+                          "w": float(w),
+                          "h": float(h),
+                      }
+                      selected_debug.append(dict(selected_row))
+                      rule_counts["rule_c"] = int(rule_counts.get("rule_c") or 0) + 1
+                      if bool(target.get("is_hint_target")):
+                          print(
+                              "SEMANTIC_MULTIREST_ANCHOR_SELECT "
+                              f"page={page_num} measure_index={int(target.get('measure_index') or 0)} "
+                              f"system_index={system_index} rule=C anchor_id={anchor_id or '-'}"
+                          )
+                      paired.append(
+                          {
+                              **target,
+                              "box": selected_row,
+                              "anchor_rule": "C",
+                              "anchor_id": str(anchor_id),
+                          }
+                      )
+
+              return paired, unmatched, candidates_debug, selected_debug, unresolved_debug, rule_counts
+
           def extract_numeric_token(value):
               txt = str(value or "").strip()
               if not txt:
@@ -1397,6 +1522,112 @@ jobs:
                   "conf": float(conf),
                   "distance": float(dist),
                   "raw_text": str(raw_text or ""),
+              }
+
+          def compute_rest_likeness(page_obj, measure_rect):
+              # Lightweight visual classifier to reduce false positives in scan-all mode.
+              gray_img, _ = render_roi_gray(page_obj, measure_rect, scale=3)
+              if gray_img is None:
+                  return 0.0, {
+                      "black_ratio": 0.0,
+                      "upper_ratio": 0.0,
+                      "lower_ratio": 0.0,
+                      "mid_horiz_strength": 0.0,
+                      "component_count": 0,
+                      "marker_col_count": 0,
+                  }
+              try:
+                  _, bin_inv = cv2.threshold(
+                      gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+                  )
+              except Exception:
+                  return 0.0, {
+                      "black_ratio": 0.0,
+                      "upper_ratio": 0.0,
+                      "lower_ratio": 0.0,
+                      "mid_horiz_strength": 0.0,
+                      "component_count": 0,
+                      "marker_col_count": 0,
+                  }
+
+              black = (bin_inv > 0).astype(np.uint8)
+              h, w = black.shape[:2]
+              if h < 6 or w < 6:
+                  return 0.0, {
+                      "black_ratio": 0.0,
+                      "upper_ratio": 0.0,
+                      "lower_ratio": 0.0,
+                      "mid_horiz_strength": 0.0,
+                      "component_count": 0,
+                      "marker_col_count": 0,
+                  }
+
+              left = int(max(1, round(w * 0.08)))
+              right = int(min(w - 1, round(w * 0.92)))
+              core = black[:, left:right]
+              if core.size == 0:
+                  return 0.0, {
+                      "black_ratio": 0.0,
+                      "upper_ratio": 0.0,
+                      "lower_ratio": 0.0,
+                      "mid_horiz_strength": 0.0,
+                      "component_count": 0,
+                      "marker_col_count": 0,
+                  }
+
+              black_ratio = float(core.mean())
+              upper = core[: max(1, int(round(core.shape[0] * 0.33))), :]
+              lower = core[min(core.shape[0] - 1, int(round(core.shape[0] * 0.67))):, :]
+              upper_ratio = float(upper.mean()) if upper.size else 0.0
+              lower_ratio = float(lower.mean()) if lower.size else 0.0
+              mid0 = int(round(core.shape[0] * 0.38))
+              mid1 = int(round(core.shape[0] * 0.68))
+              mid1 = max(mid1, mid0 + 1)
+              mid = core[mid0:mid1, :]
+              mid_horiz_strength = 0.0
+              marker_col_count = 0
+              if mid.size:
+                  row_ratio = np.sum(mid, axis=1) / float(max(1, mid.shape[1]))
+                  mid_horiz_strength = float(np.max(row_ratio)) if row_ratio.size else 0.0
+                  col_ratio = np.sum(mid, axis=0) / float(max(1, mid.shape[0]))
+                  marker_col_count = int(np.sum(col_ratio >= 0.65))
+
+              try:
+                  num_labels, _, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+                  component_count = int(max(0, num_labels - 1))
+                  large_components = int(
+                      np.sum(stats[1:, cv2.CC_STAT_AREA] >= max(12, int(0.012 * core.shape[0] * core.shape[1])))
+                  ) if component_count > 0 else 0
+              except Exception:
+                  component_count = 0
+                  large_components = 0
+
+              score = 0.0
+              if mid_horiz_strength >= 0.20:
+                  score += 0.44
+              elif mid_horiz_strength >= 0.14:
+                  score += 0.30
+              if black_ratio <= 0.17:
+                  score += 0.20
+              elif black_ratio <= 0.23:
+                  score += 0.10
+              if upper_ratio <= 0.10:
+                  score += 0.10
+              if lower_ratio <= 0.10:
+                  score += 0.10
+              if marker_col_count >= 1:
+                  score += 0.08
+              if large_components <= 6:
+                  score += 0.08
+
+              score = float(max(0.0, min(1.0, score)))
+              return score, {
+                  "black_ratio": float(black_ratio),
+                  "upper_ratio": float(upper_ratio),
+                  "lower_ratio": float(lower_ratio),
+                  "mid_horiz_strength": float(mid_horiz_strength),
+                  "component_count": int(component_count),
+                  "marker_col_count": int(marker_col_count),
               }
 
           def text_word_candidates_for_roi(page_obj, roi_rect, target_center_x, target_center_y):
@@ -1669,6 +1900,7 @@ jobs:
                   "candidate_ambiguous",
                   "no_numeric_candidates",
                   "all_candidates_below_threshold",
+                  "rest_likeness_low",
               }
               if reason in allowed:
                   return reason
@@ -1690,6 +1922,8 @@ jobs:
                   return "candidate_ambiguous"
               if reason.startswith("all_candidates_below_threshold"):
                   return "all_candidates_below_threshold"
+              if reason.startswith("rest_likeness_low"):
+                  return "rest_likeness_low"
               if reason.startswith("ocr_conf_below_threshold"):
                   return "ocr_conf_below_threshold"
               if reason.startswith("ocr_attempt_cap_reached"):
@@ -1739,13 +1973,18 @@ jobs:
               page_num = int(entry.get("page_number") or 0)
               events = list(entry.get("_semantic_measure_events") or [])
               semantic_debug = init_semantic_debug_v2(entry.get("semantic_debug"))
-              semantic_debug["multirest_recovery_version"] = "v2_tuned_profiles"
+              semantic_debug["multirest_recovery_version"] = "v3_measure_first"
               semantic_debug["multirest_targets"] = []
               semantic_debug["multirest_recovered"] = []
               semantic_debug["multirest_unresolved"] = []
               semantic_debug["multirest_unresolved_reason_counts"] = {}
               semantic_debug["multirest_recovery_source_counts"] = {"text_words": 0, "text_chars": 0, "ocr": 0}
               semantic_debug["multirest_roi_trace"] = []
+              semantic_debug["multirest_scan_total_measures"] = int(len(events))
+              semantic_debug["multirest_scan_candidates"] = []
+              semantic_debug["multirest_scan_selected"] = []
+              semantic_debug["multirest_scan_unresolved"] = []
+              semantic_debug["multirest_scan_reason_counts"] = {}
               semantic_debug["multirest_recovery_skipped_by_filter"] = False
               semantic_debug["multirest_stage_mode"] = str(MULTIREST_STAGE_MODE)
               semantic_debug["multirest_recovery_skipped_by_stage_mode"] = False
@@ -1766,12 +2005,13 @@ jobs:
               targets = build_multirest_targets(events, warning_measures)
               semantic_debug["multirest_targets"] = list(targets)
               for target in targets:
-                  print(
-                      "SEMANTIC_MULTIREST_TARGET "
-                      f"page={page_num} measure_index={target.get('measure_index')} "
-                      f"system_index={target.get('system_index')} raw_measure={target.get('raw_measure_number')} "
-                      f"reasons={','.join(target.get('reasons') or []) or '-'}"
-                  )
+                  if bool(target.get("is_hint_target")):
+                      print(
+                          "SEMANTIC_MULTIREST_TARGET "
+                          f"page={page_num} measure_index={target.get('measure_index')} "
+                          f"system_index={target.get('system_index')} raw_measure={target.get('raw_measure_number')} "
+                          f"reasons={','.join(target.get('reasons') or []) or '-'}"
+                      )
               if not targets:
                   return
 
@@ -1796,16 +2036,28 @@ jobs:
               recovered = []
               source_counts = {"text_words": 0, "text_chars": 0, "ocr": 0}
               roi_trace = []
+              scan_candidates = []
+              scan_selected = []
+              scan_unresolved = []
+              scan_reason_counts = {}
               multirest_debug_root = os.path.join("/tmp/work/multirest_debug", f"page_{page_num:04d}")
               os.makedirs(multirest_debug_root, exist_ok=True)
 
-              def add_unresolved(pair, reason, detail=""):
+              def record_scan_reason(reason):
+                  key = map_multirest_reason(reason)
+                  scan_reason_counts[str(key)] = int(scan_reason_counts.get(str(key), 0)) + 1
+                  return str(key)
+
+              def add_unresolved(pair, reason, detail="", include_in_scan=True):
                   reason_code = map_multirest_reason(reason)
                   row = dict(pair or {})
                   row["reason"] = str(reason_code)
                   if detail:
                       row["detail"] = str(detail)
                   unresolved.append(row)
+                  if include_in_scan:
+                      scan_unresolved.append(dict(row))
+                      record_scan_reason(reason_code)
                   print(
                       "SEMANTIC_MULTIREST_UNRESOLVED_DETAIL "
                       f"page={page_num} measure_index={int(pair.get('measure_index') or 0)} "
@@ -1815,11 +2067,18 @@ jobs:
               geometry, geom_error = load_page_split_multirest_geometry(page_num, entry)
               if geometry is None:
                   for target in targets:
-                      add_unresolved(target, "geometry_unavailable", geom_error or "")
+                      if bool(target.get("is_hint_target")):
+                          add_unresolved(target, "geometry_unavailable", geom_error or "")
                   semantic_debug["multirest_unresolved"] = list(unresolved)
                   semantic_debug["multirest_unresolved_reason_counts"] = {
                       k: sum(1 for row in unresolved if str(row.get("reason")) == k)
                       for k in sorted({str(row.get("reason")) for row in unresolved})
+                  }
+                  semantic_debug["multirest_scan_candidates"] = []
+                  semantic_debug["multirest_scan_selected"] = []
+                  semantic_debug["multirest_scan_unresolved"] = list(scan_unresolved)
+                  semantic_debug["multirest_scan_reason_counts"] = {
+                      key: int(scan_reason_counts[key]) for key in sorted(scan_reason_counts.keys())
                   }
                   if MULTIREST_WARN_ONLY or MULTIREST_ROI_ONLY_DEBUG:
                       print(
@@ -1840,6 +2099,7 @@ jobs:
               pic_h = to_float(geometry.get("picture_height"))
               boxes_by_system = dict(geometry.get("boxes_by_system") or {})
               anchors_by_system = dict(geometry.get("anchors_by_system") or {})
+
               if MULTIREST_ANCHOR_MODE == "measure_stack_v1":
                   (
                       paired,
@@ -1848,11 +2108,10 @@ jobs:
                       anchor_selected,
                       anchor_unresolved,
                       anchor_rule_counts,
-                  ) = pair_targets_with_measure_anchors(
+                  ) = pair_scan_targets_with_measure_anchors(
                       page_num=page_num,
                       targets=targets,
                       anchors_by_system=anchors_by_system,
-                      warning_measure_numbers=warning_measures,
                   )
                   semantic_debug["multirest_anchor_candidates"] = list(anchor_candidates)
                   semantic_debug["multirest_anchor_selected"] = list(anchor_selected)
@@ -1871,7 +2130,8 @@ jobs:
                           "SEMANTIC_WARN "
                           f"page={page_num} reason=measure_anchor_empty_fallback_legacy"
                       )
-                      paired, unmatched = pair_targets_with_boxes(targets, boxes_by_system)
+                      fallback_targets = [dict(t) for t in targets if bool(t.get("is_hint_target"))]
+                      paired, unmatched = pair_targets_with_boxes(fallback_targets, boxes_by_system)
                       semantic_debug["multirest_anchor_mode"] = "legacy_inter_pairing_fallback"
                       semantic_debug["multirest_anchor_selected"] = [
                           {
@@ -1889,9 +2149,16 @@ jobs:
                       semantic_debug["multirest_anchor_unresolved"] = []
                       semantic_debug["multirest_anchor_source_counts"] = {"rule_a": 0, "rule_b": 0, "rule_c": 0}
                   for row in unmatched:
-                      add_unresolved(row, str(row.get("reason") or "measure_anchor_not_found"), str(row.get("detail") or ""))
+                      if bool(row.get("is_hint_target")):
+                          add_unresolved(
+                              row,
+                              str(row.get("reason") or "measure_anchor_not_found"),
+                              str(row.get("detail") or ""),
+                              include_in_scan=False,
+                          )
               else:
-                  paired, unmatched = pair_targets_with_boxes(targets, boxes_by_system)
+                  fallback_targets = [dict(t) for t in targets if bool(t.get("is_hint_target"))]
+                  paired, unmatched = pair_targets_with_boxes(fallback_targets, boxes_by_system)
                   semantic_debug["multirest_anchor_selected"] = [
                       {
                           "measure_index": int(row.get("measure_index") or 0),
@@ -1907,12 +2174,13 @@ jobs:
                   ]
                   semantic_debug["multirest_anchor_source_counts"] = {"rule_a": 0, "rule_b": 0, "rule_c": 0}
                   for row in unmatched:
-                      add_unresolved(row, "no_multirest_box_for_system")
+                      add_unresolved(row, "no_multirest_box_for_system", include_in_scan=False)
 
               pdf_path = os.path.join(PAGE_PDF_DIR, f"page_{page_num:04d}.pdf")
               if not os.path.exists(pdf_path):
                   for pair in paired:
-                      add_unresolved(pair, "geometry_unavailable", "page_pdf_missing")
+                      if bool(pair.get("is_hint_target")):
+                          add_unresolved(pair, "geometry_unavailable", "page_pdf_missing", include_in_scan=False)
                   paired = []
               page_doc = None
               page_obj = None
@@ -1922,7 +2190,8 @@ jobs:
                       page_obj = page_doc[0]
                   except Exception as exc:
                       for pair in paired:
-                          add_unresolved(pair, "geometry_unavailable", f"page_pdf_open_error:{exc}")
+                          if bool(pair.get("is_hint_target")):
+                              add_unresolved(pair, "geometry_unavailable", f"page_pdf_open_error:{exc}", include_in_scan=False)
                       paired = []
 
               ocr_attempts_by_page = 0
@@ -1936,32 +2205,44 @@ jobs:
                       measure_index = int(pair.get("measure_index") or 0)
                       system_index = int(pair.get("system_index") or 0)
                       event_idx = int(pair.get("event_idx") or 0)
+                      is_hint_target = bool(pair.get("is_hint_target"))
                       box = dict(pair.get("box") or {})
                       x = float(box.get("x") or 0.0)
                       y = float(box.get("y") or 0.0)
                       w = max(1.0, float(box.get("w") or 1.0))
                       h = max(1.0, float(box.get("h") or 1.0))
+                      measure_rect = fitz.Rect(x * sx, y * sy, (x + w) * sx, (y + h) * sy)
                       target_center_x = float((x + 0.5 * w) * sx)
                       target_center_y = float((y - 0.8 * h) * sy)
-                      target_dir = os.path.join(multirest_debug_root, f"measure_{measure_index:04d}")
+                      rest_likeness_score, rest_metrics = compute_rest_likeness(page_obj, measure_rect)
+
+                      target_dir = os.path.join(
+                          multirest_debug_root, f"system_{system_index:03d}_measure_{measure_index:04d}"
+                      )
                       os.makedirs(target_dir, exist_ok=True)
+
+                      resolved = False
+                      unresolved_reason = "no_numeric_candidates"
+                      pooled_candidates = []
+                      ocr_snippets = []
+
+                      should_try_ocr = bool(is_hint_target) or (
+                          float(rest_likeness_score) >= float(MULTIREST_SCAN_OCR_REST_GATE)
+                      )
+
                       target_trace = {
                           "measure_index": measure_index,
                           "system_index": system_index,
                           "anchor_rule": str(pair.get("anchor_rule") or ""),
                           "anchor_id": str(pair.get("anchor_id") or ""),
+                          "rest_likeness_score": float(rest_likeness_score),
+                          "rest_metrics": dict(rest_metrics),
                           "attempts": [],
                       }
-                      resolved = False
-                      unresolved_reason = "no_numeric_candidates"
-                      best_pool = []
-                      ocr_snippets = []
 
                       for roi_name, rx0, ry0, rx1, ry1 in build_roi_attempts(
                           x, y, w, h, sx, sy, MULTIREST_ANCHOR_MODE
                       ):
-                          if resolved:
-                              break
                           rx0 = clamp(rx0, 0.0, page_w)
                           rx1 = clamp(rx1, 0.0, page_w)
                           ry0 = clamp(ry0, 0.0, page_h)
@@ -1995,6 +2276,7 @@ jobs:
                                   roi_pix.save(roi_path)
                               except Exception:
                                   pass
+
                           if MULTIREST_ROI_ONLY_DEBUG:
                               target_trace["attempts"].append(
                                   {
@@ -2004,175 +2286,111 @@ jobs:
                                   }
                               )
                               continue
+
                           if roi_gray is None:
                               continue
 
                           words_candidates = text_word_candidates_for_roi(page_obj, roi, target_center_x, target_center_y)
                           chars_candidates = text_char_candidates_for_roi(page_obj, roi, target_center_x, target_center_y)
-                          print(
-                              "SEMANTIC_MULTIREST_TEXT_CANDIDATES_WORDS "
-                              f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
-                              f"candidates={format_candidates_for_log(words_candidates, limit=3)}"
-                          )
-                          print(
-                              "SEMANTIC_MULTIREST_TEXT_CANDIDATES_CHARS "
-                              f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
-                              f"candidates={format_candidates_for_log(chars_candidates, limit=3)}"
-                          )
-                          pool = list(words_candidates) + list(chars_candidates)
-                          selected, select_reason = choose_best_candidate(pool)
-                          if selected is not None:
-                              value = int(selected.get("value") or 0)
-                              events[event_idx]["multiple_rest_count"] = int(value)
-                              events[event_idx]["logical_span"] = int(value)
-                              events[event_idx]["logical_span_source"] = f"recovered_{selected.get('source')}"
-                              events[event_idx]["multiple_rest_missing_count_flag"] = False
-                              rec = {
-                                  "measure_index": measure_index,
-                                  "system_index": system_index,
-                                  "value": int(value),
-                                  "source": str(selected.get("source")),
-                                  "score": float(selected.get("score") or 0.0),
-                                  "conf": float(selected.get("conf") or 0.0),
-                              }
-                              recovered.append(rec)
-                              source_counts[str(selected.get("source"))] = int(source_counts.get(str(selected.get("source")), 0)) + 1
-                              print(
-                                  "SEMANTIC_MULTIREST_RECOVER "
-                                  f"page={page_num} measure_index={measure_index} system_index={system_index} "
-                                  f"source={selected.get('source')} value={value} "
-                                  f"score={float(selected.get('score') or 0.0):.2f} "
-                                  f"conf={float(selected.get('conf') or 0.0):.2f}"
-                              )
-                              resolved = True
-                              target_trace["attempts"].append(
-                                  {
-                                      "roi_name": str(roi_name),
-                                      "selected": dict(selected),
-                                      "selected_reason": "ok",
-                                  }
-                              )
-                              break
+                          pooled_candidates.extend(list(words_candidates))
+                          pooled_candidates.extend(list(chars_candidates))
 
-                          # OCR fallback for this ROI attempt
-                          ocr_pool = []
+                          if is_hint_target or words_candidates or chars_candidates:
+                              print(
+                                  "SEMANTIC_MULTIREST_TEXT_CANDIDATES_WORDS "
+                                  f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
+                                  f"candidates={format_candidates_for_log(words_candidates, limit=3)}"
+                              )
+                              print(
+                                  "SEMANTIC_MULTIREST_TEXT_CANDIDATES_CHARS "
+                                  f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
+                                  f"candidates={format_candidates_for_log(chars_candidates, limit=3)}"
+                              )
+
                           ocr_attempt_traces = []
-                          for scale in (4, 6):
-                              if ocr_attempts_by_page >= MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE:
-                                  unresolved_reason = "ocr_attempt_cap_reached"
-                                  break
-                              gray_img, _ = render_roi_gray(page_obj, roi, scale=scale)
-                              if gray_img is None:
-                                  continue
-                              for pre_name in ("adaptive", "otsu", "inverse_otsu"):
+                          ocr_pool = []
+                          if should_try_ocr:
+                              for scale in (4, 6):
                                   if ocr_attempts_by_page >= MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE:
                                       unresolved_reason = "ocr_attempt_cap_reached"
                                       break
-                                  proc = preprocess_for_ocr(gray_img, pre_name)
-                                  for psm in (7, 6):
+                                  gray_img, _ = render_roi_gray(page_obj, roi, scale=scale)
+                                  if gray_img is None:
+                                      continue
+                                  for pre_name in ("adaptive", "otsu", "inverse_otsu"):
                                       if ocr_attempts_by_page >= MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE:
                                           unresolved_reason = "ocr_attempt_cap_reached"
                                           break
-                                      ocr_attempts_by_page += 1
-                                      semantic_debug["multirest_attempt_count"] = int(semantic_debug.get("multirest_attempt_count") or 0) + 1
-                                      cands, snippets = ocr_candidates_for_image(proc, psm=psm)
-                                      ocr_attempt_traces.append(
-                                          {
-                                              "roi_name": str(roi_name),
-                                              "scale": int(scale),
-                                              "preprocess": str(pre_name),
-                                              "psm": int(psm),
-                                              "candidates": len(cands),
-                                              "snippets": snippets[:8],
-                                          }
-                                      )
-                                      if snippets:
-                                          ocr_snippets.append(
+                                      proc = preprocess_for_ocr(gray_img, pre_name)
+                                      for psm in (7, 6):
+                                          if ocr_attempts_by_page >= MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE:
+                                              unresolved_reason = "ocr_attempt_cap_reached"
+                                              break
+                                          ocr_attempts_by_page += 1
+                                          semantic_debug["multirest_attempt_count"] = int(semantic_debug.get("multirest_attempt_count") or 0) + 1
+                                          cands, snippets = ocr_candidates_for_image(proc, psm=psm)
+                                          ocr_attempt_traces.append(
                                               {
                                                   "roi_name": str(roi_name),
                                                   "scale": int(scale),
                                                   "preprocess": str(pre_name),
                                                   "psm": int(psm),
+                                                  "candidates": len(cands),
                                                   "snippets": snippets[:8],
                                               }
                                           )
-                                      for cand in cands:
-                                          bx = list(cand.get("bbox_local") or [0, 0, 0, 0])
-                                          # map local bbox back into page coordinates
-                                          sx_scale = float(scale)
-                                          page_bbox = [
-                                              float(roi.x0) + float(bx[0]) / sx_scale,
-                                              float(roi.y0) + float(bx[1]) / sx_scale,
-                                              float(roi.x0) + float(bx[2]) / sx_scale,
-                                              float(roi.y0) + float(bx[3]) / sx_scale,
-                                          ]
-                                          ocr_pool.append(
-                                              build_candidate(
-                                                  source="ocr",
-                                                  value=int(cand.get("value") or 0),
-                                                  bbox=page_bbox,
-                                                  target_center_x=target_center_x,
-                                                  target_center_y=target_center_y,
-                                                  score=float(cand.get("conf") or 0.0),
-                                                  conf=float(cand.get("conf") or 0.0),
-                                                  raw_text=str(cand.get("raw_text") or ""),
+                                          if snippets:
+                                              ocr_snippets.append(
+                                                  {
+                                                      "roi_name": str(roi_name),
+                                                      "scale": int(scale),
+                                                      "preprocess": str(pre_name),
+                                                      "psm": int(psm),
+                                                      "snippets": snippets[:8],
+                                                  }
                                               )
-                                          )
-                          if ocr_pool:
-                              print(
-                                  "SEMANTIC_MULTIREST_OCR_CANDIDATE "
-                                  f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
-                                  f"candidates={format_candidates_for_log(ocr_pool, limit=3)}"
-                              )
-                          else:
-                              print(
-                                  "SEMANTIC_MULTIREST_OCR_CANDIDATE "
-                                  f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
-                                  f"value=none conf=na raw=- reason={unresolved_reason}"
-                              )
+                                          for cand in cands:
+                                              bx = list(cand.get("bbox_local") or [0, 0, 0, 0])
+                                              sx_scale = float(scale)
+                                              page_bbox = [
+                                                  float(roi.x0) + float(bx[0]) / sx_scale,
+                                                  float(roi.y0) + float(bx[1]) / sx_scale,
+                                                  float(roi.x0) + float(bx[2]) / sx_scale,
+                                                  float(roi.y0) + float(bx[3]) / sx_scale,
+                                              ]
+                                              ocr_pool.append(
+                                                  build_candidate(
+                                                      source="ocr",
+                                                      value=int(cand.get("value") or 0),
+                                                      bbox=page_bbox,
+                                                      target_center_x=target_center_x,
+                                                      target_center_y=target_center_y,
+                                                      score=float(cand.get("conf") or 0.0),
+                                                      conf=float(cand.get("conf") or 0.0),
+                                                      raw_text=str(cand.get("raw_text") or ""),
+                                                  )
+                                              )
+                          pooled_candidates.extend(list(ocr_pool))
 
-                          pool = list(words_candidates) + list(chars_candidates) + list(ocr_pool)
-                          selected, select_reason = choose_best_candidate(pool)
-                          best_pool = pool if pool else best_pool
-                          if selected is not None:
-                              value = int(selected.get("value") or 0)
-                              events[event_idx]["multiple_rest_count"] = int(value)
-                              events[event_idx]["logical_span"] = int(value)
-                              events[event_idx]["logical_span_source"] = f"recovered_{selected.get('source')}"
-                              events[event_idx]["multiple_rest_missing_count_flag"] = False
-                              rec = {
-                                  "measure_index": measure_index,
-                                  "system_index": system_index,
-                                  "value": int(value),
-                                  "source": str(selected.get("source")),
-                                  "score": float(selected.get("score") or 0.0),
-                                  "conf": float(selected.get("conf") or 0.0),
-                              }
-                              recovered.append(rec)
-                              source_counts[str(selected.get("source"))] = int(source_counts.get(str(selected.get("source")), 0)) + 1
-                              print(
-                                  "SEMANTIC_MULTIREST_RECOVER "
-                                  f"page={page_num} measure_index={measure_index} system_index={system_index} "
-                                  f"source={selected.get('source')} value={value} "
-                                  f"score={float(selected.get('score') or 0.0):.2f} "
-                                  f"conf={float(selected.get('conf') or 0.0):.2f}"
-                              )
-                              resolved = True
-                              target_trace["attempts"].append(
-                                  {
-                                      "roi_name": str(roi_name),
-                                      "selected": dict(selected),
-                                      "selected_reason": "ok_after_ocr",
-                                      "ocr_attempts": list(ocr_attempt_traces[:4]),
-                                  }
-                              )
-                              break
-                          unresolved_reason = select_reason or unresolved_reason
+                          if is_hint_target or ocr_pool:
+                              if ocr_pool:
+                                  print(
+                                      "SEMANTIC_MULTIREST_OCR_CANDIDATE "
+                                      f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
+                                      f"candidates={format_candidates_for_log(ocr_pool, limit=3)}"
+                                  )
+                              else:
+                                  print(
+                                      "SEMANTIC_MULTIREST_OCR_CANDIDATE "
+                                      f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
+                                      f"value=none conf=na raw=- reason={unresolved_reason}"
+                                  )
+
                           target_trace["attempts"].append(
                               {
                                   "roi_name": str(roi_name),
                                   "selected": None,
-                                  "selected_reason": str(unresolved_reason),
+                                  "selected_reason": "collected_candidates",
                                   "ocr_attempts": list(ocr_attempt_traces[:4]),
                               }
                           )
@@ -2180,16 +2398,92 @@ jobs:
                       if MULTIREST_ROI_ONLY_DEBUG:
                           continue
 
+                      selected, select_reason = choose_best_candidate(pooled_candidates)
+                      if selected is None:
+                          unresolved_reason = str(select_reason or unresolved_reason or "no_numeric_candidates")
+                      else:
+                          required_score = (
+                              float(MULTIREST_SCAN_REST_SCORE_MIN_HINT)
+                              if is_hint_target
+                              else float(MULTIREST_SCAN_REST_SCORE_MIN)
+                          )
+                          if float(rest_likeness_score) >= required_score:
+                              value = int(selected.get("value") or 0)
+                              events[event_idx]["multiple_rest_count"] = int(value)
+                              events[event_idx]["logical_span"] = int(value)
+                              events[event_idx]["logical_span_source"] = f"recovered_{selected.get('source')}"
+                              events[event_idx]["multiple_rest_missing_count_flag"] = False
+                              rec = {
+                                  "measure_index": measure_index,
+                                  "system_index": system_index,
+                                  "value": int(value),
+                                  "source": str(selected.get("source")),
+                                  "score": float(selected.get("score") or 0.0),
+                                  "conf": float(selected.get("conf") or 0.0),
+                                  "rest_likeness_score": float(rest_likeness_score),
+                                  "x": float(x),
+                                  "y": float(y),
+                                  "w": float(w),
+                                  "h": float(h),
+                                  "anchor_rule": str(pair.get("anchor_rule") or ""),
+                                  "anchor_id": str(pair.get("anchor_id") or ""),
+                              }
+                              recovered.append(rec)
+                              scan_selected.append(dict(rec))
+                              source_counts[str(selected.get("source"))] = int(source_counts.get(str(selected.get("source")), 0)) + 1
+                              print(
+                                  "SEMANTIC_MULTIREST_RECOVER "
+                                  f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                                  f"source={selected.get('source')} value={value} "
+                                  f"score={float(selected.get('score') or 0.0):.2f} "
+                                  f"conf={float(selected.get('conf') or 0.0):.2f} "
+                                  f"rest_score={float(rest_likeness_score):.2f}"
+                              )
+                              resolved = True
+                          else:
+                              unresolved_reason = "rest_likeness_low"
+
+                      candidate_row = {
+                          "measure_index": int(measure_index),
+                          "system_index": int(system_index),
+                          "is_hint_target": bool(is_hint_target),
+                          "rest_likeness_score": float(rest_likeness_score),
+                          "rest_metrics": dict(rest_metrics),
+                          "selected": bool(resolved),
+                          "anchor_rule": str(pair.get("anchor_rule") or ""),
+                          "anchor_id": str(pair.get("anchor_id") or ""),
+                          "x": float(x),
+                          "y": float(y),
+                          "w": float(w),
+                          "h": float(h),
+                      }
+                      if selected is not None:
+                          candidate_row["candidate_value"] = int(selected.get("value") or 0)
+                          candidate_row["candidate_source"] = str(selected.get("source") or "")
+                          candidate_row["candidate_score"] = float(selected.get("score") or 0.0)
+                          candidate_row["candidate_conf"] = float(selected.get("conf") or 0.0)
+
+                      should_record_candidate = bool(selected is not None) or bool(is_hint_target) or float(rest_likeness_score) >= 0.40
+                      if should_record_candidate:
+                          if not resolved:
+                              reason_key = record_scan_reason(unresolved_reason)
+                              candidate_row["reject_reason"] = str(reason_key)
+                              scan_unresolved.append(dict(candidate_row))
+                          scan_candidates.append(dict(candidate_row))
+
+                      if not resolved and is_hint_target:
+                          add_unresolved(pair, unresolved_reason or "no_numeric_candidates", include_in_scan=False)
+
                       if not resolved:
-                          add_unresolved(pair, unresolved_reason or "no_numeric_candidates")
-                          # forensic files for unresolved targets
                           forensic = {
                               "page": int(page_num),
                               "measure_index": int(measure_index),
                               "system_index": int(system_index),
                               "reason": str(unresolved_reason or "no_numeric_candidates"),
-                              "candidate_preview": best_pool[:6],
+                              "candidate_preview": pooled_candidates[:6],
                               "trace": target_trace,
+                              "rest_likeness_score": float(rest_likeness_score),
+                              "rest_metrics": dict(rest_metrics),
                           }
                           try:
                               with open(os.path.join(target_dir, "candidate_summary.json"), "w", encoding="utf-8") as f:
@@ -2223,6 +2517,12 @@ jobs:
               }
               semantic_debug["multirest_recovery_source_counts"] = dict(source_counts)
               semantic_debug["multirest_roi_trace"] = list(roi_trace)
+              semantic_debug["multirest_scan_candidates"] = list(scan_candidates)
+              semantic_debug["multirest_scan_selected"] = list(scan_selected)
+              semantic_debug["multirest_scan_unresolved"] = list(scan_unresolved)
+              semantic_debug["multirest_scan_reason_counts"] = {
+                  key: int(scan_reason_counts[key]) for key in sorted(scan_reason_counts.keys())
+              }
               entry["_semantic_measure_events"] = events
 
               if unresolved:
@@ -3032,7 +3332,7 @@ jobs:
               base.setdefault("multiple_rest_detected_count", 0)
               base.setdefault("multiple_rest_missing_count", 0)
               base.setdefault("multiple_rest_total_span_added", 0)
-              base.setdefault("multirest_recovery_version", "v2_tuned_profiles")
+              base.setdefault("multirest_recovery_version", "v3_measure_first")
               base.setdefault("multirest_stage_mode", "full_recovery")
               base.setdefault("multirest_anchor_mode", "measure_stack_v1")
               base.setdefault("multirest_targets", [])
@@ -3048,6 +3348,11 @@ jobs:
               base.setdefault("multirest_recovery_skipped_by_filter", False)
               base.setdefault("multirest_recovery_skipped_by_stage_mode", False)
               base.setdefault("multirest_attempt_count", 0)
+              base.setdefault("multirest_scan_total_measures", 0)
+              base.setdefault("multirest_scan_candidates", [])
+              base.setdefault("multirest_scan_selected", [])
+              base.setdefault("multirest_scan_unresolved", [])
+              base.setdefault("multirest_scan_reason_counts", {})
               base.setdefault("multirest_missing_from_audiveris_log_count", 0)
               base.setdefault("multirest_missing_from_audiveris_log_measures", [])
               base.setdefault("multirest_log_source", "")
@@ -4573,7 +4878,7 @@ jobs:
                           "multiple_rest_detected_count": 0,
                           "multiple_rest_missing_count": 0,
                           "multiple_rest_total_span_added": 0,
-                          "multirest_recovery_version": "v2_tuned_profiles",
+                          "multirest_recovery_version": "v3_measure_first",
                           "multirest_stage_mode": str(MULTIREST_STAGE_MODE),
                           "multirest_anchor_mode": str(MULTIREST_ANCHOR_MODE),
                           "multirest_targets": [],
@@ -4589,6 +4894,11 @@ jobs:
                           "multirest_recovery_skipped_by_filter": False,
                           "multirest_recovery_skipped_by_stage_mode": False,
                           "multirest_attempt_count": 0,
+                          "multirest_scan_total_measures": 0,
+                          "multirest_scan_candidates": [],
+                          "multirest_scan_selected": [],
+                          "multirest_scan_unresolved": [],
+                          "multirest_scan_reason_counts": {},
                           "multirest_missing_from_audiveris_log_count": 0,
                           "multirest_missing_from_audiveris_log_measures": [],
                           "multirest_log_source": "",
@@ -4696,7 +5006,7 @@ jobs:
                           "multiple_rest_detected_count": 0,
                           "multiple_rest_missing_count": 0,
                           "multiple_rest_total_span_added": 0,
-                          "multirest_recovery_version": "v2_tuned_profiles",
+                          "multirest_recovery_version": "v3_measure_first",
                           "multirest_stage_mode": str(MULTIREST_STAGE_MODE),
                           "multirest_anchor_mode": str(MULTIREST_ANCHOR_MODE),
                           "multirest_targets": [],
@@ -4712,6 +5022,11 @@ jobs:
                           "multirest_recovery_skipped_by_filter": False,
                           "multirest_recovery_skipped_by_stage_mode": False,
                           "multirest_attempt_count": 0,
+                          "multirest_scan_total_measures": 0,
+                          "multirest_scan_candidates": [],
+                          "multirest_scan_selected": [],
+                          "multirest_scan_unresolved": [],
+                          "multirest_scan_reason_counts": {},
                           "multirest_missing_from_audiveris_log_count": 0,
                           "multirest_missing_from_audiveris_log_measures": [],
                           "multirest_log_source": "",
@@ -4867,10 +5182,11 @@ jobs:
                   continue
               page = doc[page_idx]
               sem_dbg = entry.get("semantic_debug") or {}
-              targets = list(sem_dbg.get("multirest_targets") or [])
-              anchor_rows = list(sem_dbg.get("multirest_anchor_selected") or [])
+              scan_rows = list(sem_dbg.get("multirest_scan_candidates") or [])
+              anchor_rows = list(sem_dbg.get("multirest_scan_selected") or [])
+              rejected_rows = [row for row in scan_rows if not bool(row.get("selected"))]
               roi_rows = list(sem_dbg.get("multirest_roi_trace") or [])
-              targets_total += int(len(targets))
+              targets_total += int(len(scan_rows))
               boxes_total += int(len(roi_rows))
               for row in anchor_rows:
                   ax = float(row.get("x") or 0.0)
@@ -4898,6 +5214,37 @@ jobs:
                           "system_index": int(system_index),
                           "anchor_rule": str(rule),
                           "anchor_id": str(row.get("anchor_id") or ""),
+                          "x0": float(ax),
+                          "y0": float(ay),
+                          "x1": float(ax + aw),
+                          "y1": float(ay + ah),
+                      }
+                  )
+              for row in rejected_rows:
+                  ax = float(row.get("x") or 0.0)
+                  ay = float(row.get("y") or 0.0)
+                  aw = float(row.get("w") or 0.0)
+                  ah = float(row.get("h") or 0.0)
+                  if aw <= 0.0 or ah <= 0.0:
+                      continue
+                  rect = fitz.Rect(ax, ay, ax + aw, ay + ah)
+                  page.draw_rect(rect, color=(1.0, 0.85, 0.0), width=0.8, overlay=True)
+                  measure_index = int(row.get("measure_index") or 0)
+                  system_index = int(row.get("system_index") or 0)
+                  reason = str(row.get("reject_reason") or "-")
+                  label = f"REJECT p{page_num} m{measure_index} s{system_index} {reason}"
+                  label_x = ax + 1.0
+                  label_y = ay - 2.0
+                  if label_y < 6.0:
+                      label_y = ay + ah + 7.0
+                  page.insert_text((label_x, label_y), label, fontsize=5.0, color=(1.0, 0.85, 0.0), overlay=True)
+                  flat_rows.append(
+                      {
+                          "row_type": "rejected",
+                          "page_number": int(page_num),
+                          "measure_index": int(measure_index),
+                          "system_index": int(system_index),
+                          "reject_reason": str(reason),
                           "x0": float(ax),
                           "y0": float(ay),
                           "x1": float(ax + aw),
@@ -4995,6 +5342,12 @@ jobs:
           multirest_roi_targets_total = 0
           multirest_roi_boxes_total = 0
           multirest_roi_boxes_by_page = {}
+          multirest_scan_total_measures = 0
+          multirest_scan_candidates_total = 0
+          multirest_scan_selected_total = 0
+          multirest_scan_unresolved_total = 0
+          multirest_scan_reason_totals = {}
+          semantic_multirest_scan_rows = []
           manifest_select_error_detail = {}
           multirest_warn_only = (
               (os.environ.get("MULTIREST_WARN_ONLY", "0") or "0").strip().lower()
@@ -5069,6 +5422,11 @@ jobs:
                       mr_anchor_rules = dict(dbg.get("multirest_anchor_source_counts") or {})
                       mr_attempt_count = int(dbg.get("multirest_attempt_count") or 0)
                       mr_roi_rows = list(dbg.get("multirest_roi_trace") or [])
+                      mr_scan_total_measures = int(dbg.get("multirest_scan_total_measures") or 0)
+                      mr_scan_candidates = list(dbg.get("multirest_scan_candidates") or [])
+                      mr_scan_selected = list(dbg.get("multirest_scan_selected") or [])
+                      mr_scan_unresolved = list(dbg.get("multirest_scan_unresolved") or [])
+                      mr_scan_reason_counts = dict(dbg.get("multirest_scan_reason_counts") or {})
                       multirest_anchor_total_targets += int(len(mr_targets))
                       multirest_anchor_total_anchored += int(len(mr_anchor_selected))
                       multirest_anchor_total_unresolved += int(len(mr_anchor_unresolved))
@@ -5079,10 +5437,26 @@ jobs:
                       multirest_roi_targets_total += int(len(mr_targets))
                       multirest_roi_boxes_total += int(len(mr_roi_rows))
                       multirest_roi_boxes_by_page[int(page_no)] = int(len(mr_roi_rows))
+                      multirest_scan_total_measures += int(mr_scan_total_measures)
+                      multirest_scan_candidates_total += int(len(mr_scan_candidates))
+                      multirest_scan_selected_total += int(len(mr_scan_selected))
+                      multirest_scan_unresolved_total += int(len(mr_scan_unresolved))
                       for key in multirest_anchor_rule_totals.keys():
                           multirest_anchor_rule_totals[key] += int(mr_anchor_rules.get(key) or 0)
                       for key in multirest_method_totals.keys():
                           multirest_method_totals[key] += int(mr_source_counts.get(key) or 0)
+                      for key, val in mr_scan_reason_counts.items():
+                          multirest_scan_reason_totals[str(key)] = int(multirest_scan_reason_totals.get(str(key), 0)) + int(val or 0)
+                      semantic_multirest_scan_rows.append(
+                          (
+                              page_no,
+                              int(mr_scan_total_measures),
+                              int(len(mr_scan_candidates)),
+                              int(len(mr_scan_selected)),
+                              int(len(mr_scan_unresolved)),
+                              dict(mr_scan_reason_counts),
+                          )
+                      )
                       semantic_multirest_recovery_rows.append(
                           (
                               page_no,
@@ -5126,6 +5500,34 @@ jobs:
                   f"recovered={int(multirest_total_recovered)} "
                   f"unresolved={int(multirest_total_unresolved)}"
               )
+              print(
+                  "SUMMARY semantic_multirest_scan_total "
+                  f"measures={int(multirest_scan_total_measures)} "
+                  f"candidates={int(multirest_scan_candidates_total)} "
+                  f"selected={int(multirest_scan_selected_total)} "
+                  f"unresolved={int(multirest_scan_unresolved_total)}"
+              )
+              if multirest_scan_reason_totals:
+                  reasons_scan_txt = ",".join(
+                      f"{str(k)}:{int(multirest_scan_reason_totals[k])}"
+                      for k in sorted(multirest_scan_reason_totals.keys())
+                  )
+              else:
+                  reasons_scan_txt = "-"
+              print(f"SUMMARY semantic_multirest_scan_reasons={reasons_scan_txt}")
+              for page_no, m_count, c_count, s_count, u_count, reason_counts in semantic_multirest_scan_rows:
+                  reasons_txt = ",".join(
+                      f"{str(k)}:{int(reason_counts[k])}" for k in sorted(reason_counts.keys())
+                  ) if reason_counts else "-"
+                  print(
+                      "SUMMARY semantic_multirest_scan "
+                      f"page={int(page_no)} "
+                      f"measures={int(m_count)} "
+                      f"candidates={int(c_count)} "
+                      f"selected={int(s_count)} "
+                      f"unresolved={int(u_count)} "
+                      f"reasons={reasons_txt}"
+                  )
               print(f"SUMMARY semantic_multirest_stage_mode={multirest_stage_mode}")
               print(f"SUMMARY semantic_multirest_anchor_mode={multirest_anchor_mode}")
               print(
@@ -5180,6 +5582,8 @@ jobs:
                       f"reasons={reasons_txt}"
                   )
           else:
+              print("SUMMARY semantic_multirest_scan_total measures=0 candidates=0 selected=0 unresolved=0")
+              print("SUMMARY semantic_multirest_scan_reasons=-")
               print(f"SUMMARY semantic_multirest_stage_mode={multirest_stage_mode}")
               print(f"SUMMARY semantic_multirest_anchor_mode={multirest_anchor_mode}")
               print("SUMMARY semantic_multirest_anchor_total targets=0 anchored=0 unresolved=0")
