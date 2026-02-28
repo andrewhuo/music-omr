@@ -7,6 +7,28 @@ on:
         description: "GCS URI to input PDF (gs://music-omr-bucket-777135743132/input/test.pdf)"
         required: true
         type: string
+      multirest_warn_only:
+        description: "Multi-rest unresolved handling: 1=warn only, 0=strict fail"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
+      multirest_debug_page_filter:
+        description: "Comma-separated pages for multi-rest tuning (empty = all pages)"
+        required: false
+        default: "1,4,6,7"
+        type: string
+      multirest_profile:
+        description: "Multi-rest tuning profile"
+        required: false
+        default: "wide_roi"
+        type: choice
+        options:
+          - base
+          - wide_roi
+          - aggressive
 
 jobs:
   pipeline:
@@ -16,14 +38,15 @@ jobs:
       AUDIVERIS_IMAGE: "ghcr.io/andrewhuo/audiveris-engine@sha256:61c2a4a39e6f545bb9153a984247b83ace541196c4861329b295982e4cf57bed"
       AUDIVERIS_VERSION: "5.9.0"
       MEASURE_NUMBERING_POLICY: "semantic_continuous_v1"
-      MULTIREST_WARN_ONLY: "1"
-      MULTIREST_DEBUG_PAGE_FILTER: "1,4,6,7"
-      MULTIREST_ROI_EXPAND_X: "1.6"
-      MULTIREST_ROI_EXPAND_Y: "1.8"
-      MULTIREST_TEXT_SCORE_MIN: "20"
-      MULTIREST_TEXT_MARGIN_MIN: "7"
-      MULTIREST_OCR_CONF_MIN: "60"
-      MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE: "6"
+      MULTIREST_WARN_ONLY: "${{ inputs.multirest_warn_only || '1' }}"
+      MULTIREST_DEBUG_PAGE_FILTER: "${{ inputs.multirest_debug_page_filter || '1,4,6,7' }}"
+      MULTIREST_PROFILE: "${{ inputs.multirest_profile || 'wide_roi' }}"
+      MULTIREST_ROI_EXPAND_X: ""
+      MULTIREST_ROI_EXPAND_Y: ""
+      MULTIREST_TEXT_SCORE_MIN: ""
+      MULTIREST_TEXT_MARGIN_MIN: ""
+      MULTIREST_OCR_CONF_MIN: ""
+      MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE: ""
 
     permissions:
       contents: read
@@ -77,6 +100,9 @@ jobs:
           echo "run_id: ${GITHUB_RUN_ID}"
           echo "run_attempt: ${GITHUB_RUN_ATTEMPT}"
           echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
+          echo "multirest_warn_only: ${{ inputs.multirest_warn_only }}"
+          echo "multirest_debug_page_filter: ${{ inputs.multirest_debug_page_filter }}"
+          echo "multirest_profile: ${{ inputs.multirest_profile }}"
           echo "audiveris_image: ${AUDIVERIS_IMAGE}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
           echo "run_output_prefix: ${RUN_OUTPUT_PREFIX}"
@@ -624,19 +650,53 @@ jobs:
                   out.add(int(token))
               return out
 
+          MULTIREST_PROFILE = (os.environ.get("MULTIREST_PROFILE", "wide_roi") or "").strip().lower()
+          profile_defaults = {
+              "base": {
+                  "roi_expand_x": 1.0,
+                  "roi_expand_y": 1.0,
+                  "text_score_min": 20.0,
+                  "text_margin_min": 7.0,
+                  "ocr_conf_min": 60.0,
+                  "ocr_max_attempts_per_page": 6,
+              },
+              "wide_roi": {
+                  "roi_expand_x": 1.8,
+                  "roi_expand_y": 2.4,
+                  "text_score_min": 12.0,
+                  "text_margin_min": 3.0,
+                  "ocr_conf_min": 35.0,
+                  "ocr_max_attempts_per_page": 12,
+              },
+              "aggressive": {
+                  "roi_expand_x": 2.2,
+                  "roi_expand_y": 2.8,
+                  "text_score_min": 8.0,
+                  "text_margin_min": 2.0,
+                  "ocr_conf_min": 20.0,
+                  "ocr_max_attempts_per_page": 20,
+              },
+          }
+          if MULTIREST_PROFILE not in profile_defaults:
+              print(
+                  f"SEMANTIC_WARN page=- reason=invalid_multirest_profile:{MULTIREST_PROFILE} fallback=wide_roi"
+              )
+              MULTIREST_PROFILE = "wide_roi"
+
+          defaults = profile_defaults[MULTIREST_PROFILE]
           MULTIREST_WARN_ONLY = parse_env_bool("MULTIREST_WARN_ONLY", False)
           MULTIREST_DEBUG_PAGE_FILTER_RAW = (
               os.environ.get("MULTIREST_DEBUG_PAGE_FILTER", "") or ""
           ).strip()
           MULTIREST_DEBUG_PAGE_FILTER = parse_page_filter_env(MULTIREST_DEBUG_PAGE_FILTER_RAW)
-          MULTIREST_ROI_EXPAND_X = max(0.1, parse_env_float("MULTIREST_ROI_EXPAND_X", 1.0))
-          MULTIREST_ROI_EXPAND_Y = max(0.1, parse_env_float("MULTIREST_ROI_EXPAND_Y", 1.0))
+          MULTIREST_ROI_EXPAND_X = max(0.1, parse_env_float("MULTIREST_ROI_EXPAND_X", defaults["roi_expand_x"]))
+          MULTIREST_ROI_EXPAND_Y = max(0.1, parse_env_float("MULTIREST_ROI_EXPAND_Y", defaults["roi_expand_y"]))
           MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE = max(
-              0, parse_env_int("MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE", 6)
+              0, parse_env_int("MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE", defaults["ocr_max_attempts_per_page"])
           )
-          MULTIREST_TEXT_SCORE_MIN = parse_env_float("MULTIREST_TEXT_SCORE_MIN", 20.0)
-          MULTIREST_TEXT_MARGIN_MIN = parse_env_float("MULTIREST_TEXT_MARGIN_MIN", 7.0)
-          MULTIREST_OCR_CONF_MIN = parse_env_float("MULTIREST_OCR_CONF_MIN", 60.0)
+          MULTIREST_TEXT_SCORE_MIN = parse_env_float("MULTIREST_TEXT_SCORE_MIN", defaults["text_score_min"])
+          MULTIREST_TEXT_MARGIN_MIN = parse_env_float("MULTIREST_TEXT_MARGIN_MIN", defaults["text_margin_min"])
+          MULTIREST_OCR_CONF_MIN = parse_env_float("MULTIREST_OCR_CONF_MIN", defaults["ocr_conf_min"])
           NUMBERING_POLICY = (os.environ.get("MEASURE_NUMBERING_POLICY", "semantic_continuous_v1") or "").strip() or "semantic_continuous_v1"
           if NUMBERING_POLICY not in ("semantic_continuous_v1", "legacy_raw_starts"):
               print(
@@ -645,6 +705,7 @@ jobs:
               NUMBERING_POLICY = "semantic_continuous_v1"
           print(
               "SEMANTIC_MULTIREST_CONFIG "
+              f"profile={MULTIREST_PROFILE} "
               f"warn_only={int(MULTIREST_WARN_ONLY)} "
               f"page_filter={sorted(MULTIREST_DEBUG_PAGE_FILTER)} "
               f"roi_expand_x={MULTIREST_ROI_EXPAND_X:.2f} "
@@ -982,10 +1043,25 @@ jobs:
                   return int(m.group(1))
               return None
 
-          def text_candidates_for_roi(page_obj, roi_rect, target_center_x, target_center_y):
+          def build_candidate(source, value, bbox, target_center_x, target_center_y, score, conf, raw_text):
+              x0, y0, x1, y1 = [float(v) for v in bbox]
+              cx = 0.5 * (x0 + x1)
+              cy = 0.5 * (y0 + y1)
+              dist = ((cx - float(target_center_x)) ** 2 + (cy - float(target_center_y)) ** 2) ** 0.5
+              return {
+                  "source": str(source),
+                  "value": int(value),
+                  "bbox": [x0, y0, x1, y1],
+                  "score": float(score),
+                  "conf": float(conf),
+                  "distance": float(dist),
+                  "raw_text": str(raw_text or ""),
+              }
+
+          def text_word_candidates_for_roi(page_obj, roi_rect, target_center_x, target_center_y):
               candidates = []
               try:
-                  words = page_obj.get_text("words") or []
+                  words = page_obj.get_text("words", clip=roi_rect) or []
               except Exception:
                   words = []
               roi_w = max(1.0, float(roi_rect.width))
@@ -994,49 +1070,147 @@ jobs:
                   if len(row) < 5:
                       continue
                   x0, y0, x1, y1, word = row[:5]
+                  value = extract_numeric_token(word)
+                  if value is None or value < MULTIREST_MIN_COUNT or value > MULTIREST_MAX_COUNT:
+                      continue
                   cx = 0.5 * (float(x0) + float(x1))
                   cy = 0.5 * (float(y0) + float(y1))
-                  if cx < roi_rect.x0 or cx > roi_rect.x1 or cy < roi_rect.y0 or cy > roi_rect.y1:
-                      continue
-                  value = extract_numeric_token(word)
-                  if value is None:
-                      continue
-                  if value < MULTIREST_MIN_COUNT or value > MULTIREST_MAX_COUNT:
-                      continue
                   dist_norm = (abs(cx - float(target_center_x)) / roi_w) + (abs(cy - float(target_center_y)) / roi_h)
                   glyph_h = max(1.0, float(y1) - float(y0))
                   score = 100.0 - (70.0 * float(dist_norm)) + min(20.0, glyph_h * 2.0)
                   candidates.append(
-                      {
-                          "value": int(value),
-                          "score": float(score),
-                          "word": str(word),
-                          "bbox": [float(x0), float(y0), float(x1), float(y1)],
-                      }
+                      build_candidate(
+                          source="text_words",
+                          value=int(value),
+                          bbox=[x0, y0, x1, y1],
+                          target_center_x=target_center_x,
+                          target_center_y=target_center_y,
+                          score=score,
+                          conf=100.0,
+                          raw_text=str(word),
+                      )
                   )
-              candidates.sort(key=lambda c: (-float(c["score"]), float(c["bbox"][0]), int(c["value"])))
+              candidates.sort(key=lambda c: (-float(c["score"]), float(c["distance"]), int(c["value"])))
               return candidates
 
-          def pick_text_candidate(candidates):
-              if not candidates:
-                  return None, "no_numeric_text_in_roi"
-              top = candidates[0]
-              if float(top.get("score") or 0.0) < float(MULTIREST_TEXT_SCORE_MIN):
-                  return None, "text_score_below_threshold"
-              if len(candidates) >= 2:
-                  second = candidates[1]
-                  margin = float(top.get("score") or 0.0) - float(second.get("score") or 0.0)
-                  if margin < float(MULTIREST_TEXT_MARGIN_MIN):
-                      return None, "text_score_ambiguous"
-              return top, None
-
-          def ocr_candidate_for_roi(page_obj, roi_rect):
+          def text_char_candidates_for_roi(page_obj, roi_rect, target_center_x, target_center_y):
+              candidates = []
               try:
-                  pix = page_obj.get_pixmap(matrix=fitz.Matrix(4, 4), clip=roi_rect, alpha=False)
-              except Exception as exc:
-                  return None, f"ocr_pixmap_error:{exc}"
+                  rawdict = page_obj.get_text("rawdict", clip=roi_rect) or {}
+              except Exception:
+                  rawdict = {}
+              char_rows = []
+              for block in rawdict.get("blocks") or []:
+                  for line in block.get("lines") or []:
+                      for span in line.get("spans") or []:
+                          for ch in span.get("chars") or []:
+                              txt = str(ch.get("c") or "")
+                              if not txt.isdigit():
+                                  continue
+                              bbox = ch.get("bbox") or [0, 0, 0, 0]
+                              if len(bbox) < 4:
+                                  continue
+                              x0, y0, x1, y1 = [float(v) for v in bbox[:4]]
+                              char_rows.append(
+                                  {
+                                      "char": txt,
+                                      "bbox": [x0, y0, x1, y1],
+                                      "cx": 0.5 * (x0 + x1),
+                                      "cy": 0.5 * (y0 + y1),
+                                      "h": max(1.0, y1 - y0),
+                                  }
+                              )
+              if not char_rows:
+                  return candidates
+              char_rows.sort(key=lambda r: (float(r["cy"]), float(r["cx"])))
+              lines = []
+              for row in char_rows:
+                  placed = False
+                  for group in lines:
+                      if abs(float(row["cy"]) - float(group["cy"])) <= max(6.0, float(group["avg_h"]) * 0.8):
+                          group["rows"].append(row)
+                          group["cy"] = (
+                              (float(group["cy"]) * len(group["rows"]) + float(row["cy"]))
+                              / float(len(group["rows"]) + 1)
+                          )
+                          group["avg_h"] = (
+                              (float(group["avg_h"]) * len(group["rows"]) + float(row["h"]))
+                              / float(len(group["rows"]) + 1)
+                          )
+                          placed = True
+                          break
+                  if not placed:
+                      lines.append({"cy": float(row["cy"]), "avg_h": float(row["h"]), "rows": [row]})
+              for group in lines:
+                  rows = sorted(group["rows"], key=lambda r: float(r["cx"]))
+                  seq = []
+                  prev = None
+                  for row in rows:
+                      if prev is None:
+                          seq = [row]
+                      else:
+                          gap = float(row["bbox"][0]) - float(prev["bbox"][2])
+                          if gap <= max(6.0, float(group["avg_h"]) * 0.9):
+                              seq.append(row)
+                          else:
+                              if seq:
+                                  txt = "".join(str(item["char"]) for item in seq)
+                                  value = extract_numeric_token(txt)
+                                  if value is not None and MULTIREST_MIN_COUNT <= value <= MULTIREST_MAX_COUNT:
+                                      x0 = min(float(item["bbox"][0]) for item in seq)
+                                      y0 = min(float(item["bbox"][1]) for item in seq)
+                                      x1 = max(float(item["bbox"][2]) for item in seq)
+                                      y1 = max(float(item["bbox"][3]) for item in seq)
+                                      score = 92.0 - (abs(((x0 + x1) * 0.5) - float(target_center_x)) / max(1.0, float(roi_rect.width)) * 60.0)
+                                      candidates.append(
+                                          build_candidate(
+                                              source="text_chars",
+                                              value=int(value),
+                                              bbox=[x0, y0, x1, y1],
+                                              target_center_x=target_center_x,
+                                              target_center_y=target_center_y,
+                                              score=score,
+                                              conf=95.0,
+                                              raw_text=txt,
+                                          )
+                                      )
+                              seq = [row]
+                      prev = row
+                  if seq:
+                      txt = "".join(str(item["char"]) for item in seq)
+                      value = extract_numeric_token(txt)
+                      if value is not None and MULTIREST_MIN_COUNT <= value <= MULTIREST_MAX_COUNT:
+                          x0 = min(float(item["bbox"][0]) for item in seq)
+                          y0 = min(float(item["bbox"][1]) for item in seq)
+                          x1 = max(float(item["bbox"][2]) for item in seq)
+                          y1 = max(float(item["bbox"][3]) for item in seq)
+                          score = 92.0 - (abs(((x0 + x1) * 0.5) - float(target_center_x)) / max(1.0, float(roi_rect.width)) * 60.0)
+                          candidates.append(
+                              build_candidate(
+                                  source="text_chars",
+                                  value=int(value),
+                                  bbox=[x0, y0, x1, y1],
+                                  target_center_x=target_center_x,
+                                  target_center_y=target_center_y,
+                                  score=score,
+                                  conf=95.0,
+                                  raw_text=txt,
+                              )
+                          )
+              dedup = {}
+              for cand in candidates:
+                  key = (int(cand["value"]), round(float(cand["bbox"][0]), 1), round(float(cand["bbox"][1]), 1))
+                  prev = dedup.get(key)
+                  if prev is None or float(cand["score"]) > float(prev["score"]):
+                      dedup[key] = cand
+              out = list(dedup.values())
+              out.sort(key=lambda c: (-float(c["score"]), float(c["distance"]), int(c["value"])))
+              return out
+
+          def render_roi_gray(page_obj, roi_rect, scale):
+              pix = page_obj.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=roi_rect, alpha=False)
               if pix.width <= 0 or pix.height <= 0:
-                  return None, "ocr_empty_crop"
+                  return None, None
               arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
               if pix.n == 4:
                   gray = cv2.cvtColor(arr, cv2.COLOR_RGBA2GRAY)
@@ -1044,52 +1218,100 @@ jobs:
                   gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
               else:
                   gray = arr
-              gray = cv2.GaussianBlur(gray, (3, 3), 0)
-              bin_img = cv2.adaptiveThreshold(
-                  gray,
-                  255,
-                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                  cv2.THRESH_BINARY,
-                  31,
-                  7,
-              )
-              config = "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789"
+              return gray, pix
+
+          def preprocess_for_ocr(gray, mode):
+              if mode == "adaptive":
+                  return cv2.adaptiveThreshold(
+                      gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
+                  )
+              _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+              if mode == "otsu":
+                  return otsu
+              if mode == "inverse_otsu":
+                  return cv2.bitwise_not(otsu)
+              return otsu
+
+          def ocr_candidates_for_image(image, psm):
+              config = f"--oem 3 --psm {int(psm)} -c tessedit_char_whitelist=0123456789"
               try:
                   data = pytesseract.image_to_data(
-                      bin_img,
+                      image,
                       config=config,
                       output_type=pytesseract.Output.DICT,
                   )
               except Exception as exc:
-                  return None, f"ocr_error:{exc}"
-              best = None
+                  return [], [f"ocr_error:{exc}"]
+              candidates = []
+              snippets = []
               n = len(data.get("text", []))
               for idx in range(n):
                   raw_text = str((data.get("text") or [""])[idx] or "").strip()
+                  if not raw_text:
+                      continue
                   conf_raw = (data.get("conf") or ["-1"])[idx]
                   try:
                       conf = float(conf_raw)
                   except Exception:
                       conf = -1.0
                   value = extract_numeric_token(raw_text)
-                  if value is None:
+                  snippets.append(f"{raw_text}:{conf:.1f}")
+                  if value is None or value < MULTIREST_MIN_COUNT or value > MULTIREST_MAX_COUNT:
                       continue
-                  if value < MULTIREST_MIN_COUNT or value > MULTIREST_MAX_COUNT:
-                      continue
-                  cand = {"value": int(value), "conf": float(conf), "raw": str(raw_text)}
-                  if best is None or cand["conf"] > best["conf"]:
-                      best = cand
-              if best is None:
-                  return None, "ocr_no_numeric_token"
-              if float(best["conf"]) < float(MULTIREST_OCR_CONF_MIN):
-                  return None, "ocr_conf_below_threshold"
-              return best, None
+                  x = float((data.get("left") or [0])[idx] or 0)
+                  y = float((data.get("top") or [0])[idx] or 0)
+                  w = float((data.get("width") or [0])[idx] or 0)
+                  h = float((data.get("height") or [0])[idx] or 0)
+                  candidates.append(
+                      {
+                          "value": int(value),
+                          "conf": float(conf),
+                          "bbox_local": [x, y, x + w, y + h],
+                          "raw_text": str(raw_text),
+                      }
+                  )
+              return candidates, snippets
+
+          def source_priority(source):
+              pri = {"text_words": 3, "text_chars": 2, "ocr": 1}
+              return int(pri.get(str(source), 0))
+
+          def choose_best_candidate(candidates):
+              if not candidates:
+                  return None, "no_numeric_candidates"
+              ordered = sorted(
+                  candidates,
+                  key=lambda c: (
+                      -source_priority(c.get("source")),
+                      -float(c.get("score") or 0.0),
+                      -float(c.get("conf") or 0.0),
+                      float(c.get("distance") or 0.0),
+                      int(c.get("value") or 0),
+                  ),
+              )
+              top = ordered[0]
+              if str(top.get("source")) in ("text_words", "text_chars"):
+                  if float(top.get("score") or 0.0) < float(MULTIREST_TEXT_SCORE_MIN):
+                      return None, "all_candidates_below_threshold"
+              else:
+                  if float(top.get("conf") or 0.0) < float(MULTIREST_OCR_CONF_MIN):
+                      return None, "all_candidates_below_threshold"
+              if len(ordered) >= 2:
+                  second = ordered[1]
+                  if str(top.get("source")) == str(second.get("source")):
+                      if str(top.get("source")) in ("text_words", "text_chars"):
+                          gap = float(top.get("score") or 0.0) - float(second.get("score") or 0.0)
+                          if gap < float(MULTIREST_TEXT_MARGIN_MIN):
+                              return None, "candidate_ambiguous"
+                      else:
+                          gap = float(top.get("conf") or 0.0) - float(second.get("conf") or 0.0)
+                          if gap < float(MULTIREST_TEXT_MARGIN_MIN):
+                              return None, "candidate_ambiguous"
+              return top, None
 
           def map_multirest_reason(raw_reason):
               reason = str(raw_reason or "").strip()
-              if not reason:
-                  return "ocr_no_numeric_token"
-              if reason in {
+              allowed = {
                   "geometry_unavailable",
                   "no_multirest_box_for_system",
                   "invalid_roi",
@@ -1100,62 +1322,75 @@ jobs:
                   "ocr_conf_below_threshold",
                   "text_ocr_conflict",
                   "ocr_attempt_cap_reached",
-              }:
+                  "candidate_ambiguous",
+                  "no_numeric_candidates",
+                  "all_candidates_below_threshold",
+              }
+              if reason in allowed:
                   return reason
-              if reason.startswith("geometry_unavailable"):
+              if not reason:
+                  return "no_numeric_candidates"
+              if reason.startswith("geometry_") or reason.startswith("missing_page_split_omr") or reason.startswith("sheet_xml_not_found") or reason.startswith("omr_geometry_error") or reason.startswith("page_pdf_"):
                   return "geometry_unavailable"
               if reason.startswith("no_multirest_box_for_system"):
                   return "no_multirest_box_for_system"
               if reason.startswith("invalid_roi"):
                   return "invalid_roi"
-              if reason.startswith("no_numeric_text_in_roi"):
-                  return "no_numeric_text_in_roi"
-              if reason.startswith("text_score_below_threshold"):
-                  return "text_score_below_threshold"
-              if reason.startswith("text_score_ambiguous"):
-                  return "text_score_ambiguous"
+              if reason.startswith("candidate_ambiguous"):
+                  return "candidate_ambiguous"
+              if reason.startswith("all_candidates_below_threshold"):
+                  return "all_candidates_below_threshold"
               if reason.startswith("ocr_conf_below_threshold"):
                   return "ocr_conf_below_threshold"
-              if reason.startswith("text_ocr_conflict"):
-                  return "text_ocr_conflict"
               if reason.startswith("ocr_attempt_cap_reached"):
                   return "ocr_attempt_cap_reached"
-              if reason.startswith("ocr_no_numeric_token"):
-                  return "ocr_no_numeric_token"
               if reason.startswith("ocr_"):
-                  if "conf_below_threshold" in reason:
-                      return "ocr_conf_below_threshold"
                   return "ocr_no_numeric_token"
-              if reason.startswith("page_pdf_") or reason.startswith("missing_page_split_omr"):
-                  return "geometry_unavailable"
-              if reason.startswith("sheet_xml_not_found") or reason.startswith("omr_geometry_error"):
-                  return "geometry_unavailable"
-              return "ocr_no_numeric_token"
+              return "no_numeric_candidates"
 
-          def format_text_candidates_for_log(candidates, limit=3):
+          def format_candidates_for_log(candidates, limit=3):
               out = []
               for row in list(candidates or [])[: max(0, int(limit))]:
                   bbox = list(row.get("bbox") or [0, 0, 0, 0])
                   if len(bbox) < 4:
                       bbox = [0, 0, 0, 0]
                   out.append(
-                      f"{int(row.get('value') or 0)}:{float(row.get('score') or 0.0):.2f}:"
+                      f"{str(row.get('source') or '-')}:"
+                      f"{int(row.get('value') or 0)}:"
+                      f"{float(row.get('score') or 0.0):.2f}:"
+                      f"{float(row.get('conf') or 0.0):.2f}:"
                       f"{float(bbox[0]):.1f},{float(bbox[1]):.1f},{float(bbox[2]):.1f},{float(bbox[3]):.1f}"
                   )
               return "[" + ";".join(out) + "]"
+
+          def build_roi_attempts(x, y, w, h, sx, sy):
+              profiles = [
+                  ("above_tight", 0.6, 1.6, 2.2, 0.1),
+                  ("above_wide", 1.0, 2.0, 2.6, 0.05),
+                  ("above_extra_high", 1.1, 2.1, 3.1, 0.15),
+              ]
+              out = []
+              for name, left_m, right_m, up_m, down_m in profiles:
+                  rx0 = (x - (left_m * w * MULTIREST_ROI_EXPAND_X)) * sx
+                  rx1 = (x + (right_m * w * MULTIREST_ROI_EXPAND_X)) * sx
+                  ry0 = (y - (up_m * h * MULTIREST_ROI_EXPAND_Y)) * sy
+                  ry1 = (y - (down_m * h * MULTIREST_ROI_EXPAND_Y)) * sy
+                  out.append((name, rx0, ry0, rx1, ry1))
+              return out
 
           def recover_multirest_for_entry(entry, page_warning_map):
               page_num = int(entry.get("page_number") or 0)
               events = list(entry.get("_semantic_measure_events") or [])
               semantic_debug = init_semantic_debug_v2(entry.get("semantic_debug"))
-              semantic_debug["multirest_recovery_version"] = "v1_hybrid"
+              semantic_debug["multirest_recovery_version"] = "v2_tuned_profiles"
               semantic_debug["multirest_targets"] = []
               semantic_debug["multirest_recovered"] = []
               semantic_debug["multirest_unresolved"] = []
               semantic_debug["multirest_unresolved_reason_counts"] = {}
-              semantic_debug["multirest_recovery_source_counts"] = {"pdf_text": 0, "ocr": 0}
+              semantic_debug["multirest_recovery_source_counts"] = {"text_words": 0, "text_chars": 0, "ocr": 0}
               semantic_debug["multirest_roi_trace"] = []
               semantic_debug["multirest_recovery_skipped_by_filter"] = False
+              semantic_debug["multirest_attempt_count"] = 0
               warning_measures = list(page_warning_map.get(page_num) or [])
               semantic_debug["multirest_missing_from_audiveris_log_count"] = int(len(warning_measures))
               semantic_debug["multirest_missing_from_audiveris_log_measures"] = list(warning_measures)
@@ -1186,8 +1421,10 @@ jobs:
 
               unresolved = []
               recovered = []
-              source_counts = {"pdf_text": 0, "ocr": 0}
+              source_counts = {"text_words": 0, "text_chars": 0, "ocr": 0}
               roi_trace = []
+              multirest_debug_root = os.path.join("/tmp/work/multirest_debug", f"page_{page_num:04d}")
+              os.makedirs(multirest_debug_root, exist_ok=True)
 
               def add_unresolved(pair, reason, detail=""):
                   reason_code = map_multirest_reason(reason)
@@ -1249,7 +1486,7 @@ jobs:
                           add_unresolved(pair, "geometry_unavailable", f"page_pdf_open_error:{exc}")
                       paired = []
 
-              attempts_by_page = 0
+              ocr_attempts_by_page = 0
               if page_obj is not None:
                   page_w = float(page_obj.rect.width)
                   page_h = float(page_obj.rect.height)
@@ -1257,140 +1494,262 @@ jobs:
                   sy = (page_h / pic_h) if (pic_h and pic_h > 0) else 1.0
 
                   for pair in paired:
+                      measure_index = int(pair.get("measure_index") or 0)
+                      system_index = int(pair.get("system_index") or 0)
+                      event_idx = int(pair.get("event_idx") or 0)
                       box = dict(pair.get("box") or {})
                       x = float(box.get("x") or 0.0)
                       y = float(box.get("y") or 0.0)
                       w = max(1.0, float(box.get("w") or 1.0))
                       h = max(1.0, float(box.get("h") or 1.0))
-                      rx0_img = x - (0.6 * w * MULTIREST_ROI_EXPAND_X)
-                      rx1_img = x + (1.6 * w * MULTIREST_ROI_EXPAND_X)
-                      ry0_img = y - (2.2 * h * MULTIREST_ROI_EXPAND_Y)
-                      ry1_img = y - (0.1 * h * MULTIREST_ROI_EXPAND_Y)
-                      rx0 = clamp(rx0_img * sx, 0.0, page_w)
-                      rx1 = clamp(rx1_img * sx, 0.0, page_w)
-                      ry0 = clamp(ry0_img * sy, 0.0, page_h)
-                      ry1 = clamp(ry1_img * sy, 0.0, page_h)
-                      if rx1 <= rx0 or ry1 <= ry0:
-                          add_unresolved(pair, "invalid_roi")
-                          continue
-                      roi = fitz.Rect(rx0, ry0, rx1, ry1)
                       target_center_x = float((x + 0.5 * w) * sx)
                       target_center_y = float((y - 0.8 * h) * sy)
-                      roi_row = {
-                          "measure_index": int(pair.get("measure_index") or 0),
-                          "system_index": int(pair.get("system_index") or 0),
-                          "x0": float(roi.x0),
-                          "y0": float(roi.y0),
-                          "x1": float(roi.x1),
-                          "y1": float(roi.y1),
+                      target_dir = os.path.join(multirest_debug_root, f"measure_{measure_index:04d}")
+                      os.makedirs(target_dir, exist_ok=True)
+                      target_trace = {
+                          "measure_index": measure_index,
+                          "system_index": system_index,
+                          "attempts": [],
                       }
-                      roi_trace.append(roi_row)
-                      print(
-                          "SEMANTIC_MULTIREST_ROI "
-                          f"page={page_num} measure_index={pair.get('measure_index')} "
-                          f"system_index={pair.get('system_index')} "
-                          f"x0={roi.x0:.2f} y0={roi.y0:.2f} x1={roi.x1:.2f} y1={roi.y1:.2f}"
-                      )
+                      resolved = False
+                      unresolved_reason = "no_numeric_candidates"
+                      best_pool = []
+                      ocr_snippets = []
 
-                      text_candidates = text_candidates_for_roi(page_obj, roi, target_center_x, target_center_y)
-                      print(
-                          "SEMANTIC_MULTIREST_TEXT_CANDIDATES "
-                          f"page={page_num} measure_index={pair.get('measure_index')} "
-                          f"candidates={format_text_candidates_for_log(text_candidates, limit=3)}"
-                      )
-                      top_text, text_reason = pick_text_candidate(text_candidates)
-                      if top_text is not None:
-                          value = int(top_text.get("value"))
-                          event_idx = int(pair.get("event_idx") or 0)
-                          events[event_idx]["multiple_rest_count"] = int(value)
-                          events[event_idx]["logical_span"] = int(value)
-                          events[event_idx]["logical_span_source"] = "recovered_pdf_text"
-                          events[event_idx]["multiple_rest_missing_count_flag"] = False
-                          rec = {
-                              "measure_index": int(pair.get("measure_index") or 0),
-                              "system_index": int(pair.get("system_index") or 0),
-                              "value": int(value),
-                              "source": "pdf_text",
-                              "score": float(top_text.get("score") or 0.0),
-                              "conf": None,
+                      for roi_name, rx0, ry0, rx1, ry1 in build_roi_attempts(x, y, w, h, sx, sy):
+                          if resolved:
+                              break
+                          rx0 = clamp(rx0, 0.0, page_w)
+                          rx1 = clamp(rx1, 0.0, page_w)
+                          ry0 = clamp(ry0, 0.0, page_h)
+                          ry1 = clamp(ry1, 0.0, page_h)
+                          if rx1 <= rx0 or ry1 <= ry0:
+                              continue
+                          roi = fitz.Rect(rx0, ry0, rx1, ry1)
+                          semantic_debug["multirest_attempt_count"] = int(semantic_debug.get("multirest_attempt_count") or 0) + 1
+                          roi_row = {
+                              "measure_index": measure_index,
+                              "system_index": system_index,
+                              "roi_name": str(roi_name),
+                              "x0": float(roi.x0),
+                              "y0": float(roi.y0),
+                              "x1": float(roi.x1),
+                              "y1": float(roi.y1),
                           }
-                          recovered.append(rec)
-                          source_counts["pdf_text"] += 1
+                          roi_trace.append(roi_row)
                           print(
-                              "SEMANTIC_MULTIREST_RECOVER "
-                              f"page={page_num} measure_index={pair.get('measure_index')} "
-                              f"system_index={pair.get('system_index')} source=pdf_text "
-                              f"value={value} score={float(top_text.get('score') or 0.0):.2f} conf=na"
+                              "SEMANTIC_MULTIREST_ROI_ATTEMPT "
+                              f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                              f"roi_name={roi_name} x0={roi.x0:.2f} y0={roi.y0:.2f} x1={roi.x1:.2f} y1={roi.y1:.2f}"
                           )
-                          continue
 
-                      if attempts_by_page >= MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE:
-                          add_unresolved(pair, "ocr_attempt_cap_reached")
-                          continue
-                      attempts_by_page += 1
-
-                      top_ocr, ocr_reason = ocr_candidate_for_roi(page_obj, roi)
-                      if top_ocr is None:
-                          print(
-                              "SEMANTIC_MULTIREST_OCR_CANDIDATE "
-                              f"page={page_num} measure_index={pair.get('measure_index')} "
-                              f"value=none conf=na raw=- reason={ocr_reason or text_reason or 'unknown'}"
-                          )
-                          preferred_reason = ocr_reason or text_reason or "ocr_no_numeric_token"
-                          if preferred_reason not in (
-                              "no_numeric_text_in_roi",
-                              "text_score_below_threshold",
-                              "text_score_ambiguous",
-                              "ocr_no_numeric_token",
-                              "ocr_conf_below_threshold",
-                          ):
-                              preferred_reason = text_reason or preferred_reason
-                          add_unresolved(pair, preferred_reason)
-                          continue
-
-                      print(
-                          "SEMANTIC_MULTIREST_OCR_CANDIDATE "
-                          f"page={page_num} measure_index={pair.get('measure_index')} "
-                          f"value={int(top_ocr.get('value') or 0)} "
-                          f"conf={float(top_ocr.get('conf') or 0.0):.2f} "
-                          f"raw={top_ocr.get('raw') or '-'}"
-                      )
-
-                      if text_candidates:
-                          text_best_value = int(text_candidates[0].get("value"))
-                          ocr_value = int(top_ocr.get("value"))
-                          if text_best_value != ocr_value and float(text_candidates[0].get("score") or 0.0) >= MULTIREST_TEXT_SCORE_MIN:
-                              print(
-                                  "SEMANTIC_MULTIREST_CONFLICT "
-                                  f"page={page_num} measure_index={pair.get('measure_index')} "
-                                  f"system_index={pair.get('system_index')} "
-                                  f"text={text_best_value} ocr={ocr_value}"
-                              )
-                              add_unresolved(pair, "text_ocr_conflict")
+                          roi_gray, roi_pix = render_roi_gray(page_obj, roi, scale=4)
+                          if roi_pix is not None:
+                              roi_path = os.path.join(target_dir, f"{roi_name}_crop.png")
+                              try:
+                                  roi_pix.save(roi_path)
+                              except Exception:
+                                  pass
+                          if roi_gray is None:
                               continue
 
-                      value = int(top_ocr.get("value"))
-                      event_idx = int(pair.get("event_idx") or 0)
-                      events[event_idx]["multiple_rest_count"] = int(value)
-                      events[event_idx]["logical_span"] = int(value)
-                      events[event_idx]["logical_span_source"] = "recovered_ocr"
-                      events[event_idx]["multiple_rest_missing_count_flag"] = False
-                      rec = {
-                          "measure_index": int(pair.get("measure_index") or 0),
-                          "system_index": int(pair.get("system_index") or 0),
-                          "value": int(value),
-                          "source": "ocr",
-                          "score": None,
-                          "conf": float(top_ocr.get("conf") or 0.0),
-                      }
-                      recovered.append(rec)
-                      source_counts["ocr"] += 1
-                      print(
-                          "SEMANTIC_MULTIREST_RECOVER "
-                          f"page={page_num} measure_index={pair.get('measure_index')} "
-                          f"system_index={pair.get('system_index')} source=ocr "
-                          f"value={value} score=na conf={float(top_ocr.get('conf') or 0.0):.2f}"
-                      )
+                          words_candidates = text_word_candidates_for_roi(page_obj, roi, target_center_x, target_center_y)
+                          chars_candidates = text_char_candidates_for_roi(page_obj, roi, target_center_x, target_center_y)
+                          print(
+                              "SEMANTIC_MULTIREST_TEXT_CANDIDATES_WORDS "
+                              f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
+                              f"candidates={format_candidates_for_log(words_candidates, limit=3)}"
+                          )
+                          print(
+                              "SEMANTIC_MULTIREST_TEXT_CANDIDATES_CHARS "
+                              f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
+                              f"candidates={format_candidates_for_log(chars_candidates, limit=3)}"
+                          )
+                          pool = list(words_candidates) + list(chars_candidates)
+                          selected, select_reason = choose_best_candidate(pool)
+                          if selected is not None:
+                              value = int(selected.get("value") or 0)
+                              events[event_idx]["multiple_rest_count"] = int(value)
+                              events[event_idx]["logical_span"] = int(value)
+                              events[event_idx]["logical_span_source"] = f"recovered_{selected.get('source')}"
+                              events[event_idx]["multiple_rest_missing_count_flag"] = False
+                              rec = {
+                                  "measure_index": measure_index,
+                                  "system_index": system_index,
+                                  "value": int(value),
+                                  "source": str(selected.get("source")),
+                                  "score": float(selected.get("score") or 0.0),
+                                  "conf": float(selected.get("conf") or 0.0),
+                              }
+                              recovered.append(rec)
+                              source_counts[str(selected.get("source"))] = int(source_counts.get(str(selected.get("source")), 0)) + 1
+                              print(
+                                  "SEMANTIC_MULTIREST_RECOVER "
+                                  f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                                  f"source={selected.get('source')} value={value} "
+                                  f"score={float(selected.get('score') or 0.0):.2f} "
+                                  f"conf={float(selected.get('conf') or 0.0):.2f}"
+                              )
+                              resolved = True
+                              target_trace["attempts"].append(
+                                  {
+                                      "roi_name": str(roi_name),
+                                      "selected": dict(selected),
+                                      "selected_reason": "ok",
+                                  }
+                              )
+                              break
+
+                          # OCR fallback for this ROI attempt
+                          ocr_pool = []
+                          ocr_attempt_traces = []
+                          for scale in (4, 6):
+                              if ocr_attempts_by_page >= MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE:
+                                  unresolved_reason = "ocr_attempt_cap_reached"
+                                  break
+                              gray_img, _ = render_roi_gray(page_obj, roi, scale=scale)
+                              if gray_img is None:
+                                  continue
+                              for pre_name in ("adaptive", "otsu", "inverse_otsu"):
+                                  if ocr_attempts_by_page >= MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE:
+                                      unresolved_reason = "ocr_attempt_cap_reached"
+                                      break
+                                  proc = preprocess_for_ocr(gray_img, pre_name)
+                                  for psm in (7, 6):
+                                      if ocr_attempts_by_page >= MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE:
+                                          unresolved_reason = "ocr_attempt_cap_reached"
+                                          break
+                                      ocr_attempts_by_page += 1
+                                      semantic_debug["multirest_attempt_count"] = int(semantic_debug.get("multirest_attempt_count") or 0) + 1
+                                      cands, snippets = ocr_candidates_for_image(proc, psm=psm)
+                                      ocr_attempt_traces.append(
+                                          {
+                                              "roi_name": str(roi_name),
+                                              "scale": int(scale),
+                                              "preprocess": str(pre_name),
+                                              "psm": int(psm),
+                                              "candidates": len(cands),
+                                              "snippets": snippets[:8],
+                                          }
+                                      )
+                                      if snippets:
+                                          ocr_snippets.append(
+                                              {
+                                                  "roi_name": str(roi_name),
+                                                  "scale": int(scale),
+                                                  "preprocess": str(pre_name),
+                                                  "psm": int(psm),
+                                                  "snippets": snippets[:8],
+                                              }
+                                          )
+                                      for cand in cands:
+                                          bx = list(cand.get("bbox_local") or [0, 0, 0, 0])
+                                          # map local bbox back into page coordinates
+                                          sx_scale = float(scale)
+                                          page_bbox = [
+                                              float(roi.x0) + float(bx[0]) / sx_scale,
+                                              float(roi.y0) + float(bx[1]) / sx_scale,
+                                              float(roi.x0) + float(bx[2]) / sx_scale,
+                                              float(roi.y0) + float(bx[3]) / sx_scale,
+                                          ]
+                                          ocr_pool.append(
+                                              build_candidate(
+                                                  source="ocr",
+                                                  value=int(cand.get("value") or 0),
+                                                  bbox=page_bbox,
+                                                  target_center_x=target_center_x,
+                                                  target_center_y=target_center_y,
+                                                  score=float(cand.get("conf") or 0.0),
+                                                  conf=float(cand.get("conf") or 0.0),
+                                                  raw_text=str(cand.get("raw_text") or ""),
+                                              )
+                                          )
+                          if ocr_pool:
+                              print(
+                                  "SEMANTIC_MULTIREST_OCR_CANDIDATE "
+                                  f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
+                                  f"candidates={format_candidates_for_log(ocr_pool, limit=3)}"
+                              )
+                          else:
+                              print(
+                                  "SEMANTIC_MULTIREST_OCR_CANDIDATE "
+                                  f"page={page_num} measure_index={measure_index} roi_name={roi_name} "
+                                  f"value=none conf=na raw=- reason={unresolved_reason}"
+                              )
+
+                          pool = list(words_candidates) + list(chars_candidates) + list(ocr_pool)
+                          selected, select_reason = choose_best_candidate(pool)
+                          best_pool = pool if pool else best_pool
+                          if selected is not None:
+                              value = int(selected.get("value") or 0)
+                              events[event_idx]["multiple_rest_count"] = int(value)
+                              events[event_idx]["logical_span"] = int(value)
+                              events[event_idx]["logical_span_source"] = f"recovered_{selected.get('source')}"
+                              events[event_idx]["multiple_rest_missing_count_flag"] = False
+                              rec = {
+                                  "measure_index": measure_index,
+                                  "system_index": system_index,
+                                  "value": int(value),
+                                  "source": str(selected.get("source")),
+                                  "score": float(selected.get("score") or 0.0),
+                                  "conf": float(selected.get("conf") or 0.0),
+                              }
+                              recovered.append(rec)
+                              source_counts[str(selected.get("source"))] = int(source_counts.get(str(selected.get("source")), 0)) + 1
+                              print(
+                                  "SEMANTIC_MULTIREST_RECOVER "
+                                  f"page={page_num} measure_index={measure_index} system_index={system_index} "
+                                  f"source={selected.get('source')} value={value} "
+                                  f"score={float(selected.get('score') or 0.0):.2f} "
+                                  f"conf={float(selected.get('conf') or 0.0):.2f}"
+                              )
+                              resolved = True
+                              target_trace["attempts"].append(
+                                  {
+                                      "roi_name": str(roi_name),
+                                      "selected": dict(selected),
+                                      "selected_reason": "ok_after_ocr",
+                                      "ocr_attempts": list(ocr_attempt_traces[:4]),
+                                  }
+                              )
+                              break
+                          unresolved_reason = select_reason or unresolved_reason
+                          target_trace["attempts"].append(
+                              {
+                                  "roi_name": str(roi_name),
+                                  "selected": None,
+                                  "selected_reason": str(unresolved_reason),
+                                  "ocr_attempts": list(ocr_attempt_traces[:4]),
+                              }
+                          )
+
+                      if not resolved:
+                          add_unresolved(pair, unresolved_reason or "no_numeric_candidates")
+                          # forensic files for unresolved targets
+                          forensic = {
+                              "page": int(page_num),
+                              "measure_index": int(measure_index),
+                              "system_index": int(system_index),
+                              "reason": str(unresolved_reason or "no_numeric_candidates"),
+                              "candidate_preview": best_pool[:6],
+                              "trace": target_trace,
+                          }
+                          try:
+                              with open(os.path.join(target_dir, "candidate_summary.json"), "w", encoding="utf-8") as f:
+                                  json.dump(forensic, f, indent=2)
+                          except Exception:
+                              pass
+                          if ocr_snippets:
+                              try:
+                                  with open(os.path.join(target_dir, "ocr_tsv_snippets.txt"), "w", encoding="utf-8") as f:
+                                      for row in ocr_snippets[:2]:
+                                          f.write(
+                                              f"{row.get('roi_name')} scale={row.get('scale')} "
+                                              f"pre={row.get('preprocess')} psm={row.get('psm')}\n"
+                                          )
+                                          f.write(" | ".join(row.get("snippets") or []) + "\n\n")
+                              except Exception:
+                                  pass
 
               if page_doc is not None:
                   page_doc.close()
@@ -2216,14 +2575,15 @@ jobs:
               base.setdefault("multiple_rest_detected_count", 0)
               base.setdefault("multiple_rest_missing_count", 0)
               base.setdefault("multiple_rest_total_span_added", 0)
-              base.setdefault("multirest_recovery_version", "v1_hybrid")
+              base.setdefault("multirest_recovery_version", "v2_tuned_profiles")
               base.setdefault("multirest_targets", [])
               base.setdefault("multirest_recovered", [])
               base.setdefault("multirest_unresolved", [])
               base.setdefault("multirest_unresolved_reason_counts", {})
-              base.setdefault("multirest_recovery_source_counts", {"pdf_text": 0, "ocr": 0})
+              base.setdefault("multirest_recovery_source_counts", {"text_words": 0, "text_chars": 0, "ocr": 0})
               base.setdefault("multirest_roi_trace", [])
               base.setdefault("multirest_recovery_skipped_by_filter", False)
+              base.setdefault("multirest_attempt_count", 0)
               base.setdefault("multirest_missing_from_audiveris_log_count", 0)
               base.setdefault("multirest_missing_from_audiveris_log_measures", [])
               base.setdefault("multirest_log_source", "")
@@ -3749,14 +4109,15 @@ jobs:
                           "multiple_rest_detected_count": 0,
                           "multiple_rest_missing_count": 0,
                           "multiple_rest_total_span_added": 0,
-                          "multirest_recovery_version": "v1_hybrid",
+                          "multirest_recovery_version": "v2_tuned_profiles",
                           "multirest_targets": [],
                           "multirest_recovered": [],
                           "multirest_unresolved": [],
                           "multirest_unresolved_reason_counts": {},
-                          "multirest_recovery_source_counts": {"pdf_text": 0, "ocr": 0},
+                          "multirest_recovery_source_counts": {"text_words": 0, "text_chars": 0, "ocr": 0},
                           "multirest_roi_trace": [],
                           "multirest_recovery_skipped_by_filter": False,
+                          "multirest_attempt_count": 0,
                           "multirest_missing_from_audiveris_log_count": 0,
                           "multirest_missing_from_audiveris_log_measures": [],
                           "multirest_log_source": "",
@@ -3864,14 +4225,15 @@ jobs:
                           "multiple_rest_detected_count": 0,
                           "multiple_rest_missing_count": 0,
                           "multiple_rest_total_span_added": 0,
-                          "multirest_recovery_version": "v1_hybrid",
+                          "multirest_recovery_version": "v2_tuned_profiles",
                           "multirest_targets": [],
                           "multirest_recovered": [],
                           "multirest_unresolved": [],
                           "multirest_unresolved_reason_counts": {},
-                          "multirest_recovery_source_counts": {"pdf_text": 0, "ocr": 0},
+                          "multirest_recovery_source_counts": {"text_words": 0, "text_chars": 0, "ocr": 0},
                           "multirest_roi_trace": [],
                           "multirest_recovery_skipped_by_filter": False,
+                          "multirest_attempt_count": 0,
                           "multirest_missing_from_audiveris_log_count": 0,
                           "multirest_missing_from_audiveris_log_measures": [],
                           "multirest_log_source": "",
@@ -4012,6 +4374,8 @@ jobs:
           multirest_total_targets = 0
           multirest_total_recovered = 0
           multirest_total_unresolved = 0
+          multirest_total_attempts = 0
+          multirest_method_totals = {"text_words": 0, "text_chars": 0, "ocr": 0}
           manifest_select_error_detail = {}
           multirest_warn_only = (
               (os.environ.get("MULTIREST_WARN_ONLY", "0") or "0").strip().lower()
@@ -4066,9 +4430,14 @@ jobs:
                       mr_targets = list(dbg.get("multirest_targets") or [])
                       mr_recovered = list(dbg.get("multirest_recovered") or [])
                       mr_reason_counts = dict(dbg.get("multirest_unresolved_reason_counts") or {})
+                      mr_source_counts = dict(dbg.get("multirest_recovery_source_counts") or {})
+                      mr_attempt_count = int(dbg.get("multirest_attempt_count") or 0)
                       multirest_total_targets += int(len(mr_targets))
                       multirest_total_recovered += int(len(mr_recovered))
                       multirest_total_unresolved += int(len(mr_unresolved))
+                      multirest_total_attempts += int(mr_attempt_count)
+                      for key in multirest_method_totals.keys():
+                          multirest_method_totals[key] += int(mr_source_counts.get(key) or 0)
                       semantic_multirest_recovery_rows.append(
                           (
                               page_no,
@@ -4076,6 +4445,8 @@ jobs:
                               int(len(mr_recovered)),
                               int(len(mr_unresolved)),
                               dict(mr_reason_counts),
+                              dict(mr_source_counts),
+                              int(mr_attempt_count),
                           )
                       )
                       if mr_unresolved:
@@ -4110,17 +4481,30 @@ jobs:
                   f"recovered={int(multirest_total_recovered)} "
                   f"unresolved={int(multirest_total_unresolved)}"
               )
-              for page_no, targets_count, recovered_count, unresolved_count, reason_counts in semantic_multirest_recovery_rows:
+              print(
+                  "SUMMARY semantic_multirest_attempts_total "
+                  f"attempts={int(multirest_total_attempts)} "
+                  f"hits_text_words={int(multirest_method_totals['text_words'])} "
+                  f"hits_text_chars={int(multirest_method_totals['text_chars'])} "
+                  f"hits_ocr={int(multirest_method_totals['ocr'])}"
+              )
+              for page_no, targets_count, recovered_count, unresolved_count, reason_counts, source_counts, attempt_count in semantic_multirest_recovery_rows:
                   reasons_txt = ",".join(
                       f"{str(k)}:{int(reason_counts[k])}"
                       for k in sorted(reason_counts.keys())
                   ) if reason_counts else "-"
+                  source_txt = ",".join(
+                      f"{str(k)}:{int(source_counts.get(k) or 0)}"
+                      for k in ("text_words", "text_chars", "ocr")
+                  )
                   print(
                       "SUMMARY semantic_multirest_recovery "
                       f"page={int(page_no)} "
                       f"targets={int(targets_count)} "
                       f"recovered={int(recovered_count)} "
                       f"unresolved={int(unresolved_count)} "
+                      f"attempts={int(attempt_count)} "
+                      f"methods={source_txt} "
                       f"reasons={reasons_txt}"
                   )
           print(f"SUMMARY semantic_multirest_warn_only={multirest_warn_only}")
@@ -4215,6 +4599,7 @@ jobs:
             /tmp/work/pages \
             /tmp/work/page_logs \
             /tmp/work/audiveris_pages \
+            /tmp/work/multirest_debug \
             /tmp/work/mxl_page_manifest.json \
             /tmp/work/measure_mapping_debug.json \
             2>/dev/null || true
