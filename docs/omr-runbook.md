@@ -29,20 +29,14 @@ Base prefix:
 
 - `gs://music-omr-bucket-777135743132/output`
 
-Run-scoped prefix (for traceability):
+This workflow now uses a single-latest storage contract.  
+Each run clears the output prefix first, then writes only:
 
-- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/`
+- `gs://music-omr-bucket-777135743132/output/audiveris_out.pdf`
+- `gs://music-omr-bucket-777135743132/output/artifacts/run_info.json`
+- `gs://music-omr-bucket-777135743132/output/artifacts/mapping_summary.json`
 
-Artifacts written per run:
-
-- `annotated.pdf`
-- `measure_mapping_debug.json`
-- `mxl_page_manifest.json`
-- `omr_debug_bundle.tar.gz`
-
-Latest convenience copy:
-
-- `gs://music-omr-bucket-777135743132/output/annotated.pdf`
+No `runs/<run_id>/...` folders are written by this workflow.
 
 ## Success criteria
 
@@ -63,11 +57,13 @@ Download and share these step logs:
 - `8_Run Audiveris OMR.txt`
 - `13_Build page-split XML manifest (strict mode).txt`
 - `16_Mapping debug summary.txt`
-- `18_Upload outputs and debug artifacts.txt`
+- `Upload outputs.txt`
 
-Also share run-scoped debug bundle URI:
+Also share these storage lines from Step 18:
 
-- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/omr_debug_bundle.tar.gz`
+- `uploaded_audiveris_out=...`
+- `uploaded_artifact_run_info=...`
+- `uploaded_artifact_mapping_summary=...`
 
 ## Troubleshooting note: system-count mismatch
 

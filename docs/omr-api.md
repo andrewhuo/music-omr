@@ -31,11 +31,9 @@ Response (202):
   "status_url": "/api/omr/jobs/<job_id>",
   "run_url": "https://github.com/...",
   "artifacts": {
-    "annotated_pdf": "gs://.../output/runs/<run_id>/annotated.pdf",
-    "measure_mapping_debug": "gs://.../output/runs/<run_id>/measure_mapping_debug.json",
-    "mxl_page_manifest": "gs://.../output/runs/<run_id>/mxl_page_manifest.json",
-    "omr_debug_bundle": "gs://.../output/runs/<run_id>/omr_debug_bundle.tar.gz",
-    "latest_annotated_pdf": "gs://.../output/annotated.pdf"
+    "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
+    "run_info": "gs://.../output/artifacts/run_info.json",
+    "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
   }
 }
 ```
@@ -58,11 +56,9 @@ Response (200):
   "updated_at": "ISO-8601",
   "run_url": "https://github.com/...",
   "artifacts": {
-    "annotated_pdf": "gs://.../output/runs/<run_id>/annotated.pdf",
-    "measure_mapping_debug": "gs://.../output/runs/<run_id>/measure_mapping_debug.json",
-    "mxl_page_manifest": "gs://.../output/runs/<run_id>/mxl_page_manifest.json",
-    "omr_debug_bundle": "gs://.../output/runs/<run_id>/omr_debug_bundle.tar.gz",
-    "latest_annotated_pdf": "gs://.../output/annotated.pdf"
+    "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
+    "run_info": "gs://.../output/artifacts/run_info.json",
+    "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
   }
 }
 ```
@@ -85,3 +81,4 @@ Optional:
 
 - `workflow_dispatch` does not return `run_id` directly. The backend performs a short discovery poll to find the newly created run.
 - Frontend should never call GitHub APIs directly.
+- Storage mode is currently single-latest: each new run overwrites prior output at `OUTPUT_PREFIX`.
