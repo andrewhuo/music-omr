@@ -15,15 +15,8 @@ jobs:
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
       AUDIVERIS_IMAGE: "ghcr.io/andrewhuo/audiveris-engine@sha256:61c2a4a39e6f545bb9153a984247b83ace541196c4861329b295982e4cf57bed"
       AUDIVERIS_VERSION: "5.9.0"
-      MEASURE_NUMBERING_POLICY: "semantic_continuous_v1"
-      MULTIREST_WARN_ONLY: "0"
-      MULTIREST_DEBUG_PAGE_FILTER: ""
-      MULTIREST_ROI_EXPAND_X: "1.0"
-      MULTIREST_ROI_EXPAND_Y: "1.0"
-      MULTIREST_TEXT_SCORE_MIN: "20"
-      MULTIREST_TEXT_MARGIN_MIN: "7"
-      MULTIREST_OCR_CONF_MIN: "60"
-      MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE: "6"
+      BASELINE_MODE: "1"
+      MEASURE_NUMBERING_POLICY: "baseline_continuous_v1"
 
     permissions:
       contents: read
@@ -481,18 +474,11 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install OCR system dependency
-        run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y tesseract-ocr
-          tesseract --version | head -n 1 || true
-
       - name: Install Python dependencies
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0 pytesseract==0.3.13
+          pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0
 
       - name: Build page-split XML manifest (strict mode)
         run: |
@@ -556,10 +542,13 @@ jobs:
           import json
           import numpy as np
           import os
-          import pytesseract
           import re
           import zipfile
           import xml.etree.ElementTree as ET
+          try:
+              import pytesseract  # type: ignore
+          except Exception:
+              pytesseract = None
 
           MANIFEST_PATH = "/tmp/work/mxl_page_manifest.json"
           OMR_PATH = os.environ.get("AUDI_OMR_PATH", "").strip()
@@ -622,36 +611,27 @@ jobs:
                   out.add(int(token))
               return out
 
-          MULTIREST_WARN_ONLY = parse_env_bool("MULTIREST_WARN_ONLY", False)
-          MULTIREST_DEBUG_PAGE_FILTER_RAW = (
-              os.environ.get("MULTIREST_DEBUG_PAGE_FILTER", "") or ""
-          ).strip()
-          MULTIREST_DEBUG_PAGE_FILTER = parse_page_filter_env(MULTIREST_DEBUG_PAGE_FILTER_RAW)
-          MULTIREST_ROI_EXPAND_X = max(0.1, parse_env_float("MULTIREST_ROI_EXPAND_X", 1.0))
-          MULTIREST_ROI_EXPAND_Y = max(0.1, parse_env_float("MULTIREST_ROI_EXPAND_Y", 1.0))
-          MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE = max(
-              0, parse_env_int("MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE", 6)
-          )
-          MULTIREST_TEXT_SCORE_MIN = parse_env_float("MULTIREST_TEXT_SCORE_MIN", 20.0)
-          MULTIREST_TEXT_MARGIN_MIN = parse_env_float("MULTIREST_TEXT_MARGIN_MIN", 7.0)
-          MULTIREST_OCR_CONF_MIN = parse_env_float("MULTIREST_OCR_CONF_MIN", 60.0)
-          NUMBERING_POLICY = (os.environ.get("MEASURE_NUMBERING_POLICY", "semantic_continuous_v1") or "").strip() or "semantic_continuous_v1"
-          if NUMBERING_POLICY not in ("semantic_continuous_v1", "legacy_raw_starts"):
+          BASELINE_MODE = parse_env_bool("BASELINE_MODE", True)
+          NUMBERING_POLICY = (os.environ.get("MEASURE_NUMBERING_POLICY", "baseline_continuous_v1") or "").strip() or "baseline_continuous_v1"
+          if NUMBERING_POLICY not in ("baseline_continuous_v1", "legacy_raw_starts"):
               print(
-                  f"SEMANTIC_WARN page=- reason=invalid_numbering_policy:{NUMBERING_POLICY} fallback=semantic_continuous_v1"
+                  f"SEMANTIC_WARN page=- reason=invalid_numbering_policy:{NUMBERING_POLICY} fallback=baseline_continuous_v1"
               )
-              NUMBERING_POLICY = "semantic_continuous_v1"
-          print(
-              "SEMANTIC_MULTIREST_CONFIG "
-              f"warn_only={int(MULTIREST_WARN_ONLY)} "
-              f"page_filter={sorted(MULTIREST_DEBUG_PAGE_FILTER)} "
-              f"roi_expand_x={MULTIREST_ROI_EXPAND_X:.2f} "
-              f"roi_expand_y={MULTIREST_ROI_EXPAND_Y:.2f} "
-              f"text_score_min={MULTIREST_TEXT_SCORE_MIN:.2f} "
-              f"text_margin_min={MULTIREST_TEXT_MARGIN_MIN:.2f} "
-              f"ocr_conf_min={MULTIREST_OCR_CONF_MIN:.2f} "
-              f"ocr_max_attempts_per_page={MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE}"
-          )
+              NUMBERING_POLICY = "baseline_continuous_v1"
+
+          # Baseline mode disables special-case rewrites and OCR recovery.
+          MULTIREST_WARN_ONLY = False
+          MULTIREST_DEBUG_PAGE_FILTER = set()
+          MULTIREST_ROI_EXPAND_X = 1.0
+          MULTIREST_ROI_EXPAND_Y = 1.0
+          MULTIREST_OCR_MAX_ATTEMPTS_PER_PAGE = 0
+          MULTIREST_TEXT_SCORE_MIN = 20.0
+          MULTIREST_TEXT_MARGIN_MIN = 7.0
+          MULTIREST_OCR_CONF_MIN = 60.0
+
+          print(f"BASELINE_MODE enabled={1 if BASELINE_MODE else 0}")
+          if BASELINE_MODE:
+              print("BASELINE_SPECIAL_CASES disabled=ending,pickup,repeat,multirest")
 
           def to_float(v):
               try:
@@ -1051,6 +1031,8 @@ jobs:
                   31,
                   7,
               )
+              if pytesseract is None:
+                  return None, "ocr_unavailable"
               config = "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789"
               try:
                   data = pytesseract.image_to_data(
@@ -3290,6 +3272,60 @@ jobs:
                       )
                   return
 
+              if numbering_policy == "baseline_continuous_v1":
+                  global_next_start = None
+                  for entry in sorted(entries, key=lambda e: int(e.get("page_number") or 0)):
+                      semantic_debug = init_semantic_debug_v2(entry.get("semantic_debug"))
+                      semantic_debug["baseline_mode"] = True
+                      semantic_debug["multirest_policy"] = "disabled_in_baseline_mode"
+                      entry["semantic_debug"] = semantic_debug
+                      entry["ending_groups"] = []
+                      entry["ending_anchors"] = []
+                      entry["semantic_model"] = "disabled_baseline"
+                      entry["numbering_policy"] = "baseline_continuous_v1"
+
+                      if entry.get("status") != "ok":
+                          continue
+
+                      raw_starts = list(entry.get("system_starts_normalized") or entry.get("system_starts") or [])
+                      raw_nums, parse_warnings = parse_int_labels(raw_starts, allow_normalize=False)
+                      if parse_warnings:
+                          entry.setdefault("semantic_warnings", []).extend(parse_warnings)
+
+                      if not raw_nums:
+                          entry.setdefault("semantic_warnings", []).append("baseline_non_numeric_system_starts")
+                          entry["system_starts_semantic"] = list(raw_starts)
+                          entry["system_starts"] = list(raw_starts)
+                          print(
+                              "BASELINE_PAGE "
+                              f"page={entry.get('page_number')} "
+                              f"system_starts={entry.get('system_starts')} "
+                              f"selection_source={entry.get('selection_source')}"
+                          )
+                          continue
+
+                      if global_next_start is None:
+                          baseline_nums = list(raw_nums)
+                      else:
+                          offset = int(global_next_start) - int(raw_nums[0])
+                          baseline_nums = [int(n) + int(offset) for n in raw_nums]
+
+                      semantic_starts = [str(n) for n in baseline_nums]
+                      entry["system_starts_semantic"] = list(semantic_starts)
+                      entry["system_starts"] = list(semantic_starts)
+
+                      tail_increment_raw = estimate_page_tail_increment(raw_starts, entry.get("measures"))
+                      tail_increment = max(1, int(tail_increment_raw))
+                      global_next_start = int(baseline_nums[-1]) + int(tail_increment)
+
+                      print(
+                          "BASELINE_PAGE "
+                          f"page={entry.get('page_number')} "
+                          f"system_starts={semantic_starts} "
+                          f"selection_source={entry.get('selection_source')}"
+                      )
+                  return
+
               global_next_start = None
               seen_first_page = False
 
@@ -3583,7 +3619,10 @@ jobs:
               f"omr_path={OMR_PATH or '-'} status={omr_target_status} "
               f"error={omr_target_error} pages={len(omr_targets)}"
           )
-          page_log_multirest_warnings = parse_page_multirest_warnings(PAGE_LOG_DIR)
+          if BASELINE_MODE:
+              page_log_multirest_warnings = {}
+          else:
+              page_log_multirest_warnings = parse_page_multirest_warnings(PAGE_LOG_DIR)
 
           for page_pdf in page_pdfs:
               page_num = int(re.search(r"page_(\d{4})\.pdf$", page_pdf).group(1))
@@ -3898,8 +3937,21 @@ jobs:
                   )
               entries.append(entry)
 
-          for entry in entries:
-              recover_multirest_for_entry(entry, page_log_multirest_warnings)
+          if not BASELINE_MODE:
+              for entry in entries:
+                  recover_multirest_for_entry(entry, page_log_multirest_warnings)
+          else:
+              for entry in entries:
+                  semantic_debug = init_semantic_debug_v2(entry.get("semantic_debug"))
+                  semantic_debug["baseline_mode"] = True
+                  semantic_debug["multirest_policy"] = "disabled_in_baseline_mode"
+                  semantic_debug["multirest_targets"] = []
+                  semantic_debug["multirest_recovered"] = []
+                  semantic_debug["multirest_unresolved"] = []
+                  semantic_debug["multirest_unresolved_reason_counts"] = {}
+                  semantic_debug["multirest_recovery_source_counts"] = {"pdf_text": 0, "ocr": 0}
+                  semantic_debug["multirest_roi_trace"] = []
+                  entry["semantic_debug"] = semantic_debug
 
           print(f"SEMANTIC_POLICY effective={NUMBERING_POLICY}")
           apply_semantic_numbering(entries, NUMBERING_POLICY)
@@ -3985,7 +4037,6 @@ jobs:
           set -euo pipefail
           python - << 'PY'
           import json
-          import os
 
           p = "/tmp/work/measure_mapping_debug.json"
           d = json.load(open(p, "r", encoding="utf-8"))
@@ -4003,21 +4054,8 @@ jobs:
           pages = d.get("pages") or []
           manifest_path = d.get("mxl_page_manifest_path")
           manifest_summary = {}
-          semantic_suspect_pages = []
-          semantic_census_rows = []
-          semantic_multirest_issue_pages = []
-          semantic_multirest_recovery_rows = []
-          multirest_total_targets = 0
-          multirest_total_recovered = 0
-          multirest_total_unresolved = 0
           manifest_select_error_detail = {}
-          multirest_warn_only = (
-              (os.environ.get("MULTIREST_WARN_ONLY", "0") or "0").strip().lower()
-          )
-          if multirest_warn_only in ("1", "true", "yes", "on"):
-              multirest_warn_only = "1"
-          else:
-              multirest_warn_only = "0"
+
           if manifest_path:
               manifest_summary = d.get("mxl_page_manifest_summary") or {}
               print(f"SUMMARY manifest_path={manifest_path}")
@@ -4034,94 +4072,17 @@ jobs:
                       key=lambda entry: int(entry.get("page_number") or (int(entry.get("page_index", 0)) + 1)),
                   )
                   for entry in manifest_entries_doc:
-                      dbg = entry.get("semantic_debug") or {}
-                      flags = [str(flag) for flag in (dbg.get("suspicious_flags") or []) if str(flag)]
                       page_no = entry.get("page_number")
                       if page_no is None:
                           page_no = int(entry.get("page_index", 0)) + 1
                       page_no = int(page_no)
-                      census = dbg.get("ending_tag_census") or {}
                       merge_dbg = entry.get("merge_debug") or {}
                       detail = merge_dbg.get("final_select_error_detail")
                       if detail is not None and str(detail).strip():
                           manifest_select_error_detail[page_no] = str(detail)
-                      numbers_map = census.get("numbers") or {}
-                      number_keys = sorted(
-                          [str(k) for k in numbers_map.keys()],
-                          key=lambda tok: (int(tok) if str(tok).isdigit() else 10**9, str(tok)),
-                      )
-                      semantic_census_rows.append(
-                          (
-                              page_no,
-                              int(census.get("total_tags") or 0),
-                              ",".join(number_keys) if number_keys else "-",
-                              int(census.get("text_cue_count") or 0),
-                          )
-                      )
-                      if flags:
-                          semantic_suspect_pages.append((page_no, flags))
-                      mr_unresolved = list(dbg.get("multirest_unresolved") or [])
-                      mr_targets = list(dbg.get("multirest_targets") or [])
-                      mr_recovered = list(dbg.get("multirest_recovered") or [])
-                      mr_reason_counts = dict(dbg.get("multirest_unresolved_reason_counts") or {})
-                      multirest_total_targets += int(len(mr_targets))
-                      multirest_total_recovered += int(len(mr_recovered))
-                      multirest_total_unresolved += int(len(mr_unresolved))
-                      semantic_multirest_recovery_rows.append(
-                          (
-                              page_no,
-                              int(len(mr_targets)),
-                              int(len(mr_recovered)),
-                              int(len(mr_unresolved)),
-                              dict(mr_reason_counts),
-                          )
-                      )
-                      if mr_unresolved:
-                          semantic_multirest_issue_pages.append((page_no, len(mr_unresolved)))
               except Exception as exc:
-                  print(f"SUMMARY semantic_suspect_scan_error={exc}")
+                  print(f"SUMMARY manifest_scan_error={exc}")
 
-              manifest_entries = int(manifest_summary.get("entries") or len(pages) or 0)
-              print(f"SUMMARY semantic_suspect_pages={len(semantic_suspect_pages)}/{manifest_entries}")
-              for page_no, total_tags, numbers_txt, cue_count in semantic_census_rows:
-                  print(
-                      "SUMMARY semantic_census "
-                      f"page={int(page_no)} tags={int(total_tags)} numbers={numbers_txt} text_cues={int(cue_count)}"
-                  )
-              for page_no, flags in semantic_suspect_pages:
-                  print(
-                      "SUMMARY semantic_suspect "
-                      f"page={int(page_no)} flags={','.join(flags)}"
-                  )
-              print(
-                  "SUMMARY semantic_multirest_unresolved_pages="
-                  f"{len(semantic_multirest_issue_pages)}/{manifest_entries}"
-              )
-              for page_no, unresolved_count in semantic_multirest_issue_pages:
-                  print(
-                      "SUMMARY semantic_multirest_unresolved "
-                      f"page={int(page_no)} count={int(unresolved_count)}"
-                  )
-              print(
-                  "SUMMARY semantic_multirest_recovery_total "
-                  f"targets={int(multirest_total_targets)} "
-                  f"recovered={int(multirest_total_recovered)} "
-                  f"unresolved={int(multirest_total_unresolved)}"
-              )
-              for page_no, targets_count, recovered_count, unresolved_count, reason_counts in semantic_multirest_recovery_rows:
-                  reasons_txt = ",".join(
-                      f"{str(k)}:{int(reason_counts[k])}"
-                      for k in sorted(reason_counts.keys())
-                  ) if reason_counts else "-"
-                  print(
-                      "SUMMARY semantic_multirest_recovery "
-                      f"page={int(page_no)} "
-                      f"targets={int(targets_count)} "
-                      f"recovered={int(recovered_count)} "
-                      f"unresolved={int(unresolved_count)} "
-                      f"reasons={reasons_txt}"
-                  )
-          print(f"SUMMARY semantic_multirest_warn_only={multirest_warn_only}")
           strict_xml_pages_ok = 0
           total_pages = len(pages)
           strict_xml_missing = []
