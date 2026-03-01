@@ -706,23 +706,60 @@ def _apply_mxl_staff_start_labels(
     return out, f"ok_{map_mode}"
 
 
+def _aggregate_system_guide_rows(
+    staff_guides_pdf: list[tuple[float, float, float]],
+    system_staff_counts: list[int],
+) -> list[tuple[float, float, float]]:
+    out: list[tuple[float, float, float]] = []
+    idx = 0
+    total = len(staff_guides_pdf)
+    for staff_cnt in system_staff_counts:
+        take = max(0, int(staff_cnt))
+        rows = staff_guides_pdf[idx:min(total, idx + take)]
+        idx += take
+        if not rows:
+            continue
+        x_pdf = float(min(r[0] for r in rows))
+        y0_pdf = float(min(r[1] for r in rows))
+        y1_pdf = float(max(r[2] for r in rows))
+        out.append((x_pdf, y0_pdf, y1_pdf))
+    return out
+
+
+def _aggregate_system_label_rows(
+    staff_start_labels_pdf: list[tuple[float, float, float, str]],
+    system_staff_counts: list[int],
+) -> list[tuple[float, float, float, str] | None]:
+    out: list[tuple[float, float, float, str] | None] = []
+    idx = 0
+    total = len(staff_start_labels_pdf)
+    for staff_cnt in system_staff_counts:
+        take = max(0, int(staff_cnt))
+        rows = staff_start_labels_pdf[idx:min(total, idx + take)]
+        idx += take
+        if not rows:
+            out.append(None)
+            continue
+        x_pdf = float(min(r[0] for r in rows))
+        y0_pdf = float(min(r[1] for r in rows))
+        y1_pdf = float(max(r[2] for r in rows))
+        base_label = str(rows[0][3])
+        out.append((x_pdf, y0_pdf, y1_pdf, base_label))
+    return out
+
+
 def _system_start_label_positions(
     staff_start_labels_pdf: list[tuple[float, float, float, str]],
     system_staff_counts: list[int],
 ) -> list[tuple[float, float, float] | None]:
+    system_rows = _aggregate_system_label_rows(staff_start_labels_pdf, system_staff_counts)
     positions: list[tuple[float, float, float] | None] = []
-    idx = 0
-    total = len(staff_start_labels_pdf)
-    for staff_cnt in system_staff_counts:
-        if staff_cnt <= 0:
+    for row in system_rows:
+        if row is None:
             positions.append(None)
             continue
-        if idx >= total:
-            positions.append(None)
-            continue
-        x_pdf, y0_pdf, y1_pdf, _ = staff_start_labels_pdf[idx]
+        x_pdf, y0_pdf, y1_pdf, _ = row
         positions.append((float(x_pdf), float(y0_pdf), float(y1_pdf)))
-        idx += int(staff_cnt)
     return positions
 
 
@@ -2046,13 +2083,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             scale_x = rect.width / pic_w
             scale_y = rect.height / pic_h
 
-            guides_pdf = []
-            first_labels_pdf = []
+            staff_guides_pdf_raw: list[tuple[float, float, float]] = []
             for (x_px, y0_px, y1_px) in guides_px:
-                x_pdf = x_px * scale_x
-                y0_pdf = y0_px * scale_y
-                y1_pdf = y1_px * scale_y
-                guides_pdf.append((x_pdf, y0_pdf, y1_pdf))
+                staff_guides_pdf_raw.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y))
+
+            system_guides_pdf = _aggregate_system_guide_rows(staff_guides_pdf_raw, system_staff_counts)
+            first_labels_pdf: list[tuple[float, float, float, str]] = []
+            for (x_pdf, y0_pdf, y1_pdf) in system_guides_pdf:
                 page.draw_line(
                     (x_pdf, y0_pdf),
                     (x_pdf, y1_pdf),
@@ -2060,6 +2097,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     width=GUIDE_WIDTH,
                 )
                 first_labels_pdf.append((x_pdf, y0_pdf, y1_pdf, "1"))
+
+            guide_fallback_used = False
 
             sequential_labels_pdf = []
             for (x_px, y0_px, y1_px, text) in measure_marks_px:
@@ -2221,14 +2260,15 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     )
                     ending_anchor_count = len(ending_anchor_labels_pdf)
 
-            if staff_total > 0 and len(guides_pdf) < staff_total:
-                extras = _fallback_missing_staff_guides(page, guides_pdf)
+            if not system_guides_pdf:
+                extras = _fallback_missing_staff_guides(page, staff_guides_pdf_raw)
                 if _debug_enabled():
                     print(
                         f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
-                        f"staff_total={staff_total} omr_guides={len(guides_pdf)} fallback_extras={len(extras)}",
+                        f"staff_total={staff_total} omr_guides={len(staff_guides_pdf_raw)} fallback_extras={len(extras)}",
                         flush=True,
                     )
+                guide_fallback_used = len(extras) > 0
                 for (x_pdf, y0_pdf, y1_pdf) in extras:
                     page.draw_line(
                         (x_pdf, y0_pdf),
@@ -2238,10 +2278,20 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     )
                     first_labels_pdf.append((x_pdf, y0_pdf, y1_pdf, "1"))
 
+            if _debug_measure_labels_enabled():
+                print(
+                    f"[DBG] page={page_index+1} guide_mode=system "
+                    f"system_guides={len(system_guides_pdf)} "
+                    f"fallback_used={str(guide_fallback_used).lower()}",
+                    flush=True,
+                )
+
             if write_measure_labels:
                 labels_to_draw = first_labels_pdf
                 if measure_label_mode == "staff_start":
-                    labels_to_draw = list(staff_start_labels_pdf)
+                    labels_to_draw = [
+                        row for row in _aggregate_system_label_rows(staff_start_labels_pdf, system_staff_counts) if row is not None
+                    ]
                     if ending_label_mode == "system_plus_endings" and ending_anchor_labels_pdf:
                         labels_to_draw.extend(ending_anchor_labels_pdf)
                 elif measure_label_mode == "sequential" and sequential_labels_pdf:
@@ -2335,6 +2385,10 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "mxl_system_count": mxl_system_count,
                     "omr_system_staff_counts": system_staff_counts,
                     "omr_system_count": omr_system_count,
+                    "guide_mode": "system",
+                    "system_guide_count": len(system_guides_pdf),
+                    "staff_guide_count_raw": len(staff_guides_pdf_raw),
+                    "guide_fallback_used": guide_fallback_used,
                     "staff_start_source": staff_start_source,
                     "mapping_status": mapping_status,
                     "mapping_reason": mapping_reason,
