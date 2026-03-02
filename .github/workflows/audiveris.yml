@@ -19,6 +19,7 @@ jobs:
       MEASURE_NUMBERING_POLICY: "baseline_continuous_v1"
       SYSTEM_QA_POLICY: "warn"
       SYSTEM_GUIDE_CV_FALLBACK: "0"
+      PIPELINE_LOG_MODE: "${{ vars.PIPELINE_LOG_MODE != '' && vars.PIPELINE_LOG_MODE || 'quiet' }}"
 
     permissions:
       contents: read
@@ -73,6 +74,7 @@ jobs:
           echo "pdf_gcs_uri: ${{ inputs.pdf_gcs_uri }}"
           echo "audiveris_image: ${AUDIVERIS_IMAGE}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
+          echo "pipeline_log_mode: ${PIPELINE_LOG_MODE}"
 
       - name: Download input PDF
         run: |
@@ -3982,9 +3984,9 @@ jobs:
 
           echo "MXL_PAGE_MANIFEST_PATH=/tmp/work/mxl_page_manifest.json" >> "$GITHUB_ENV"
 
-      - name: Annotate PDF (guides + measure labels) with verbose debug
+      - name: Annotate PDF (guides + measure labels)
         env:
-          DEBUG_GUIDES: "0"
+          DEBUG_GUIDES: "${{ env.PIPELINE_LOG_MODE == 'debug' && '1' || '0' }}"
           ENABLE_MEASURE_LABELS: "1"
           MEASURE_LABEL_MODE: "staff_start"
           MEASURE_SOURCE_POLICY: "mxl_strict"
@@ -3994,14 +3996,21 @@ jobs:
           MXL_PATH_OVERRIDE: "${{ env.MXL_PATH_OVERRIDE }}"
           MXL_MEMBER_OVERRIDE: "${{ env.MXL_MEMBER_OVERRIDE }}"
           MXL_PAGE_MANIFEST_PATH: "${{ env.MXL_PAGE_MANIFEST_PATH }}"
-          DEBUG_MEASURE_LABELS: "1"
-          DEBUG_MEASURE_MARKERS: "0"
-          DEBUG_SENTINEL_TEXT: "1"
+          DEBUG_MEASURE_LABELS: "${{ env.PIPELINE_LOG_MODE == 'debug' && '1' || '0' }}"
+          DEBUG_MEASURE_MARKERS: "${{ env.PIPELINE_LOG_MODE == 'debug' && '1' || '0' }}"
+          DEBUG_SENTINEL_TEXT: "${{ env.PIPELINE_LOG_MODE == 'debug' && '1' || '0' }}"
           SYSTEM_GUIDE_CV_FALLBACK: "${{ env.SYSTEM_GUIDE_CV_FALLBACK }}"
           SYSTEM_QA_POLICY: "${{ env.SYSTEM_QA_POLICY }}"
+          PIPELINE_LOG_MODE: "${{ env.PIPELINE_LOG_MODE }}"
           MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"
         run: |
           set -euo pipefail
+          mode="$(echo "${PIPELINE_LOG_MODE:-quiet}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$mode" != "quiet" && "$mode" != "debug" ]]; then
+            echo "WARN: invalid PIPELINE_LOG_MODE=${PIPELINE_LOG_MODE}; falling back to quiet"
+            mode="quiet"
+          fi
+          echo "PIPELINE_LOG_MODE_EFFECTIVE=${mode}"
           echo "PARSER_SHA=$(git rev-parse --short HEAD)"
           python - << 'PY'
           p = "parser-api/annotate_guides_from_omr.py"
@@ -4191,6 +4200,7 @@ jobs:
               )
 
           print(f"SUMMARY strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}")
+          print(f"SUMMARY pipeline_log_mode={str(os.environ.get('PIPELINE_LOG_MODE') or 'quiet')}")
           print(f"SUMMARY system_qa_policy={system_qa_policy}")
           if system_qa_policy == "warn":
               for page_no, detail in strict_system_drift:
@@ -4340,6 +4350,7 @@ jobs:
 
           mapping_summary = {
               "generated_at_utc": now,
+              "pipeline_log_mode": str(os.environ.get("PIPELINE_LOG_MODE") or "quiet"),
               "strict_xml_pages_ok": strict_ok,
               "strict_xml_pages_total": strict_total,
               "strict_xml_missing_pages": strict_missing_pages,

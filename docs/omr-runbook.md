@@ -12,7 +12,7 @@ This runbook is for day-to-day operation of:
 2. Runs Audiveris OMR with pinned runtime image.
 3. Builds per-page XML manifest in strict mode.
 4. Annotates the PDF with guides/measure labels.
-5. Uploads output files and debug artifacts to GCS.
+5. Uploads compact output files to GCS.
 
 ## How to run
 
@@ -37,6 +37,47 @@ Each run clears the output prefix first, then writes only:
 - `gs://music-omr-bucket-777135743132/output/artifacts/mapping_summary.json`
 
 No `runs/<run_id>/...` folders are written by this workflow.
+
+## 2E test-input prep
+
+Use two prefixes under the existing `input/` path:
+
+- `gs://music-omr-bucket-777135743132/input/user-input/`
+- `gs://music-omr-bucket-777135743132/input/test-input/`
+
+Keep a stable regression pack in `test-input/` with fixed filenames:
+
+- `01_single_staff.pdf`
+- `02_piano.pdf`
+- `03_score_easy.pdf`
+- `04_score_hard.pdf`
+- `05_endings.pdf`
+
+Treat these as canonical test fixtures; avoid replacing them casually.
+
+## Log modes
+
+Default mode is quiet production logging.
+
+- Env key: `PIPELINE_LOG_MODE`
+- Allowed values: `quiet`, `debug`
+- Default: `quiet`
+
+`quiet` mode:
+
+- suppresses user-facing debug marks in output PDF
+- keeps strict mapping summary and system QA summary lines
+- keeps compact JSON artifacts as the source of truth
+
+`debug` mode:
+
+- re-enables parser debug overlays/logging for investigations
+- does not change strict gates or mapping behavior
+
+Operational guidance:
+
+- use `quiet` for normal runs
+- switch to `debug` only while triaging a failure
 
 ## Success criteria
 
