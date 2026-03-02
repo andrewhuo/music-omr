@@ -4037,6 +4037,7 @@ jobs:
           set -euo pipefail
           python - << 'PY'
           import json
+          import os
 
           p = "/tmp/work/measure_mapping_debug.json"
           d = json.load(open(p, "r", encoding="utf-8"))
@@ -4055,6 +4056,7 @@ jobs:
           manifest_path = d.get("mxl_page_manifest_path")
           manifest_summary = {}
           manifest_select_error_detail = {}
+          baseline_mode = str(os.environ.get("BASELINE_MODE", "0")).strip() == "1"
 
           if manifest_path:
               manifest_summary = d.get("mxl_page_manifest_summary") or {}
@@ -4086,6 +4088,7 @@ jobs:
           strict_xml_pages_ok = 0
           total_pages = len(pages)
           strict_xml_missing = []
+          strict_system_drift = []
           for pg in pages:
               source = pg.get("staff_start_source")
               status = pg.get("mapping_status")
@@ -4094,6 +4097,28 @@ jobs:
               labels_to_draw = int(pg.get("labels_to_draw_count") or 0)
               labels_drawn = int(pg.get("labels_drawn") or 0)
               labels_in_bounds = int(pg.get("labels_in_bounds") or 0)
+              omr_system_count = int(pg.get("omr_system_count") or len(pg.get("omr_system_staff_counts") or []))
+              system_guide_count = int(pg.get("system_guide_count") or 0)
+              system_label_candidate_count = int(pg.get("system_label_candidate_count") or 0)
+              system_labels_assigned_count = int(pg.get("system_labels_assigned_count") or 0)
+              system_labels_drawn_count = int(pg.get("system_labels_drawn_count") or 0)
+              system_labels_in_bounds_count = int(pg.get("system_labels_in_bounds_count") or 0)
+              page_no = int(pg.get("page_index", 0)) + 1
+              drift_detail = ""
+
+              if baseline_mode and source == "mxl" and status == "ok":
+                  drift_bits = []
+                  if system_guide_count != omr_system_count:
+                      drift_bits.append(
+                          f"system_guides={system_guide_count} expected_systems={omr_system_count}"
+                      )
+                  if system_labels_drawn_count != omr_system_count:
+                      drift_bits.append(
+                          f"system_labels_drawn={system_labels_drawn_count} expected_systems={omr_system_count}"
+                      )
+                  if drift_bits:
+                      drift_detail = ";".join(drift_bits)
+                      strict_system_drift.append((page_no, drift_detail))
 
               if source != "mxl":
                   if mode == "missing":
@@ -4108,13 +4133,14 @@ jobs:
                   failure_class = "DRAW_ZERO"
               elif labels_in_bounds == 0:
                   failure_class = "DRAW_OFFPAGE"
+              elif drift_detail:
+                  failure_class = "SYSTEM_COUNT_DRIFT"
               else:
                   failure_class = "DRAW_OK"
 
               if source == "mxl":
                   strict_xml_pages_ok += 1
               else:
-                  page_no = int(pg.get("page_index", 0)) + 1
                   strict_xml_missing.append(
                       (
                           page_no,
@@ -4134,18 +4160,23 @@ jobs:
                   f"selection_source={pg.get('xml_selection_source')} "
                   f"confidence={pg.get('xml_confidence_tier')} "
                   f"mxl_sys={len(pg.get('mxl_page_system_starts') or [])} "
-                  f"omr_sys={len(pg.get('omr_system_staff_counts') or [])} "
+                  f"omr_sys={omr_system_count} "
                   f"assigned={len(pg.get('assigned_labels') or [])} "
                   f"candidates={pg.get('staff_start_candidate_count')} "
+                  f"system_candidates={system_label_candidate_count} "
+                  f"system_assigned={system_labels_assigned_count} "
+                  f"system_guides={system_guide_count} "
                   f"draw_attempted={draw_attempted} "
                   f"labels_to_draw={labels_to_draw} "
                   f"labels_drawn={labels_drawn} "
                   f"labels_in_bounds={labels_in_bounds} "
+                  f"system_labels_drawn={system_labels_drawn_count} "
+                  f"system_labels_in_bounds={system_labels_in_bounds_count} "
                   f"failure_class={failure_class}"
               )
 
           print(f"SUMMARY strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}")
-          if strict_xml_pages_ok != total_pages:
+          if strict_xml_pages_ok != total_pages or strict_system_drift:
               for page_no, reason, status, mode, detail in strict_xml_missing:
                   line = (
                       "SUMMARY strict_xml_missing "
@@ -4154,8 +4185,12 @@ jobs:
                   if detail:
                       line += f" select_error_detail={detail}"
                   print(line)
+              for page_no, detail in strict_system_drift:
+                  print(f"SUMMARY strict_system_drift page={page_no} detail={detail}")
               raise SystemExit(
-                  f"ERROR: strict XML coverage failed strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}"
+                  "ERROR: strict checks failed "
+                  f"strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages} "
+                  f"system_count_drift={len(strict_system_drift)}"
               )
           PY
 
@@ -4203,7 +4238,10 @@ jobs:
           strict_total = len(pages)
           strict_ok = 0
           strict_missing_pages = []
+          system_count_drift_pages = []
+          system_page_qa = []
           reason_counts = collections.Counter()
+          baseline_mode = str(os.environ.get("BASELINE_MODE", "0")).strip() == "1"
 
           for pg in pages:
               if not isinstance(pg, dict):
@@ -4212,6 +4250,32 @@ jobs:
               source = str(pg.get("staff_start_source") or "")
               status = str(pg.get("mapping_status") or "")
               reason = str(pg.get("mapping_reason") or "unknown")
+              omr_system_count = int(pg.get("omr_system_count") or len(pg.get("omr_system_staff_counts") or []))
+              system_guide_count = int(pg.get("system_guide_count") or 0)
+              system_label_candidate_count = int(pg.get("system_label_candidate_count") or 0)
+              system_labels_assigned_count = int(pg.get("system_labels_assigned_count") or 0)
+              system_labels_drawn_count = int(pg.get("system_labels_drawn_count") or 0)
+              system_labels_in_bounds_count = int(pg.get("system_labels_in_bounds_count") or 0)
+              system_count_drift = False
+              if baseline_mode and source == "mxl" and status == "ok":
+                  if system_guide_count != omr_system_count or system_labels_drawn_count != omr_system_count:
+                      system_count_drift = True
+                      system_count_drift_pages.append(page_no)
+
+              system_page_qa.append(
+                  {
+                      "page": page_no,
+                      "source": source,
+                      "status": status,
+                      "omr_system_count": omr_system_count,
+                      "system_guide_count": system_guide_count,
+                      "system_label_candidate_count": system_label_candidate_count,
+                      "system_labels_assigned_count": system_labels_assigned_count,
+                      "system_labels_drawn_count": system_labels_drawn_count,
+                      "system_labels_in_bounds_count": system_labels_in_bounds_count,
+                      "system_count_drift": system_count_drift,
+                  }
+              )
               if source == "mxl" and status == "ok":
                   strict_ok += 1
               else:
@@ -4248,6 +4312,9 @@ jobs:
               "strict_xml_pages_total": strict_total,
               "strict_xml_missing_pages": strict_missing_pages,
               "strict_xml_missing_count": len(strict_missing_pages),
+              "system_count_drift_pages": sorted(set(system_count_drift_pages)),
+              "system_count_drift_count": len(set(system_count_drift_pages)),
+              "system_page_qa": system_page_qa,
               "key_failure_reasons": [{"reason": k, "count": v} for k, v in reason_counts.most_common(5)],
               "manifest_status": manifest_status,
               "manifest_entries": manifest_entries,

@@ -2107,6 +2107,10 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             staff_start_labels_pdf = []
             for (x_px, y0_px, y1_px, text) in staff_start_marks_px:
                 staff_start_labels_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y, text))
+            system_label_candidate_rows = [
+                row for row in _aggregate_system_label_rows(staff_start_labels_pdf, system_staff_counts) if row is not None
+            ]
+            system_label_candidate_count = len(system_label_candidate_rows)
 
             staff_start_source = "none"
             mapping_status = "not_applicable"
@@ -2261,6 +2265,11 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     )
                     ending_anchor_count = len(ending_anchor_labels_pdf)
 
+            system_labels_assigned_rows = [
+                row for row in _aggregate_system_label_rows(staff_start_labels_pdf, system_staff_counts) if row is not None
+            ]
+            system_labels_assigned_count = len(system_labels_assigned_rows)
+
             if not system_guides_pdf:
                 extras = _fallback_missing_staff_guides(page, staff_guides_pdf_raw)
                 if _debug_enabled():
@@ -2290,9 +2299,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             if write_measure_labels:
                 labels_to_draw = first_labels_pdf
                 if measure_label_mode == "staff_start":
-                    labels_to_draw = [
-                        row for row in _aggregate_system_label_rows(staff_start_labels_pdf, system_staff_counts) if row is not None
-                    ]
+                    labels_to_draw = list(system_labels_assigned_rows)
                     if ending_label_mode == "system_plus_endings" and ending_anchor_labels_pdf:
                         labels_to_draw.extend(ending_anchor_labels_pdf)
                 elif measure_label_mode == "sequential" and sequential_labels_pdf:
@@ -2312,6 +2319,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 draw_attempted = labels_to_draw_count > 0
                 labels_drawn = 0
                 labels_in_bounds = 0
+                system_labels_drawn_count = 0
+                system_labels_in_bounds_count = 0
                 label_preview: list[dict] = []
                 for label_idx, (x_pdf, y0_pdf, y1_pdf, label_text) in enumerate(labels_to_draw):
                     y_offset = MEASURE_TEXT_Y_OFFSET
@@ -2326,6 +2335,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     )
                     if in_bounds:
                         labels_in_bounds += 1
+                        if measure_label_mode == "staff_start" and label_idx < base_label_count:
+                            system_labels_in_bounds_count += 1
 
                     if len(label_preview) < 5:
                         label_preview.append(
@@ -2339,6 +2350,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
                     _draw_measure_label(page, rect, x_text, y_text, label_text)
                     labels_drawn += 1
+                    if measure_label_mode == "staff_start" and label_idx < base_label_count:
+                        system_labels_drawn_count += 1
                     if label_idx >= base_label_count:
                         ending_labels_drawn += 1
 
@@ -2361,6 +2374,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 labels_to_draw_count = 0
                 labels_drawn = 0
                 labels_in_bounds = 0
+                system_labels_drawn_count = 0
+                system_labels_in_bounds_count = 0
                 label_preview = []
                 ending_anchor_count = 0
                 ending_labels_drawn = 0
@@ -2408,10 +2423,14 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "omr_fallback_rows": omr_fallback_rows,
                     "assigned_labels": [t[3] for t in staff_start_labels_pdf],
                     "staff_start_candidate_count": len(staff_start_labels_pdf),
+                    "system_label_candidate_count": system_label_candidate_count,
+                    "system_labels_assigned_count": system_labels_assigned_count,
                     "draw_attempted": draw_attempted,
                     "labels_to_draw_count": labels_to_draw_count,
                     "labels_drawn": labels_drawn,
                     "labels_in_bounds": labels_in_bounds,
+                    "system_labels_drawn_count": system_labels_drawn_count,
+                    "system_labels_in_bounds_count": system_labels_in_bounds_count,
                     "ending_anchor_count": ending_anchor_count,
                     "ending_labels_drawn": ending_labels_drawn,
                     "label_y_offset_mode": "fixed",

@@ -50,6 +50,23 @@ Look for these lines in logs:
 
 If strict coverage fails, the run should fail.
 
+## System QA Gate
+
+This pipeline now enforces system-level output consistency in baseline mode:
+
+- one long guideline per system
+- one system-start label per system
+
+In Step 16, pages with `staff_start_source=mxl` and `mapping_status=ok` must satisfy:
+
+- `system_guide_count == omr_system_count`
+- `system_labels_drawn_count == omr_system_count`
+
+If not, the run fails with:
+
+- `failure_class=SYSTEM_COUNT_DRIFT`
+- `SUMMARY strict_system_drift page=... detail=...`
+
 ## What to collect when a run fails
 
 Download and share these step logs:
