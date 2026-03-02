@@ -18,7 +18,7 @@ GUIDE_WIDTH = 1.0
 MEASURE_TEXT_COLOR = (0, 0, 0)  # black
 MEASURE_TEXT_SIZE = 10.0
 MEASURE_TEXT_X_OFFSET = 1.0
-MEASURE_TEXT_Y_OFFSET = 12.0
+MEASURE_TEXT_Y_OFFSET = 6.0
 MEASURE_TEXT_BG_COLOR = (1, 1, 1)  # white
 
 # Small left shift so line sits just left of the staff start / clef
