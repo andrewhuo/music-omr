@@ -113,6 +113,11 @@ def _debug_sentinel_text_enabled() -> bool:
     return v in ("1", "true", "True", "yes", "YES")
 
 
+def _system_guide_cv_fallback_enabled() -> bool:
+    v = os.getenv("SYSTEM_GUIDE_CV_FALLBACK", "0").strip().lower()
+    return v in ("1", "true", "yes")
+
+
 def _draw_measure_label(page: fitz.Page, rect: fitz.Rect, x: float, y: float, text: str) -> None:
     # Draw a tiny white background so labels stay visible over notation.
     tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
@@ -749,6 +754,95 @@ def _aggregate_system_label_rows(
     return out
 
 
+def _system_guides_invalid(
+    guides_aligned: list[tuple[float, float, float] | None],
+    page_w: float,
+    page_h: float,
+) -> bool:
+    prev_top = None
+    for row in guides_aligned:
+        if row is None:
+            continue
+        x_pdf, y0_pdf, y1_pdf = row
+        if not (0.0 <= float(x_pdf) <= float(page_w)):
+            return True
+        if float(y1_pdf) <= float(y0_pdf):
+            return True
+        if float(y0_pdf) < 0.0 or float(y1_pdf) > float(page_h):
+            return True
+        if prev_top is not None and float(y0_pdf) + 1.0 < float(prev_top):
+            return True
+        prev_top = float(y0_pdf)
+    return False
+
+
+def _rebuild_system_guides_from_omr_geometry(
+    primary_guides_aligned: list[tuple[float, float, float] | None],
+    staff_start_labels_pdf: list[tuple[float, float, float, str]],
+    system_staff_counts: list[int],
+    page_w: float,
+    page_h: float,
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float, str]], list[str], list[str], str]:
+    expected_systems = max(0, len(system_staff_counts))
+    warnings: list[str] = []
+    detail: list[str] = []
+
+    guides_aligned = list(primary_guides_aligned)
+    if len(guides_aligned) != expected_systems:
+        detail.append(
+            f"guide_count_mismatch primary={len(guides_aligned)} expected={expected_systems}"
+        )
+        if len(guides_aligned) < expected_systems:
+            guides_aligned.extend([None] * (expected_systems - len(guides_aligned)))
+        else:
+            guides_aligned = guides_aligned[:expected_systems]
+        warnings.append("guide_count_mismatch")
+
+    label_rows = _aggregate_system_label_rows(staff_start_labels_pdf, system_staff_counts)
+    rebuilt_aligned: list[tuple[float, float, float] | None] = []
+    used_label_anchor = False
+    prev_top = None
+
+    for sys_idx in range(expected_systems):
+        row = guides_aligned[sys_idx] if sys_idx < len(guides_aligned) else None
+        source = "primary"
+        if row is None and sys_idx < len(label_rows) and label_rows[sys_idx] is not None:
+            lx, ly0, ly1, _ = label_rows[sys_idx]
+            row = (float(lx), float(ly0), float(ly1))
+            source = "label_anchor"
+            used_label_anchor = True
+            warnings.append("guide_rebuilt_from_label_anchor")
+
+        if row is None:
+            warnings.append("missing_system_guide")
+            detail.append(f"system={sys_idx} reason=missing_system_guide")
+            rebuilt_aligned.append(None)
+            continue
+
+        x_pdf, y0_pdf, y1_pdf = row
+        x_pdf = min(max(float(x_pdf), 0.0), float(page_w))
+        y0_pdf = min(max(float(y0_pdf), 0.0), float(page_h))
+        y1_pdf = min(max(float(y1_pdf), 0.0), float(page_h))
+        if y1_pdf <= y0_pdf:
+            warnings.append("invalid_system_span")
+            detail.append(f"system={sys_idx} reason=invalid_system_span source={source}")
+            rebuilt_aligned.append(None)
+            continue
+
+        if prev_top is not None and y0_pdf + 1.0 < float(prev_top):
+            warnings.append("bad_system_vertical_order")
+            detail.append(
+                f"system={sys_idx} reason=bad_system_vertical_order y0={y0_pdf:.2f} prev={float(prev_top):.2f}"
+            )
+        prev_top = y0_pdf
+        rebuilt_aligned.append((x_pdf, y0_pdf, y1_pdf))
+
+    guides_pdf = [row for row in rebuilt_aligned if row is not None]
+    first_labels_pdf = [(x, y0, y1, "1") for (x, y0, y1) in guides_pdf]
+    build_source = "omr_geometry_rebuild" if used_label_anchor or warnings else "primary"
+    return guides_pdf, first_labels_pdf, sorted(set(warnings)), detail, build_source
+
+
 def _system_start_label_positions(
     staff_start_labels_pdf: list[tuple[float, float, float, str]],
     system_staff_counts: list[int],
@@ -1336,6 +1430,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     measure_marks_px: list[tuple[float, float, float, str]] = []
     staff_start_marks_px: list[tuple[float, float, float, str]] = []
     system_staff_counts: list[int] = []
+    system_guides_px_aligned: list[tuple[float, float, float] | None] = []
     omr_fallback_rows: list[dict] = []
 
     pages = root.findall("page")
@@ -1348,6 +1443,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             staff_start_marks_px,
             0,
             system_staff_counts,
+            system_guides_px_aligned,
             omr_fallback_rows,
         )
 
@@ -1363,6 +1459,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         for sys_index, system in enumerate(systems):
             staff_nodes = system.findall(".//staff")
             system_staff_counts.append(len(staff_nodes))
+            system_guide_rows_px: list[tuple[float, float, float]] = []
 
             # FIX: SIG is per-system; prefer system-local inters
             system_inters = system.find(".//sig/inters")
@@ -1717,6 +1814,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     )
 
                 guides_px.append((x_postpad, y_top, y_bot))
+                system_guide_rows_px.append((x_postpad, y_top, y_bot))
                 staff_barline_ids_raw = (staff.findtext("barlines") or "").strip()
                 staff_barline_ids = [tok for tok in staff_barline_ids_raw.split() if tok]
                 staff_barline_xs, candidate_source = barline_xs_for_staff(
@@ -1791,6 +1889,14 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 for measure_num, bx in enumerate(staff_barline_xs, start=1):
                     measure_marks_px.append((bx, y_top, y_bot, str(measure_num)))
 
+            if system_guide_rows_px:
+                sx = float(min(r[0] for r in system_guide_rows_px))
+                sy0 = float(min(r[1] for r in system_guide_rows_px))
+                sy1 = float(max(r[2] for r in system_guide_rows_px))
+                system_guides_px_aligned.append((sx, sy0, sy1))
+            else:
+                system_guides_px_aligned.append(None)
+
     return (
         pic_w,
         pic_h,
@@ -1799,6 +1905,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         staff_start_marks_px,
         staff_total,
         system_staff_counts,
+        system_guides_px_aligned,
         omr_fallback_rows,
     )
 
@@ -2075,6 +2182,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 staff_start_marks_px,
                 staff_total,
                 system_staff_counts,
+                system_guides_px_aligned,
                 omr_fallback_rows,
             ) = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
@@ -2088,19 +2196,6 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             for (x_px, y0_px, y1_px) in guides_px:
                 staff_guides_pdf_raw.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y))
 
-            system_guides_pdf = _aggregate_system_guide_rows(staff_guides_pdf_raw, system_staff_counts)
-            first_labels_pdf: list[tuple[float, float, float, str]] = []
-            for (x_pdf, y0_pdf, y1_pdf) in system_guides_pdf:
-                page.draw_line(
-                    (x_pdf, y0_pdf),
-                    (x_pdf, y1_pdf),
-                    color=GUIDE_COLOR,
-                    width=GUIDE_WIDTH,
-                )
-                first_labels_pdf.append((x_pdf, y0_pdf, y1_pdf, "1"))
-
-            guide_fallback_used = False
-
             sequential_labels_pdf = []
             for (x_px, y0_px, y1_px, text) in measure_marks_px:
                 sequential_labels_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y, text))
@@ -2111,6 +2206,63 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 row for row in _aggregate_system_label_rows(staff_start_labels_pdf, system_staff_counts) if row is not None
             ]
             system_label_candidate_count = len(system_label_candidate_rows)
+            omr_system_count = len(system_staff_counts)
+            guide_fallback_used = False
+            guide_build_source = "primary"
+            system_qa_warnings: list[str] = []
+            system_qa_warning_detail: list[str] = []
+
+            primary_system_guides_aligned_pdf: list[tuple[float, float, float] | None] = []
+            for row in system_guides_px_aligned:
+                if row is None:
+                    primary_system_guides_aligned_pdf.append(None)
+                else:
+                    x_px, y0_px, y1_px = row
+                    primary_system_guides_aligned_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y))
+
+            needs_rebuild = (
+                len([r for r in primary_system_guides_aligned_pdf if r is not None]) != omr_system_count
+                or _system_guides_invalid(primary_system_guides_aligned_pdf, float(rect.width), float(rect.height))
+            )
+            if needs_rebuild:
+                (
+                    system_guides_pdf,
+                    first_labels_pdf,
+                    system_qa_warnings,
+                    system_qa_warning_detail,
+                    guide_build_source,
+                ) = _rebuild_system_guides_from_omr_geometry(
+                    primary_guides_aligned=primary_system_guides_aligned_pdf,
+                    staff_start_labels_pdf=staff_start_labels_pdf,
+                    system_staff_counts=system_staff_counts,
+                    page_w=float(rect.width),
+                    page_h=float(rect.height),
+                )
+            else:
+                system_guides_pdf = [row for row in primary_system_guides_aligned_pdf if row is not None]
+                first_labels_pdf = [(x, y0, y1, "1") for (x, y0, y1) in system_guides_pdf]
+
+            if len(system_guides_pdf) < omr_system_count and _system_guide_cv_fallback_enabled():
+                extras = _fallback_missing_staff_guides(page, staff_guides_pdf_raw)
+                if extras:
+                    guide_fallback_used = True
+                    guide_build_source = "cv_last_resort"
+                    system_qa_warnings.append("cv_last_resort_used")
+                    for row in extras:
+                        system_guides_pdf.append(row)
+                        first_labels_pdf.append((row[0], row[1], row[2], "1"))
+                    # Keep output bounded and deterministic.
+                    if len(system_guides_pdf) > omr_system_count:
+                        system_guides_pdf = sorted(system_guides_pdf, key=lambda r: (r[1], r[0]))[:omr_system_count]
+                        first_labels_pdf = [(x, y0, y1, "1") for (x, y0, y1) in system_guides_pdf]
+
+            for (x_pdf, y0_pdf, y1_pdf) in system_guides_pdf:
+                page.draw_line(
+                    (x_pdf, y0_pdf),
+                    (x_pdf, y1_pdf),
+                    color=GUIDE_COLOR,
+                    width=GUIDE_WIDTH,
+                )
 
             staff_start_source = "none"
             mapping_status = "not_applicable"
@@ -2270,29 +2422,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             ]
             system_labels_assigned_count = len(system_labels_assigned_rows)
 
-            if not system_guides_pdf:
-                extras = _fallback_missing_staff_guides(page, staff_guides_pdf_raw)
-                if _debug_enabled():
-                    print(
-                        f"[DBG] page={page_index+1} sheet={sheet_xml_path} "
-                        f"staff_total={staff_total} omr_guides={len(staff_guides_pdf_raw)} fallback_extras={len(extras)}",
-                        flush=True,
-                    )
-                guide_fallback_used = len(extras) > 0
-                for (x_pdf, y0_pdf, y1_pdf) in extras:
-                    page.draw_line(
-                        (x_pdf, y0_pdf),
-                        (x_pdf, y1_pdf),
-                        color=GUIDE_COLOR,
-                        width=GUIDE_WIDTH,
-                    )
-                    first_labels_pdf.append((x_pdf, y0_pdf, y1_pdf, "1"))
-
             if _debug_measure_labels_enabled():
                 print(
                     f"[DBG] page={page_index+1} guide_mode=system "
                     f"system_guides={len(system_guides_pdf)} "
-                    f"fallback_used={str(guide_fallback_used).lower()}",
+                    f"fallback_used={str(guide_fallback_used).lower()} "
+                    f"guide_build_source={guide_build_source} "
+                    f"system_qa_warnings={sorted(set(system_qa_warnings))}",
                     flush=True,
                 )
 
@@ -2401,9 +2537,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "omr_system_staff_counts": system_staff_counts,
                     "omr_system_count": omr_system_count,
                     "guide_mode": "system",
+                    "guide_build_source": guide_build_source,
                     "system_guide_count": len(system_guides_pdf),
                     "staff_guide_count_raw": len(staff_guides_pdf_raw),
                     "guide_fallback_used": guide_fallback_used,
+                    "system_qa_status": "warn" if system_qa_warnings else "ok",
+                    "system_qa_warnings": sorted(set(system_qa_warnings)),
+                    "system_qa_warning_detail": list(system_qa_warning_detail),
                     "staff_start_source": staff_start_source,
                     "mapping_status": mapping_status,
                     "mapping_reason": mapping_reason,

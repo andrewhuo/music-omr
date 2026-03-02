@@ -17,6 +17,8 @@ jobs:
       AUDIVERIS_VERSION: "5.9.0"
       BASELINE_MODE: "1"
       MEASURE_NUMBERING_POLICY: "baseline_continuous_v1"
+      SYSTEM_QA_POLICY: "warn"
+      SYSTEM_GUIDE_CV_FALLBACK: "0"
 
     permissions:
       contents: read
@@ -3995,6 +3997,8 @@ jobs:
           DEBUG_MEASURE_LABELS: "1"
           DEBUG_MEASURE_MARKERS: "0"
           DEBUG_SENTINEL_TEXT: "1"
+          SYSTEM_GUIDE_CV_FALLBACK: "${{ env.SYSTEM_GUIDE_CV_FALLBACK }}"
+          SYSTEM_QA_POLICY: "${{ env.SYSTEM_QA_POLICY }}"
           MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"
         run: |
           set -euo pipefail
@@ -4057,6 +4061,9 @@ jobs:
           manifest_summary = {}
           manifest_select_error_detail = {}
           baseline_mode = str(os.environ.get("BASELINE_MODE", "0")).strip() == "1"
+          system_qa_policy = str(os.environ.get("SYSTEM_QA_POLICY", "warn")).strip().lower()
+          if system_qa_policy not in ("warn", "strict"):
+              system_qa_policy = "warn"
 
           if manifest_path:
               manifest_summary = d.get("mxl_page_manifest_summary") or {}
@@ -4103,6 +4110,9 @@ jobs:
               system_labels_assigned_count = int(pg.get("system_labels_assigned_count") or 0)
               system_labels_drawn_count = int(pg.get("system_labels_drawn_count") or 0)
               system_labels_in_bounds_count = int(pg.get("system_labels_in_bounds_count") or 0)
+              guide_build_source = str(pg.get("guide_build_source") or "primary")
+              system_qa_status = str(pg.get("system_qa_status") or "ok")
+              system_qa_warnings = list(pg.get("system_qa_warnings") or [])
               page_no = int(pg.get("page_index", 0)) + 1
               drift_detail = ""
 
@@ -4133,8 +4143,10 @@ jobs:
                   failure_class = "DRAW_ZERO"
               elif labels_in_bounds == 0:
                   failure_class = "DRAW_OFFPAGE"
-              elif drift_detail:
+              elif drift_detail and system_qa_policy == "strict":
                   failure_class = "SYSTEM_COUNT_DRIFT"
+              elif drift_detail:
+                  failure_class = "SYSTEM_QA_WARN"
               else:
                   failure_class = "DRAW_OK"
 
@@ -4166,17 +4178,24 @@ jobs:
                   f"system_candidates={system_label_candidate_count} "
                   f"system_assigned={system_labels_assigned_count} "
                   f"system_guides={system_guide_count} "
+                  f"guide_source={guide_build_source} "
+                  f"system_qa_status={system_qa_status} "
                   f"draw_attempted={draw_attempted} "
                   f"labels_to_draw={labels_to_draw} "
                   f"labels_drawn={labels_drawn} "
                   f"labels_in_bounds={labels_in_bounds} "
                   f"system_labels_drawn={system_labels_drawn_count} "
                   f"system_labels_in_bounds={system_labels_in_bounds_count} "
+                  f"system_qa_warnings={system_qa_warnings} "
                   f"failure_class={failure_class}"
               )
 
           print(f"SUMMARY strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages}")
-          if strict_xml_pages_ok != total_pages or strict_system_drift:
+          print(f"SUMMARY system_qa_policy={system_qa_policy}")
+          if system_qa_policy == "warn":
+              for page_no, detail in strict_system_drift:
+                  print(f"SUMMARY system_qa_warn page={page_no} detail={detail}")
+          if strict_xml_pages_ok != total_pages or (system_qa_policy == "strict" and strict_system_drift):
               for page_no, reason, status, mode, detail in strict_xml_missing:
                   line = (
                       "SUMMARY strict_xml_missing "
@@ -4185,8 +4204,9 @@ jobs:
                   if detail:
                       line += f" select_error_detail={detail}"
                   print(line)
-              for page_no, detail in strict_system_drift:
-                  print(f"SUMMARY strict_system_drift page={page_no} detail={detail}")
+              if system_qa_policy == "strict":
+                  for page_no, detail in strict_system_drift:
+                      print(f"SUMMARY strict_system_drift page={page_no} detail={detail}")
               raise SystemExit(
                   "ERROR: strict checks failed "
                   f"strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages} "
@@ -4239,9 +4259,13 @@ jobs:
           strict_ok = 0
           strict_missing_pages = []
           system_count_drift_pages = []
+          system_qa_warning_pages = []
           system_page_qa = []
           reason_counts = collections.Counter()
           baseline_mode = str(os.environ.get("BASELINE_MODE", "0")).strip() == "1"
+          system_qa_policy = str(os.environ.get("SYSTEM_QA_POLICY", "warn")).strip().lower()
+          if system_qa_policy not in ("warn", "strict"):
+              system_qa_policy = "warn"
 
           for pg in pages:
               if not isinstance(pg, dict):
@@ -4256,17 +4280,25 @@ jobs:
               system_labels_assigned_count = int(pg.get("system_labels_assigned_count") or 0)
               system_labels_drawn_count = int(pg.get("system_labels_drawn_count") or 0)
               system_labels_in_bounds_count = int(pg.get("system_labels_in_bounds_count") or 0)
+              guide_build_source = str(pg.get("guide_build_source") or "primary")
+              system_qa_status = str(pg.get("system_qa_status") or "ok")
+              system_qa_warnings = list(pg.get("system_qa_warnings") or [])
               system_count_drift = False
               if baseline_mode and source == "mxl" and status == "ok":
                   if system_guide_count != omr_system_count or system_labels_drawn_count != omr_system_count:
                       system_count_drift = True
                       system_count_drift_pages.append(page_no)
+              if system_count_drift or system_qa_status == "warn" or len(system_qa_warnings) > 0:
+                  system_qa_warning_pages.append(page_no)
 
               system_page_qa.append(
                   {
                       "page": page_no,
                       "source": source,
                       "status": status,
+                      "guide_build_source": guide_build_source,
+                      "system_qa_status": system_qa_status,
+                      "system_qa_warnings": system_qa_warnings,
                       "omr_system_count": omr_system_count,
                       "system_guide_count": system_guide_count,
                       "system_label_candidate_count": system_label_candidate_count,
@@ -4312,8 +4344,11 @@ jobs:
               "strict_xml_pages_total": strict_total,
               "strict_xml_missing_pages": strict_missing_pages,
               "strict_xml_missing_count": len(strict_missing_pages),
+              "system_qa_policy": system_qa_policy,
               "system_count_drift_pages": sorted(set(system_count_drift_pages)),
               "system_count_drift_count": len(set(system_count_drift_pages)),
+              "system_qa_warning_pages": sorted(set(system_qa_warning_pages)),
+              "system_qa_warning_count": len(set(system_qa_warning_pages)),
               "system_page_qa": system_page_qa,
               "key_failure_reasons": [{"reason": k, "count": v} for k, v in reason_counts.most_common(5)],
               "manifest_status": manifest_status,

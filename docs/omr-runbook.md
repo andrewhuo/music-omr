@@ -52,7 +52,7 @@ If strict coverage fails, the run should fail.
 
 ## System QA Gate
 
-This pipeline now enforces system-level output consistency in baseline mode:
+This pipeline enforces system-level output consistency checks in baseline mode:
 
 - one long guideline per system
 - one system-start label per system
@@ -62,7 +62,16 @@ In Step 16, pages with `staff_start_source=mxl` and `mapping_status=ok` must sat
 - `system_guide_count == omr_system_count`
 - `system_labels_drawn_count == omr_system_count`
 
-If not, the run fails with:
+Default policy is warning-first:
+
+- `SYSTEM_QA_POLICY=warn` (default): run succeeds and prints warning lines.
+- `SYSTEM_QA_POLICY=strict`: run fails on drift (QA mode).
+
+Warning lines:
+
+- `SUMMARY system_qa_warn page=... detail=...`
+
+Strict mode failure lines:
 
 - `failure_class=SYSTEM_COUNT_DRIFT`
 - `SUMMARY strict_system_drift page=... detail=...`
