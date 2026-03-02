@@ -17,8 +17,8 @@ GUIDE_COLOR = (1, 0, 0)  # red
 GUIDE_WIDTH = 1.0
 MEASURE_TEXT_COLOR = (0, 0, 0)  # black
 MEASURE_TEXT_SIZE = 10.0
-MEASURE_TEXT_X_OFFSET = 1.0
 MEASURE_TEXT_Y_OFFSET = 6.0
+MEASURE_TEXT_GUIDE_RIGHT_LIMIT = 6.0
 MEASURE_TEXT_BG_COLOR = (1, 1, 1)  # white
 
 # Small left shift so line sits just left of the staff start / clef
@@ -2461,7 +2461,11 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 for label_idx, (x_pdf, y0_pdf, y1_pdf, label_text) in enumerate(labels_to_draw):
                     y_offset = MEASURE_TEXT_Y_OFFSET
                     tw = float(fitz.get_text_length(label_text, fontsize=MEASURE_TEXT_SIZE))
-                    x_text = min(max(0.0, x_pdf + MEASURE_TEXT_X_OFFSET), max(0.0, rect.width - tw - 2.0))
+                    x_centered = float(x_pdf) - (tw / 2.0)
+                    max_right = float(x_pdf) + MEASURE_TEXT_GUIDE_RIGHT_LIMIT
+                    if (x_centered + tw) > max_right:
+                        x_centered = max_right - tw
+                    x_text = min(max(0.0, x_centered), max(0.0, rect.width - tw - 2.0))
                     y_text = max(MEASURE_TEXT_SIZE + 2.0, y0_pdf - y_offset)
                     y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, rect.height - 2.0))
 
@@ -2573,6 +2577,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "system_labels_in_bounds_count": system_labels_in_bounds_count,
                     "ending_anchor_count": ending_anchor_count,
                     "ending_labels_drawn": ending_labels_drawn,
+                    "label_x_mode": "center_with_anti_clef_shift",
+                    "label_guide_right_limit_px": MEASURE_TEXT_GUIDE_RIGHT_LIMIT,
                     "label_y_offset_mode": "fixed",
                     "label_y_offset_px": MEASURE_TEXT_Y_OFFSET,
                     "ending_label_preview": ending_anchor_preview,
