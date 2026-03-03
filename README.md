@@ -67,69 +67,26 @@ No `runs/<run_id>/...` folders are used by the production workflow.
 
 Implemented in `omr-worker/worker.py`.
 
-### `POST /api/omr/jobs`
+Endpoints:
 
-Request:
-```json
-{
-  "pdf_gcs_uri": "gs://music-omr-bucket-777135743132/input/test.pdf"
-}
-Response (202):
+- `POST /api/omr/jobs`
+- `GET /api/omr/jobs/{job_id}`
+- `GET /api/omr/jobs/{job_id}/state`
+- `POST /api/omr/jobs/{job_id}/relabel`
 
-{
-  "job_id": "uuid",
-  "status": "queued",
-  "run_id": 12345678901,
-  "workflow": "audiveris.yml",
-  "ref": "main",
-  "pdf_gcs_uri": "gs://...",
-  "status_url": "/api/omr/jobs/<job_id>",
-  "run_url": "https://github.com/...",
-  "artifacts": {
-    "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
-    "run_info": "gs://.../output/artifacts/run_info.json",
-    "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
-  }
-}
-GET /api/omr/jobs/{job_id}
-Returns run lifecycle status and artifact URIs:
+The relabel flow is fast and does not rerun Audiveris:
 
-queued | running | succeeded | failed
-See full API details in docs/omr-api.md.
+1. Run OMR once with `POST /api/omr/jobs`.
+2. Read clickable systems from `/state`.
+3. Submit edit(s) to `/relabel`.
+4. Download `audiveris_out_corrected.pdf`.
 
-Required Backend Environment Variables
-GITHUB_TOKEN (required)
-GITHUB_OWNER (default: andrewhuo)
-GITHUB_REPO (default: music-omr)
-GITHUB_WORKFLOW_ID (default: audiveris.yml)
-GITHUB_REF (default: main)
-OUTPUT_PREFIX (default: gs://music-omr-bucket-777135743132/output)
-Optional:
+### Smoke test (no frontend required)
 
-RUN_DISCOVERY_TIMEOUT_SEC (default: 20)
-RUN_DISCOVERY_POLL_SEC (default: 2)
-Quality Gates
-A successful run should include:
+```bash
+python3 /Users/andrew/Desktop/music-omr/omr-worker/scripts/relabel_smoke.py \
+  --worker-url "https://<your-worker-url>" \
+  --pdf-gcs-uri "gs://music-omr-bucket-777135743132/input/test-input/01_single_staff.pdf"
+```
 
-SUMMARY strict_xml_pages_ok=N/N
-No SUMMARY strict_system_drift ... lines
-If strict checks fail, run failure is expected (by design).
-
-Troubleshooting
-When a run fails, collect these step logs:
-
-8_Run Audiveris OMR.txt
-13_Build page-split XML manifest (strict mode).txt
-16_Mapping debug summary.txt
-18_Upload outputs and debug artifacts.txt
-Also capture upload lines:
-
-uploaded_audiveris_out=...
-uploaded_artifact_run_info=...
-uploaded_artifact_mapping_summary=...
-Then follow docs/omr-runbook.md.
-
-Notes
-Production flow is tuned for stable baseline output first.
-Homr workflow is currently experimental (A/B path).
-Frontend/manual correction UX is planned as a later phase.
+See full API details in `/Users/andrew/Desktop/music-omr/docs/omr-api.md`.

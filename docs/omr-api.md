@@ -95,10 +95,53 @@ Response (200):
   "relabel": {
     "applied_edits": [{ "type": "set_system_start", "system_id": "p4_s2", "value": 230 }],
     "rejected_edits": [],
+    "state_version_before": "8c1f9a0e1f3a8d6b",
+    "state_version_after": "5d40d4e5a76ec7f9",
+    "updated_system_ids": ["p4_s2", "p4_s3", "p5_s0"],
     "systems_updated_count": 120,
     "labels_redrawn_count": 120,
     "duration_ms": 1800,
     "redraw_duration_ms": 950
+  }
+}
+```
+
+### `GET /api/omr/jobs/{job_id}/state`
+
+Returns frontend-friendly clickable system state (no need to read raw GCS JSON directly).
+
+Response (200):
+
+```json
+{
+  "job_id": "uuid or run_id",
+  "run_id": 22209738954,
+  "state_version": "8c1f9a0e1f3a8d6b",
+  "editable_state": {
+    "version": "system_state_v1",
+    "qa": {
+      "ok": true,
+      "reason_counts": {},
+      "warnings": [],
+      "total_systems": 120
+    },
+    "systems": [
+      {
+        "system_id": "p1_s0",
+        "page": 1,
+        "system_index": 0,
+        "current_value": "1",
+        "anchor": { "x": 44.2, "y_top": 71.3, "y_bottom": 122.7 },
+        "in_bounds": true,
+        "guide_build_source": "primary"
+      }
+    ]
+  },
+  "artifacts": {
+    "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
+    "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
+    "run_info": "gs://.../output/artifacts/run_info.json",
+    "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
   }
 }
 ```
@@ -126,3 +169,21 @@ Optional:
 - Frontend should never call GitHub APIs directly.
 - Storage mode is currently single-latest: each new run overwrites prior output at `OUTPUT_PREFIX`.
 - `mapping_summary.json` now includes `editable_state` (system-level clickable anchors + current values) for frontend interaction.
+- When a different run has already overwritten single-latest artifacts, `/state` and `/relabel` return `409` with requested/artifact run IDs.
+
+## Smoke Test Script
+
+Use:
+
+```bash
+python3 /Users/andrew/Desktop/music-omr/omr-worker/scripts/relabel_smoke.py \
+  --worker-url "https://<your-worker-url>" \
+  --pdf-gcs-uri "gs://music-omr-bucket-777135743132/input/test-input/01_single_staff.pdf"
+```
+
+Expected:
+
+- job reaches `succeeded`
+- relabel call succeeds
+- response contains `audiveris_out_corrected.pdf`
+- script prints `SMOKE ok ...`

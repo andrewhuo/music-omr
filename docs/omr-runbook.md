@@ -142,6 +142,7 @@ Also share these storage lines from Step 18:
 
 The backend supports fast user corrections via:
 
+- `GET /api/omr/jobs/{job_id}/state`
 - `POST /api/omr/jobs/{job_id}/relabel`
 
 This endpoint:
@@ -152,6 +153,29 @@ This endpoint:
 - writes `audiveris_out_corrected.pdf`
 
 It does not rerun Audiveris or GitHub Actions.
+
+## Fast relabel smoke test
+
+Use the helper script:
+
+- `/Users/andrew/Desktop/music-omr/omr-worker/scripts/relabel_smoke.py`
+
+Example:
+
+```bash
+python3 /Users/andrew/Desktop/music-omr/omr-worker/scripts/relabel_smoke.py \
+  --worker-url "https://<your-worker-url>" \
+  --pdf-gcs-uri "gs://music-omr-bucket-777135743132/input/test-input/01_single_staff.pdf"
+```
+
+Expected result:
+
+- Script prints `SMOKE ok ...`
+- Relabel response includes `state_version_before`, `state_version_after`, `updated_system_ids`
+- `audiveris_out_corrected.pdf` exists in output.
+
+If a newer workflow run overwrote single-latest artifacts, `/state` or `/relabel` returns `409`
+with requested/artifact run IDs.
 
 ## Troubleshooting note: system-count mismatch
 

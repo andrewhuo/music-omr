@@ -3,6 +3,7 @@ import os
 import re
 import time
 import uuid
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -44,6 +45,16 @@ class GitHubAPIError(RuntimeError):
         super().__init__(message)
         self.status_code = int(status_code)
         self.message = str(message)
+
+
+class StaleArtifactsError(RuntimeError):
+    def __init__(self, requested_run_id: int, artifact_run_id: int):
+        super().__init__(
+            f"requested job_id does not match single-latest artifacts: "
+            f"requested_run_id={requested_run_id} artifact_run_id={artifact_run_id}"
+        )
+        self.requested_run_id = int(requested_run_id)
+        self.artifact_run_id = int(artifact_run_id)
 
 
 def _utc_now() -> datetime:
@@ -242,6 +253,19 @@ def _resolve_run_id_from_job_id(job_id: str) -> tuple[int | None, dict | None, s
     return int(run_id), rec, None
 
 
+def _load_mapping_for_run(run_id: int) -> tuple[dict, dict, int]:
+    artifacts = _artifact_uris_for_run(int(run_id))
+    run_info = _download_gcs_json(artifacts["run_info"])
+    mapping_summary = _download_gcs_json(artifacts["mapping_summary"])
+
+    summary_run_id = _safe_int(run_info.get("run_id"), 0)
+    if summary_run_id and summary_run_id != int(run_id):
+        raise StaleArtifactsError(int(run_id), int(summary_run_id))
+    if not isinstance(mapping_summary, dict):
+        raise ValueError("mapping_summary is not an object")
+    return artifacts, mapping_summary, summary_run_id
+
+
 def _safe_int(value, default: int = 0) -> int:
     try:
         return int(value)
@@ -259,7 +283,15 @@ def _label_position(anchor_x: float, anchor_y_top: float, page_width: float, pag
     y_text = max(MEASURE_TEXT_SIZE + 2.0, float(anchor_y_top) - MEASURE_TEXT_Y_OFFSET)
     y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, float(page_height) - 2.0))
     return x_text, y_text, tw
-    return x_text, y_text, tw
+
+
+def _editable_state_version(editable_state: dict) -> str:
+    payload = {
+        "version": editable_state.get("version"),
+        "systems": editable_state.get("systems") or [],
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
 
 
 def _draw_measure_label(page: fitz.Page, page_rect: fitz.Rect, anchor_x: float, anchor_y_top: float, text: str) -> None:
@@ -551,6 +583,54 @@ def get_job(job_id: str):
     return jsonify(response), 200
 
 
+@app.route("/api/omr/jobs/<job_id>/state", methods=["GET"])
+def get_job_state(job_id: str):
+    run_id, _, err = _resolve_run_id_from_job_id(job_id)
+    if err:
+        return jsonify({"error": err, "job_id": job_id}), 409
+
+    try:
+        artifacts, mapping_summary, _ = _load_mapping_for_run(int(run_id))
+    except StaleArtifactsError as exc:
+        return (
+            jsonify(
+                {
+                    "error": "requested job_id does not match single-latest artifacts",
+                    "job_id": job_id,
+                    "requested_run_id": exc.requested_run_id,
+                    "artifact_run_id": exc.artifact_run_id,
+                }
+            ),
+            409,
+        )
+    except Exception as exc:
+        return jsonify({"error": f"failed to load state: {exc}", "job_id": job_id, "run_id": run_id}), 502
+
+    editable_state = mapping_summary.get("editable_state") or {}
+    if not isinstance(editable_state, dict):
+        return jsonify({"error": "editable_state missing in mapping_summary", "job_id": job_id, "run_id": run_id}), 409
+
+    systems = editable_state.get("systems")
+    if not isinstance(systems, list):
+        systems = []
+    qa = editable_state.get("qa")
+    if not isinstance(qa, dict):
+        qa = {}
+
+    response = {
+        "job_id": job_id,
+        "run_id": int(run_id),
+        "state_version": _editable_state_version(editable_state),
+        "editable_state": {
+            "version": str(editable_state.get("version") or "system_state_v1"),
+            "qa": qa,
+            "systems": systems,
+        },
+        "artifacts": artifacts,
+    }
+    return jsonify(response), 200
+
+
 @app.route("/api/omr/jobs/<job_id>/relabel", methods=["POST"])
 def relabel_job(job_id: str):
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
@@ -562,35 +642,31 @@ def relabel_job(job_id: str):
     if not isinstance(edits, list) or len(edits) == 0:
         return jsonify({"error": "edits array is required", "job_id": job_id}), 400
 
-    artifacts = _artifact_uris_for_run(int(run_id))
-    mapping_uri = artifacts["mapping_summary"]
-    baseline_pdf_uri = artifacts["audiveris_out_pdf"]
-    corrected_pdf_uri = artifacts["audiveris_out_corrected_pdf"]
-    run_info_uri = artifacts["run_info"]
-
     try:
-        run_info = _download_gcs_json(run_info_uri)
-        mapping_summary = _download_gcs_json(mapping_uri)
-    except Exception as exc:
-        return jsonify({"error": f"failed to load artifacts: {exc}", "job_id": job_id, "run_id": run_id}), 502
-
-    summary_run_id = _safe_int(run_info.get("run_id"), 0)
-    if summary_run_id and summary_run_id != int(run_id):
+        artifacts, mapping_summary, _ = _load_mapping_for_run(int(run_id))
+    except StaleArtifactsError as exc:
         return (
             jsonify(
                 {
                     "error": "requested job_id does not match single-latest artifacts",
                     "job_id": job_id,
-                    "requested_run_id": int(run_id),
-                    "artifact_run_id": summary_run_id,
+                    "requested_run_id": exc.requested_run_id,
+                    "artifact_run_id": exc.artifact_run_id,
                 }
             ),
             409,
         )
+    except Exception as exc:
+        return jsonify({"error": f"failed to load artifacts: {exc}", "job_id": job_id, "run_id": run_id}), 502
+
+    mapping_uri = artifacts["mapping_summary"]
+    baseline_pdf_uri = artifacts["audiveris_out_pdf"]
+    corrected_pdf_uri = artifacts["audiveris_out_corrected_pdf"]
 
     editable_state = mapping_summary.get("editable_state") or {}
     if not isinstance(editable_state, dict):
         return jsonify({"error": "editable_state missing in mapping_summary", "job_id": job_id, "run_id": run_id}), 409
+    state_version_before = _editable_state_version(editable_state)
 
     started = time.time()
     try:
@@ -625,6 +701,21 @@ def relabel_job(job_id: str):
         qa = {}
         editable_state["qa"] = qa
     qa["total_systems"] = len(systems)
+    state_version_after = _editable_state_version(editable_state)
+    before_values = {}
+    for row in baseline_systems:
+        if isinstance(row, dict):
+            sid = str(row.get("system_id") or "").strip()
+            if sid:
+                before_values[sid] = str(row.get("current_value") or row.get("value") or "")
+    updated_system_ids: list[str] = []
+    for row in systems:
+        sid = str(row.get("system_id") or "").strip()
+        if not sid:
+            continue
+        after_value = str(row.get("current_value") or row.get("value") or "")
+        if before_values.get(sid) != after_value:
+            updated_system_ids.append(sid)
 
     relabel_info = {
         "updated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
@@ -651,6 +742,9 @@ def relabel_job(job_id: str):
         "relabel": {
             "applied_edits": applied,
             "rejected_edits": rejected,
+            "state_version_before": state_version_before,
+            "state_version_after": state_version_after,
+            "updated_system_ids": updated_system_ids,
             "systems_updated_count": total_systems,
             "labels_redrawn_count": labels_drawn,
             "duration_ms": relabel_info["duration_ms"],
