@@ -2421,6 +2421,26 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 row for row in _aggregate_system_label_rows(staff_start_labels_pdf, system_staff_counts) if row is not None
             ]
             system_labels_assigned_count = len(system_labels_assigned_rows)
+            system_label_rows: list[dict] = []
+            for system_idx, (sx, sy0, sy1, slabel) in enumerate(system_labels_assigned_rows):
+                anchor_in_bounds = (
+                    0.0 <= float(sx) <= float(rect.width)
+                    and 0.0 <= float(sy0) < float(sy1) <= float(rect.height)
+                )
+                system_label_rows.append(
+                    {
+                        "system_id": f"p{page_index + 1}_s{system_idx}",
+                        "page": page_index + 1,
+                        "system_index": system_idx,
+                        "value": str(slabel),
+                        "anchor": {
+                            "x": round(float(sx), 3),
+                            "y_top": round(float(sy0), 3),
+                            "y_bottom": round(float(sy1), 3),
+                        },
+                        "anchor_in_bounds": bool(anchor_in_bounds),
+                    }
+                )
 
             if _debug_measure_labels_enabled():
                 print(
@@ -2575,6 +2595,9 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "labels_in_bounds": labels_in_bounds,
                     "system_labels_drawn_count": system_labels_drawn_count,
                     "system_labels_in_bounds_count": system_labels_in_bounds_count,
+                    "system_label_rows": system_label_rows,
+                    "page_width": round(float(rect.width), 3),
+                    "page_height": round(float(rect.height), 3),
                     "ending_anchor_count": ending_anchor_count,
                     "ending_labels_drawn": ending_labels_drawn,
                     "label_x_mode": "center_with_anti_clef_shift",

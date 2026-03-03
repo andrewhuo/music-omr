@@ -38,6 +38,12 @@ Each run clears the output prefix first, then writes only:
 
 No `runs/<run_id>/...` folders are written by this workflow.
 
+`mapping_summary.json` now includes `editable_state` (system-level anchors + current values) for fast relabel.
+
+When backend relabel is used, one additional output may be written:
+
+- `gs://music-omr-bucket-777135743132/output/audiveris_out_corrected.pdf`
+
 ## 2E test-input prep
 
 Use two prefixes under the existing `input/` path:
@@ -131,6 +137,21 @@ Also share these storage lines from Step 18:
 - `uploaded_audiveris_out=...`
 - `uploaded_artifact_run_info=...`
 - `uploaded_artifact_mapping_summary=...`
+
+## Fast relabel flow (no full OMR rerun)
+
+The backend supports fast user corrections via:
+
+- `POST /api/omr/jobs/{job_id}/relabel`
+
+This endpoint:
+
+- reads baseline PDF + `editable_state` from `mapping_summary.json`
+- applies `set_system_start` edits
+- redraws labels only
+- writes `audiveris_out_corrected.pdf`
+
+It does not rerun Audiveris or GitHub Actions.
 
 ## Troubleshooting note: system-count mismatch
 

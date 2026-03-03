@@ -32,6 +32,7 @@ Response (202):
   "run_url": "https://github.com/...",
   "artifacts": {
     "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
+    "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
     "run_info": "gs://.../output/artifacts/run_info.json",
     "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
   }
@@ -57,8 +58,47 @@ Response (200):
   "run_url": "https://github.com/...",
   "artifacts": {
     "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
+    "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
     "run_info": "gs://.../output/artifacts/run_info.json",
     "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+  }
+}
+```
+
+### `POST /api/omr/jobs/{job_id}/relabel`
+
+Applies user edits to system-start numbering and redraws labels without rerunning OMR.
+
+Request body:
+
+```json
+{
+  "edits": [
+    { "type": "set_system_start", "system_id": "p4_s2", "value": 230 }
+  ]
+}
+```
+
+Response (200):
+
+```json
+{
+  "job_id": "uuid or run_id",
+  "run_id": 22209738954,
+  "status": "succeeded",
+  "artifacts": {
+    "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
+    "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
+    "run_info": "gs://.../output/artifacts/run_info.json",
+    "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+  },
+  "relabel": {
+    "applied_edits": [{ "type": "set_system_start", "system_id": "p4_s2", "value": 230 }],
+    "rejected_edits": [],
+    "systems_updated_count": 120,
+    "labels_redrawn_count": 120,
+    "duration_ms": 1800,
+    "redraw_duration_ms": 950
   }
 }
 ```
@@ -71,14 +111,18 @@ Response (200):
 - `GITHUB_WORKFLOW_ID` (default: `audiveris.yml`)
 - `GITHUB_REF` (default: `main`)
 - `OUTPUT_PREFIX` (default: `gs://music-omr-bucket-777135743132/output`)
+- Google Cloud ADC credentials (service account/workload identity) with read/write access to `OUTPUT_PREFIX`
 
 Optional:
 
 - `RUN_DISCOVERY_TIMEOUT_SEC` (default: `20`)
 - `RUN_DISCOVERY_POLL_SEC` (default: `2`)
+- `RELABEL_MIN_VALUE` (default: `0`)
+- `RELABEL_MAX_VALUE` (default: `1000000`)
 
 ## Notes
 
 - `workflow_dispatch` does not return `run_id` directly. The backend performs a short discovery poll to find the newly created run.
 - Frontend should never call GitHub APIs directly.
 - Storage mode is currently single-latest: each new run overwrites prior output at `OUTPUT_PREFIX`.
+- `mapping_summary.json` now includes `editable_state` (system-level clickable anchors + current values) for frontend interaction.
