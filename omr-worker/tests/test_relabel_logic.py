@@ -123,6 +123,52 @@ class RelabelLogicTests(unittest.TestCase):
         ordering = [(row["page"], row["system_index"]) for row in systems]
         self.assertEqual(ordering, [(1, 0), (1, 1), (1, 2), (2, 0)])
 
+    def test_relabel_trace_history_cap(self):
+        mapping_summary = {}
+        for idx in range(55):
+            WORKER._append_relabel_trace(
+                mapping_summary,
+                {
+                    "trace_id": f"t{idx}",
+                    "result": "success",
+                    "rejected_reason_counts": {},
+                },
+                max_history=50,
+            )
+        relabel_debug = mapping_summary.get("relabel_debug") or {}
+        history = relabel_debug.get("history") or []
+        self.assertEqual(len(history), 50)
+        self.assertEqual(history[0].get("trace_id"), "t5")
+        self.assertEqual((relabel_debug.get("last_trace") or {}).get("trace_id"), "t54")
+
+    def test_relabel_trace_reason_counts_aggregate(self):
+        mapping_summary = {}
+        WORKER._append_relabel_trace(
+            mapping_summary,
+            {
+                "trace_id": "one",
+                "result": "validation_error",
+                "reason": "invalid_payload",
+                "rejected_reason_counts": {"unknown_system_id": 2},
+            },
+            max_history=50,
+        )
+        WORKER._append_relabel_trace(
+            mapping_summary,
+            {
+                "trace_id": "two",
+                "result": "stale_conflict",
+                "reason": "stale_run_mismatch",
+                "rejected_reason_counts": {},
+            },
+            max_history=50,
+        )
+        summary = WORKER._summarize_relabel_debug(mapping_summary)
+        self.assertEqual(summary["history_count"], 2)
+        self.assertEqual(summary["reason_counts"].get("invalid_payload"), 1)
+        self.assertEqual(summary["reason_counts"].get("unknown_system_id"), 2)
+        self.assertEqual(summary["reason_counts"].get("stale_run_mismatch"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

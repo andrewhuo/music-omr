@@ -28,6 +28,8 @@ RUN_DISCOVERY_TIMEOUT_SEC = int(os.environ.get("RUN_DISCOVERY_TIMEOUT_SEC", "20"
 RUN_DISCOVERY_POLL_SEC = float(os.environ.get("RUN_DISCOVERY_POLL_SEC", "2"))
 RELABEL_MAX_VALUE = int(os.environ.get("RELABEL_MAX_VALUE", "1000000"))
 RELABEL_MIN_VALUE = int(os.environ.get("RELABEL_MIN_VALUE", "0"))
+RELABEL_DEBUG_HISTORY_MAX = int(os.environ.get("RELABEL_DEBUG_HISTORY_MAX", "50"))
+RELABEL_DEBUG_VERSION = "relabel_debug_v1"
 
 MEASURE_TEXT_COLOR = (0, 0, 0)
 MEASURE_TEXT_SIZE = 10.0
@@ -292,6 +294,115 @@ def _editable_state_version(editable_state: dict) -> str:
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _new_trace_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _safe_error_text(exc: Exception | str, max_len: int = 220) -> str:
+    txt = str(exc or "").strip().replace("\n", " ").replace("\r", " ")
+    if len(txt) <= max_len:
+        return txt
+    return f"{txt[:max_len]}..."
+
+
+def _rejected_reason_counts(rejected: list[dict] | None) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rejected or []:
+        if not isinstance(row, dict):
+            continue
+        reason = str(row.get("reason") or "").strip()
+        if not reason:
+            continue
+        counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _append_relabel_trace(mapping_summary: dict, trace: dict, max_history: int = RELABEL_DEBUG_HISTORY_MAX) -> dict:
+    if not isinstance(mapping_summary, dict):
+        return {}
+
+    relabel_debug = mapping_summary.get("relabel_debug")
+    if not isinstance(relabel_debug, dict):
+        relabel_debug = {}
+
+    history = relabel_debug.get("history")
+    if not isinstance(history, list):
+        history = []
+    clean_trace = {k: v for k, v in trace.items() if v is not None}
+    history.append(clean_trace)
+
+    max_keep = max(1, int(max_history))
+    if len(history) > max_keep:
+        history = history[-max_keep:]
+
+    reason_counts: dict[str, int] = {}
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+        reason = str(row.get("reason") or "").strip()
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        rejected_counts = row.get("rejected_reason_counts")
+        if isinstance(rejected_counts, dict):
+            for key, value in rejected_counts.items():
+                code = str(key or "").strip()
+                if not code:
+                    continue
+                reason_counts[code] = reason_counts.get(code, 0) + _safe_int(value, 0)
+
+    relabel_debug["version"] = RELABEL_DEBUG_VERSION
+    relabel_debug["history_max"] = max_keep
+    relabel_debug["history"] = history
+    relabel_debug["last_trace"] = history[-1] if history else {}
+    relabel_debug["reason_counts"] = dict(sorted(reason_counts.items()))
+    mapping_summary["relabel_debug"] = relabel_debug
+    return relabel_debug
+
+
+def _summarize_relabel_debug(mapping_summary: dict) -> dict:
+    relabel_debug = mapping_summary.get("relabel_debug")
+    if not isinstance(relabel_debug, dict):
+        return {
+            "history_count": 0,
+            "history_max": max(1, RELABEL_DEBUG_HISTORY_MAX),
+            "last_result": "",
+            "last_trace_id": "",
+            "reason_counts": {},
+        }
+
+    history = relabel_debug.get("history")
+    if not isinstance(history, list):
+        history = []
+    last_trace = relabel_debug.get("last_trace")
+    if not isinstance(last_trace, dict):
+        last_trace = history[-1] if history and isinstance(history[-1], dict) else {}
+    reason_counts = relabel_debug.get("reason_counts")
+    if not isinstance(reason_counts, dict):
+        reason_counts = {}
+
+    return {
+        "history_count": len(history),
+        "history_max": max(1, _safe_int(relabel_debug.get("history_max"), RELABEL_DEBUG_HISTORY_MAX)),
+        "last_result": str(last_trace.get("result") or ""),
+        "last_trace_id": str(last_trace.get("trace_id") or ""),
+        "reason_counts": reason_counts,
+    }
+
+
+def _persist_relabel_trace(mapping_summary: dict, mapping_uri: str, trace: dict, trace_id: str) -> bool:
+    try:
+        _append_relabel_trace(mapping_summary, trace)
+        _upload_json_to_gcs(mapping_summary, mapping_uri)
+        return True
+    except Exception as exc:
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} "
+            f"stage=trace_persist reason=mapping_upload_failed "
+            f"detail={_safe_error_text(exc)}"
+        )
+        return False
 
 
 def _draw_measure_label(page: fitz.Page, page_rect: fitz.Rect, anchor_x: float, anchor_y_top: float, text: str) -> None:
@@ -626,6 +737,7 @@ def get_job_state(job_id: str):
             "qa": qa,
             "systems": systems,
         },
+        "relabel_debug_summary": _summarize_relabel_debug(mapping_summary),
         "artifacts": artifacts,
     }
     return jsonify(response), 200
@@ -633,18 +745,59 @@ def get_job_state(job_id: str):
 
 @app.route("/api/omr/jobs/<job_id>/relabel", methods=["POST"])
 def relabel_job(job_id: str):
-    run_id, rec, err = _resolve_run_id_from_job_id(job_id)
-    if err:
-        return jsonify({"error": err, "job_id": job_id}), 409
-
+    trace_id = _new_trace_id()
+    started = time.time()
     payload = request.json or {}
     edits = payload.get("edits")
-    if not isinstance(edits, list) or len(edits) == 0:
-        return jsonify({"error": "edits array is required", "job_id": job_id}), 400
+    edits_requested_count = len(edits) if isinstance(edits, list) else 0
+
+    run_id, rec, err = _resolve_run_id_from_job_id(job_id)
+    requested_run_id = int(run_id) if isinstance(run_id, int) else 0
+    print(
+        f"RELABEL_TRACE_START trace_id={trace_id} job_id={job_id} "
+        f"run_id={requested_run_id or 'unknown'} edits={edits_requested_count}"
+    )
+
+    if err:
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=resolve_run "
+            f"reason=state_load_failed detail={_safe_error_text(err)}"
+        )
+        return jsonify({"error": err, "job_id": job_id, "trace_id": trace_id, "debug_result": "validation_error"}), 409
 
     try:
-        artifacts, mapping_summary, _ = _load_mapping_for_run(int(run_id))
+        artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id))
     except StaleArtifactsError as exc:
+        trace = {
+            "trace_id": trace_id,
+            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "requested_run_id": int(exc.requested_run_id),
+            "artifact_run_id": int(exc.artifact_run_id),
+            "edits_requested_count": edits_requested_count,
+            "applied_count": 0,
+            "rejected_count": 0,
+            "rejected_reason_counts": {},
+            "updated_system_ids_count": 0,
+            "labels_redrawn_count": 0,
+            "duration_ms": int((time.time() - started) * 1000),
+            "redraw_duration_ms": 0,
+            "result": "stale_conflict",
+            "reason": "stale_run_mismatch",
+            "error_detail": "requested job_id does not match single-latest artifacts",
+        }
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=load_artifacts "
+            "reason=stale_run_mismatch detail=requested job_id does not match single-latest artifacts"
+        )
+        try:
+            stale_artifacts, stale_mapping_summary, _ = _load_mapping_for_run(int(exc.artifact_run_id))
+            _persist_relabel_trace(stale_mapping_summary, stale_artifacts["mapping_summary"], trace, trace_id)
+        except Exception as trace_exc:
+            print(
+                f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=trace_persist "
+                f"reason=mapping_upload_failed detail={_safe_error_text(trace_exc)}"
+            )
         return (
             jsonify(
                 {
@@ -652,12 +805,29 @@ def relabel_job(job_id: str):
                     "job_id": job_id,
                     "requested_run_id": exc.requested_run_id,
                     "artifact_run_id": exc.artifact_run_id,
+                    "trace_id": trace_id,
+                    "debug_result": "stale_conflict",
                 }
             ),
             409,
         )
     except Exception as exc:
-        return jsonify({"error": f"failed to load artifacts: {exc}", "job_id": job_id, "run_id": run_id}), 502
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=load_artifacts "
+            f"reason=state_load_failed detail={_safe_error_text(exc)}"
+        )
+        return (
+            jsonify(
+                {
+                    "error": f"failed to load artifacts: {exc}",
+                    "job_id": job_id,
+                    "run_id": run_id,
+                    "trace_id": trace_id,
+                    "debug_result": "internal_error",
+                }
+            ),
+            502,
+        )
 
     mapping_uri = artifacts["mapping_summary"]
     baseline_pdf_uri = artifacts["audiveris_out_pdf"]
@@ -665,10 +835,81 @@ def relabel_job(job_id: str):
 
     editable_state = mapping_summary.get("editable_state") or {}
     if not isinstance(editable_state, dict):
-        return jsonify({"error": "editable_state missing in mapping_summary", "job_id": job_id, "run_id": run_id}), 409
+        trace = {
+            "trace_id": trace_id,
+            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "requested_run_id": int(run_id),
+            "artifact_run_id": int(artifact_run_id),
+            "edits_requested_count": edits_requested_count,
+            "applied_count": 0,
+            "rejected_count": 0,
+            "rejected_reason_counts": {},
+            "updated_system_ids_count": 0,
+            "labels_redrawn_count": 0,
+            "duration_ms": int((time.time() - started) * 1000),
+            "redraw_duration_ms": 0,
+            "result": "validation_error",
+            "reason": "editable_state_missing",
+            "error_detail": "editable_state missing in mapping_summary",
+        }
+        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=validate_state "
+            "reason=editable_state_missing detail=editable_state missing in mapping_summary"
+        )
+        return (
+            jsonify(
+                {
+                    "error": "editable_state missing in mapping_summary",
+                    "job_id": job_id,
+                    "run_id": run_id,
+                    "trace_id": trace_id,
+                    "debug_result": "validation_error",
+                }
+            ),
+            409,
+        )
+
+    if not isinstance(edits, list) or len(edits) == 0:
+        trace = {
+            "trace_id": trace_id,
+            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "requested_run_id": int(run_id),
+            "artifact_run_id": int(artifact_run_id),
+            "state_version_before": _editable_state_version(editable_state),
+            "edits_requested_count": edits_requested_count,
+            "applied_count": 0,
+            "rejected_count": 0,
+            "rejected_reason_counts": {"invalid_payload": 1},
+            "updated_system_ids_count": 0,
+            "labels_redrawn_count": 0,
+            "duration_ms": int((time.time() - started) * 1000),
+            "redraw_duration_ms": 0,
+            "result": "validation_error",
+            "reason": "invalid_payload",
+            "error_detail": "edits array is required",
+        }
+        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=validate_payload "
+            "reason=invalid_payload detail=edits array is required"
+        )
+        return (
+            jsonify(
+                {
+                    "error": "edits array is required",
+                    "job_id": job_id,
+                    "trace_id": trace_id,
+                    "debug_result": "validation_error",
+                }
+            ),
+            400,
+        )
+
     state_version_before = _editable_state_version(editable_state)
 
-    started = time.time()
     try:
         baseline_systems = list(editable_state.get("systems") or [])
         baseline_by_id = {
@@ -678,22 +919,135 @@ def relabel_job(job_id: str):
         }
         systems, applied, rejected, total_systems = _apply_relabel_edits(editable_state, edits)
     except ValueError as exc:
-        return jsonify({"error": str(exc), "job_id": job_id, "run_id": run_id}), 400
+        reason = "invalid_payload"
+        if "unknown_system_id" in str(exc):
+            reason = "unknown_system_id"
+        trace = {
+            "trace_id": trace_id,
+            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "requested_run_id": int(run_id),
+            "artifact_run_id": int(artifact_run_id),
+            "state_version_before": state_version_before,
+            "edits_requested_count": edits_requested_count,
+            "applied_count": 0,
+            "rejected_count": 0,
+            "rejected_reason_counts": {reason: 1},
+            "updated_system_ids_count": 0,
+            "labels_redrawn_count": 0,
+            "duration_ms": int((time.time() - started) * 1000),
+            "redraw_duration_ms": 0,
+            "result": "validation_error",
+            "reason": reason,
+            "error_detail": _safe_error_text(exc),
+        }
+        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=apply_edits "
+            f"reason={reason} detail={_safe_error_text(exc)}"
+        )
+        return (
+            jsonify(
+                {
+                    "error": str(exc),
+                    "job_id": job_id,
+                    "run_id": run_id,
+                    "trace_id": trace_id,
+                    "debug_result": "validation_error",
+                }
+            ),
+            400,
+        )
     except Exception as exc:
-        return jsonify({"error": f"failed to process edits: {exc}", "job_id": job_id, "run_id": run_id}), 500
+        trace = {
+            "trace_id": trace_id,
+            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "requested_run_id": int(run_id),
+            "artifact_run_id": int(artifact_run_id),
+            "state_version_before": state_version_before,
+            "edits_requested_count": edits_requested_count,
+            "applied_count": 0,
+            "rejected_count": 0,
+            "rejected_reason_counts": {"internal_error": 1},
+            "updated_system_ids_count": 0,
+            "labels_redrawn_count": 0,
+            "duration_ms": int((time.time() - started) * 1000),
+            "redraw_duration_ms": 0,
+            "result": "internal_error",
+            "reason": "internal_error",
+            "error_detail": _safe_error_text(exc),
+        }
+        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=apply_edits "
+            f"reason=internal_error detail={_safe_error_text(exc)}"
+        )
+        return (
+            jsonify(
+                {
+                    "error": f"failed to process edits: {exc}",
+                    "job_id": job_id,
+                    "run_id": run_id,
+                    "trace_id": trace_id,
+                    "debug_result": "internal_error",
+                }
+            ),
+            500,
+        )
 
-    with TemporaryDirectory(prefix="omr-relabel-") as tmp:
-        tmpdir = Path(tmp)
-        in_pdf = tmpdir / "audiveris_out.pdf"
-        out_pdf = tmpdir / "audiveris_out_corrected.pdf"
-        try:
+    redraw_ms = 0
+    try:
+        with TemporaryDirectory(prefix="omr-relabel-") as tmp:
+            tmpdir = Path(tmp)
+            in_pdf = tmpdir / "audiveris_out.pdf"
+            out_pdf = tmpdir / "audiveris_out_corrected.pdf"
             _download_gcs_to_file(baseline_pdf_uri, in_pdf)
             redraw_started = time.time()
             labels_drawn = _render_corrected_pdf(in_pdf, out_pdf, systems, baseline_by_id)
             redraw_ms = int((time.time() - redraw_started) * 1000)
             _upload_file_to_gcs(out_pdf, corrected_pdf_uri, content_type="application/pdf")
-        except Exception as exc:
-            return jsonify({"error": f"failed to render corrected pdf: {exc}", "job_id": job_id, "run_id": run_id}), 500
+    except Exception as exc:
+        reason = "pdf_render_failed"
+        error_txt = _safe_error_text(exc)
+        if "download" in error_txt.lower():
+            reason = "pdf_download_failed"
+        trace = {
+            "trace_id": trace_id,
+            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "requested_run_id": int(run_id),
+            "artifact_run_id": int(artifact_run_id),
+            "state_version_before": state_version_before,
+            "edits_requested_count": edits_requested_count,
+            "applied_count": len(applied),
+            "rejected_count": len(rejected),
+            "rejected_reason_counts": _rejected_reason_counts(rejected),
+            "updated_system_ids_count": 0,
+            "labels_redrawn_count": 0,
+            "duration_ms": int((time.time() - started) * 1000),
+            "redraw_duration_ms": redraw_ms,
+            "result": "render_error",
+            "reason": reason,
+            "error_detail": error_txt,
+        }
+        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=render_pdf "
+            f"reason={reason} detail={error_txt}"
+        )
+        return (
+            jsonify(
+                {
+                    "error": f"failed to render corrected pdf: {exc}",
+                    "job_id": job_id,
+                    "run_id": run_id,
+                    "trace_id": trace_id,
+                    "debug_result": "render_error",
+                }
+            ),
+            500,
+        )
 
     editable_state["systems"] = systems
     qa = editable_state.get("qa")
@@ -702,6 +1056,7 @@ def relabel_job(job_id: str):
         editable_state["qa"] = qa
     qa["total_systems"] = len(systems)
     state_version_after = _editable_state_version(editable_state)
+
     before_values = {}
     for row in baseline_systems:
         if isinstance(row, dict):
@@ -729,15 +1084,52 @@ def relabel_job(job_id: str):
     mapping_summary["editable_state"] = editable_state
     mapping_summary["relabel"] = relabel_info
 
-    try:
-        _upload_json_to_gcs(mapping_summary, mapping_uri)
-    except Exception as exc:
-        return jsonify({"error": f"failed to upload mapping_summary: {exc}", "job_id": job_id, "run_id": run_id}), 500
+    trace = {
+        "trace_id": trace_id,
+        "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+        "job_id": job_id,
+        "requested_run_id": int(run_id),
+        "artifact_run_id": int(artifact_run_id),
+        "state_version_before": state_version_before,
+        "state_version_after": state_version_after,
+        "edits_requested_count": edits_requested_count,
+        "applied_count": len(applied),
+        "rejected_count": len(rejected),
+        "rejected_reason_counts": _rejected_reason_counts(rejected),
+        "updated_system_ids_count": len(updated_system_ids),
+        "labels_redrawn_count": labels_drawn,
+        "duration_ms": relabel_info["duration_ms"],
+        "redraw_duration_ms": relabel_info["redraw_duration_ms"],
+        "result": "success",
+    }
+    if len(rejected) > 0:
+        trace["reason"] = "invalid_payload"
+
+    if not _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id):
+        return (
+            jsonify(
+                {
+                    "error": "failed to upload mapping_summary",
+                    "job_id": job_id,
+                    "run_id": run_id,
+                    "trace_id": trace_id,
+                    "debug_result": "upload_error",
+                }
+            ),
+            500,
+        )
+
+    print(
+        f"RELABEL_TRACE_RESULT trace_id={trace_id} result={trace['result']} "
+        f"applied={len(applied)} rejected={len(rejected)} duration_ms={relabel_info['duration_ms']}"
+    )
 
     response = {
         "job_id": job_id,
         "run_id": int(run_id),
         "status": "succeeded",
+        "trace_id": trace_id,
+        "debug_result": str(trace.get("result") or "success"),
         "artifacts": _artifact_uris_for_run(int(run_id)),
         "relabel": {
             "applied_edits": applied,

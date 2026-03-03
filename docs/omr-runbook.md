@@ -154,6 +154,57 @@ This endpoint:
 
 It does not rerun Audiveris or GitHub Actions.
 
+## Relabel debug traces
+
+Relabel now writes structured traces into:
+
+- `gs://music-omr-bucket-777135743132/output/artifacts/mapping_summary.json`
+- path: `relabel_debug`
+
+Fields:
+
+- `relabel_debug.version` (`relabel_debug_v1`)
+- `relabel_debug.history_max` (default `50`)
+- `relabel_debug.history` (latest traces only)
+- `relabel_debug.last_trace`
+- `relabel_debug.reason_counts`
+
+Each relabel response includes:
+
+- `trace_id`
+- `debug_result`
+
+Each `/state` response includes:
+
+- `relabel_debug_summary` (`history_count`, `history_max`, `last_result`, `last_trace_id`, `reason_counts`)
+
+Common reason codes:
+
+- `stale_run_mismatch`
+- `editable_state_missing`
+- `invalid_payload`
+- `unknown_system_id`
+- `invalid_value`
+- `value_out_of_range`
+- `pdf_download_failed`
+- `pdf_render_failed`
+- `mapping_upload_failed`
+- `state_load_failed`
+- `internal_error`
+
+Quick troubleshooting flow:
+
+1. Find `trace_id` from relabel API response.
+2. Grep worker logs for `RELABEL_TRACE_* trace_id=<id>`.
+3. Check `relabel_debug.last_trace` and `relabel_debug.reason_counts` in `mapping_summary.json`.
+4. If reason is `stale_run_mismatch`, rerun baseline first, then relabel again.
+
+Worker logs include grep-friendly lines:
+
+- `RELABEL_TRACE_START ...`
+- `RELABEL_TRACE_RESULT ...`
+- `RELABEL_TRACE_ERROR ...`
+
 ## Fast relabel smoke test
 
 Use the helper script:

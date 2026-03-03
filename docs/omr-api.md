@@ -86,6 +86,8 @@ Response (200):
   "job_id": "uuid or run_id",
   "run_id": 22209738954,
   "status": "succeeded",
+  "trace_id": "a1b2c3d4e5f6",
+  "debug_result": "success",
   "artifacts": {
     "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
     "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
@@ -105,6 +107,25 @@ Response (200):
   }
 }
 ```
+
+Error responses from relabel are additive and include:
+
+- `trace_id`
+- `debug_result` (`validation_error|stale_conflict|render_error|upload_error|internal_error`)
+
+Debug taxonomy codes are tracked in `mapping_summary.json.relabel_debug.reason_counts`, including:
+
+- `stale_run_mismatch`
+- `editable_state_missing`
+- `invalid_payload`
+- `unknown_system_id`
+- `invalid_value`
+- `value_out_of_range`
+- `pdf_download_failed`
+- `pdf_render_failed`
+- `mapping_upload_failed`
+- `state_load_failed`
+- `internal_error`
 
 ### `GET /api/omr/jobs/{job_id}/state`
 
@@ -137,6 +158,16 @@ Response (200):
       }
     ]
   },
+  "relabel_debug_summary": {
+    "history_count": 12,
+    "history_max": 50,
+    "last_result": "success",
+    "last_trace_id": "a1b2c3d4e5f6",
+    "reason_counts": {
+      "invalid_payload": 2,
+      "unknown_system_id": 1
+    }
+  },
   "artifacts": {
     "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
     "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
@@ -162,6 +193,7 @@ Optional:
 - `RUN_DISCOVERY_POLL_SEC` (default: `2`)
 - `RELABEL_MIN_VALUE` (default: `0`)
 - `RELABEL_MAX_VALUE` (default: `1000000`)
+- `RELABEL_DEBUG_HISTORY_MAX` (default: `50`)
 
 ## Notes
 
@@ -169,6 +201,7 @@ Optional:
 - Frontend should never call GitHub APIs directly.
 - Storage mode is currently single-latest: each new run overwrites prior output at `OUTPUT_PREFIX`.
 - `mapping_summary.json` now includes `editable_state` (system-level clickable anchors + current values) for frontend interaction.
+- `mapping_summary.json` also includes `relabel_debug` with latest trace history and aggregated reason counts.
 - When a different run has already overwritten single-latest artifacts, `/state` and `/relabel` return `409` with requested/artifact run IDs.
 
 ## Smoke Test Script
