@@ -10,14 +10,8 @@ Framework note:
 
 It is intended for website/app integration. The frontend calls your backend API, and the backend dispatches GitHub Actions.
 
-## Authentication and CORS
+## CORS
 
-- Header required for all `/api/omr/*` routes:
-  - `X-Invite-Code: <INVITE_CODE>`
-- If the invite code is missing/invalid:
-  - `401 {"error":"invalid invite code"}`
-- If server is missing `INVITE_CODE`:
-  - `500 {"error":"server not configured: INVITE_CODE missing"}`
 - CORS allowlist comes from:
   - `CORS_ALLOW_ORIGINS` (comma-separated)
 - Preflight `OPTIONS` is supported for `/api/omr/*`.
@@ -251,7 +245,6 @@ Response (200):
 - `GITHUB_WORKFLOW_ID` (default: `audiveris.yml`)
 - `GITHUB_REF` (default: `main`)
 - `OUTPUT_PREFIX` (default: `gs://music-omr-bucket-777135743132/output`)
-- `INVITE_CODE`: shared invite code required by `X-Invite-Code`.
 - Google Cloud ADC credentials (service account/workload identity) with read/write access to storage prefixes.
 
 Optional:

@@ -87,7 +87,7 @@ def _apply_cors_headers(resp, origin: str | None):
     resp.headers["Access-Control-Allow-Origin"] = allow_origin
     resp.headers["Access-Control-Allow-Credentials"] = "true"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type,X-Invite-Code"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     vary = str(resp.headers.get("Vary") or "").strip()
     if vary:
         if "Origin" not in [v.strip() for v in vary.split(",")]:

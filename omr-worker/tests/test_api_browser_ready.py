@@ -130,7 +130,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(getattr(resp, "status_code", 0), 204)
         self.assertEqual(getattr(resp, "headers", {}).get("Access-Control-Allow-Origin"), "http://localhost:5173")
 
-    def test_non_options_requests_pass_without_invite_code(self):
+    def test_non_options_requests_pass_without_auth_header(self):
         WORKER.request = SimpleNamespace(
             path="/api/omr/jobs",
             method="POST",

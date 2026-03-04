@@ -67,8 +67,6 @@ The backend service in `/Users/andrew/Desktop/music-omr/omr-worker/worker.py` is
 
 For frontend/browser usage:
 
-- All `/api/omr/*` requests require header:
-  - `X-Invite-Code: <INVITE_CODE>`
 - CORS allowlist is controlled by:
   - `CORS_ALLOW_ORIGINS` (comma-separated)
 - Browser upload endpoint:
@@ -160,18 +158,14 @@ Also share these storage lines from Step 18:
 
 Common browser/API failures:
 
-1. `401 invalid invite code`
-- Check `X-Invite-Code` header from frontend.
-- Check backend `INVITE_CODE` env var.
-
-2. CORS blocked in browser
+1. CORS blocked in browser
 - Check request origin exactly matches an entry in `CORS_ALLOW_ORIGINS`.
 - Confirm preflight `OPTIONS` is reaching backend.
 
-3. `413 file too large` on upload
+2. `413 file too large` on upload
 - Increase `MAX_UPLOAD_MB` or use smaller input file.
 
-4. Missing PDF link in frontend (`artifacts_http` empty)
+3. Missing PDF link in frontend (`artifacts_http` empty)
 - File may not exist yet, or signed URL generation failed.
 - Retry status/state API call after run completion.
 
