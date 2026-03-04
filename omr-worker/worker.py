@@ -97,16 +97,6 @@ def _apply_cors_headers(resp, origin: str | None):
     return resp
 
 
-def _check_invite_code() -> tuple[bool, int, str]:
-    expected = str(os.environ.get("INVITE_CODE") or "").strip()
-    if not expected:
-        return False, 500, "server not configured: INVITE_CODE missing"
-    supplied = str(request.headers.get("X-Invite-Code") or "").strip()
-    if supplied != expected:
-        return False, 401, "invalid invite code"
-    return True, 200, ""
-
-
 @app.before_request
 def _api_before_request():
     if not _api_path():
@@ -115,10 +105,6 @@ def _api_before_request():
     origin = request.headers.get("Origin")
     if request.method == "OPTIONS":
         return _apply_cors_headers(app.make_response(("", 204)), origin)
-
-    ok, status, msg = _check_invite_code()
-    if not ok:
-        return jsonify({"error": msg}), status
     return None
 
 

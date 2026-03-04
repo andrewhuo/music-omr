@@ -112,7 +112,6 @@ class _FakeUploadFile:
 
 class BrowserReadyApiTests(unittest.TestCase):
     def setUp(self):
-        os.environ["INVITE_CODE"] = "invite-123"
         os.environ["CORS_ALLOW_ORIGINS"] = "http://localhost:5173"
         WORKER.request = SimpleNamespace(path="", method="GET", headers={}, files={}, json={})
 
@@ -131,7 +130,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(getattr(resp, "status_code", 0), 204)
         self.assertEqual(getattr(resp, "headers", {}).get("Access-Control-Allow-Origin"), "http://localhost:5173")
 
-    def test_invite_code_missing_or_invalid(self):
+    def test_non_options_requests_pass_without_invite_code(self):
         WORKER.request = SimpleNamespace(
             path="/api/omr/jobs",
             method="POST",
@@ -139,20 +138,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             files={},
             json={},
         )
-        body, status = _unpack(WORKER._api_before_request())
-        self.assertEqual(status, 401)
-        self.assertEqual(body.get("error"), "invalid invite code")
-
-        WORKER.request = SimpleNamespace(
-            path="/api/omr/jobs",
-            method="POST",
-            headers={"X-Invite-Code": "wrong"},
-            files={},
-            json={},
-        )
-        body, status = _unpack(WORKER._api_before_request())
-        self.assertEqual(status, 401)
-        self.assertEqual(body.get("error"), "invalid invite code")
+        self.assertIsNone(WORKER._api_before_request())
 
     def test_signed_url_fallback_returns_empty(self):
         class _FakeBlob:
