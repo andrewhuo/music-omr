@@ -24,12 +24,16 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "music-omr")
 GITHUB_WORKFLOW_ID = os.environ.get("GITHUB_WORKFLOW_ID", "audiveris.yml")
 GITHUB_REF = os.environ.get("GITHUB_REF", "main")
 OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "gs://music-omr-bucket-777135743132/output")
+INPUT_UPLOAD_PREFIX = os.environ.get("INPUT_UPLOAD_PREFIX", "gs://music-omr-bucket-777135743132/input/user-input")
 RUN_DISCOVERY_TIMEOUT_SEC = int(os.environ.get("RUN_DISCOVERY_TIMEOUT_SEC", "20"))
 RUN_DISCOVERY_POLL_SEC = float(os.environ.get("RUN_DISCOVERY_POLL_SEC", "2"))
 RELABEL_MAX_VALUE = int(os.environ.get("RELABEL_MAX_VALUE", "1000000"))
 RELABEL_MIN_VALUE = int(os.environ.get("RELABEL_MIN_VALUE", "0"))
+ARTIFACT_SIGNED_URL_TTL_SEC = int(os.environ.get("ARTIFACT_SIGNED_URL_TTL_SEC", "1800"))
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "25"))
 RELABEL_DEBUG_HISTORY_MAX = int(os.environ.get("RELABEL_DEBUG_HISTORY_MAX", "50"))
 RELABEL_DEBUG_VERSION = "relabel_debug_v1"
+CORS_ALLOW_ORIGINS_DEFAULT = "http://localhost:5173,http://localhost:3000"
 
 MEASURE_TEXT_COLOR = (0, 0, 0)
 MEASURE_TEXT_SIZE = 10.0
@@ -57,6 +61,72 @@ class StaleArtifactsError(RuntimeError):
         )
         self.requested_run_id = int(requested_run_id)
         self.artifact_run_id = int(artifact_run_id)
+
+
+def _api_path(path: str | None = None) -> bool:
+    txt = str(path or request.path or "").strip()
+    return txt.startswith("/api/omr/")
+
+
+def _allowed_origins() -> set[str]:
+    raw = os.environ.get("CORS_ALLOW_ORIGINS", CORS_ALLOW_ORIGINS_DEFAULT)
+    return {entry.strip() for entry in str(raw or "").split(",") if entry.strip()}
+
+
+def _origin_allowed(origin: str | None) -> bool:
+    txt = str(origin or "").strip()
+    if not txt:
+        return False
+    return txt in _allowed_origins()
+
+
+def _apply_cors_headers(resp, origin: str | None):
+    if not _origin_allowed(origin):
+        return resp
+    allow_origin = str(origin).strip()
+    resp.headers["Access-Control-Allow-Origin"] = allow_origin
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type,X-Invite-Code"
+    vary = str(resp.headers.get("Vary") or "").strip()
+    if vary:
+        if "Origin" not in [v.strip() for v in vary.split(",")]:
+            resp.headers["Vary"] = f"{vary}, Origin"
+    else:
+        resp.headers["Vary"] = "Origin"
+    return resp
+
+
+def _check_invite_code() -> tuple[bool, int, str]:
+    expected = str(os.environ.get("INVITE_CODE") or "").strip()
+    if not expected:
+        return False, 500, "server not configured: INVITE_CODE missing"
+    supplied = str(request.headers.get("X-Invite-Code") or "").strip()
+    if supplied != expected:
+        return False, 401, "invalid invite code"
+    return True, 200, ""
+
+
+@app.before_request
+def _api_before_request():
+    if not _api_path():
+        return None
+
+    origin = request.headers.get("Origin")
+    if request.method == "OPTIONS":
+        return _apply_cors_headers(app.make_response(("", 204)), origin)
+
+    ok, status, msg = _check_invite_code()
+    if not ok:
+        return jsonify({"error": msg}), status
+    return None
+
+
+@app.after_request
+def _api_after_request(resp):
+    if _api_path():
+        _apply_cors_headers(resp, request.headers.get("Origin"))
+    return resp
 
 
 def _utc_now() -> datetime:
@@ -190,6 +260,37 @@ def _artifact_uris_for_run(run_id: int) -> dict[str, str]:
     }
 
 
+def _gs_uri_to_bucket_blob(uri: str) -> tuple[str, str]:
+    return _parse_gs_uri(uri)
+
+
+def _signed_http_url_for_gs(uri: str) -> str:
+    try:
+        bucket_name, blob_name = _gs_uri_to_bucket_blob(uri)
+        bucket = _gcs_client().bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            return ""
+        ttl_sec = max(60, _safe_int(os.environ.get("ARTIFACT_SIGNED_URL_TTL_SEC"), ARTIFACT_SIGNED_URL_TTL_SEC))
+        return str(
+            blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(seconds=ttl_sec),
+                method="GET",
+            )
+        )
+    except Exception as exc:
+        print(f"SIGNED_URL_WARN uri={uri} detail={_safe_error_text(exc)}")
+        return ""
+
+
+def _artifact_http_uris_for_run(run_id: int) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in _artifact_uris_for_run(run_id).items():
+        out[key] = _signed_http_url_for_gs(value)
+    return out
+
+
 def _gcs_client() -> storage.Client:
     global _GCS_CLIENT
     if _GCS_CLIENT is None:
@@ -242,6 +343,10 @@ def _upload_json_to_gcs(data: dict, dest_uri: str) -> None:
         json.dumps(data, indent=2, sort_keys=True) + "\n",
         content_type="application/json",
     )
+
+
+def _max_upload_bytes() -> int:
+    return max(1, _safe_int(os.environ.get("MAX_UPLOAD_MB"), MAX_UPLOAD_MB)) * 1024 * 1024
 
 
 def _resolve_run_id_from_job_id(job_id: str) -> tuple[int | None, dict | None, str | None]:
@@ -605,6 +710,64 @@ def process_stub():
     ), 200
 
 
+@app.route("/api/omr/uploads", methods=["POST"])
+def upload_pdf():
+    file_obj = request.files.get("file")
+    if file_obj is None:
+        return jsonify({"error": "file is required"}), 400
+
+    filename = str(file_obj.filename or "").strip()
+    content_type = str(file_obj.mimetype or file_obj.content_type or "").strip().lower()
+    looks_pdf = filename.lower().endswith(".pdf") or content_type in ("application/pdf", "application/x-pdf")
+    if not looks_pdf:
+        return jsonify({"error": "file must be a PDF"}), 400
+
+    try:
+        raw = file_obj.read()
+    except Exception as exc:
+        return jsonify({"error": f"failed to read upload: {_safe_error_text(exc)}"}), 400
+
+    if not raw:
+        return jsonify({"error": "empty file"}), 400
+
+    max_bytes = _max_upload_bytes()
+    if len(raw) > max_bytes:
+        return (
+            jsonify(
+                {
+                    "error": "file too large",
+                    "max_upload_mb": max(1, _safe_int(os.environ.get("MAX_UPLOAD_MB"), MAX_UPLOAD_MB)),
+                    "size_bytes": len(raw),
+                }
+            ),
+            413,
+        )
+
+    upload_id = uuid.uuid4().hex[:16]
+    upload_prefix = str(os.environ.get("INPUT_UPLOAD_PREFIX") or INPUT_UPLOAD_PREFIX).rstrip("/")
+    pdf_gcs_uri = f"{upload_prefix}/{upload_id}.pdf"
+
+    with TemporaryDirectory(prefix="omr-upload-") as tmp:
+        tmp_pdf = Path(tmp) / f"{upload_id}.pdf"
+        tmp_pdf.write_bytes(raw)
+        try:
+            _upload_file_to_gcs(tmp_pdf, pdf_gcs_uri, content_type="application/pdf")
+        except Exception as exc:
+            return jsonify({"error": f"failed to upload pdf: {_safe_error_text(exc)}"}), 500
+
+    return (
+        jsonify(
+            {
+                "upload_id": upload_id,
+                "pdf_gcs_uri": pdf_gcs_uri,
+                "size_bytes": len(raw),
+                "content_type": "application/pdf",
+            }
+        ),
+        201,
+    )
+
+
 @app.route("/api/omr/jobs", methods=["POST"])
 def create_job():
     data = request.json or {}
@@ -645,6 +808,7 @@ def create_job():
     if run_id is not None:
         response["run_url"] = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{run_id}"
         response["artifacts"] = _artifact_uris_for_run(int(run_id))
+        response["artifacts_http"] = _artifact_http_uris_for_run(int(run_id))
 
     return jsonify(response), 202
 
@@ -690,6 +854,7 @@ def get_job(job_id: str):
         "updated_at": run.get("updated_at"),
         "run_url": run.get("html_url") or f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{run_id}",
         "artifacts": _artifact_uris_for_run(int(run_id)),
+        "artifacts_http": _artifact_http_uris_for_run(int(run_id)),
     }
     return jsonify(response), 200
 
@@ -739,6 +904,7 @@ def get_job_state(job_id: str):
         },
         "relabel_debug_summary": _summarize_relabel_debug(mapping_summary),
         "artifacts": artifacts,
+        "artifacts_http": _artifact_http_uris_for_run(int(run_id)),
     }
     return jsonify(response), 200
 
@@ -1131,6 +1297,7 @@ def relabel_job(job_id: str):
         "trace_id": trace_id,
         "debug_result": str(trace.get("result") or "success"),
         "artifacts": _artifact_uris_for_run(int(run_id)),
+        "artifacts_http": _artifact_http_uris_for_run(int(run_id)),
         "relabel": {
             "applied_edits": applied,
             "rejected_edits": rejected,

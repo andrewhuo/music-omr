@@ -61,6 +61,24 @@ Keep a stable regression pack in `test-input/` with fixed filenames:
 
 Treat these as canonical test fixtures; avoid replacing them casually.
 
+## Backend browser mode (Flask API)
+
+The backend service in `/Users/andrew/Desktop/music-omr/omr-worker/worker.py` is Flask.
+
+For frontend/browser usage:
+
+- All `/api/omr/*` requests require header:
+  - `X-Invite-Code: <INVITE_CODE>`
+- CORS allowlist is controlled by:
+  - `CORS_ALLOW_ORIGINS` (comma-separated)
+- Browser upload endpoint:
+  - `POST /api/omr/uploads` (multipart `file`)
+- API responses include:
+  - `artifacts` (`gs://...`)
+  - `artifacts_http` (signed HTTPS URLs, best-effort)
+
+If a signed URL cannot be generated, that field may be empty (`""`) while the API call still succeeds.
+
 ## Log modes
 
 Default mode is quiet production logging.
@@ -137,6 +155,25 @@ Also share these storage lines from Step 18:
 - `uploaded_audiveris_out=...`
 - `uploaded_artifact_run_info=...`
 - `uploaded_artifact_mapping_summary=...`
+
+## Frontend/API troubleshooting
+
+Common browser/API failures:
+
+1. `401 invalid invite code`
+- Check `X-Invite-Code` header from frontend.
+- Check backend `INVITE_CODE` env var.
+
+2. CORS blocked in browser
+- Check request origin exactly matches an entry in `CORS_ALLOW_ORIGINS`.
+- Confirm preflight `OPTIONS` is reaching backend.
+
+3. `413 file too large` on upload
+- Increase `MAX_UPLOAD_MB` or use smaller input file.
+
+4. Missing PDF link in frontend (`artifacts_http` empty)
+- File may not exist yet, or signed URL generation failed.
+- Retry status/state API call after run completion.
 
 ## Fast relabel flow (no full OMR rerun)
 

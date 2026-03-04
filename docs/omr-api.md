@@ -4,9 +4,51 @@ This API is implemented in:
 
 - `/Users/andrew/Desktop/music-omr/omr-worker/worker.py`
 
+Framework note:
+
+- This backend is **Flask**, not FastAPI.
+
 It is intended for website/app integration. The frontend calls your backend API, and the backend dispatches GitHub Actions.
 
+## Authentication and CORS
+
+- Header required for all `/api/omr/*` routes:
+  - `X-Invite-Code: <INVITE_CODE>`
+- If the invite code is missing/invalid:
+  - `401 {"error":"invalid invite code"}`
+- If server is missing `INVITE_CODE`:
+  - `500 {"error":"server not configured: INVITE_CODE missing"}`
+- CORS allowlist comes from:
+  - `CORS_ALLOW_ORIGINS` (comma-separated)
+- Preflight `OPTIONS` is supported for `/api/omr/*`.
+
 ## Endpoints
+
+### `POST /api/omr/uploads`
+
+Upload a PDF from browser/frontend (multipart form).
+
+Request:
+
+- `Content-Type: multipart/form-data`
+- form field name: `file`
+
+Response (201):
+
+```json
+{
+  "upload_id": "91fa67040ce4495b",
+  "pdf_gcs_uri": "gs://music-omr-bucket-777135743132/input/user-input/91fa67040ce4495b.pdf",
+  "size_bytes": 142839,
+  "content_type": "application/pdf"
+}
+```
+
+Errors:
+
+- `400` missing file / invalid type / empty file
+- `413` file too large
+- `500` upload failure
 
 ### `POST /api/omr/jobs`
 
@@ -35,6 +77,12 @@ Response (202):
     "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
     "run_info": "gs://.../output/artifacts/run_info.json",
     "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+  },
+  "artifacts_http": {
+    "audiveris_out_pdf": "https://storage.googleapis.com/...",
+    "audiveris_out_corrected_pdf": "",
+    "run_info": "https://storage.googleapis.com/...",
+    "mapping_summary": "https://storage.googleapis.com/..."
   }
 }
 ```
@@ -61,6 +109,12 @@ Response (200):
     "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
     "run_info": "gs://.../output/artifacts/run_info.json",
     "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+  },
+  "artifacts_http": {
+    "audiveris_out_pdf": "https://storage.googleapis.com/...",
+    "audiveris_out_corrected_pdf": "",
+    "run_info": "https://storage.googleapis.com/...",
+    "mapping_summary": "https://storage.googleapis.com/..."
   }
 }
 ```
@@ -93,6 +147,12 @@ Response (200):
     "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
     "run_info": "gs://.../output/artifacts/run_info.json",
     "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+  },
+  "artifacts_http": {
+    "audiveris_out_pdf": "https://storage.googleapis.com/...",
+    "audiveris_out_corrected_pdf": "https://storage.googleapis.com/...",
+    "run_info": "https://storage.googleapis.com/...",
+    "mapping_summary": "https://storage.googleapis.com/..."
   },
   "relabel": {
     "applied_edits": [{ "type": "set_system_start", "system_id": "p4_s2", "value": 230 }],
@@ -173,6 +233,12 @@ Response (200):
     "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
     "run_info": "gs://.../output/artifacts/run_info.json",
     "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+  },
+  "artifacts_http": {
+    "audiveris_out_pdf": "https://storage.googleapis.com/...",
+    "audiveris_out_corrected_pdf": "https://storage.googleapis.com/...",
+    "run_info": "https://storage.googleapis.com/...",
+    "mapping_summary": "https://storage.googleapis.com/..."
   }
 }
 ```
@@ -185,10 +251,15 @@ Response (200):
 - `GITHUB_WORKFLOW_ID` (default: `audiveris.yml`)
 - `GITHUB_REF` (default: `main`)
 - `OUTPUT_PREFIX` (default: `gs://music-omr-bucket-777135743132/output`)
-- Google Cloud ADC credentials (service account/workload identity) with read/write access to `OUTPUT_PREFIX`
+- `INVITE_CODE`: shared invite code required by `X-Invite-Code`.
+- Google Cloud ADC credentials (service account/workload identity) with read/write access to storage prefixes.
 
 Optional:
 
+- `CORS_ALLOW_ORIGINS` (default: `http://localhost:5173,http://localhost:3000`)
+- `ARTIFACT_SIGNED_URL_TTL_SEC` (default: `1800`)
+- `INPUT_UPLOAD_PREFIX` (default: `gs://music-omr-bucket-777135743132/input/user-input`)
+- `MAX_UPLOAD_MB` (default: `25`)
 - `RUN_DISCOVERY_TIMEOUT_SEC` (default: `20`)
 - `RUN_DISCOVERY_POLL_SEC` (default: `2`)
 - `RELABEL_MIN_VALUE` (default: `0`)
@@ -200,9 +271,9 @@ Optional:
 - `workflow_dispatch` does not return `run_id` directly. The backend performs a short discovery poll to find the newly created run.
 - Frontend should never call GitHub APIs directly.
 - Storage mode is currently single-latest: each new run overwrites prior output at `OUTPUT_PREFIX`.
-- `mapping_summary.json` now includes `editable_state` (system-level clickable anchors + current values) for frontend interaction.
-- `mapping_summary.json` also includes `relabel_debug` with latest trace history and aggregated reason counts.
-- When a different run has already overwritten single-latest artifacts, `/state` and `/relabel` return `409` with requested/artifact run IDs.
+- `mapping_summary.json` includes `editable_state` and `relabel_debug`.
+- When a different run overwrote single-latest artifacts, `/state` and `/relabel` return `409` with requested/artifact run IDs.
+- Signed URL fields in `artifacts_http` are best-effort. If a file does not exist or signing fails, that field may be an empty string.
 
 ## Smoke Test Script
 

@@ -41,6 +41,27 @@ def _load_worker_module():
 
                 return _decorator
 
+            def before_request(self, fn=None, *_args, **_kwargs):
+                if callable(fn):
+                    return fn
+
+                def _decorator(inner):
+                    return inner
+
+                return _decorator
+
+            def after_request(self, fn=None, *_args, **_kwargs):
+                if callable(fn):
+                    return fn
+
+                def _decorator(inner):
+                    return inner
+
+                return _decorator
+
+            def make_response(self, payload):
+                return payload
+
             def run(self, *args, **kwargs):
                 return None
 
