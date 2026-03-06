@@ -77,6 +77,49 @@ For frontend/browser usage:
 
 If a signed URL cannot be generated, that field may be empty (`""`) while the API call still succeeds.
 
+## Cloud Run deploy contract (omr-trigger)
+
+Deploy `omr-trigger` with immutable image tags (do not use `:latest`) and explicit runtime env vars.
+
+Recommended env vars:
+
+- `CORS_ALLOW_ORIGINS=http://localhost:5173,https://measure-marker.created.app`
+- `ARTIFACT_SIGNED_URL_TTL_SEC=1800`
+- `MAX_UPLOAD_MB=25`
+- `INPUT_UPLOAD_PREFIX=gs://music-omr-bucket-777135743132/input/user-input`
+
+Remove stale vars if present:
+
+- `INVITE_CODE`
+- `UPLOAD_GCS_PREFIX`
+
+Notes:
+
+- `omr-worker` Cloud Run image is now Flask API only (no local Audiveris install).
+- Audiveris execution remains in GitHub Actions workflow, not in Cloud Run API service.
+
+### Deploy snippet (immutable image)
+
+```bash
+set -euo pipefail
+PROJECT="music-omr-backend"
+REGION="us-central1"
+SERVICE="omr-trigger"
+REPO="us-central1-docker.pkg.dev/${PROJECT}/omr-trigger-service/trigger"
+SHA="$(git rev-parse --short HEAD)"
+TS="$(date +%Y%m%d-%H%M%S)"
+IMAGE="${REPO}:${SHA}-${TS}"
+
+gcloud builds submit ./omr-worker --tag "${IMAGE}" --project "${PROJECT}" --region "${REGION}"
+gcloud run deploy "${SERVICE}" \
+  --image "${IMAGE}" \
+  --project "${PROJECT}" \
+  --region "${REGION}" \
+  --allow-unauthenticated \
+  --set-env-vars "CORS_ALLOW_ORIGINS=http://localhost:5173,https://measure-marker.created.app,ARTIFACT_SIGNED_URL_TTL_SEC=1800,MAX_UPLOAD_MB=25,INPUT_UPLOAD_PREFIX=gs://music-omr-bucket-777135743132/input/user-input" \
+  --remove-env-vars "INVITE_CODE,UPLOAD_GCS_PREFIX"
+```
+
 ## Log modes
 
 Default mode is quiet production logging.
@@ -168,6 +211,26 @@ Common browser/API failures:
 3. Missing PDF link in frontend (`artifacts_http` empty)
 - File may not exist yet, or signed URL generation failed.
 - Retry status/state API call after run completion.
+
+## Anything handoff (copy/paste)
+
+Use backend:
+
+- `https://omr-trigger-777135743132.us-central1.run.app`
+
+Use flow:
+
+1. `POST /api/omr/uploads`
+2. `POST /api/omr/jobs`
+3. Poll `GET /api/omr/jobs/{job_id}` until `succeeded`
+4. `GET /api/omr/jobs/{job_id}/state`
+5. `POST /api/omr/jobs/{job_id}/relabel`
+
+Rules:
+
+- No invite/auth header required.
+- Use `artifacts_http` URLs for browser preview/download.
+- Handle `409` stale mismatch by starting a new job.
 
 ## Fast relabel flow (no full OMR rerun)
 

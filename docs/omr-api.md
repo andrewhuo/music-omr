@@ -263,10 +263,31 @@ Optional:
 
 - `workflow_dispatch` does not return `run_id` directly. The backend performs a short discovery poll to find the newly created run.
 - Frontend should never call GitHub APIs directly.
+- Cloud Run API image is Flask-only. It does not install or run Audiveris locally.
 - Storage mode is currently single-latest: each new run overwrites prior output at `OUTPUT_PREFIX`.
 - `mapping_summary.json` includes `editable_state` and `relabel_debug`.
 - When a different run overwrote single-latest artifacts, `/state` and `/relabel` return `409` with requested/artifact run IDs.
 - Signed URL fields in `artifacts_http` are best-effort. If a file does not exist or signing fails, that field may be an empty string.
+
+## Anything handoff (copy/paste)
+
+Backend URL:
+
+- `https://omr-trigger-777135743132.us-central1.run.app`
+
+Browser flow:
+
+1. `POST /api/omr/uploads`
+2. `POST /api/omr/jobs`
+3. Poll `GET /api/omr/jobs/{job_id}`
+4. `GET /api/omr/jobs/{job_id}/state`
+5. `POST /api/omr/jobs/{job_id}/relabel`
+
+Frontend rules:
+
+- Do not send invite/auth header.
+- Use `artifacts_http` for browser links.
+- Handle `409` stale mismatch by starting a new job.
 
 ## Smoke Test Script
 
