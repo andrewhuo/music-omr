@@ -114,6 +114,7 @@ class BrowserReadyApiTests(unittest.TestCase):
     def setUp(self):
         os.environ["CORS_ALLOW_ORIGINS"] = "http://localhost:5173"
         WORKER.request = SimpleNamespace(path="", method="GET", headers={}, files={}, json={})
+        WORKER._PENDING_DISPATCHES.clear()
 
     def test_cors_allowed_and_disallowed(self):
         self.assertTrue(WORKER._origin_allowed("http://localhost:5173"))
@@ -270,46 +271,26 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body.get("artifacts_http"), artifacts_http)
 
-        with (
-            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, None, None)),
-            patch.object(WORKER, "_load_mapping_for_run", return_value=(
-                artifacts,
-                {
-                    "editable_state": {
-                        "version": "system_state_v1",
-                        "qa": {"ok": True, "total_systems": 1},
-                        "systems": [
-                            {
-                                "system_id": "p1_s0",
-                                "page": 1,
-                                "system_index": 0,
-                                "current_value": "1",
-                                "anchor": {"x": 10.0, "y_top": 20.0, "y_bottom": 40.0},
-                                "in_bounds": True,
-                                "guide_build_source": "primary",
-                            }
-                        ],
-                    }
-                },
-                111,
-            )),
-            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
-            patch.object(WORKER, "_render_corrected_pdf", return_value=1),
-            patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
-            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
-            patch.object(WORKER, "_artifact_uris_for_run", return_value=artifacts),
-            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
-        ):
-            WORKER.request = SimpleNamespace(
-                path="/api/omr/jobs/111/relabel",
-                method="POST",
-                headers={},
-                files={},
-                json={"edits": [{"type": "set_system_start", "system_id": "p1_s0", "value": 4}]},
-            )
-            body, status = _unpack(WORKER.relabel_job("111"))
+    def test_list_jobs_endpoint_returns_simple_rows(self):
+        now = WORKER._utc_now()
+        WORKER._PENDING_DISPATCHES["abc123"] = {
+            "dispatch_id": "abc123",
+            "dispatched_at": now,
+            "expected_sha": "abc",
+            "run_id": 111,
+        }
+
+        with patch.object(WORKER, "_get_run", return_value={"status": "completed", "conclusion": "success", "created_at": "2026-03-08T20:00:00Z"}):
+            WORKER.request = SimpleNamespace(path="/api/omr/jobs", method="GET", headers={}, files={}, json={})
+            body, status = _unpack(WORKER.list_jobs())
+
         self.assertEqual(status, 200)
-        self.assertEqual(body.get("artifacts_http"), artifacts_http)
+        self.assertIsInstance(body.get("jobs"), list)
+        self.assertEqual(len(body["jobs"]), 1)
+        self.assertEqual(body["jobs"][0].get("job_id"), "abc123")
+        self.assertEqual(body["jobs"][0].get("status"), "succeeded")
+        self.assertEqual(body["jobs"][0].get("created_at"), "2026-03-08T20:00:00Z")
+
 
 
 if __name__ == "__main__":

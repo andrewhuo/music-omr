@@ -220,11 +220,12 @@ Use backend:
 
 Use flow:
 
-1. `POST /api/omr/uploads`
-2. `POST /api/omr/jobs`
-3. Poll `GET /api/omr/jobs/{job_id}` until `succeeded`
-4. `GET /api/omr/jobs/{job_id}/state`
-5. `POST /api/omr/jobs/{job_id}/relabel`
+1. `GET /api/omr/jobs` (optional connection check)
+2. `POST /api/omr/uploads`
+3. `POST /api/omr/jobs`
+4. Poll `GET /api/omr/jobs/{job_id}` until `succeeded`
+5. `GET /api/omr/jobs/{job_id}/state`
+6. `POST /api/omr/jobs/{job_id}/relabel`
 
 Rules:
 

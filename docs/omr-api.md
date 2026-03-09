@@ -18,6 +18,29 @@ It is intended for website/app integration. The frontend calls your backend API,
 
 ## Endpoints
 
+### `GET /api/omr/jobs`
+
+Returns a simple list of known jobs (in-memory on this worker instance).
+
+Response (200):
+
+```json
+{
+  "jobs": [
+    {
+      "job_id": "abc123",
+      "status": "succeeded",
+      "created_at": "2026-03-08T20:00:00Z"
+    }
+  ]
+}
+```
+
+Notes:
+
+- May return `{"jobs":[]}` when no jobs are currently tracked by this instance.
+- Intended for lightweight connection checks / basic list UX.
+
 ### `POST /api/omr/uploads`
 
 Upload a PDF from browser/frontend (multipart form).
@@ -277,11 +300,12 @@ Backend URL:
 
 Browser flow:
 
-1. `POST /api/omr/uploads`
-2. `POST /api/omr/jobs`
-3. Poll `GET /api/omr/jobs/{job_id}`
-4. `GET /api/omr/jobs/{job_id}/state`
-5. `POST /api/omr/jobs/{job_id}/relabel`
+1. `GET /api/omr/jobs` (optional connection/list check)
+2. `POST /api/omr/uploads`
+3. `POST /api/omr/jobs`
+4. Poll `GET /api/omr/jobs/{job_id}`
+5. `GET /api/omr/jobs/{job_id}/state`
+6. `POST /api/omr/jobs/{job_id}/relabel`
 
 Frontend rules:
 

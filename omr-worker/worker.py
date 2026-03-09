@@ -119,6 +119,12 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _to_utc_z(raw: datetime | None) -> str:
+    if not isinstance(raw, datetime):
+        raw = _utc_now()
+    return raw.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _parse_gh_datetime(raw: str | None) -> datetime | None:
     if not raw:
         return None
@@ -797,6 +803,37 @@ def create_job():
         response["artifacts_http"] = _artifact_http_uris_for_run(int(run_id))
 
     return jsonify(response), 202
+
+
+@app.route("/api/omr/jobs", methods=["GET"])
+def list_jobs():
+    rows: list[dict] = []
+    items = sorted(
+        [item for item in _PENDING_DISPATCHES.items() if isinstance(item, tuple) and len(item) == 2],
+        key=lambda kv: (kv[1].get("dispatched_at") if isinstance(kv[1], dict) else _utc_now()) or _utc_now(),
+        reverse=True,
+    )
+    for dispatch_id, rec in items:
+        if not isinstance(rec, dict):
+            continue
+        created_at = _to_utc_z(rec.get("dispatched_at"))
+        status = "queued"
+        run_id = rec.get("run_id")
+        if isinstance(run_id, int):
+            try:
+                run = _get_run(int(run_id))
+                status = _run_public_status(run)
+                created_at = str(run.get("created_at") or created_at)
+            except Exception:
+                status = "queued"
+        rows.append(
+            {
+                "job_id": str(dispatch_id),
+                "status": str(status),
+                "created_at": str(created_at),
+            }
+        )
+    return jsonify({"jobs": rows}), 200
 
 
 @app.route("/api/omr/jobs/<job_id>", methods=["GET"])
