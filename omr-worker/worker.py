@@ -12,6 +12,8 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 import fitz  # PyMuPDF
+import google.auth
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
 from flask import Flask, jsonify, request
 
@@ -44,6 +46,7 @@ MEASURE_TEXT_BG_COLOR = (1, 1, 1)
 # In-memory correlation for workflow dispatches that do not return run_id directly.
 _PENDING_DISPATCHES: dict[str, dict] = {}
 _GCS_CLIENT: storage.Client | None = None
+_GOOGLE_CREDENTIALS = None
 
 
 class GitHubAPIError(RuntimeError):
@@ -264,13 +267,33 @@ def _signed_http_url_for_gs(uri: str) -> str:
         if not blob.exists():
             return ""
         ttl_sec = max(60, _safe_int(os.environ.get("ARTIFACT_SIGNED_URL_TTL_SEC"), ARTIFACT_SIGNED_URL_TTL_SEC))
-        return str(
-            blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(seconds=ttl_sec),
-                method="GET",
+        expiry = timedelta(seconds=ttl_sec)
+        try:
+            return str(
+                blob.generate_signed_url(
+                    version="v4",
+                    expiration=expiry,
+                    method="GET",
+                )
             )
-        )
+        except Exception as exc:
+            # Cloud Run default credentials are token-only; retry with IAM signBlob flow.
+            detail = _safe_error_text(exc).lower()
+            if ("private key" not in detail) and ("sign credentials" not in detail):
+                raise
+            access_token = _runtime_access_token()
+            service_account_email = _runtime_service_account_email()
+            if not access_token or not service_account_email:
+                raise
+            return str(
+                blob.generate_signed_url(
+                    version="v4",
+                    expiration=expiry,
+                    method="GET",
+                    service_account_email=service_account_email,
+                    access_token=access_token,
+                )
+            )
     except Exception as exc:
         print(f"SIGNED_URL_WARN uri={uri} detail={_safe_error_text(exc)}")
         return ""
@@ -288,6 +311,40 @@ def _gcs_client() -> storage.Client:
     if _GCS_CLIENT is None:
         _GCS_CLIENT = storage.Client()
     return _GCS_CLIENT
+
+
+def _runtime_credentials():
+    global _GOOGLE_CREDENTIALS
+    if _GOOGLE_CREDENTIALS is None:
+        _GOOGLE_CREDENTIALS, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    return _GOOGLE_CREDENTIALS
+
+
+def _runtime_access_token() -> str:
+    creds = _runtime_credentials()
+    try:
+        if not getattr(creds, "valid", False) or getattr(creds, "expired", False) or not getattr(creds, "token", None):
+            creds.refresh(GoogleAuthRequest())
+    except Exception:
+        return ""
+    return str(getattr(creds, "token", "") or "")
+
+
+def _runtime_service_account_email() -> str:
+    creds = _runtime_credentials()
+    email = str(getattr(creds, "service_account_email", "") or "").strip()
+    if email and email.lower() != "default":
+        return email
+    try:
+        req = urlrequest.Request(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        with urlrequest.urlopen(req, timeout=2) as resp:
+            txt = resp.read().decode("utf-8", errors="replace").strip()
+            return txt
+    except Exception:
+        return ""
 
 
 def _parse_gs_uri(uri: str) -> tuple[str, str]:

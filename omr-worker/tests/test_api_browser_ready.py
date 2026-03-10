@@ -19,16 +19,38 @@ def _load_worker_module():
         google = sys.modules.get("google") or types.ModuleType("google")
         cloud = sys.modules.get("google.cloud") or types.ModuleType("google.cloud")
         storage = types.ModuleType("google.cloud.storage")
+        auth = types.ModuleType("google.auth")
+        transport = types.ModuleType("google.auth.transport")
+        requests_mod = types.ModuleType("google.auth.transport.requests")
 
         class _DummyClient:
             pass
 
+        class _DummyCreds:
+            valid = True
+            expired = False
+            token = "token"
+            service_account_email = "service@example.com"
+
+            def refresh(self, _request):
+                self.token = "token"
+
+        class _DummyRequest:
+            pass
+
         storage.Client = _DummyClient
+        auth.default = lambda scopes=None: (_DummyCreds(), None)
+        requests_mod.Request = _DummyRequest
+        transport.requests = requests_mod
         cloud.storage = storage
         google.cloud = cloud
+        google.auth = auth
         sys.modules["google"] = google
         sys.modules["google.cloud"] = cloud
         sys.modules["google.cloud.storage"] = storage
+        sys.modules["google.auth"] = auth
+        sys.modules["google.auth.transport"] = transport
+        sys.modules["google.auth.transport.requests"] = requests_mod
 
     if "flask" not in sys.modules:
         flask = types.ModuleType("flask")
