@@ -4498,9 +4498,8 @@ jobs:
             if grep -q "No URLs matched" /tmp/work/output_cleanup.log; then
               echo "OUTPUT_CLEANUP status=empty_prefix"
             else
-              echo "OUTPUT_CLEANUP status=error"
-              cat /tmp/work/output_cleanup.log
-              exit 1
+              echo "OUTPUT_CLEANUP status=warn"
+              sed -n '1,200p' /tmp/work/output_cleanup.log || true
             fi
           fi
 
