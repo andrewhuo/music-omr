@@ -29,20 +29,17 @@ Base prefix:
 
 - `gs://music-omr-bucket-777135743132/output`
 
-This workflow now uses a single-latest storage contract.  
-Each run clears the output prefix first, then writes only:
+This workflow now writes per-run outputs:
 
-- `gs://music-omr-bucket-777135743132/output/audiveris_out.pdf`
-- `gs://music-omr-bucket-777135743132/output/artifacts/run_info.json`
-- `gs://music-omr-bucket-777135743132/output/artifacts/mapping_summary.json`
-
-No `runs/<run_id>/...` folders are written by this workflow.
+- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/audiveris_out.pdf`
+- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/artifacts/run_info.json`
+- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/artifacts/mapping_summary.json`
 
 `mapping_summary.json` now includes `editable_state` (system-level anchors + current values) for fast relabel.
 
 When backend relabel is used, one additional output may be written:
 
-- `gs://music-omr-bucket-777135743132/output/audiveris_out_corrected.pdf`
+- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/audiveris_out_corrected.pdf`
 
 ## 2E test-input prep
 
@@ -118,6 +115,29 @@ gcloud run deploy "${SERVICE}" \
   --allow-unauthenticated \
   --set-env-vars "CORS_ALLOW_ORIGINS=http://localhost:5173,https://measure-marker.created.app,ARTIFACT_SIGNED_URL_TTL_SEC=1800,MAX_UPLOAD_MB=25,INPUT_UPLOAD_PREFIX=gs://music-omr-bucket-777135743132/input/user-input" \
   --remove-env-vars "INVITE_CODE,UPLOAD_GCS_PREFIX"
+```
+
+### Per-run lifecycle policy (1 day fallback cleanup)
+
+Apply a lifecycle rule to auto-delete old per-run artifacts if frontend cleanup is skipped:
+
+```bash
+cat > /tmp/omr-lifecycle.json <<'JSON'
+{
+  "rule": [
+    {
+      "action": { "type": "Delete" },
+      "condition": {
+        "age": 1,
+        "matchesPrefix": ["output/runs/"]
+      }
+    }
+  ]
+}
+JSON
+
+gcloud storage buckets update gs://music-omr-bucket-777135743132 \
+  --lifecycle-file=/tmp/omr-lifecycle.json
 ```
 
 ## Log modes
@@ -226,12 +246,13 @@ Use flow:
 4. Poll `GET /api/omr/jobs/{job_id}` until `succeeded`
 5. `GET /api/omr/jobs/{job_id}/state`
 6. `POST /api/omr/jobs/{job_id}/relabel`
+7. Optional cleanup: `POST /api/omr/jobs/{job_id}/cleanup`
 
 Rules:
 
 - No invite/auth header required.
 - Use `artifacts_http` URLs for browser preview/download.
-- Handle `409` stale mismatch by starting a new job.
+- Legacy jobs may return `409` stale mismatch during fallback mode; start a new job if that occurs.
 
 ## Fast relabel flow (no full OMR rerun)
 
@@ -253,7 +274,7 @@ It does not rerun Audiveris or GitHub Actions.
 
 Relabel now writes structured traces into:
 
-- `gs://music-omr-bucket-777135743132/output/artifacts/mapping_summary.json`
+- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/artifacts/mapping_summary.json`
 - path: `relabel_debug`
 
 Fields:
@@ -292,7 +313,7 @@ Quick troubleshooting flow:
 1. Find `trace_id` from relabel API response.
 2. Grep worker logs for `RELABEL_TRACE_* trace_id=<id>`.
 3. Check `relabel_debug.last_trace` and `relabel_debug.reason_counts` in `mapping_summary.json`.
-4. If reason is `stale_run_mismatch`, rerun baseline first, then relabel again.
+4. If reason is `stale_run_mismatch` (legacy fallback only), rerun baseline first, then relabel again.
 
 Worker logs include grep-friendly lines:
 
@@ -318,10 +339,10 @@ Expected result:
 
 - Script prints `SMOKE ok ...`
 - Relabel response includes `state_version_before`, `state_version_after`, `updated_system_ids`
-- `audiveris_out_corrected.pdf` exists in output.
+- `audiveris_out_corrected.pdf` exists in the run-specific output prefix.
 
-If a newer workflow run overwrote single-latest artifacts, `/state` or `/relabel` returns `409`
-with requested/artifact run IDs.
+During migration fallback, `/state` or `/relabel` may still return `409` for legacy single-latest
+artifacts with requested/artifact run IDs.
 
 ## Troubleshooting note: system-count mismatch
 

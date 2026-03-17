@@ -15,7 +15,7 @@ This repo includes:
 - Strict quality gates are active:
   - XML coverage (`strict_xml_pages_ok`)
   - system drift guard (`SYSTEM_COUNT_DRIFT`)
-- Storage mode is **single-latest** (each new run overwrites previous output).
+- Storage mode is **per-run** (`output/runs/<run_id>/...`) with legacy single-latest fallback.
 
 ## Repo Layout
 
@@ -50,18 +50,19 @@ This repo includes:
    - `pdf_gcs_uri` = `gs://.../your.pdf`
 6. Run.
 
-## Output Contract (Single-Latest)
+## Output Contract (Per-Run)
 
 Base prefix:
 - `gs://music-omr-bucket-777135743132/output`
 
-Each run clears previous output and writes only:
+Each run writes to its own prefix:
 
-- `gs://music-omr-bucket-777135743132/output/audiveris_out.pdf`
-- `gs://music-omr-bucket-777135743132/output/artifacts/run_info.json`
-- `gs://music-omr-bucket-777135743132/output/artifacts/mapping_summary.json`
+- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/audiveris_out.pdf`
+- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/artifacts/run_info.json`
+- `gs://music-omr-bucket-777135743132/output/runs/<run_id>/artifacts/mapping_summary.json`
+- relabel writes: `.../output/runs/<run_id>/audiveris_out_corrected.pdf`
 
-No `runs/<run_id>/...` folders are used by the production workflow.
+Legacy single-latest paths may still be read for older jobs during migration.
 
 ## Backend API (Workflow Dispatch)
 
@@ -73,6 +74,7 @@ Endpoints:
 - `GET /api/omr/jobs/{job_id}`
 - `GET /api/omr/jobs/{job_id}/state`
 - `POST /api/omr/jobs/{job_id}/relabel`
+- `POST /api/omr/jobs/{job_id}/cleanup` (idempotent artifact cleanup helper)
 
 The relabel flow is fast and does not rerun Audiveris:
 

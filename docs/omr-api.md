@@ -90,10 +90,10 @@ Response (202):
   "status_url": "/api/omr/jobs/<job_id>",
   "run_url": "https://github.com/...",
   "artifacts": {
-    "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
-    "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
-    "run_info": "gs://.../output/artifacts/run_info.json",
-    "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+    "audiveris_out_pdf": "gs://.../output/runs/<run_id>/audiveris_out.pdf",
+    "audiveris_out_corrected_pdf": "gs://.../output/runs/<run_id>/audiveris_out_corrected.pdf",
+    "run_info": "gs://.../output/runs/<run_id>/artifacts/run_info.json",
+    "mapping_summary": "gs://.../output/runs/<run_id>/artifacts/mapping_summary.json"
   },
   "artifacts_http": {
     "audiveris_out_pdf": "https://storage.googleapis.com/...",
@@ -122,10 +122,10 @@ Response (200):
   "updated_at": "ISO-8601",
   "run_url": "https://github.com/...",
   "artifacts": {
-    "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
-    "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
-    "run_info": "gs://.../output/artifacts/run_info.json",
-    "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+    "audiveris_out_pdf": "gs://.../output/runs/<run_id>/audiveris_out.pdf",
+    "audiveris_out_corrected_pdf": "gs://.../output/runs/<run_id>/audiveris_out_corrected.pdf",
+    "run_info": "gs://.../output/runs/<run_id>/artifacts/run_info.json",
+    "mapping_summary": "gs://.../output/runs/<run_id>/artifacts/mapping_summary.json"
   },
   "artifacts_http": {
     "audiveris_out_pdf": "https://storage.googleapis.com/...",
@@ -160,10 +160,10 @@ Response (200):
   "trace_id": "a1b2c3d4e5f6",
   "debug_result": "success",
   "artifacts": {
-    "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
-    "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
-    "run_info": "gs://.../output/artifacts/run_info.json",
-    "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+    "audiveris_out_pdf": "gs://.../output/runs/<run_id>/audiveris_out.pdf",
+    "audiveris_out_corrected_pdf": "gs://.../output/runs/<run_id>/audiveris_out_corrected.pdf",
+    "run_info": "gs://.../output/runs/<run_id>/artifacts/run_info.json",
+    "mapping_summary": "gs://.../output/runs/<run_id>/artifacts/mapping_summary.json"
   },
   "artifacts_http": {
     "audiveris_out_pdf": "https://storage.googleapis.com/...",
@@ -246,10 +246,10 @@ Response (200):
     }
   },
   "artifacts": {
-    "audiveris_out_pdf": "gs://.../output/audiveris_out.pdf",
-    "audiveris_out_corrected_pdf": "gs://.../output/audiveris_out_corrected.pdf",
-    "run_info": "gs://.../output/artifacts/run_info.json",
-    "mapping_summary": "gs://.../output/artifacts/mapping_summary.json"
+    "audiveris_out_pdf": "gs://.../output/runs/<run_id>/audiveris_out.pdf",
+    "audiveris_out_corrected_pdf": "gs://.../output/runs/<run_id>/audiveris_out_corrected.pdf",
+    "run_info": "gs://.../output/runs/<run_id>/artifacts/run_info.json",
+    "mapping_summary": "gs://.../output/runs/<run_id>/artifacts/mapping_summary.json"
   },
   "artifacts_http": {
     "audiveris_out_pdf": "https://storage.googleapis.com/...",
@@ -257,6 +257,38 @@ Response (200):
     "run_info": "https://storage.googleapis.com/...",
     "mapping_summary": "https://storage.googleapis.com/..."
   }
+}
+```
+
+### `POST /api/omr/jobs/{job_id}/cleanup`
+
+Idempotent artifact cleanup helper (typically called by frontend after successful final download).
+
+Request body (all optional):
+
+```json
+{
+  "delete_corrected_pdf": true,
+  "delete_baseline_pdf": false,
+  "delete_artifacts": false
+}
+```
+
+Response (200):
+
+```json
+{
+  "job_id": "uuid or run_id",
+  "run_id": 22209738954,
+  "storage_mode": "per_run_v1",
+  "deleted_count": 1,
+  "results": [
+    {
+      "uri": "gs://.../output/runs/<run_id>/audiveris_out_corrected.pdf",
+      "existed": true,
+      "deleted": true
+    }
+  ]
 }
 ```
 
@@ -281,15 +313,19 @@ Optional:
 - `RELABEL_MIN_VALUE` (default: `0`)
 - `RELABEL_MAX_VALUE` (default: `1000000`)
 - `RELABEL_DEBUG_HISTORY_MAX` (default: `50`)
+- `RUNS_PREFIX` (default: `runs`)
+- `ENABLE_JOB_STORE` (default: `1`)
+- `JOB_STORE_COLLECTION` (default: `omr_jobs`)
+- `ALLOW_LEGACY_ARTIFACT_FALLBACK` (default: `1`)
 
 ## Notes
 
 - `workflow_dispatch` does not return `run_id` directly. The backend performs a short discovery poll to find the newly created run.
 - Frontend should never call GitHub APIs directly.
 - Cloud Run API image is Flask-only. It does not install or run Audiveris locally.
-- Storage mode is currently single-latest: each new run overwrites prior output at `OUTPUT_PREFIX`.
+- Storage mode is per-run by default: each run writes to `OUTPUT_PREFIX/runs/<run_id>/...`.
 - `mapping_summary.json` includes `editable_state` and `relabel_debug`.
-- When a different run overwrote single-latest artifacts, `/state` and `/relabel` return `409` with requested/artifact run IDs.
+- Legacy single-latest fallback can be enabled for older jobs during migration (`ALLOW_LEGACY_ARTIFACT_FALLBACK=1`).
 - Signed URL fields in `artifacts_http` are best-effort. If a file does not exist or signing fails, that field may be an empty string.
 
 ## Anything handoff (copy/paste)
@@ -311,7 +347,7 @@ Frontend rules:
 
 - Do not send invite/auth header.
 - Use `artifacts_http` for browser links.
-- Handle `409` stale mismatch by starting a new job.
+- If using legacy fallback and a stale mismatch occurs, start a new job.
 
 ## Smoke Test Script
 

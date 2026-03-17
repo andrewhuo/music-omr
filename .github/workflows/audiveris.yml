@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output"
+      RUN_OUTPUT_PREFIX: "gs://music-omr-bucket-777135743132/output/runs/${{ github.run_id }}"
       AUDIVERIS_IMAGE: "ghcr.io/andrewhuo/audiveris-engine@sha256:61c2a4a39e6f545bb9153a984247b83ace541196c4861329b295982e4cf57bed"
       AUDIVERIS_VERSION: "5.9.0"
       BASELINE_MODE: "1"
@@ -4285,7 +4286,8 @@ jobs:
                   return None
 
           now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-          output_prefix = os.environ.get("OUTPUT_PREFIX", "")
+          output_prefix = os.environ.get("RUN_OUTPUT_PREFIX", "") or os.environ.get("OUTPUT_PREFIX", "")
+          output_base_prefix = os.environ.get("OUTPUT_PREFIX", "")
 
           run_info = {
               "run_id": os.environ.get("GITHUB_RUN_ID"),
@@ -4294,6 +4296,7 @@ jobs:
               "sha": os.environ.get("GITHUB_SHA"),
               "workflow_signature": "engine-pin-v1",
               "output_prefix": output_prefix,
+              "output_base_prefix": output_base_prefix,
               "generated_at_utc": now,
           }
 
@@ -4487,12 +4490,13 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          ARTIFACTS_PREFIX="${OUTPUT_PREFIX}/artifacts"
+          RUN_OUTPUT_PREFIX="${RUN_OUTPUT_PREFIX:-${OUTPUT_PREFIX}/runs/${GITHUB_RUN_ID}}"
+          ARTIFACTS_PREFIX="${RUN_OUTPUT_PREFIX}/artifacts"
           RUN_REF="${GITHUB_REF_NAME:-$GITHUB_REF}"
           echo "RUN_SUMMARY run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT} ref=${RUN_REF} sha=${GITHUB_SHA}"
-          echo "RUN_SUMMARY output_prefix=${OUTPUT_PREFIX}"
-          echo "OUTPUT_CLEANUP prefix=${OUTPUT_PREFIX}"
-          if gsutil -m rm -r "${OUTPUT_PREFIX}/**" >/tmp/work/output_cleanup.log 2>&1; then
+          echo "RUN_SUMMARY output_prefix=${RUN_OUTPUT_PREFIX}"
+          echo "OUTPUT_CLEANUP prefix=${RUN_OUTPUT_PREFIX}"
+          if gsutil -m rm -r "${RUN_OUTPUT_PREFIX}/**" >/tmp/work/output_cleanup.log 2>&1; then
             echo "OUTPUT_CLEANUP status=ok"
           else
             if grep -q "No URLs matched" /tmp/work/output_cleanup.log; then
@@ -4507,8 +4511,8 @@ jobs:
           missing_count=0
 
           if [[ -f /tmp/work/annotated.pdf ]]; then
-            gsutil cp /tmp/work/annotated.pdf "${OUTPUT_PREFIX}/audiveris_out.pdf"
-            echo "uploaded_audiveris_out=${OUTPUT_PREFIX}/audiveris_out.pdf"
+            gsutil cp /tmp/work/annotated.pdf "${RUN_OUTPUT_PREFIX}/audiveris_out.pdf"
+            echo "uploaded_audiveris_out=${RUN_OUTPUT_PREFIX}/audiveris_out.pdf"
             uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/annotated.pdf not found"
