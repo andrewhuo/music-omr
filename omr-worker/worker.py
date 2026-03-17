@@ -227,15 +227,19 @@ def _get_ref_sha(ref_name: str) -> str | None:
     return sha or None
 
 
-def _dispatch_workflow(pdf_gcs_uri: str) -> None:
+def _dispatch_workflow(pdf_gcs_uri: str, artifact_key: str | None = None) -> None:
+    inputs = {
+        "pdf_gcs_uri": pdf_gcs_uri,
+    }
+    key = str(artifact_key or "").strip()
+    if key:
+        inputs["artifact_key"] = key
     _gh_request(
         "POST",
         f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{urlparse.quote(GITHUB_WORKFLOW_ID, safe='')}/dispatches",
         payload={
             "ref": GITHUB_REF,
-            "inputs": {
-                "pdf_gcs_uri": pdf_gcs_uri,
-            },
+            "inputs": inputs,
         },
     )
 
@@ -284,16 +288,27 @@ def _output_prefix_normalized() -> str:
     return str(OUTPUT_PREFIX or "").rstrip("/")
 
 
-def _run_output_prefix(run_id: int) -> str:
-    return f"{_output_prefix_normalized()}/{RUNS_PREFIX}/{int(run_id)}"
+def _normalize_artifact_key(value: str | int | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-.")
+
+
+def _run_output_prefix(run_key: str | int) -> str:
+    safe_key = _normalize_artifact_key(run_key)
+    if not safe_key:
+        safe_key = "unknown"
+    return f"{_output_prefix_normalized()}/{RUNS_PREFIX}/{safe_key}"
 
 
 def _legacy_output_prefix() -> str:
     return _output_prefix_normalized()
 
 
-def _artifact_uris_for_run(run_id: int) -> dict[str, str]:
-    out = _run_output_prefix(int(run_id))
+def _artifact_uris_for_run(run_id: int, artifact_key: str | None = None) -> dict[str, str]:
+    run_key = _normalize_artifact_key(artifact_key) or str(int(run_id))
+    out = _run_output_prefix(run_key)
     return {
         "audiveris_out_pdf": f"{out}/audiveris_out.pdf",
         "audiveris_out_corrected_pdf": f"{out}/audiveris_out_corrected.pdf",
@@ -312,16 +327,22 @@ def _legacy_artifact_uris_for_run(run_id: int) -> dict[str, str]:
     }
 
 
-def _artifact_uris_for_existing_run(run_id: int) -> dict[str, str]:
-    per_run = _artifact_uris_for_run(int(run_id))
-    try:
-        if _gcs_uri_exists(per_run["run_info"]):
+def _artifact_uris_for_existing_run(run_id: int, artifact_key: str | None = None) -> dict[str, str]:
+    candidates: list[dict[str, str]] = []
+    primary = _artifact_uris_for_run(int(run_id), artifact_key=artifact_key)
+    candidates.append(primary)
+    fallback_key = str(int(run_id))
+    if _normalize_artifact_key(artifact_key) and _normalize_artifact_key(artifact_key) != fallback_key:
+        candidates.append(_artifact_uris_for_run(int(run_id), artifact_key=fallback_key))
+    for per_run in candidates:
+        try:
+            if _gcs_uri_exists(per_run["run_info"]):
+                return per_run
+        except Exception:
             return per_run
-    except Exception:
-        return per_run
     if ALLOW_LEGACY_ARTIFACT_FALLBACK:
         return _legacy_artifact_uris_for_run(int(run_id))
-    return per_run
+    return primary
 
 
 def _gs_uri_to_bucket_blob(uri: str) -> tuple[str, str]:
@@ -460,6 +481,41 @@ def _job_store_get(job_id: str) -> dict | None:
         return None
 
 
+def _derive_job_id_from_pdf_uri(pdf_gcs_uri: str) -> str:
+    try:
+        _, blob_name = _parse_gs_uri(pdf_gcs_uri)
+    except Exception:
+        return ""
+    base = Path(blob_name).name
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    return _normalize_artifact_key(stem)[:96]
+
+
+def _job_artifact_key(job_id: str, run_id: int | None = None, rec: dict | None = None) -> str:
+    if isinstance(rec, dict):
+        for key in ("artifact_key", "job_id", "dispatch_id"):
+            val = _normalize_artifact_key(rec.get(key))
+            if val:
+                return val
+    txt = _normalize_artifact_key(job_id)
+    if txt:
+        return txt
+    if isinstance(run_id, int):
+        return str(int(run_id))
+    return ""
+
+
+def _ensure_unique_job_id(base_job_id: str) -> str:
+    base = _normalize_artifact_key(base_job_id)[:96] or str(uuid.uuid4())
+    if _pending_record(base) is None and _job_store_get(base) is None:
+        return base
+    for idx in range(2, 1000):
+        candidate = f"{base}-{idx}"
+        if _pending_record(candidate) is None and _job_store_get(candidate) is None:
+            return candidate
+    return f"{base}-{uuid.uuid4().hex[:8]}"
+
+
 def _parse_gs_uri(uri: str) -> tuple[str, str]:
     txt = str(uri or "").strip()
     if not txt.startswith("gs://"):
@@ -524,13 +580,36 @@ def _delete_gcs_uri_if_exists(uri: str) -> tuple[bool, bool]:
     return True, True
 
 
+def _delete_gcs_prefix(prefix_uri: str, max_samples: int = 20) -> dict:
+    bucket_name, blob_prefix = _parse_gs_uri(prefix_uri.rstrip("/") + "/_")
+    blob_prefix = blob_prefix.rsplit("/_", 1)[0].rstrip("/") + "/"
+    bucket = _gcs_client().bucket(bucket_name)
+    deleted = 0
+    found = 0
+    samples: list[str] = []
+    for blob in _gcs_client().list_blobs(bucket_name, prefix=blob_prefix):
+        found += 1
+        if len(samples) < max(1, int(max_samples)):
+            samples.append(f"gs://{bucket_name}/{blob.name}")
+        try:
+            blob.delete()
+            deleted += 1
+        except Exception as exc:
+            if len(samples) < max(1, int(max_samples)):
+                samples.append(f"ERROR:{blob.name}:{_safe_error_text(exc)}")
+    return {
+        "prefix": f"gs://{bucket_name}/{blob_prefix.rstrip('/')}",
+        "found_count": found,
+        "deleted_count": deleted,
+        "samples": samples,
+    }
+
+
 def _max_upload_bytes() -> int:
     return max(1, _safe_int(os.environ.get("MAX_UPLOAD_MB"), MAX_UPLOAD_MB)) * 1024 * 1024
 
 
 def _resolve_run_id_from_job_id(job_id: str) -> tuple[int | None, dict | None, str | None]:
-    if re.fullmatch(r"\d+", job_id or ""):
-        return int(job_id), None, None
     run_id, rec = _ensure_run_id_for_pending(job_id)
     if isinstance(run_id, int):
         return int(run_id), rec, None
@@ -543,30 +622,41 @@ def _resolve_run_id_from_job_id(job_id: str) -> tuple[int | None, dict | None, s
                 merged = {**rec, **store}
             return int(store_run_id), merged, None
         return None, (rec if isinstance(rec, dict) else store), "job has been dispatched but run_id is not available yet"
+    if re.fullmatch(r"\d+", job_id or ""):
+        return int(job_id), None, None
     if rec is None:
         return None, None, f"unknown job_id: {job_id}"
     return None, rec, "job has been dispatched but run_id is not available yet"
 
 
-def _load_mapping_for_run(run_id: int) -> tuple[dict, dict, int]:
+def _load_mapping_for_run(run_id: int, artifact_key: str | None = None) -> tuple[dict, dict, int]:
     run_id_int = int(run_id)
-    artifacts = _artifact_uris_for_run(run_id_int)
+    key = _normalize_artifact_key(artifact_key)
+    candidate_keys: list[str] = []
+    if key:
+        candidate_keys.append(key)
+    run_key = str(run_id_int)
+    if run_key not in candidate_keys:
+        candidate_keys.append(run_key)
 
-    if _gcs_uri_exists(artifacts["run_info"]) and _gcs_uri_exists(artifacts["mapping_summary"]):
-        run_info = _download_gcs_json(artifacts["run_info"])
-        mapping_summary = _download_gcs_json(artifacts["mapping_summary"])
-        summary_run_id = _safe_int(run_info.get("run_id"), run_id_int)
-        if summary_run_id and summary_run_id != run_id_int:
-            print(
-                f"RUN_INFO_WARN requested_run_id={run_id_int} "
-                f"run_info_run_id={summary_run_id} mode=per_run_v1"
-            )
-        if not isinstance(mapping_summary, dict):
-            raise ValueError("mapping_summary is not an object")
-        return artifacts, mapping_summary, int(summary_run_id or run_id_int)
+    for candidate in candidate_keys:
+        artifacts = _artifact_uris_for_run(run_id_int, artifact_key=candidate)
+        if _gcs_uri_exists(artifacts["run_info"]) and _gcs_uri_exists(artifacts["mapping_summary"]):
+            run_info = _download_gcs_json(artifacts["run_info"])
+            mapping_summary = _download_gcs_json(artifacts["mapping_summary"])
+            summary_run_id = _safe_int(run_info.get("run_id"), run_id_int)
+            if summary_run_id and summary_run_id != run_id_int:
+                print(
+                    f"RUN_INFO_WARN requested_run_id={run_id_int} "
+                    f"run_info_run_id={summary_run_id} mode=per_run_v1"
+                )
+            if not isinstance(mapping_summary, dict):
+                raise ValueError("mapping_summary is not an object")
+            return artifacts, mapping_summary, int(summary_run_id or run_id_int)
 
     if not ALLOW_LEGACY_ARTIFACT_FALLBACK:
-        raise FileNotFoundError(f"per-run artifacts not found for run_id={run_id_int}")
+        key_note = f" artifact_key={key}" if key else ""
+        raise FileNotFoundError(f"per-run artifacts not found for run_id={run_id_int}{key_note}")
 
     legacy_artifacts = _legacy_artifact_uris_for_run(run_id_int)
     run_info = _download_gcs_json(legacy_artifacts["run_info"])
@@ -1033,11 +1123,15 @@ def create_job():
     if not pdf_gcs_uri.startswith("gs://"):
         return jsonify({"error": "pdf_gcs_uri must start with gs://"}), 400
 
-    dispatch_id = str(uuid.uuid4())
+    requested_job_id = str(data.get("job_id") or "").strip()
+    if not requested_job_id:
+        requested_job_id = _derive_job_id_from_pdf_uri(pdf_gcs_uri)
+    dispatch_id = _ensure_unique_job_id(requested_job_id or str(uuid.uuid4()))
+    artifact_key = _job_artifact_key(dispatch_id)
     dispatched_at = _utc_now()
     try:
         expected_sha = _get_ref_sha(GITHUB_REF)
-        _dispatch_workflow(pdf_gcs_uri)
+        _dispatch_workflow(pdf_gcs_uri, artifact_key=artifact_key)
         run_id = _discover_run_id(dispatched_at, expected_sha)
     except GitHubAPIError as exc:
         return jsonify({"error": exc.message, "status_code": exc.status_code}), (
@@ -1052,6 +1146,7 @@ def create_job():
             "expected_sha": expected_sha,
             "run_id": run_id,
             "pdf_gcs_uri": pdf_gcs_uri,
+            "artifact_key": artifact_key,
         },
     )
     _job_store_upsert(
@@ -1064,11 +1159,13 @@ def create_job():
             "workflow": GITHUB_WORKFLOW_ID,
             "ref": GITHUB_REF,
             "mode": "per_run_v1",
+            "artifact_key": artifact_key,
         },
     )
 
     response = {
         "job_id": dispatch_id,
+        "artifact_key": artifact_key,
         "status": "queued",
         "run_id": run_id,
         "workflow": GITHUB_WORKFLOW_ID,
@@ -1077,7 +1174,7 @@ def create_job():
         "status_url": f"/api/omr/jobs/{dispatch_id}",
     }
     if run_id is not None:
-        artifacts = _artifact_uris_for_existing_run(int(run_id))
+        artifacts = _artifact_uris_for_existing_run(int(run_id), artifact_key=artifact_key)
         response["run_url"] = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{run_id}"
         response["artifacts"] = artifacts
         response["artifacts_http"] = _artifact_http_uris_for_run(int(run_id), artifacts)
@@ -1165,7 +1262,8 @@ def get_job(job_id: str):
         "updated_at": run.get("updated_at"),
         "run_url": run.get("html_url") or f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{run_id}",
     }
-    artifacts = _artifact_uris_for_existing_run(int(run_id))
+    artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
+    artifacts = _artifact_uris_for_existing_run(int(run_id), artifact_key=artifact_key)
     response["artifacts"] = artifacts
     response["artifacts_http"] = _artifact_http_uris_for_run(int(run_id), artifacts)
     response["storage_mode"] = _storage_mode_for_artifacts(artifacts)
@@ -1176,12 +1274,13 @@ def get_job(job_id: str):
 
 @app.route("/api/omr/jobs/<job_id>/state", methods=["GET"])
 def get_job_state(job_id: str):
-    run_id, _, err = _resolve_run_id_from_job_id(job_id)
+    run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     if err:
         return jsonify({"error": err, "job_id": job_id}), 409
+    artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
 
     try:
-        artifacts, mapping_summary, _ = _load_mapping_for_run(int(run_id))
+        artifacts, mapping_summary, _ = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
     except StaleArtifactsError as exc:
         return (
             jsonify(
@@ -1235,6 +1334,7 @@ def relabel_job(job_id: str):
 
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     requested_run_id = int(run_id) if isinstance(run_id, int) else 0
+    artifact_key = _job_artifact_key(job_id, requested_run_id or None, rec if isinstance(rec, dict) else None)
     print(
         f"RELABEL_TRACE_START trace_id={trace_id} job_id={job_id} "
         f"run_id={requested_run_id or 'unknown'} edits={edits_requested_count}"
@@ -1248,7 +1348,7 @@ def relabel_job(job_id: str):
         return jsonify({"error": err, "job_id": job_id, "trace_id": trace_id, "debug_result": "validation_error"}), 409
 
     try:
-        artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id))
+        artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
     except StaleArtifactsError as exc:
         trace = {
             "trace_id": trace_id,
@@ -1648,8 +1748,11 @@ def cleanup_job_artifacts(job_id: str):
     delete_corrected_pdf = _safe_bool(payload.get("delete_corrected_pdf", True), True)
     delete_baseline_pdf = _safe_bool(payload.get("delete_baseline_pdf", False), False)
     delete_artifacts = _safe_bool(payload.get("delete_artifacts", False), False)
+    delete_all_run_objects = _safe_bool(payload.get("delete_all_run_objects", False), False)
+    delete_input_pdf = _safe_bool(payload.get("delete_input_pdf", False), False)
 
-    artifacts = _artifact_uris_for_existing_run(int(run_id))
+    artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
+    artifacts = _artifact_uris_for_existing_run(int(run_id), artifact_key=artifact_key)
     targets: list[str] = []
     if delete_corrected_pdf:
         targets.append(artifacts["audiveris_out_corrected_pdf"])
@@ -1660,6 +1763,17 @@ def cleanup_job_artifacts(job_id: str):
 
     results: list[dict] = []
     deleted_count = 0
+
+    if delete_all_run_objects:
+        run_prefix = str(artifacts.get("audiveris_out_pdf") or "").rsplit("/", 1)[0]
+        if run_prefix.startswith("gs://"):
+            try:
+                prefix_result = _delete_gcs_prefix(run_prefix)
+                deleted_count += _safe_int(prefix_result.get("deleted_count"), 0)
+                results.append({"prefix_cleanup": prefix_result})
+            except Exception as exc:
+                results.append({"prefix_cleanup": {"prefix": run_prefix, "error": _safe_error_text(exc)}})
+
     for uri in targets:
         try:
             existed, deleted = _delete_gcs_uri_if_exists(uri)
@@ -1668,6 +1782,16 @@ def cleanup_job_artifacts(job_id: str):
             results.append({"uri": uri, "existed": bool(existed), "deleted": bool(deleted)})
         except Exception as exc:
             results.append({"uri": uri, "error": _safe_error_text(exc)})
+    if delete_input_pdf and isinstance(rec, dict):
+        input_uri = str(rec.get("pdf_gcs_uri") or "").strip()
+        if input_uri.startswith("gs://"):
+            try:
+                existed, deleted = _delete_gcs_uri_if_exists(input_uri)
+                if deleted:
+                    deleted_count += 1
+                results.append({"uri": input_uri, "existed": bool(existed), "deleted": bool(deleted)})
+            except Exception as exc:
+                results.append({"uri": input_uri, "error": _safe_error_text(exc)})
 
     _job_store_upsert(
         job_id,
