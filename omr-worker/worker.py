@@ -227,27 +227,84 @@ def _get_ref_sha(ref_name: str) -> str | None:
     return sha or None
 
 
-def _dispatch_workflow(pdf_gcs_uri: str, artifact_key: str | None = None) -> None:
+def _workflow_id_candidates(primary: str) -> list[str]:
+    ordered: list[str] = []
+
+    def _add(value: str | None):
+        txt = str(value or "").strip()
+        if txt and txt not in ordered:
+            ordered.append(txt)
+
+    primary_txt = str(primary or "").strip()
+    _add(primary_txt)
+
+    base = Path(primary_txt).name if primary_txt else ""
+    _add(base)
+    if base:
+        _add(f".github/workflows/{base}")
+
+    try:
+        payload = _gh_request(
+            "GET",
+            f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows",
+            query={"per_page": 100},
+        )
+        workflows = payload.get("workflows") if isinstance(payload, dict) else None
+        if isinstance(workflows, list):
+            for wf in workflows:
+                if not isinstance(wf, dict):
+                    continue
+                path = str(wf.get("path") or "").strip()
+                wid = wf.get("id")
+                name = str(wf.get("name") or "").strip()
+                if base and (path.endswith(f"/{base}") or path.endswith(base)):
+                    _add(path)
+                    _add(str(wid) if wid is not None else "")
+                if primary_txt and name == primary_txt:
+                    _add(str(wid) if wid is not None else "")
+    except Exception as exc:
+        print(f"WORKFLOW_DISCOVERY_WARN detail={_safe_error_text(exc)}")
+
+    return ordered
+
+
+def _dispatch_workflow(pdf_gcs_uri: str, artifact_key: str | None = None) -> str:
     inputs = {
         "pdf_gcs_uri": pdf_gcs_uri,
     }
     key = str(artifact_key or "").strip()
     if key:
         inputs["artifact_key"] = key
-    _gh_request(
-        "POST",
-        f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{urlparse.quote(GITHUB_WORKFLOW_ID, safe='')}/dispatches",
-        payload={
-            "ref": GITHUB_REF,
-            "inputs": inputs,
-        },
-    )
+    last_exc: GitHubAPIError | None = None
+    for workflow_id in _workflow_id_candidates(GITHUB_WORKFLOW_ID):
+        try:
+            _gh_request(
+                "POST",
+                f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{urlparse.quote(workflow_id, safe='')}/dispatches",
+                payload={
+                    "ref": GITHUB_REF,
+                    "inputs": inputs,
+                },
+            )
+            if workflow_id != GITHUB_WORKFLOW_ID:
+                print(f"WORKFLOW_DISPATCH_FALLBACK configured={GITHUB_WORKFLOW_ID} used={workflow_id}")
+            return workflow_id
+        except GitHubAPIError as exc:
+            msg = str(exc.message or "")
+            if exc.status_code == 422 and "workflow_dispatch" in msg:
+                last_exc = exc
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise GitHubAPIError(500, "failed to dispatch workflow")
 
 
-def _list_workflow_dispatch_runs(limit: int = 30) -> list[dict]:
+def _list_workflow_dispatch_runs(limit: int = 30, workflow_id: str | None = None) -> list[dict]:
+    selector = str(workflow_id or GITHUB_WORKFLOW_ID).strip() or GITHUB_WORKFLOW_ID
     data = _gh_request(
         "GET",
-        f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{urlparse.quote(GITHUB_WORKFLOW_ID, safe='')}/runs",
+        f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{urlparse.quote(selector, safe='')}/runs",
         query={
             "event": "workflow_dispatch",
             "branch": GITHUB_REF,
@@ -262,12 +319,12 @@ def _list_workflow_dispatch_runs(limit: int = 30) -> list[dict]:
     return [r for r in runs if isinstance(r, dict)]
 
 
-def _discover_run_id(dispatched_at: datetime, expected_sha: str | None) -> int | None:
+def _discover_run_id(dispatched_at: datetime, expected_sha: str | None, workflow_id: str | None = None) -> int | None:
     deadline = time.time() + max(2, int(RUN_DISCOVERY_TIMEOUT_SEC))
     lower_bound = dispatched_at - timedelta(minutes=2)
 
     while time.time() <= deadline:
-        for run in _list_workflow_dispatch_runs():
+        for run in _list_workflow_dispatch_runs(workflow_id=workflow_id):
             run_created = _parse_gh_datetime(run.get("created_at"))
             if run_created is None or run_created < lower_bound:
                 continue
@@ -893,7 +950,12 @@ def _ensure_run_id_for_pending(dispatch_id: str) -> tuple[int | None, dict | Non
     if not isinstance(dispatched_at, datetime):
         dispatched_at = _utc_now()
     expected_sha = rec.get("expected_sha")
-    run_id = _discover_run_id(dispatched_at, expected_sha if isinstance(expected_sha, str) else None)
+    workflow_id = str(rec.get("workflow_id") or GITHUB_WORKFLOW_ID).strip() or GITHUB_WORKFLOW_ID
+    run_id = _discover_run_id(
+        dispatched_at,
+        expected_sha if isinstance(expected_sha, str) else None,
+        workflow_id=workflow_id,
+    )
     if run_id is not None:
         rec["run_id"] = int(run_id)
         _pending_set(dispatch_id, rec)
@@ -903,6 +965,7 @@ def _ensure_run_id_for_pending(dispatch_id: str) -> tuple[int | None, dict | Non
                 "run_id": int(run_id),
                 "status": "queued",
                 "mode": "per_run_v1",
+                "workflow_id": workflow_id,
             },
         )
     return run_id, rec
@@ -1131,8 +1194,8 @@ def create_job():
     dispatched_at = _utc_now()
     try:
         expected_sha = _get_ref_sha(GITHUB_REF)
-        _dispatch_workflow(pdf_gcs_uri, artifact_key=artifact_key)
-        run_id = _discover_run_id(dispatched_at, expected_sha)
+        workflow_id_used = _dispatch_workflow(pdf_gcs_uri, artifact_key=artifact_key) or GITHUB_WORKFLOW_ID
+        run_id = _discover_run_id(dispatched_at, expected_sha, workflow_id=workflow_id_used)
     except GitHubAPIError as exc:
         return jsonify({"error": exc.message, "status_code": exc.status_code}), (
             exc.status_code if 400 <= exc.status_code <= 599 else 500
@@ -1147,6 +1210,7 @@ def create_job():
             "run_id": run_id,
             "pdf_gcs_uri": pdf_gcs_uri,
             "artifact_key": artifact_key,
+            "workflow_id": workflow_id_used,
         },
     )
     _job_store_upsert(
@@ -1157,6 +1221,7 @@ def create_job():
             "run_id": int(run_id) if isinstance(run_id, int) else None,
             "pdf_gcs_uri": pdf_gcs_uri,
             "workflow": GITHUB_WORKFLOW_ID,
+            "workflow_id": workflow_id_used,
             "ref": GITHUB_REF,
             "mode": "per_run_v1",
             "artifact_key": artifact_key,
@@ -1168,7 +1233,7 @@ def create_job():
         "artifact_key": artifact_key,
         "status": "queued",
         "run_id": run_id,
-        "workflow": GITHUB_WORKFLOW_ID,
+        "workflow": workflow_id_used,
         "ref": GITHUB_REF,
         "pdf_gcs_uri": pdf_gcs_uri,
         "status_url": f"/api/omr/jobs/{dispatch_id}",
