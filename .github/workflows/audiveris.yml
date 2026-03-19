@@ -4273,6 +4273,8 @@ jobs:
 
       - name: Prepare compact artifacts
         if: always()
+        env:
+          INPUT_ARTIFACT_KEY: ${{ inputs.artifact_key }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -4490,8 +4492,6 @@ jobs:
               encoding="utf-8",
           )
           PY
-        env:
-          INPUT_ARTIFACT_KEY: ${{ inputs.artifact_key }}
           ls -lh /tmp/work/run_info.json /tmp/work/mapping_summary.json
 
       - name: Upload outputs
