@@ -1368,6 +1368,9 @@ def get_job_state(job_id: str):
     systems = editable_state.get("systems")
     if not isinstance(systems, list):
         systems = []
+    measures = editable_state.get("measures")
+    if not isinstance(measures, list):
+        measures = []
     qa = editable_state.get("qa")
     if not isinstance(qa, dict):
         qa = {}
@@ -1380,6 +1383,7 @@ def get_job_state(job_id: str):
             "version": str(editable_state.get("version") or "system_state_v1"),
             "qa": qa,
             "systems": systems,
+            "measures": measures,
         },
         "relabel_debug_summary": _summarize_relabel_debug(mapping_summary),
         "artifacts": artifacts,

@@ -233,6 +233,23 @@ Response (200):
         "in_bounds": true,
         "guide_build_source": "primary"
       }
+    ],
+    "measures": [
+      {
+        "measure_id": "p1_s0_m0",
+        "page": 1,
+        "system_id": "p1_s0",
+        "system_index": 0,
+        "measure_local_index": 0,
+        "global_index": 0,
+        "x_left": 54.8,
+        "x_right": 173.1,
+        "y_top": 71.3,
+        "y_bottom": 122.7,
+        "raw_measure_number": "1",
+        "source": "omr",
+        "in_bounds": true
+      }
     ]
   },
   "relabel_debug_summary": {

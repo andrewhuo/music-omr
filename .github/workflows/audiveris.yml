@@ -3993,6 +3993,7 @@ jobs:
       - name: Annotate PDF (guides + measure labels)
         env:
           DEBUG_GUIDES: "${{ env.PIPELINE_LOG_MODE == 'debug' && '1' || '0' }}"
+          DRAW_SYSTEM_GUIDES: "0"
           ENABLE_MEASURE_LABELS: "1"
           MEASURE_LABEL_MODE: "staff_start"
           MEASURE_SOURCE_POLICY: "mxl_strict"
@@ -4327,6 +4328,9 @@ jobs:
           editable_reason_counts = collections.Counter()
           editable_systems: list[dict] = []
           editable_seen_ids = set()
+          editable_measures: list[dict] = []
+          editable_measure_ids = set()
+          measure_box_reason_counts = collections.Counter()
           baseline_mode = str(os.environ.get("BASELINE_MODE", "0")).strip() == "1"
           system_qa_policy = str(os.environ.get("SYSTEM_QA_POLICY", "warn")).strip().lower()
           if system_qa_policy not in ("warn", "strict"):
@@ -4428,6 +4432,76 @@ jobs:
                       }
                   )
 
+              measure_rows = pg.get("measure_box_rows") or []
+              if not isinstance(measure_rows, list):
+                  measure_rows = []
+                  measure_box_reason_counts["invalid"] += 1
+              if len(measure_rows) == 0:
+                  measure_box_reason_counts["missing"] += 1
+              for row in measure_rows:
+                  if not isinstance(row, dict):
+                      measure_box_reason_counts["invalid"] += 1
+                      continue
+                  try:
+                      system_index = int(row.get("system_index"))
+                      measure_local_index = int(row.get("measure_local_index"))
+                      x_left = float(row.get("x_left"))
+                      x_right = float(row.get("x_right"))
+                      y_top = float(row.get("y_top"))
+                      y_bottom = float(row.get("y_bottom"))
+                  except Exception:
+                      measure_box_reason_counts["invalid"] += 1
+                      continue
+                  if x_right <= x_left or (x_right - x_left) < 6.0 or y_bottom <= y_top:
+                      measure_box_reason_counts["invalid"] += 1
+                      continue
+
+                  measure_id = str(
+                      row.get("measure_id")
+                      or f"p{page_no}_s{system_index}_m{measure_local_index}"
+                  ).strip()
+                  if not measure_id:
+                      measure_box_reason_counts["invalid"] += 1
+                      continue
+                  if measure_id in editable_measure_ids:
+                      measure_box_reason_counts["skipped"] += 1
+                      continue
+                  editable_measure_ids.add(measure_id)
+
+                  source_raw = str(row.get("source") or "omr").strip().lower()
+                  source = source_raw if source_raw in ("omr", "mxl", "hybrid") else "omr"
+                  if source_raw not in ("omr", "mxl", "hybrid"):
+                      measure_box_reason_counts["skipped"] += 1
+
+                  raw_measure_number = row.get("raw_measure_number")
+                  if raw_measure_number is None or str(raw_measure_number).strip() == "":
+                      raw_measure_number = None
+                  else:
+                      raw_measure_number = str(raw_measure_number)
+
+                  in_bounds = True
+                  if page_w > 0.0 and page_h > 0.0:
+                      in_bounds = (
+                          x_left >= 0.0 and x_right <= page_w and y_top >= 0.0 and y_bottom <= page_h
+                      )
+
+                  editable_measures.append(
+                      {
+                          "measure_id": measure_id,
+                          "page": page_no,
+                          "system_id": str(row.get("system_id") or f"p{page_no}_s{system_index}"),
+                          "system_index": system_index,
+                          "measure_local_index": measure_local_index,
+                          "x_left": round(x_left, 3),
+                          "x_right": round(x_right, 3),
+                          "y_top": round(y_top, 3),
+                          "y_bottom": round(y_bottom, 3),
+                          "raw_measure_number": raw_measure_number,
+                          "source": source,
+                          "in_bounds": bool(in_bounds),
+                      }
+                  )
+
           manifest_entries = None
           manifest_missing = None
           manifest_status = "missing"
@@ -4452,17 +4526,35 @@ jobs:
           if manifest_entries is not None and manifest_missing is not None:
               manifest_status = "ok" if manifest_missing == 0 else "missing"
 
+          editable_measures_sorted = sorted(
+              editable_measures,
+              key=lambda item: (
+                  int(item.get("page", 0)),
+                  int(item.get("system_index", 0)),
+                  int(item.get("measure_local_index", 0)),
+              ),
+          )
+          for global_index, row in enumerate(editable_measures_sorted):
+              row["global_index"] = int(global_index)
+
           editable_state = {
               "version": "system_state_v1",
               "systems": sorted(
                   editable_systems,
                   key=lambda item: (int(item.get("page", 0)), int(item.get("system_index", 0))),
               ),
+              "measures": editable_measures_sorted,
               "qa": {
                   "ok": len(editable_reason_counts) == 0,
                   "reason_counts": dict(editable_reason_counts),
                   "warnings": [f"{k}:{v}" for k, v in sorted(editable_reason_counts.items())],
                   "total_systems": len(editable_systems),
+                  "measure_boxes_count": len(editable_measures_sorted),
+                  "measure_box_reason_counts": {
+                      "missing": int(measure_box_reason_counts.get("missing", 0)),
+                      "invalid": int(measure_box_reason_counts.get("invalid", 0)),
+                      "skipped": int(measure_box_reason_counts.get("skipped", 0)),
+                  },
               },
           }
 

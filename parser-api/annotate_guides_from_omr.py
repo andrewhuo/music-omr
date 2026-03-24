@@ -118,6 +118,11 @@ def _system_guide_cv_fallback_enabled() -> bool:
     return v in ("1", "true", "yes")
 
 
+def _draw_system_guides_enabled() -> bool:
+    v = os.getenv("DRAW_SYSTEM_GUIDES", "0").strip().lower()
+    return v in ("1", "true", "yes")
+
+
 def _draw_measure_label(page: fitz.Page, rect: fitz.Rect, x: float, y: float, text: str) -> None:
     # Draw a tiny white background so labels stay visible over notation.
     tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
@@ -1025,6 +1030,26 @@ def _pct(values: list[float], p: float) -> float:
     return xs[max(0, min(len(xs) - 1, i))]
 
 
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    xs = sorted(float(v) for v in values)
+    n = len(xs)
+    m = n // 2
+    if n % 2 == 1:
+        return float(xs[m])
+    return float((xs[m - 1] + xs[m]) / 2.0)
+
+
+def _dedupe_sorted(xs: list[float], tol: float) -> list[float]:
+    out: list[float] = []
+    for x in sorted(float(v) for v in xs):
+        if out and abs(x - out[-1]) <= tol:
+            continue
+        out.append(float(x))
+    return out
+
+
 def _best_five_by_spacing(
     yxs: list[tuple[float, float]], expected_spacing: float
 ) -> list[tuple[float, float]]:
@@ -1431,6 +1456,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     staff_start_marks_px: list[tuple[float, float, float, str]] = []
     system_staff_counts: list[int] = []
     system_guides_px_aligned: list[tuple[float, float, float] | None] = []
+    measure_box_rows_px: list[dict] = []
     omr_fallback_rows: list[dict] = []
 
     pages = root.findall("page")
@@ -1444,6 +1470,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             0,
             system_staff_counts,
             system_guides_px_aligned,
+            measure_box_rows_px,
             omr_fallback_rows,
         )
 
@@ -1457,9 +1484,12 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             systems = page.findall("system")
 
         for sys_index, system in enumerate(systems):
+            page_id = page.get("id") or "?"
+            system_id = system.get("id") or "?"
             staff_nodes = system.findall(".//staff")
             system_staff_counts.append(len(staff_nodes))
             system_guide_rows_px: list[tuple[float, float, float]] = []
+            system_measure_rows_px: list[dict] = []
 
             # FIX: SIG is per-system; prefer system-local inters
             system_inters = system.find(".//sig/inters")
@@ -1645,8 +1675,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             for staff in staff_nodes:
                 staff_total += 1
                 staff_id = staff.get("id") or ""
-                system_id = system.get("id") or "?"
-                page_id = page.get("id") or "?"
 
                 header = staff.find("header")
                 header_start = _safe_float(header.get("start")) if header is not None else None
@@ -1885,9 +1913,81 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         ),
                     }
                 )
+                system_measure_rows_px.append(
+                    {
+                        "page_id": page_id,
+                        "system_id": system_id,
+                        "system_index": int(sys_index),
+                        "x_start": float(x_postpad),
+                        "y_top": float(y_top),
+                        "y_bottom": float(y_bot),
+                        "staff_right": float(staff_right_raw) if staff_right_raw is not None else None,
+                        "barline_xs": [float(x) for x in staff_barline_xs],
+                    }
+                )
 
                 for measure_num, bx in enumerate(staff_barline_xs, start=1):
                     measure_marks_px.append((bx, y_top, y_bot, str(measure_num)))
+
+            if system_measure_rows_px:
+                system_y_top = min(float(row["y_top"]) for row in system_measure_rows_px)
+                system_y_bottom = max(float(row["y_bottom"]) for row in system_measure_rows_px)
+                if system_y_bottom > system_y_top:
+                    merge_tol = max(2.0, (0.20 * expected_spacing) if expected_spacing > 0 else 2.5)
+                    start_candidates: list[float] = []
+                    boundary_candidates: list[float] = []
+                    staff_right_candidates: list[float] = []
+
+                    for row in system_measure_rows_px:
+                        start_candidates.append(float(row["x_start"]))
+                        for x in row.get("barline_xs") or []:
+                            boundary_candidates.append(float(x))
+                        staff_right = row.get("staff_right")
+                        if staff_right is not None:
+                            staff_right_candidates.append(float(staff_right))
+
+                    measure_starts = _dedupe_sorted(start_candidates + boundary_candidates, merge_tol)
+                    if measure_starts:
+                        previous_spans = [
+                            float(measure_starts[i + 1] - measure_starts[i])
+                            for i in range(len(measure_starts) - 1)
+                            if (measure_starts[i + 1] - measure_starts[i]) >= 6.0
+                        ]
+                        median_prev_span = _median(previous_spans)
+                        default_tail_span = (
+                            float(median_prev_span)
+                            if median_prev_span is not None
+                            else max(24.0, (4.0 * expected_spacing) if expected_spacing > 0 else 48.0)
+                        )
+                        if staff_right_candidates:
+                            row_tail = float(max(staff_right_candidates))
+                        else:
+                            row_tail = float(measure_starts[-1] + default_tail_span)
+                        row_tail = min(float(pic_w), max(float(measure_starts[-1] + 6.0), row_tail))
+
+                        for local_idx, x_left in enumerate(measure_starts):
+                            if local_idx + 1 < len(measure_starts):
+                                x_right = float(measure_starts[local_idx + 1])
+                            else:
+                                x_right = float(row_tail)
+                            if (x_right - x_left) < 6.0:
+                                continue
+                            if (system_y_bottom - system_y_top) <= 0.0:
+                                continue
+                            measure_box_rows_px.append(
+                                {
+                                    "page_id": page_id,
+                                    "system_id": system_id,
+                                    "system_index": int(sys_index),
+                                    "measure_local_index": int(local_idx),
+                                    "x_left": float(x_left),
+                                    "x_right": float(x_right),
+                                    "y_top": float(system_y_top),
+                                    "y_bottom": float(system_y_bottom),
+                                    "raw_measure_number": str(local_idx + 1),
+                                    "source": "omr",
+                                }
+                            )
 
             if system_guide_rows_px:
                 sx = float(min(r[0] for r in system_guide_rows_px))
@@ -1906,6 +2006,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         staff_total,
         system_staff_counts,
         system_guides_px_aligned,
+        measure_box_rows_px,
         omr_fallback_rows,
     )
 
@@ -2183,6 +2284,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 staff_total,
                 system_staff_counts,
                 system_guides_px_aligned,
+                measure_box_rows_px,
                 omr_fallback_rows,
             ) = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
@@ -2256,13 +2358,14 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         system_guides_pdf = sorted(system_guides_pdf, key=lambda r: (r[1], r[0]))[:omr_system_count]
                         first_labels_pdf = [(x, y0, y1, "1") for (x, y0, y1) in system_guides_pdf]
 
-            for (x_pdf, y0_pdf, y1_pdf) in system_guides_pdf:
-                page.draw_line(
-                    (x_pdf, y0_pdf),
-                    (x_pdf, y1_pdf),
-                    color=GUIDE_COLOR,
-                    width=GUIDE_WIDTH,
-                )
+            if _draw_system_guides_enabled():
+                for (x_pdf, y0_pdf, y1_pdf) in system_guides_pdf:
+                    page.draw_line(
+                        (x_pdf, y0_pdf),
+                        (x_pdf, y1_pdf),
+                        color=GUIDE_COLOR,
+                        width=GUIDE_WIDTH,
+                    )
 
             staff_start_source = "none"
             mapping_status = "not_applicable"
@@ -2441,6 +2544,51 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         "anchor_in_bounds": bool(anchor_in_bounds),
                     }
                 )
+            measure_box_rows: list[dict] = []
+            for row in measure_box_rows_px:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    system_index = int(row.get("system_index"))
+                    measure_local_index = int(row.get("measure_local_index"))
+                    x_left_px = float(row.get("x_left"))
+                    x_right_px = float(row.get("x_right"))
+                    y_top_px = float(row.get("y_top"))
+                    y_bottom_px = float(row.get("y_bottom"))
+                except Exception:
+                    continue
+                if (x_right_px - x_left_px) < 6.0 or y_bottom_px <= y_top_px:
+                    continue
+
+                x_left_pdf = max(0.0, min(float(rect.width), x_left_px * scale_x))
+                x_right_pdf = max(0.0, min(float(rect.width), x_right_px * scale_x))
+                y_top_pdf = max(0.0, min(float(rect.height), y_top_px * scale_y))
+                y_bottom_pdf = max(0.0, min(float(rect.height), y_bottom_px * scale_y))
+                if (x_right_pdf - x_left_pdf) < 6.0 or y_bottom_pdf <= y_top_pdf:
+                    continue
+
+                raw_measure_number = row.get("raw_measure_number")
+                raw_measure_number = (
+                    str(raw_measure_number)
+                    if raw_measure_number is not None and str(raw_measure_number).strip()
+                    else None
+                )
+                page_no = int(page_index + 1)
+                measure_box_rows.append(
+                    {
+                        "measure_id": f"p{page_no}_s{system_index}_m{measure_local_index}",
+                        "page": page_no,
+                        "system_id": f"p{page_no}_s{system_index}",
+                        "system_index": int(system_index),
+                        "measure_local_index": int(measure_local_index),
+                        "x_left": round(float(x_left_pdf), 3),
+                        "x_right": round(float(x_right_pdf), 3),
+                        "y_top": round(float(y_top_pdf), 3),
+                        "y_bottom": round(float(y_bottom_pdf), 3),
+                        "raw_measure_number": raw_measure_number,
+                        "source": str(row.get("source") or "omr"),
+                    }
+                )
 
             if _debug_measure_labels_enabled():
                 print(
@@ -2596,6 +2744,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "system_labels_drawn_count": system_labels_drawn_count,
                     "system_labels_in_bounds_count": system_labels_in_bounds_count,
                     "system_label_rows": system_label_rows,
+                    "measure_box_rows": measure_box_rows,
                     "page_width": round(float(rect.width), 3),
                     "page_height": round(float(rect.height), 3),
                     "ending_anchor_count": ending_anchor_count,
