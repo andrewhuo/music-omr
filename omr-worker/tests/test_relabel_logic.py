@@ -107,6 +107,7 @@ class RelabelLogicTests(unittest.TestCase):
     def _sample_state(self):
         return {
             "version": "system_state_v1",
+            "labels_mode": "system_only",
             "systems": [
                 {"system_id": "p1_s2", "page": 1, "system_index": 2, "current_value": "7"},
                 {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1"},
@@ -165,6 +166,44 @@ class RelabelLogicTests(unittest.TestCase):
         systems, _, _, _ = WORKER._apply_relabel_edits(self._sample_state(), [])
         ordering = [(row["page"], row["system_index"]) for row in systems]
         self.assertEqual(ordering, [(1, 0), (1, 1), (1, 2), (2, 0)])
+
+    def test_set_labels_mode_applied(self):
+        state = self._sample_state()
+        systems, applied, rejected, total = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_labels_mode", "value": "all_measures"}],
+        )
+        self.assertEqual(total, 4)
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_labels_mode", "value": "all_measures"}])
+        self.assertEqual(state.get("labels_mode"), "all_measures")
+        self.assertEqual(len(systems), 4)
+
+    def test_invalid_labels_mode_rejected(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_labels_mode", "value": "bad_mode"}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "invalid_value")
+        self.assertEqual(state.get("labels_mode"), "system_only")
+
+    def test_mixed_edits_apply_mode_and_system_start(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_labels_mode", "value": "all_measures"},
+                {"type": "set_system_start", "system_id": "p1_s1", "value": 20},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(applied), 2)
+        self.assertEqual(state.get("labels_mode"), "all_measures")
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 20, 23, 26])
 
     def test_relabel_trace_history_cap(self):
         mapping_summary = {}

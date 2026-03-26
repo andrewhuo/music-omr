@@ -53,6 +53,9 @@ MEASURE_TEXT_SIZE = 10.0
 MEASURE_TEXT_Y_OFFSET = 6.0
 MEASURE_TEXT_GUIDE_RIGHT_LIMIT = 6.0
 MEASURE_TEXT_BG_COLOR = (1, 1, 1)
+LABELS_MODE_SYSTEM_ONLY = "system_only"
+LABELS_MODE_ALL_MEASURES = "all_measures"
+LABELS_MODE_ALLOWED = {LABELS_MODE_SYSTEM_ONLY, LABELS_MODE_ALL_MEASURES}
 
 # In-memory correlation for workflow dispatches that do not return run_id directly.
 _PENDING_DISPATCHES: dict[str, dict] = {}
@@ -759,7 +762,9 @@ def _label_position(anchor_x: float, anchor_y_top: float, page_width: float, pag
 def _editable_state_version(editable_state: dict) -> str:
     payload = {
         "version": editable_state.get("version"),
+        "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
         "systems": editable_state.get("systems") or [],
+        "staff_boxes": editable_state.get("staff_boxes") or [],
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
@@ -876,6 +881,23 @@ def _persist_relabel_trace(mapping_summary: dict, mapping_uri: str, trace: dict,
 
 def _draw_measure_label(page: fitz.Page, page_rect: fitz.Rect, anchor_x: float, anchor_y_top: float, text: str) -> None:
     x_text, y_text, tw = _label_position(anchor_x, anchor_y_top, float(page_rect.width), float(page_rect.height), text)
+    th = float(MEASURE_TEXT_SIZE + 2.0)
+    bg = fitz.Rect(x_text - 1.0, y_text - th + 1.0, x_text + tw + 1.0, y_text + 1.0)
+    x0 = max(0.0, min(bg.x0, page_rect.width))
+    y0 = max(0.0, min(bg.y0, page_rect.height))
+    x1 = max(0.0, min(bg.x1, page_rect.width))
+    y1 = max(0.0, min(bg.y1, page_rect.height))
+    if x1 > x0 and y1 > y0:
+        page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
+    page.insert_text((x_text, y_text), text, fontsize=MEASURE_TEXT_SIZE, color=MEASURE_TEXT_COLOR)
+
+
+def _draw_measure_label_left_barline(page: fitz.Page, page_rect: fitz.Rect, x_left: float, y_top: float, text: str) -> None:
+    tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
+    x_text = min(max(0.0, float(x_left) + 1.0), max(0.0, float(page_rect.width) - tw - 2.0))
+    y_text = max(MEASURE_TEXT_SIZE + 2.0, float(y_top) - MEASURE_TEXT_Y_OFFSET)
+    y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, float(page_rect.height) - 2.0))
+
     th = float(MEASURE_TEXT_SIZE + 2.0)
     bg = fitz.Rect(x_text - 1.0, y_text - th + 1.0, x_text + tw + 1.0, y_text + 1.0)
     x0 = max(0.0, min(bg.x0, page_rect.width))
@@ -1014,85 +1036,158 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
 
     applied: list[dict] = []
     rejected: list[dict] = []
+    labels_mode = str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY).strip().lower()
+    if labels_mode not in LABELS_MODE_ALLOWED:
+        labels_mode = LABELS_MODE_SYSTEM_ONLY
+
     for raw_edit in edits:
         if not isinstance(raw_edit, dict):
             rejected.append({"edit": raw_edit, "reason": "invalid_edit_object"})
             continue
         edit_type = str(raw_edit.get("type") or "").strip()
-        if edit_type != "set_system_start":
-            rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
-            continue
-        system_id = str(raw_edit.get("system_id") or "").strip()
-        if not system_id or system_id not in id_to_index:
-            rejected.append({"edit": raw_edit, "reason": "unknown_system_id"})
-            continue
-        try:
-            new_value = int(raw_edit.get("value"))
-        except Exception:
-            rejected.append({"edit": raw_edit, "reason": "invalid_value"})
-            continue
-        if new_value < RELABEL_MIN_VALUE or new_value > RELABEL_MAX_VALUE:
-            rejected.append(
-                {
-                    "edit": raw_edit,
-                    "reason": "value_out_of_range",
-                    "min": RELABEL_MIN_VALUE,
-                    "max": RELABEL_MAX_VALUE,
-                }
-            )
+        if edit_type == "set_system_start":
+            system_id = str(raw_edit.get("system_id") or "").strip()
+            if not system_id or system_id not in id_to_index:
+                rejected.append({"edit": raw_edit, "reason": "unknown_system_id"})
+                continue
+            try:
+                new_value = int(raw_edit.get("value"))
+            except Exception:
+                rejected.append({"edit": raw_edit, "reason": "invalid_value"})
+                continue
+            if new_value < RELABEL_MIN_VALUE or new_value > RELABEL_MAX_VALUE:
+                rejected.append(
+                    {
+                        "edit": raw_edit,
+                        "reason": "value_out_of_range",
+                        "min": RELABEL_MIN_VALUE,
+                        "max": RELABEL_MAX_VALUE,
+                    }
+                )
+                continue
+
+            idx = id_to_index[system_id]
+            values[idx] = int(new_value)
+            for j in range(idx + 1, len(values)):
+                values[j] = int(values[j - 1] + deltas[j - 1])
+            applied.append({"type": "set_system_start", "system_id": system_id, "value": int(new_value)})
             continue
 
-        idx = id_to_index[system_id]
-        values[idx] = int(new_value)
-        for j in range(idx + 1, len(values)):
-            values[j] = int(values[j - 1] + deltas[j - 1])
-        applied.append({"type": "set_system_start", "system_id": system_id, "value": int(new_value)})
+        if edit_type == "set_labels_mode":
+            mode = str(raw_edit.get("value") or "").strip().lower()
+            if mode not in LABELS_MODE_ALLOWED:
+                rejected.append({"edit": raw_edit, "reason": "invalid_value"})
+                continue
+            labels_mode = mode
+            applied.append({"type": "set_labels_mode", "value": labels_mode})
+            continue
+
+        rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
 
     for idx, row in enumerate(systems):
         row["current_value"] = str(values[idx])
         row["value"] = str(values[idx])
         row["render_label"] = str(values[idx])
 
+    editable_state["labels_mode"] = labels_mode
     return systems, applied, rejected, len(values)
 
 
-def _render_corrected_pdf(input_pdf: Path, output_pdf: Path, systems: list[dict], baseline_systems: dict[str, dict]) -> int:
+def _render_corrected_pdf(
+    input_pdf: Path,
+    output_pdf: Path,
+    systems: list[dict],
+    baseline_systems: dict[str, dict],
+    measures: list[dict],
+    labels_mode: str,
+) -> int:
     doc = fitz.open(str(input_pdf))
     drawn = 0
-    for row in systems:
-        sid = str(row.get("system_id") or "").strip()
-        anchor = row.get("anchor") or {}
-        page_no = _safe_int(row.get("page"), 0)
-        if page_no <= 0 or page_no > doc.page_count:
-            continue
+
+    def _erase_baseline_system_label(page, rect, base_row: dict) -> None:
+        base_anchor = base_row.get("anchor") if isinstance(base_row, dict) else {}
+        base_value = str(base_row.get("current_value") or base_row.get("value") or "").strip()
+        if not isinstance(base_anchor, dict) or not base_value:
+            return
         try:
-            ax = float(anchor.get("x"))
-            ay0 = float(anchor.get("y_top"))
+            bx = float(base_anchor.get("x"))
+            by0 = float(base_anchor.get("y_top"))
+            old_x, old_y, old_tw = _label_position(bx, by0, float(rect.width), float(rect.height), base_value)
+            old_h = float(MEASURE_TEXT_SIZE + 2.0)
+            erase = fitz.Rect(old_x - 2.0, old_y - old_h, old_x + old_tw + 2.0, old_y + 2.0)
+            page.draw_rect(erase, color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
         except Exception:
-            continue
-        page = doc[page_no - 1]
-        rect = page.rect
+            return
 
-        # Clear old label (if baseline exists), then draw new.
-        base = baseline_systems.get(sid) or {}
-        base_anchor = base.get("anchor") if isinstance(base, dict) else {}
-        base_value = str(base.get("current_value") or base.get("value") or "").strip()
-        if isinstance(base_anchor, dict) and base_value:
+    if labels_mode == LABELS_MODE_ALL_MEASURES:
+        starts_by_system: dict[str, int] = {}
+        for row in systems:
+            if not isinstance(row, dict):
+                continue
+            sid = str(row.get("system_id") or "").strip()
+            if not sid:
+                continue
+            starts_by_system[sid] = _safe_int(row.get("current_value") or row.get("value"), 0)
+
+        for base in baseline_systems.values():
+            if not isinstance(base, dict):
+                continue
+            page_no = _safe_int(base.get("page"), 0)
+            if page_no <= 0 or page_no > doc.page_count:
+                continue
+            page = doc[page_no - 1]
+            _erase_baseline_system_label(page, page.rect, base)
+
+        ordered_measures = sorted(
+            [m for m in measures if isinstance(m, dict)],
+            key=lambda m: (
+                _safe_int(m.get("page"), 0),
+                _safe_int(m.get("system_index"), 0),
+                _safe_int(m.get("measure_local_index"), 0),
+                _safe_int(m.get("global_index"), 0),
+            ),
+        )
+        for measure in ordered_measures:
+            system_id = str(measure.get("system_id") or "").strip()
+            if not system_id or system_id not in starts_by_system:
+                continue
+            page_no = _safe_int(measure.get("page"), 0)
+            if page_no <= 0 or page_no > doc.page_count:
+                continue
+            local_index = max(0, _safe_int(measure.get("measure_local_index"), 0))
+            label = str(int(starts_by_system[system_id] + local_index))
             try:
-                bx = float(base_anchor.get("x"))
-                by0 = float(base_anchor.get("y_top"))
-                old_x, old_y, old_tw = _label_position(bx, by0, float(rect.width), float(rect.height), base_value)
-                old_h = float(MEASURE_TEXT_SIZE + 2.0)
-                erase = fitz.Rect(old_x - 2.0, old_y - old_h, old_x + old_tw + 2.0, old_y + 2.0)
-                page.draw_rect(erase, color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
+                x_left = float(measure.get("x_left"))
+                y_top = float(measure.get("y_top"))
             except Exception:
-                pass
+                continue
+            page = doc[page_no - 1]
+            _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
+            drawn += 1
+    else:
+        for row in systems:
+            sid = str(row.get("system_id") or "").strip()
+            anchor = row.get("anchor") or {}
+            page_no = _safe_int(row.get("page"), 0)
+            if page_no <= 0 or page_no > doc.page_count:
+                continue
+            try:
+                ax = float(anchor.get("x"))
+                ay0 = float(anchor.get("y_top"))
+            except Exception:
+                continue
+            page = doc[page_no - 1]
+            rect = page.rect
 
-        label = str(row.get("current_value") or row.get("value") or "").strip()
-        if not label:
-            continue
-        _draw_measure_label(page, rect, ax, ay0, label)
-        drawn += 1
+            # Clear old label (if baseline exists), then draw new.
+            base = baseline_systems.get(sid) or {}
+            _erase_baseline_system_label(page, rect, base)
+
+            label = str(row.get("current_value") or row.get("value") or "").strip()
+            if not label:
+                continue
+            _draw_measure_label(page, rect, ax, ay0, label)
+            drawn += 1
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_pdf))
@@ -1371,6 +1466,9 @@ def get_job_state(job_id: str):
     measures = editable_state.get("measures")
     if not isinstance(measures, list):
         measures = []
+    staff_boxes = editable_state.get("staff_boxes")
+    if not isinstance(staff_boxes, list):
+        staff_boxes = []
     qa = editable_state.get("qa")
     if not isinstance(qa, dict):
         qa = {}
@@ -1381,9 +1479,11 @@ def get_job_state(job_id: str):
         "state_version": _editable_state_version(editable_state),
         "editable_state": {
             "version": str(editable_state.get("version") or "system_state_v1"),
+            "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
             "qa": qa,
             "systems": systems,
             "measures": measures,
+            "staff_boxes": staff_boxes,
         },
         "relabel_debug_summary": _summarize_relabel_debug(mapping_summary),
         "artifacts": artifacts,
@@ -1521,6 +1621,10 @@ def relabel_job(job_id: str):
             ),
             409,
         )
+    labels_mode_before = str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY).strip().lower()
+    if labels_mode_before not in LABELS_MODE_ALLOWED:
+        labels_mode_before = LABELS_MODE_SYSTEM_ONLY
+    editable_state["labels_mode"] = labels_mode_before
 
     if not isinstance(edits, list) or len(edits) == 0:
         trace = {
@@ -1655,7 +1759,14 @@ def relabel_job(job_id: str):
             out_pdf = tmpdir / "audiveris_out_corrected.pdf"
             _download_gcs_to_file(baseline_pdf_uri, in_pdf)
             redraw_started = time.time()
-            labels_drawn = _render_corrected_pdf(in_pdf, out_pdf, systems, baseline_by_id)
+            labels_drawn = _render_corrected_pdf(
+                in_pdf,
+                out_pdf,
+                systems,
+                baseline_by_id,
+                list(editable_state.get("measures") or []),
+                str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
+            )
             redraw_ms = int((time.time() - redraw_started) * 1000)
             _upload_file_to_gcs(out_pdf, corrected_pdf_uri, content_type="application/pdf")
     except Exception as exc:
@@ -1727,6 +1838,7 @@ def relabel_job(job_id: str):
         "updated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "applied_edits": applied,
         "rejected_edits": rejected,
+        "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
         "systems_updated_count": len(systems),
         "labels_redrawn_count": labels_drawn,
         "duration_ms": int((time.time() - started) * 1000),
@@ -1787,6 +1899,7 @@ def relabel_job(job_id: str):
         "relabel": {
             "applied_edits": applied,
             "rejected_edits": rejected,
+            "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
             "state_version_before": state_version_before,
             "state_version_after": state_version_after,
             "updated_system_ids": updated_system_ids,

@@ -163,6 +163,18 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         self.assertIsNone(WORKER._api_before_request())
 
+    def test_options_preflight_fallback_never_500(self):
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs",
+            method="OPTIONS",
+            headers={"Origin": "http://localhost:5173"},
+            files={},
+            json={},
+        )
+        with patch.object(WORKER, "_apply_cors_headers", side_effect=RuntimeError("boom")):
+            resp = WORKER._api_before_request()
+        self.assertEqual(getattr(resp, "status_code", 0), 204)
+
     def test_signed_url_fallback_returns_empty(self):
         class _FakeBlob:
             def exists(self):
@@ -292,6 +304,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             body, status = _unpack(WORKER.get_job_state("111"))
         self.assertEqual(status, 200)
         self.assertEqual(body.get("artifacts_http"), artifacts_http)
+        self.assertEqual((body.get("editable_state") or {}).get("labels_mode"), "system_only")
+        self.assertEqual((body.get("editable_state") or {}).get("staff_boxes"), [])
 
     def test_list_jobs_endpoint_returns_simple_rows(self):
         now = WORKER._utc_now()
@@ -312,6 +326,78 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(body["jobs"][0].get("job_id"), "abc123")
         self.assertEqual(body["jobs"][0].get("status"), "succeeded")
         self.assertEqual(body["jobs"][0].get("created_at"), "2026-03-08T20:00:00Z")
+
+    def test_list_jobs_returns_empty_array_when_snapshot_fails(self):
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs", method="GET", headers={}, files={}, json={})
+        with patch.object(WORKER, "_pending_items_snapshot", side_effect=RuntimeError("snapshot failed")):
+            body, status = _unpack(WORKER.list_jobs())
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("jobs"), [])
+
+    def test_list_jobs_tolerates_malformed_records(self):
+        WORKER._PENDING_DISPATCHES["good"] = {
+            "dispatch_id": "good",
+            "dispatched_at": WORKER._utc_now(),
+            "expected_sha": "abc",
+            "run_id": "123",
+        }
+        WORKER._PENDING_DISPATCHES["bad"] = {
+            "dispatch_id": "bad",
+            "dispatched_at": object(),
+            "run_id": object(),
+        }
+
+        with patch.object(WORKER, "_get_run", side_effect=RuntimeError("github down")):
+            WORKER.request = SimpleNamespace(path="/api/omr/jobs", method="GET", headers={}, files={}, json={})
+            body, status = _unpack(WORKER.list_jobs())
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body.get("jobs") or []), 2)
+
+    def test_relabel_set_labels_mode_all_measures(self):
+        artifacts = {
+            "audiveris_out_pdf": "gs://x/output/audiveris_out.pdf",
+            "audiveris_out_corrected_pdf": "gs://x/output/audiveris_out_corrected.pdf",
+            "run_info": "gs://x/output/artifacts/run_info.json",
+            "mapping_summary": "gs://x/output/artifacts/mapping_summary.json",
+        }
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = {
+            "editable_state": {
+                "version": "system_state_v1",
+                "systems": [
+                    {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1", "anchor": {"x": 10, "y_top": 20}},
+                    {"system_id": "p1_s1", "page": 1, "system_index": 1, "current_value": "5", "anchor": {"x": 10, "y_top": 80}},
+                ],
+                "measures": [
+                    {"measure_id": "m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "global_index": 0, "x_left": 30, "y_top": 20},
+                    {"measure_id": "m1", "system_id": "p1_s1", "page": 1, "system_index": 1, "measure_local_index": 0, "global_index": 1, "x_left": 30, "y_top": 80},
+                ],
+            }
+        }
+
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={"edits": [{"type": "set_labels_mode", "value": "all_measures"}]},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER, "_render_corrected_pdf", return_value=2),
+            patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 200)
+        relabel = body.get("relabel") or {}
+        self.assertEqual(relabel.get("labels_mode"), "all_measures")
+        self.assertEqual(relabel.get("labels_redrawn_count"), 2)
 
 
 
