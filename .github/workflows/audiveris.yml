@@ -4521,10 +4521,14 @@ jobs:
                           page_measure_bounds[system_id] = {
                               "x_left": float(x_left),
                               "x_right": float(x_right),
+                              "y_top": float(y_top),
+                              "y_bottom": float(y_bottom),
                           }
                       else:
                           bounds["x_left"] = min(float(bounds.get("x_left", x_left)), float(x_left))
                           bounds["x_right"] = max(float(bounds.get("x_right", x_right)), float(x_right))
+                          bounds["y_top"] = min(float(bounds.get("y_top", y_top)), float(y_top))
+                          bounds["y_bottom"] = max(float(bounds.get("y_bottom", y_bottom)), float(y_bottom))
 
               page_staff_boxes_count = 0
               systems_with_measures = 0
@@ -4535,13 +4539,30 @@ jobs:
                       continue
                   bounds = page_measure_bounds.get(system_id)
                   if not isinstance(bounds, dict):
-                      staff_box_reason_counts["missing_measure_bounds"] += 1
+                      staff_box_reason_counts["measure_bounds_missing"] += 1
                       continue
                   systems_with_measures += 1
                   x_left = float(bounds.get("x_left", 0.0))
                   x_right = float(bounds.get("x_right", 0.0))
-                  y_top = float(sys_row.get("anchor_y_top", 0.0)) - 2.0
-                  y_bottom = float(sys_row.get("anchor_y_bottom", 0.0)) + 2.0
+                  anchor_y_top = float(sys_row.get("anchor_y_top", 0.0))
+                  anchor_y_bottom = float(sys_row.get("anchor_y_bottom", 0.0))
+                  measure_y_top = bounds.get("y_top")
+                  measure_y_bottom = bounds.get("y_bottom")
+                  source = "measure_bounds"
+
+                  if measure_y_top is None or measure_y_bottom is None:
+                      y_top = anchor_y_top - 1.0
+                      y_bottom = anchor_y_bottom + 1.0
+                      source = "anchor_fallback"
+                  else:
+                      y_top = float(measure_y_top) - 1.0
+                      y_bottom = float(measure_y_bottom) + 1.0
+                      anchor_delta = max(
+                          abs(float(measure_y_top) - anchor_y_top),
+                          abs(float(measure_y_bottom) - anchor_y_bottom),
+                      )
+                      if anchor_delta > 8.0:
+                          staff_box_reason_counts["anchor_delta_large"] += 1
 
                   y_top = max(0.0, y_top)
                   y_bottom = min(page_h if page_h > 0.0 else y_bottom, y_bottom)
@@ -4558,6 +4579,9 @@ jobs:
                       if not in_bounds:
                           staff_box_reason_counts["out_of_bounds"] += 1
 
+                  if source == "anchor_fallback":
+                      staff_box_reason_counts["anchor_fallback"] += 1
+
                   staff_box_id = f"staff_{system_id}"
                   if staff_box_id in editable_staff_box_ids:
                       staff_box_reason_counts["duplicate_staff_box_id"] += 1
@@ -4573,7 +4597,7 @@ jobs:
                           "x_right": round(float(x_right), 3),
                           "y_top": round(float(y_top), 3),
                           "y_bottom": round(float(y_bottom), 3),
-                          "source": guide_build_source,
+                          "source": source,
                           "in_bounds": bool(in_bounds),
                       }
                   )
@@ -4650,9 +4674,11 @@ jobs:
                       "skipped": int(measure_box_reason_counts.get("skipped", 0)),
                   },
                   "staff_box_reason_counts": {
-                      "missing_measure_bounds": int(staff_box_reason_counts.get("missing_measure_bounds", 0)),
+                      "measure_bounds_missing": int(staff_box_reason_counts.get("measure_bounds_missing", 0)),
                       "invalid_span": int(staff_box_reason_counts.get("invalid_span", 0)),
                       "out_of_bounds": int(staff_box_reason_counts.get("out_of_bounds", 0)),
+                      "anchor_delta_large": int(staff_box_reason_counts.get("anchor_delta_large", 0)),
+                      "anchor_fallback": int(staff_box_reason_counts.get("anchor_fallback", 0)),
                       "count_mismatch": int(staff_box_reason_counts.get("count_mismatch", 0)),
                   },
               },

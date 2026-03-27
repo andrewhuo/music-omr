@@ -1685,6 +1685,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 yxs: list[tuple[float, float]] = []
                 all_line_xmins: list[float] = []
+                all_line_xmaxs: list[float] = []
 
                 for ln in line_nodes:
                     pts = ln.findall("point")
@@ -1692,6 +1693,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         continue
 
                     min_x = None
+                    max_x = None
                     y_at_min_x = None
 
                     for p in pts:
@@ -1702,12 +1704,15 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         if min_x is None or x < min_x:
                             min_x = x
                             y_at_min_x = y
+                        if max_x is None or x > max_x:
+                            max_x = x
 
-                    if min_x is None or y_at_min_x is None:
+                    if min_x is None or max_x is None or y_at_min_x is None:
                         continue
 
                     yxs.append((float(y_at_min_x), float(min_x)))
                     all_line_xmins.append(float(min_x))
+                    all_line_xmaxs.append(float(max_x))
 
                 yxs.sort(key=lambda t: t[0])
 
@@ -1765,8 +1770,14 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
                 x_left = _safe_float(staff.get("left"))
                 line_min_x = float(min(all_line_xmins)) if all_line_xmins else None
+                line_max_x = float(max(all_line_xmaxs)) if all_line_xmaxs else None
                 staff_left_raw = _safe_float(staff.get("left"))
                 staff_right_raw = _safe_float(staff.get("right"))
+                staff_right_effective = (
+                    float(line_max_x)
+                    if line_max_x is not None
+                    else (float(staff_right_raw) if staff_right_raw is not None else None)
+                )
 
                 if x_left is None and line_min_x is not None:
                     x_left = line_min_x
@@ -1834,10 +1845,10 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         sheet_xml_path,
                         staff_id,
                         f"[DBG] sheet={sheet_xml_path} sys={system.get('id')} staff={staff_id} indented={system.get('indented')} "
-                        f"lines={len(line_nodes)} header_start={header_start} line_min_x={line_min_x} "
+                        f"lines={len(line_nodes)} header_start={header_start} line_min_x={line_min_x} line_max_x={line_max_x} "
                         f"expected_spacing={expected_spacing:.2f} "
                         f"clef_b={'present' if clef_b is not None else None} "
-                        f"x_before={x_before:.2f} x_after={float(x_left):.2f} x_postpad={x_postpad:.2f} "
+                        f"x_before={x_before:.2f} x_after={float(x_left):.2f} x_postpad={x_postpad:.2f} staff_right_effective={staff_right_effective} "
                         f"y_top={y_top:.1f} y_bot={y_bot:.1f}",
                     )
 
@@ -1851,7 +1862,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     y_bot=y_bot,
                     staff_barline_ids=staff_barline_ids,
                     staff_left=staff_left_raw,
-                    staff_right=staff_right_raw,
+                    staff_right=staff_right_effective,
                 )
                 increment_before = len(staff_barline_xs)
                 increment_bars = increment_before
@@ -1871,9 +1882,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                             left_carryover_detected = True
                             increment_bars = max(0, increment_bars - 1)
 
-                    if staff_right_raw is not None and increment_bars > 1:
+                    if staff_right_effective is not None and increment_bars > 1:
                         last_bar_x = float(max(staff_barline_xs))
-                        if abs(float(staff_right_raw) - last_bar_x) <= carry_tol:
+                        if abs(float(staff_right_effective) - last_bar_x) <= carry_tol:
                             right_carryover_detected = True
                             increment_bars = max(0, increment_bars - 1)
 
@@ -1921,7 +1932,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         "x_start": float(x_postpad),
                         "y_top": float(y_top),
                         "y_bottom": float(y_bot),
-                        "staff_right": float(staff_right_raw) if staff_right_raw is not None else None,
+                        "staff_right": float(staff_right_effective) if staff_right_effective is not None else None,
                         "barline_xs": [float(x) for x in staff_barline_xs],
                     }
                 )
