@@ -4357,6 +4357,21 @@ jobs:
               system_qa_warnings = list(pg.get("system_qa_warnings") or [])
               page_w = float(pg.get("page_width") or 0.0)
               page_h = float(pg.get("page_height") or 0.0)
+              parser_filter_counts = pg.get("measure_box_filter_reason_counts") or {}
+              if isinstance(parser_filter_counts, dict):
+                  for reason_raw, count_raw in parser_filter_counts.items():
+                      reason = str(reason_raw or "").strip().lower()
+                      if not reason:
+                          continue
+                      try:
+                          count = int(count_raw)
+                      except Exception:
+                          continue
+                      if count <= 0:
+                          continue
+                      key = f"parser_{reason}"
+                      measure_box_reason_counts[key] += int(count)
+                      staff_box_reason_counts[key] += int(count)
               system_count_drift = False
               if baseline_mode and source == "mxl" and status == "ok":
                   if system_guide_count != omr_system_count or system_labels_drawn_count != omr_system_count:
@@ -4548,21 +4563,18 @@ jobs:
                   anchor_y_bottom = float(sys_row.get("anchor_y_bottom", 0.0))
                   measure_y_top = bounds.get("y_top")
                   measure_y_bottom = bounds.get("y_bottom")
-                  source = "measure_bounds"
-
                   if measure_y_top is None or measure_y_bottom is None:
-                      y_top = anchor_y_top - 1.0
-                      y_bottom = anchor_y_bottom + 1.0
-                      source = "anchor_fallback"
-                  else:
-                      y_top = float(measure_y_top) - 1.0
-                      y_bottom = float(measure_y_bottom) + 1.0
-                      anchor_delta = max(
-                          abs(float(measure_y_top) - anchor_y_top),
-                          abs(float(measure_y_bottom) - anchor_y_bottom),
-                      )
-                      if anchor_delta > 8.0:
-                          staff_box_reason_counts["anchor_delta_large"] += 1
+                      staff_box_reason_counts["measure_bounds_missing"] += 1
+                      continue
+                  y_top = float(measure_y_top) - 1.0
+                  y_bottom = float(measure_y_bottom) + 1.0
+                  source = "measure_bounds"
+                  anchor_delta = max(
+                      abs(float(measure_y_top) - anchor_y_top),
+                      abs(float(measure_y_bottom) - anchor_y_bottom),
+                  )
+                  if anchor_delta > 8.0:
+                      staff_box_reason_counts["anchor_delta_large"] += 1
 
                   y_top = max(0.0, y_top)
                   y_bottom = min(page_h if page_h > 0.0 else y_bottom, y_bottom)
@@ -4578,9 +4590,6 @@ jobs:
                       in_bounds = (x_left >= 0.0 and x_right <= page_w and y_top >= 0.0 and y_bottom <= page_h)
                       if not in_bounds:
                           staff_box_reason_counts["out_of_bounds"] += 1
-
-                  if source == "anchor_fallback":
-                      staff_box_reason_counts["anchor_fallback"] += 1
 
                   staff_box_id = f"staff_{system_id}"
                   if staff_box_id in editable_staff_box_ids:
@@ -4653,6 +4662,26 @@ jobs:
               if int(value) > 0:
                   editable_reason_counts[f"staff_box_{key}"] += int(value)
 
+          measure_box_reason_counts_payload = {
+              "missing": int(measure_box_reason_counts.get("missing", 0)),
+              "invalid": int(measure_box_reason_counts.get("invalid", 0)),
+              "skipped": int(measure_box_reason_counts.get("skipped", 0)),
+          }
+          for key in sorted(measure_box_reason_counts.keys()):
+              if str(key).startswith("parser_"):
+                  measure_box_reason_counts_payload[str(key)] = int(measure_box_reason_counts.get(key, 0))
+
+          staff_box_reason_counts_payload = {
+              "staff_box_measure_bounds_missing": int(staff_box_reason_counts.get("measure_bounds_missing", 0)),
+              "staff_box_invalid_span": int(staff_box_reason_counts.get("invalid_span", 0)),
+              "staff_box_out_of_bounds": int(staff_box_reason_counts.get("out_of_bounds", 0)),
+              "staff_box_anchor_delta_large": int(staff_box_reason_counts.get("anchor_delta_large", 0)),
+              "staff_box_count_mismatch": int(staff_box_reason_counts.get("count_mismatch", 0)),
+          }
+          for key in sorted(staff_box_reason_counts.keys()):
+              if str(key).startswith("parser_"):
+                  staff_box_reason_counts_payload[str(key)] = int(staff_box_reason_counts.get(key, 0))
+
           editable_state = {
               "version": "system_state_v1",
               "systems": sorted(
@@ -4668,19 +4697,8 @@ jobs:
                   "total_systems": len(editable_systems),
                   "measure_boxes_count": len(editable_measures_sorted),
                   "staff_boxes_count": len(editable_staff_boxes_sorted),
-                  "measure_box_reason_counts": {
-                      "missing": int(measure_box_reason_counts.get("missing", 0)),
-                      "invalid": int(measure_box_reason_counts.get("invalid", 0)),
-                      "skipped": int(measure_box_reason_counts.get("skipped", 0)),
-                  },
-                  "staff_box_reason_counts": {
-                      "measure_bounds_missing": int(staff_box_reason_counts.get("measure_bounds_missing", 0)),
-                      "invalid_span": int(staff_box_reason_counts.get("invalid_span", 0)),
-                      "out_of_bounds": int(staff_box_reason_counts.get("out_of_bounds", 0)),
-                      "anchor_delta_large": int(staff_box_reason_counts.get("anchor_delta_large", 0)),
-                      "anchor_fallback": int(staff_box_reason_counts.get("anchor_fallback", 0)),
-                      "count_mismatch": int(staff_box_reason_counts.get("count_mismatch", 0)),
-                  },
+                  "measure_box_reason_counts": measure_box_reason_counts_payload,
+                  "staff_box_reason_counts": staff_box_reason_counts_payload,
               },
           }
 

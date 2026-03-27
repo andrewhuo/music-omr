@@ -1458,6 +1458,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     system_guides_px_aligned: list[tuple[float, float, float] | None] = []
     measure_box_rows_px: list[dict] = []
     omr_fallback_rows: list[dict] = []
+    measure_box_filter_reason_counts: dict[str, int] = {}
 
     pages = root.findall("page")
     if not pages:
@@ -1472,6 +1473,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             system_guides_px_aligned,
             measure_box_rows_px,
             omr_fallback_rows,
+            measure_box_filter_reason_counts,
         )
 
     staff_total = 0
@@ -1731,6 +1733,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 if ys5 is not None:
                     y_top = float(min(ys5))
                     y_bot = float(max(ys5))
+                    y_source = "staff_lines"
                 else:
                     span = barline_span_for_staff(staff_id, yxs[0][0] if len(yxs) >= 1 else None)
                     if span is None:
@@ -1742,6 +1745,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         _dbg(sheet_xml_path, staff_id, f"[DBG] SKIP no_y_span sheet={sheet_xml_path} staff={staff_id}")
                         continue
                     y_top, y_bot = span
+                    y_source = "barline_span"
 
                 if y_bot <= y_top or (y_bot - y_top) < 10.0:
                     _dbg(
@@ -1934,6 +1938,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         "y_bottom": float(y_bot),
                         "staff_right": float(staff_right_effective) if staff_right_effective is not None else None,
                         "barline_xs": [float(x) for x in staff_barline_xs],
+                        "barline_count": int(len(staff_barline_xs)),
+                        "y_source": y_source,
                     }
                 )
 
@@ -1941,15 +1947,34 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     measure_marks_px.append((bx, y_top, y_bot, str(measure_num)))
 
             if system_measure_rows_px:
-                system_y_top = min(float(row["y_top"]) for row in system_measure_rows_px)
-                system_y_bottom = max(float(row["y_bottom"]) for row in system_measure_rows_px)
+                selected_measure_rows = [
+                    row for row in system_measure_rows_px if str(row.get("y_source") or "") == "staff_lines"
+                ]
+                if not selected_measure_rows:
+                    measure_box_filter_reason_counts["no_staff_line_rows"] = (
+                        int(measure_box_filter_reason_counts.get("no_staff_line_rows") or 0) + 1
+                    )
+                    selected_measure_rows = [
+                        row for row in system_measure_rows_px if int(row.get("barline_count") or 0) > 0
+                    ]
+                    if selected_measure_rows:
+                        measure_box_filter_reason_counts["fallback_barline_rows_used"] = (
+                            int(measure_box_filter_reason_counts.get("fallback_barline_rows_used") or 0) + 1
+                        )
+                    else:
+                        measure_box_filter_reason_counts["no_rows_with_barlines"] = (
+                            int(measure_box_filter_reason_counts.get("no_rows_with_barlines") or 0) + 1
+                        )
+
+                system_y_top = min(float(row["y_top"]) for row in selected_measure_rows) if selected_measure_rows else 0.0
+                system_y_bottom = max(float(row["y_bottom"]) for row in selected_measure_rows) if selected_measure_rows else 0.0
                 if system_y_bottom > system_y_top:
                     merge_tol = max(2.0, (0.20 * expected_spacing) if expected_spacing > 0 else 2.5)
                     start_candidates: list[float] = []
                     boundary_candidates: list[float] = []
                     staff_right_candidates: list[float] = []
 
-                    for row in system_measure_rows_px:
+                    for row in selected_measure_rows:
                         start_candidates.append(float(row["x_start"]))
                         for x in row.get("barline_xs") or []:
                             boundary_candidates.append(float(x))
@@ -2019,6 +2044,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         system_guides_px_aligned,
         measure_box_rows_px,
         omr_fallback_rows,
+        measure_box_filter_reason_counts,
     )
 
 
@@ -2297,6 +2323,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 system_guides_px_aligned,
                 measure_box_rows_px,
                 omr_fallback_rows,
+                measure_box_filter_reason_counts,
             ) = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
                 continue
@@ -2756,6 +2783,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "system_labels_in_bounds_count": system_labels_in_bounds_count,
                     "system_label_rows": system_label_rows,
                     "measure_box_rows": measure_box_rows,
+                    "measure_box_filter_reason_counts": dict(measure_box_filter_reason_counts),
                     "page_width": round(float(rect.width), 3),
                     "page_height": round(float(rect.height), 3),
                     "ending_anchor_count": ending_anchor_count,
