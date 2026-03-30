@@ -1004,6 +1004,104 @@ def _pending_dispatched_at(rec: dict) -> datetime:
     return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
+def _reassign_measures_to_nearest_system(systems: list[dict], measures: list[dict]) -> int:
+    """Post-process measures to fix system misassignment from OMR.
+
+    The OMR pipeline sometimes assigns measures to the wrong system based on
+    XML element order rather than geometric position.  This function reassigns
+    each measure to the system whose anchor y-range best overlaps the measure's
+    y-range on the same page.  Mutates *measures* in place.
+
+    Returns the number of measures that were reassigned.
+    """
+    # Step 1: Build per-page system lookup from anchors.
+    page_systems: dict[int, list[tuple[str, int, float, float]]] = {}  # page -> [(system_id, system_index, y_top, y_bot)]
+    for s in systems:
+        anchor = s.get("anchor")
+        if not isinstance(anchor, dict):
+            continue
+        try:
+            page = int(s["page"])
+            y_top = float(anchor["y_top"])
+            y_bot = float(anchor["y_bottom"])
+            sid = str(s["system_id"])
+            sidx = int(s.get("system_index", 0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if y_bot <= y_top:
+            continue
+        page_systems.setdefault(page, []).append((sid, sidx, y_top, y_bot))
+    # Sort each page's systems by y_top (top-to-bottom on page).
+    for page in page_systems:
+        page_systems[page].sort(key=lambda t: t[2])
+
+    if not page_systems:
+        return 0
+
+    tolerance = 5.0  # PDF points tolerance for overlap
+    reassigned = 0
+
+    # Step 2: For each measure, find the best-matching system by y-overlap.
+    for m in measures:
+        try:
+            m_page = int(m["page"])
+            m_y_top = float(m["y_top"])
+            m_y_bot = float(m["y_bottom"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        candidates = page_systems.get(m_page)
+        if not candidates:
+            continue
+
+        best_sid = None
+        best_sidx = 0
+        best_overlap = -999999.0
+        best_center_dist = 999999.0
+        m_center = (m_y_top + m_y_bot) / 2.0
+
+        for sid, sidx, s_y_top, s_y_bot in candidates:
+            overlap = min(m_y_bot, s_y_bot) - max(m_y_top, s_y_top) + tolerance
+            s_center = (s_y_top + s_y_bot) / 2.0
+            center_dist = abs(m_center - s_center)
+            if overlap > best_overlap or (overlap == best_overlap and center_dist < best_center_dist):
+                best_overlap = overlap
+                best_center_dist = center_dist
+                best_sid = sid
+                best_sidx = sidx
+
+        if best_sid is None:
+            continue
+
+        current_sid = str(m.get("system_id") or "")
+        if current_sid != best_sid:
+            print(
+                f"MEASURE_REASSIGN measure={m.get('measure_id')} "
+                f"from={current_sid} to={best_sid} "
+                f"m_y=[{m_y_top:.1f},{m_y_bot:.1f}] page={m_page}"
+            )
+            m["system_id"] = best_sid
+            m["system_index"] = best_sidx
+            reassigned += 1
+
+    # Step 3: Recompute measure_local_index and measure_id for all measures
+    # (needed because reassignment changes group membership).
+    from collections import defaultdict
+    groups: dict[tuple[int, str], list[dict]] = defaultdict(list)
+    for m in measures:
+        key = (int(m.get("page", 0)), str(m.get("system_id", "")))
+        groups[key].append(m)
+
+    for key, group in groups.items():
+        group.sort(key=lambda m: float(m.get("x_left", 0)))
+        page_no, sys_id = key
+        for local_idx, m in enumerate(group):
+            m["measure_local_index"] = local_idx
+            sidx = m.get("system_index", 0)
+            m["measure_id"] = f"p{page_no}_s{sidx}_m{local_idx}"
+
+    return reassigned
+
+
 def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[dict], list[dict], list[dict], int]:
     systems = list(editable_state.get("systems") or [])
     if not systems:
@@ -1080,6 +1178,26 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
                 continue
             labels_mode = mode
             applied.append({"type": "set_labels_mode", "value": labels_mode})
+            continue
+
+        if edit_type == "set_rest_staff":
+            system_id = str(raw_edit.get("system_id") or "").strip()
+            if not system_id or system_id not in id_to_index:
+                rejected.append({"edit": raw_edit, "reason": "unknown_system_id"})
+                continue
+            measure_count = raw_edit.get("value")
+            if not isinstance(measure_count, int) or measure_count < 1:
+                rejected.append({"edit": raw_edit, "reason": "invalid_measure_count"})
+                continue
+            idx = id_to_index[system_id]
+            if "rest_systems" not in editable_state:
+                editable_state["rest_systems"] = {}
+            editable_state["rest_systems"][system_id] = measure_count
+            if idx + 1 < len(values):
+                values[idx + 1] = values[idx] + measure_count
+            for j in range(idx + 2, len(values)):
+                values[j] = values[j - 1] + deltas[j - 1]
+            applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
             continue
 
         rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
@@ -1473,6 +1591,10 @@ def get_job_state(job_id: str):
     if not isinstance(qa, dict):
         qa = {}
 
+    reassign_count = _reassign_measures_to_nearest_system(systems, measures)
+    if reassign_count > 0:
+        print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
+
     response = {
         "job_id": job_id,
         "run_id": int(run_id),
@@ -1480,6 +1602,7 @@ def get_job_state(job_id: str):
         "editable_state": {
             "version": str(editable_state.get("version") or "system_state_v1"),
             "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
+            "rest_systems": editable_state.get("rest_systems") or {},
             "qa": qa,
             "systems": systems,
             "measures": measures,

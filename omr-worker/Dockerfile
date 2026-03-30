@@ -9,4 +9,4 @@ COPY worker.py .
 
 ENV PORT=8080
 
-CMD ["python", "worker.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "8", "--timeout", "120", "worker:app"]
