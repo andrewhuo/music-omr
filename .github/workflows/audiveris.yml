@@ -517,28 +517,33 @@ jobs:
           PY
 
           echo "--- Pre-rendering pages to high-DPI B&W PNG for Audiveris ---"
-          python - << 'PY'
+          python - << 'PY' || echo "PRERENDER_WARN prerender failed, falling back to raw PDFs"
           import fitz, cv2, numpy as np, os, glob
 
           dpi = int(os.environ.get("PRERENDER_DPI", "300"))
           zoom = dpi / 72.0
           pages_dir = "/tmp/work/pages"
           count = 0
+          errors = 0
 
           for pdf_path in sorted(glob.glob(os.path.join(pages_dir, "page_*.pdf"))):
-              doc = fitz.open(pdf_path)
-              page = doc[0]
-              pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-              img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-              gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-              bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                          cv2.THRESH_BINARY, 15, 10)
-              out_path = pdf_path.replace(".pdf", ".png")
-              cv2.imwrite(out_path, bw)
-              doc.close()
-              count += 1
+              try:
+                  doc = fitz.open(pdf_path)
+                  page = doc[0]
+                  pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                  img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                  gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                  bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                              cv2.THRESH_BINARY, 15, 10)
+                  out_path = pdf_path.replace(".pdf", ".png")
+                  cv2.imwrite(out_path, bw)
+                  doc.close()
+                  count += 1
+              except Exception as exc:
+                  errors += 1
+                  print(f"PRERENDER_ERROR page={os.path.basename(pdf_path)} error={exc}")
 
-          print(f"PRERENDER done={count} dpi={dpi}")
+          print(f"PRERENDER done={count} errors={errors} dpi={dpi}")
           PY
 
           run_page_omr() {
