@@ -24,6 +24,7 @@ jobs:
       MEASURE_NUMBERING_POLICY: "baseline_continuous_v1"
       SYSTEM_QA_POLICY: "warn"
       SYSTEM_GUIDE_CV_FALLBACK: "0"
+      PRERENDER_DPI: "300"
       PIPELINE_LOG_MODE: "${{ vars.PIPELINE_LOG_MODE != '' && vars.PIPELINE_LOG_MODE || 'quiet' }}"
 
     permissions:
@@ -515,6 +516,31 @@ jobs:
           print(f"PAGE_SPLIT total_pages={len([p for p in os.listdir(out_dir) if p.endswith('.pdf')])}")
           PY
 
+          echo "--- Pre-rendering pages to high-DPI B&W PNG for Audiveris ---"
+          python - << 'PY'
+          import fitz, cv2, numpy as np, os, glob
+
+          dpi = int(os.environ.get("PRERENDER_DPI", "300"))
+          zoom = dpi / 72.0
+          pages_dir = "/tmp/work/pages"
+          count = 0
+
+          for pdf_path in sorted(glob.glob(os.path.join(pages_dir, "page_*.pdf"))):
+              doc = fitz.open(pdf_path)
+              page = doc[0]
+              pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+              img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+              gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+              bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                          cv2.THRESH_BINARY, 15, 10)
+              out_path = pdf_path.replace(".pdf", ".png")
+              cv2.imwrite(out_path, bw)
+              doc.close()
+              count += 1
+
+          print(f"PRERENDER done={count} dpi={dpi}")
+          PY
+
           run_page_omr() {
             local image="$1"
             local page_num="$2"
@@ -530,7 +556,7 @@ jobs:
               -e XDG_CONFIG_HOME="/work/.config" \
               -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
               "${image}" \
-              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; "$AUDI_BIN" -batch -export -output "${AUDI_OUT_DIR}" "/work/pages/page_${PAGE_NUM}.pdf"'
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; INPUT="/work/pages/page_${PAGE_NUM}.png"; [ -f "$INPUT" ] || INPUT="/work/pages/page_${PAGE_NUM}.pdf"; "$AUDI_BIN" -batch -export -output "${AUDI_OUT_DIR}" "$INPUT"'
           }
 
           for page_pdf in /tmp/work/pages/page_*.pdf; do
