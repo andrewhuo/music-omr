@@ -1192,12 +1192,17 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
             idx = id_to_index[system_id]
             if "rest_systems" not in editable_state:
                 editable_state["rest_systems"] = {}
-            # Undo previous rest for this staff if any, then apply new one
-            previous_rest = editable_state["rest_systems"].get(system_id, 0)
             editable_state["rest_systems"][system_id] = measure_count
-            net_change = measure_count - previous_rest
-            for j in range(idx + 1, len(values)):
-                values[j] += net_change
+            # Rest replaces this staff's measure contribution entirely
+            # Next staff = this staff's start + rest count
+            if idx + 1 < len(values):
+                values[idx + 1] = values[idx] + measure_count
+            # Cascade subsequent staffs keeping their original deltas
+            for j in range(idx + 2, len(values)):
+                values[j] = values[j - 1] + deltas[j - 1]
+            # Update delta so subsequent edits in same request see correct spacing
+            if idx < len(deltas):
+                deltas[idx] = measure_count
             applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
             continue
 
