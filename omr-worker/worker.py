@@ -1193,10 +1193,9 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
             if "rest_systems" not in editable_state:
                 editable_state["rest_systems"] = {}
             editable_state["rest_systems"][system_id] = measure_count
-            if idx + 1 < len(values):
-                values[idx + 1] = values[idx] + measure_count
-            for j in range(idx + 2, len(values)):
-                values[j] = values[j - 1] + deltas[j - 1]
+            # Add exactly measure_count to all subsequent staff numbers
+            for j in range(idx + 1, len(values)):
+                values[j] += measure_count
             applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
             continue
 
