@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import time
@@ -21,6 +22,9 @@ try:
 except Exception:
     firestore = None
 from flask import Flask, jsonify, request
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", force=True)
+logger = logging.getLogger("omr-worker")
 
 app = Flask(__name__)
 
@@ -1196,12 +1200,19 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
             prev_rest = editable_state["rest_systems"].get(system_id, 0)
             editable_state["rest_systems"][system_id] = measure_count
             diff = measure_count - prev_rest
-            print(f"REST_DEBUG system_id={system_id} idx={idx} measure_count={measure_count} prev_rest={prev_rest} diff={diff}")
-            print(f"REST_DEBUG values_before={values}")
+            import sys
+            msg1 = f"REST_DEBUG system_id={system_id} idx={idx} measure_count={measure_count} prev_rest={prev_rest} diff={diff}"
+            msg2 = f"REST_DEBUG values_before={values}"
+            logger.warning(msg1)
+            logger.warning(msg2)
+            print(msg1, file=sys.stderr, flush=True)
+            print(msg2, file=sys.stderr, flush=True)
             # Shift all subsequent staffs by the difference
             for j in range(idx + 1, len(values)):
                 values[j] += diff
-            print(f"REST_DEBUG values_after={values}")
+            msg3 = f"REST_DEBUG values_after={values}"
+            logger.warning(msg3)
+            print(msg3, file=sys.stderr, flush=True)
             applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
             continue
 
