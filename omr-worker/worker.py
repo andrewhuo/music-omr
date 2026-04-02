@@ -54,7 +54,7 @@ ALLOW_LEGACY_ARTIFACT_FALLBACK = (
 
 MEASURE_TEXT_COLOR = (0, 0, 0)
 MEASURE_TEXT_SIZE = 10.0
-MEASURE_TEXT_Y_OFFSET = 18.0
+MEASURE_TEXT_Y_OFFSET = 8.0
 MEASURE_TEXT_GUIDE_RIGHT_LIMIT = 6.0
 MEASURE_TEXT_BG_COLOR = (1, 1, 1)
 LABELS_MODE_SYSTEM_ONLY = "system_only"
@@ -1256,37 +1256,45 @@ def _render_corrected_pdf(
         except Exception:
             return
 
+    # --- Shared: erase all baseline system labels ---
+    for base in baseline_systems.values():
+        if not isinstance(base, dict):
+            continue
+        page_no = _safe_int(base.get("page"), 0)
+        if page_no <= 0 or page_no > doc.page_count:
+            continue
+        page = doc[page_no - 1]
+        _erase_baseline_system_label(page, page.rect, base)
+
+    # --- Shared: compute sequential measure numbers ---
+    first_start = 1
+    sorted_systems = sorted(
+        [s for s in systems if isinstance(s, dict)],
+        key=lambda s: (_safe_int(s.get("page"), 0), _safe_int(s.get("system_index"), 0)),
+    )
+    if sorted_systems:
+        first_start = _safe_int(
+            sorted_systems[0].get("current_value") or sorted_systems[0].get("value"), 1
+        )
+
+    ordered_measures = sorted(
+        [m for m in measures if isinstance(m, dict)],
+        key=lambda m: (
+            _safe_int(m.get("page"), 0),
+            _safe_int(m.get("system_index"), 0),
+            float(m.get("x_left") or 0),
+        ),
+    )
+
+    # Build sequential start value for each system from measure counts
+    seq_starts_by_system: dict[str, int] = {}
+    for seq_index, measure in enumerate(ordered_measures):
+        sid = str(measure.get("system_id") or "").strip()
+        if sid and sid not in seq_starts_by_system:
+            seq_starts_by_system[sid] = first_start + seq_index
+
     if labels_mode == LABELS_MODE_ALL_MEASURES:
-        # Erase baseline system labels
-        for base in baseline_systems.values():
-            if not isinstance(base, dict):
-                continue
-            page_no = _safe_int(base.get("page"), 0)
-            if page_no <= 0 or page_no > doc.page_count:
-                continue
-            page = doc[page_no - 1]
-            _erase_baseline_system_label(page, page.rect, base)
-
-        # Get the first system's start value as the base (usually 1)
-        first_start = 1
-        sorted_systems = sorted(
-            [s for s in systems if isinstance(s, dict)],
-            key=lambda s: (_safe_int(s.get("page"), 0), _safe_int(s.get("system_index"), 0)),
-        )
-        if sorted_systems:
-            first_start = _safe_int(
-                sorted_systems[0].get("current_value") or sorted_systems[0].get("value"), 1
-            )
-
-        # Sort all measures globally by position and number them sequentially
-        ordered_measures = sorted(
-            [m for m in measures if isinstance(m, dict)],
-            key=lambda m: (
-                _safe_int(m.get("page"), 0),
-                _safe_int(m.get("system_index"), 0),
-                float(m.get("x_left") or 0),
-            ),
-        )
+        # Draw every measure with sequential number
         for seq_index, measure in enumerate(ordered_measures):
             page_no = _safe_int(measure.get("page"), 0)
             if page_no <= 0 or page_no > doc.page_count:
@@ -1301,7 +1309,8 @@ def _render_corrected_pdf(
             _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
             drawn += 1
     else:
-        for row in systems:
+        # Per Staff: draw one label per system using sequential start
+        for row in sorted_systems:
             sid = str(row.get("system_id") or "").strip()
             anchor = row.get("anchor") or {}
             page_no = _safe_int(row.get("page"), 0)
@@ -1313,16 +1322,11 @@ def _render_corrected_pdf(
             except Exception:
                 continue
             page = doc[page_no - 1]
-            rect = page.rect
-
-            # Clear old label (if baseline exists), then draw new.
-            base = baseline_systems.get(sid) or {}
-            _erase_baseline_system_label(page, rect, base)
-
-            label = str(row.get("current_value") or row.get("value") or "").strip()
+            # Use sequential start if available, fall back to stored value
+            label = str(seq_starts_by_system.get(sid, _safe_int(row.get("current_value") or row.get("value"), 0)))
             if not label:
                 continue
-            _draw_measure_label(page, rect, ax, ay0, label)
+            _draw_measure_label(page, page.rect, ax, ay0, label)
             drawn += 1
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
