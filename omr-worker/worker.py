@@ -1190,7 +1190,7 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
                 rejected.append({"edit": raw_edit, "reason": "unknown_system_id"})
                 continue
             measure_count = raw_edit.get("value")
-            if not isinstance(measure_count, int) or measure_count < 1:
+            if not isinstance(measure_count, int) or measure_count < 0:
                 rejected.append({"edit": raw_edit, "reason": "invalid_measure_count"})
                 continue
             idx = id_to_index[system_id]
@@ -1198,7 +1198,10 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
                 editable_state["rest_systems"] = {}
             # Undo previously applied rest for this staff before applying new one
             prev_rest = editable_state["rest_systems"].get(system_id, 0)
-            editable_state["rest_systems"][system_id] = measure_count
+            if measure_count == 0:
+                editable_state["rest_systems"].pop(system_id, None)
+            else:
+                editable_state["rest_systems"][system_id] = measure_count
             diff = measure_count - prev_rest
             import sys
             msg1 = f"REST_DEBUG system_id={system_id} idx={idx} measure_count={measure_count} prev_rest={prev_rest} diff={diff}"
