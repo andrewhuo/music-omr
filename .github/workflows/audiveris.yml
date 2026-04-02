@@ -4713,12 +4713,28 @@ jobs:
               if str(key).startswith("parser_"):
                   staff_box_reason_counts_payload[str(key)] = int(staff_box_reason_counts.get(key, 0))
 
+          # Recompute system start values sequentially from measure counts
+          # instead of trusting Audiveris OCR labels (which are often wrong)
+          _sorted_sys = sorted(
+              editable_systems,
+              key=lambda item: (int(item.get("page", 0)), int(item.get("system_index", 0))),
+          )
+          _measures_per_system: dict[str, int] = {}
+          for _m in editable_measures_sorted:
+              _sid = str(_m.get("system_id") or "")
+              if _sid:
+                  _measures_per_system[_sid] = _measures_per_system.get(_sid, 0) + 1
+          _running_start = 1
+          for _sys in _sorted_sys:
+              _sid = str(_sys.get("system_id") or "")
+              _sys["current_value"] = str(_running_start)
+              _sys["value"] = str(_running_start)
+              _running_start += _measures_per_system.get(_sid, 0)
+          print(f"SYSTEM_RECOMPUTE total_systems={len(_sorted_sys)} total_measures={sum(_measures_per_system.values())}")
+
           editable_state = {
               "version": "system_state_v1",
-              "systems": sorted(
-                  editable_systems,
-                  key=lambda item: (int(item.get("page", 0)), int(item.get("system_index", 0))),
-              ),
+              "systems": _sorted_sys,
               "measures": editable_measures_sorted,
               "staff_boxes": editable_staff_boxes_sorted,
               "qa": {

@@ -54,7 +54,7 @@ ALLOW_LEGACY_ARTIFACT_FALLBACK = (
 
 MEASURE_TEXT_COLOR = (0, 0, 0)
 MEASURE_TEXT_SIZE = 10.0
-MEASURE_TEXT_Y_OFFSET = 6.0
+MEASURE_TEXT_Y_OFFSET = 18.0
 MEASURE_TEXT_GUIDE_RIGHT_LIMIT = 6.0
 MEASURE_TEXT_BG_COLOR = (1, 1, 1)
 LABELS_MODE_SYSTEM_ONLY = "system_only"
@@ -1257,15 +1257,7 @@ def _render_corrected_pdf(
             return
 
     if labels_mode == LABELS_MODE_ALL_MEASURES:
-        starts_by_system: dict[str, int] = {}
-        for row in systems:
-            if not isinstance(row, dict):
-                continue
-            sid = str(row.get("system_id") or "").strip()
-            if not sid:
-                continue
-            starts_by_system[sid] = _safe_int(row.get("current_value") or row.get("value"), 0)
-
+        # Erase baseline system labels
         for base in baseline_systems.values():
             if not isinstance(base, dict):
                 continue
@@ -1275,24 +1267,31 @@ def _render_corrected_pdf(
             page = doc[page_no - 1]
             _erase_baseline_system_label(page, page.rect, base)
 
+        # Get the first system's start value as the base (usually 1)
+        first_start = 1
+        sorted_systems = sorted(
+            [s for s in systems if isinstance(s, dict)],
+            key=lambda s: (_safe_int(s.get("page"), 0), _safe_int(s.get("system_index"), 0)),
+        )
+        if sorted_systems:
+            first_start = _safe_int(
+                sorted_systems[0].get("current_value") or sorted_systems[0].get("value"), 1
+            )
+
+        # Sort all measures globally by position and number them sequentially
         ordered_measures = sorted(
             [m for m in measures if isinstance(m, dict)],
             key=lambda m: (
                 _safe_int(m.get("page"), 0),
                 _safe_int(m.get("system_index"), 0),
-                _safe_int(m.get("measure_local_index"), 0),
-                _safe_int(m.get("global_index"), 0),
+                float(m.get("x_left") or 0),
             ),
         )
-        for measure in ordered_measures:
-            system_id = str(measure.get("system_id") or "").strip()
-            if not system_id or system_id not in starts_by_system:
-                continue
+        for seq_index, measure in enumerate(ordered_measures):
             page_no = _safe_int(measure.get("page"), 0)
             if page_no <= 0 or page_no > doc.page_count:
                 continue
-            local_index = max(0, _safe_int(measure.get("measure_local_index"), 0))
-            label = str(int(starts_by_system[system_id] + local_index))
+            label = str(first_start + seq_index)
             try:
                 x_left = float(measure.get("x_left"))
                 y_top = float(measure.get("y_top"))
