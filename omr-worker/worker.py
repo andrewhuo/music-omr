@@ -1219,6 +1219,24 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
             applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
             continue
 
+        if edit_type == "set_ending":
+            measure_id = str(raw_edit.get("measure_id") or "").strip()
+            ending_val = str(raw_edit.get("value") or "").strip()
+            if not measure_id:
+                rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
+                continue
+            if "endings" not in editable_state:
+                editable_state["endings"] = {}
+            if ending_val in ("", "none"):
+                editable_state["endings"].pop(measure_id, None)
+            elif ending_val in ("1", "2"):
+                editable_state["endings"][measure_id] = ending_val
+            else:
+                rejected.append({"edit": raw_edit, "reason": "invalid_ending_value"})
+                continue
+            applied.append({"type": "set_ending", "measure_id": measure_id, "value": ending_val})
+            continue
+
         rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
 
     for idx, row in enumerate(systems):
@@ -1237,7 +1255,9 @@ def _render_corrected_pdf(
     baseline_systems: dict[str, dict],
     measures: list[dict],
     labels_mode: str,
+    editable_state: dict | None = None,
 ) -> int:
+    editable_state = editable_state or {}
     doc = fitz.open(str(input_pdf))
     drawn = 0
 
@@ -1286,20 +1306,49 @@ def _render_corrected_pdf(
         ),
     )
 
-    # Build sequential start value for each system from measure counts
+    # Build sequential labels for every measure, accounting for 1st/2nd endings.
+    # 2nd-ending measures reuse the same numbers as the 1st-ending block (they replace it).
+    endings_map: dict[str, str] = editable_state.get("endings") or {}
+    result_labels: dict[str, str] = {}    # measure_id → label string
     seq_starts_by_system: dict[str, int] = {}
-    for seq_index, measure in enumerate(ordered_measures):
+    seq_index = 0
+    first_ending_start_offset: int | None = None
+    second_ending_local = 0
+
+    for measure in ordered_measures:
+        mid = str(measure.get("measure_id") or "").strip()
         sid = str(measure.get("system_id") or "").strip()
+        ending_type = endings_map.get(mid) if mid else None
+
+        if ending_type == "1":
+            if first_ending_start_offset is None:
+                first_ending_start_offset = seq_index
+            label = str(first_start + seq_index)
+            seq_index += 1
+        elif ending_type == "2":
+            base = first_ending_start_offset if first_ending_start_offset is not None else seq_index
+            label = str(first_start + base + second_ending_local)
+            second_ending_local += 1
+            # do NOT advance seq_index — 2nd ending reuses the same numbers
+        else:
+            label = str(first_start + seq_index)
+            seq_index += 1
+
+        if mid:
+            result_labels[mid] = label
         if sid and sid not in seq_starts_by_system:
-            seq_starts_by_system[sid] = first_start + seq_index
+            seq_starts_by_system[sid] = int(label)
 
     if labels_mode == LABELS_MODE_ALL_MEASURES:
-        # Draw every measure with sequential number
-        for seq_index, measure in enumerate(ordered_measures):
+        # Draw every measure with its computed label
+        for measure in ordered_measures:
+            mid = str(measure.get("measure_id") or "").strip()
             page_no = _safe_int(measure.get("page"), 0)
             if page_no <= 0 or page_no > doc.page_count:
                 continue
-            label = str(first_start + seq_index)
+            label = result_labels.get(mid)
+            if not label:
+                continue
             try:
                 x_left = float(measure.get("x_left"))
                 y_top = float(measure.get("y_top"))
@@ -1629,6 +1678,7 @@ def get_job_state(job_id: str):
             "systems": systems,
             "measures": measures,
             "staff_boxes": staff_boxes,
+            "endings": editable_state.get("endings") or {},
         },
         "relabel_debug_summary": _summarize_relabel_debug(mapping_summary),
         "artifacts": artifacts,
@@ -1911,6 +1961,7 @@ def relabel_job(job_id: str):
                 baseline_by_id,
                 list(editable_state.get("measures") or []),
                 str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
+                editable_state=editable_state,
             )
             redraw_ms = int((time.time() - redraw_started) * 1000)
             _upload_file_to_gcs(out_pdf, corrected_pdf_uri, content_type="application/pdf")
