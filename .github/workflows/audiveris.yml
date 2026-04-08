@@ -567,13 +567,22 @@ jobs:
           for page_pdf in /tmp/work/pages/page_*.pdf; do
             [[ -f "${page_pdf}" ]] || continue
             page_num="$(basename "${page_pdf}" | sed -E 's/^page_([0-9]{4})\.pdf$/\1/')"
+            out_dir="/tmp/work/audiveris_pages/page_${page_num}"
             log_path="/tmp/work/page_logs/page_${page_num}.log"
             if run_page_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" "${page_num}" >"${log_path}" 2>&1; then
               exit_code=0
             else
               exit_code=$?
             fi
-            echo "PAGE_XML_RUN page=$((10#${page_num})) image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${exit_code} log=${log_path}"
+            echo "PAGE_XML_RUN page=$((10#${page_num})) image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${exit_code} log=${log_path} out_dir=${out_dir}"
+            echo "PAGE_XML_OUTPUTS_BEGIN page=$((10#${page_num}))"
+            find "${out_dir}" -maxdepth 4 -type f -print | sort || true
+            echo "PAGE_XML_OUTPUTS_END page=$((10#${page_num}))"
+            if [[ "${exit_code}" -ne 0 ]]; then
+              echo "PAGE_XML_LOG_TAIL_BEGIN page=$((10#${page_num}))"
+              tail -n 200 "${log_path}" || true
+              echo "PAGE_XML_LOG_TAIL_END page=$((10#${page_num}))"
+            fi
           done
 
           python - << 'PY'
@@ -3971,6 +3980,43 @@ jobs:
                           "PAGE_XML_UNRESOLVED_DETAIL "
                           f"page={page_num} select_error_detail={merge_debug.get('final_select_error_detail')}"
                       )
+                  if not scored:
+                      try:
+                          base_dir = f"/tmp/work/audiveris_pages/page_{page_num:04d}"
+                          listed_files = []
+                          if os.path.isdir(base_dir):
+                              for root, _, files in os.walk(base_dir):
+                                  for name in sorted(files):
+                                      listed_files.append(os.path.join(root, name))
+                          print(
+                              "PAGE_XML_DEBUG_NO_CANDIDATES "
+                              f"page={page_num} base_dir={base_dir} file_count={len(listed_files)} "
+                              f"files={listed_files[:20]}"
+                          )
+                      except Exception as exc:
+                          print(
+                              "PAGE_XML_DEBUG_NO_CANDIDATES_WARN "
+                              f"page={page_num} detail={exc}"
+                          )
+                      try:
+                          log_path = os.path.join(PAGE_LOG_DIR, f"page_{page_num:04d}.log")
+                          if os.path.exists(log_path):
+                              with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                                  tail_lines = fh.readlines()[-120:]
+                              print(f"PAGE_XML_DEBUG_LOG_TAIL_BEGIN page={page_num}")
+                              for line in tail_lines:
+                                  print(line.rstrip())
+                              print(f"PAGE_XML_DEBUG_LOG_TAIL_END page={page_num}")
+                          else:
+                              print(
+                                  "PAGE_XML_DEBUG_LOG_MISSING "
+                                  f"page={page_num} path={log_path}"
+                              )
+                      except Exception as exc:
+                          print(
+                              "PAGE_XML_DEBUG_LOG_WARN "
+                              f"page={page_num} detail={exc}"
+                          )
                   print(
                       "PAGE_XML_UNRESOLVED "
                       f"page={page_num} reason={reason} target={target} "
