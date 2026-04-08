@@ -1309,15 +1309,26 @@ def _render_corrected_pdf(
     # Build sequential labels for every measure, accounting for 1st/2nd endings.
     # 2nd-ending measures reuse the same numbers as the 1st-ending block (they replace it).
     endings_map: dict[str, str] = editable_state.get("endings") or {}
+    rest_systems: dict[str, int] = editable_state.get("rest_systems") or {}
     result_labels: dict[str, str] = {}    # measure_id → label string
     seq_starts_by_system: dict[str, int] = {}
     seq_index = 0
     first_ending_start_offset: int | None = None
     second_ending_local = 0
+    current_sid: str | None = None
 
     for measure in ordered_measures:
         mid = str(measure.get("measure_id") or "").strip()
         sid = str(measure.get("system_id") or "").strip()
+
+        # When crossing into a new system, jump seq_index ahead by any rest on the previous system
+        if sid != current_sid:
+            if current_sid is not None:
+                rest_count = rest_systems.get(current_sid, 0)
+                if rest_count > 0:
+                    seq_index += rest_count
+            current_sid = sid
+
         ending_type = endings_map.get(mid) if mid else None
 
         if ending_type == "1":
