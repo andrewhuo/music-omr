@@ -116,6 +116,24 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         }
 
+    def _sample_state_with_measures(self):
+        state = self._sample_state()
+        state["measures"] = [
+            {"measure_id": "p1_s0_m0", "page": 1, "system_id": "p1_s0", "system_index": 0, "measure_local_index": 0, "x_left": 10, "y_top": 10, "y_bottom": 20},
+            {"measure_id": "p1_s0_m1", "page": 1, "system_id": "p1_s0", "system_index": 0, "measure_local_index": 1, "x_left": 20, "y_top": 10, "y_bottom": 20},
+            {"measure_id": "p1_s0_m2", "page": 1, "system_id": "p1_s0", "system_index": 0, "measure_local_index": 2, "x_left": 30, "y_top": 10, "y_bottom": 20},
+            {"measure_id": "p1_s1_m0", "page": 1, "system_id": "p1_s1", "system_index": 1, "measure_local_index": 0, "x_left": 10, "y_top": 30, "y_bottom": 40},
+            {"measure_id": "p1_s1_m1", "page": 1, "system_id": "p1_s1", "system_index": 1, "measure_local_index": 1, "x_left": 20, "y_top": 30, "y_bottom": 40},
+            {"measure_id": "p1_s1_m2", "page": 1, "system_id": "p1_s1", "system_index": 1, "measure_local_index": 2, "x_left": 30, "y_top": 30, "y_bottom": 40},
+            {"measure_id": "p1_s2_m0", "page": 1, "system_id": "p1_s2", "system_index": 2, "measure_local_index": 0, "x_left": 10, "y_top": 50, "y_bottom": 60},
+            {"measure_id": "p1_s2_m1", "page": 1, "system_id": "p1_s2", "system_index": 2, "measure_local_index": 1, "x_left": 20, "y_top": 50, "y_bottom": 60},
+            {"measure_id": "p1_s2_m2", "page": 1, "system_id": "p1_s2", "system_index": 2, "measure_local_index": 2, "x_left": 30, "y_top": 50, "y_bottom": 60},
+            {"measure_id": "p2_s0_m0", "page": 2, "system_id": "p2_s0", "system_index": 0, "measure_local_index": 0, "x_left": 10, "y_top": 10, "y_bottom": 20},
+            {"measure_id": "p2_s0_m1", "page": 2, "system_id": "p2_s0", "system_index": 0, "measure_local_index": 1, "x_left": 20, "y_top": 10, "y_bottom": 20},
+            {"measure_id": "p2_s0_m2", "page": 2, "system_id": "p2_s0", "system_index": 0, "measure_local_index": 2, "x_left": 30, "y_top": 10, "y_bottom": 20},
+        ]
+        return state
+
     def test_single_edit_reflows_forward(self):
         systems, applied, rejected, total = WORKER._apply_relabel_edits(
             self._sample_state(),
@@ -204,6 +222,62 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(state.get("labels_mode"), "all_measures")
         values = [int(row["current_value"]) for row in systems]
         self.assertEqual(values, [1, 20, 23, 26])
+
+    def test_set_rest_measure_reflows_from_anchor_measure(self):
+        state = self._sample_state_with_measures()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 4}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 4}],
+        )
+        self.assertEqual(state.get("rest_measures"), {"p1_s1_m1": 4})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 11, 14])
+
+    def test_multiple_rest_anchors_on_same_staff_are_cumulative(self):
+        state = self._sample_state_with_measures()
+        systems, _, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_rest_measure", "measure_id": "p1_s1_m0", "value": 1},
+                {"type": "set_rest_measure", "measure_id": "p1_s1_m2", "value": 2},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(state.get("rest_measures"), {"p1_s1_m0": 1, "p1_s1_m2": 2})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 10, 13])
+
+    def test_set_rest_measure_rejects_unknown_measure_id(self):
+        state = self._sample_state_with_measures()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "missing", "value": 4}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "invalid_measure_id")
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 7, 10])
+
+    def test_measure_rest_count_advances_next_visible_label(self):
+        systems = [{"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "10"}]
+        measures = [
+            {"measure_id": "m0", "page": 1, "system_id": "p1_s0", "system_index": 0, "measure_local_index": 0, "x_left": 10},
+            {"measure_id": "m1", "page": 1, "system_id": "p1_s0", "system_index": 0, "measure_local_index": 1, "x_left": 20},
+        ]
+        _, _, labels, starts = WORKER._compute_measure_sequences(
+            systems,
+            measures,
+            {"rest_measures": {"m0": 4}},
+        )
+        self.assertEqual(labels["m0"], "10")
+        self.assertEqual(labels["m1"], "15")
+        self.assertEqual(starts["p1_s0"], 10)
 
     def test_relabel_trace_history_cap(self):
         mapping_summary = {}
