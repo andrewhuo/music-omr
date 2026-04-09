@@ -768,7 +768,10 @@ def _editable_state_version(editable_state: dict) -> str:
         "version": editable_state.get("version"),
         "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
         "systems": editable_state.get("systems") or [],
-        "staff_boxes": editable_state.get("staff_boxes") or [],
+        "measures": editable_state.get("measures") or [],
+        "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
+        "rest_systems": editable_state.get("rest_systems") or {},
+        "endings": editable_state.get("endings") or {},
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
@@ -1106,41 +1109,164 @@ def _reassign_measures_to_nearest_system(systems: list[dict], measures: list[dic
     return reassigned
 
 
-def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[dict], list[dict], list[dict], int]:
-    systems = list(editable_state.get("systems") or [])
-    if not systems:
-        raise ValueError("editable_state.systems is missing or empty")
+def _sorted_measure_rows(measures: list[dict] | None) -> list[dict]:
+    return sorted(
+        [m for m in (measures or []) if isinstance(m, dict)],
+        key=lambda m: (
+            _safe_int(m.get("page"), 0),
+            _safe_int(m.get("system_index"), 0),
+            float(m.get("x_left") or 0),
+            _safe_int(m.get("measure_local_index"), 0),
+            str(m.get("measure_id") or ""),
+        ),
+    )
 
-    systems = sorted(
-        [s for s in systems if isinstance(s, dict)],
+
+def _sorted_system_rows(systems: list[dict] | None) -> list[dict]:
+    return sorted(
+        [s for s in (systems or []) if isinstance(s, dict)],
         key=lambda s: (_safe_int(s.get("page"), 0), _safe_int(s.get("system_index"), 0)),
     )
+
+
+def _measure_number_overrides(editable_state: dict) -> dict[str, int]:
+    raw = editable_state.get("measure_number_overrides")
+    if not isinstance(raw, dict):
+        editable_state["measure_number_overrides"] = {}
+        return {}
+
+    cleaned: dict[str, int] = {}
+    for raw_key, raw_value in raw.items():
+        measure_id = str(raw_key or "").strip()
+        if not measure_id:
+            continue
+        try:
+            value = int(raw_value)
+        except Exception:
+            continue
+        if value < RELABEL_MIN_VALUE or value > RELABEL_MAX_VALUE:
+            continue
+        cleaned[measure_id] = value
+
+    editable_state["measure_number_overrides"] = cleaned
+    return cleaned
+
+
+def _recompute_measure_numbering(
+    systems: list[dict] | None,
+    measures: list[dict] | None,
+    editable_state: dict | None = None,
+) -> tuple[list[dict], list[dict], dict[str, str], dict[str, int]]:
+    editable_state = editable_state or {}
+    sorted_systems = _sorted_system_rows(systems)
+    ordered_measures = _sorted_measure_rows(measures)
+
+    first_start = 1
+    if sorted_systems:
+        first_start = _safe_int(
+            sorted_systems[0].get("current_value") or sorted_systems[0].get("value"),
+            1,
+        )
+
+    endings_map = editable_state.get("endings")
+    if not isinstance(endings_map, dict):
+        endings_map = {}
+    rest_systems = editable_state.get("rest_systems")
+    if not isinstance(rest_systems, dict):
+        rest_systems = {}
+    measure_overrides = _measure_number_overrides(editable_state)
+
+    if ordered_measures:
+        first_measure_id = str(ordered_measures[0].get("measure_id") or "").strip()
+        if first_measure_id and first_measure_id in measure_overrides:
+            first_start = int(measure_overrides[first_measure_id])
+
+    result_labels: dict[str, str] = {}
+    seq_starts_by_system: dict[str, int] = {}
+    current_value = int(first_start)
+    first_ending_start_value: int | None = None
+    second_ending_local = 0
+    current_sid: str | None = None
+
+    for measure in ordered_measures:
+        measure_id = str(measure.get("measure_id") or "").strip()
+        system_id = str(measure.get("system_id") or "").strip()
+
+        if system_id != current_sid:
+            if current_sid is not None:
+                rest_count = _safe_int(rest_systems.get(current_sid), 0)
+                if rest_count > 0:
+                    current_value += rest_count
+            current_sid = system_id
+
+        if measure_id and measure_id in measure_overrides:
+            current_value = int(measure_overrides[measure_id])
+
+        ending_type = str(endings_map.get(measure_id) or "").strip() if measure_id else ""
+        if ending_type == "1":
+            if first_ending_start_value is None:
+                first_ending_start_value = current_value
+            label_value = int(current_value)
+            current_value += 1
+        elif ending_type == "2":
+            base = first_ending_start_value if first_ending_start_value is not None else current_value
+            label_value = int(base + second_ending_local)
+            second_ending_local += 1
+        else:
+            label_value = int(current_value)
+            current_value += 1
+
+        label = str(label_value)
+        if measure_id:
+            result_labels[measure_id] = label
+        if system_id and system_id not in seq_starts_by_system:
+            seq_starts_by_system[system_id] = label_value
+        measure["current_value"] = label
+        measure["value"] = label
+        measure["render_label"] = label
+
+    for system in sorted_systems:
+        system_id = str(system.get("system_id") or "").strip()
+        if system_id and system_id in seq_starts_by_system:
+            label = seq_starts_by_system[system_id]
+        else:
+            label = _safe_int(system.get("current_value") or system.get("value"), first_start)
+        system["current_value"] = str(label)
+        system["value"] = str(label)
+        system["render_label"] = str(label)
+
+    return sorted_systems, ordered_measures, result_labels, seq_starts_by_system
+
+
+def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[dict], list[dict], list[dict], int]:
+    systems = _sorted_system_rows(editable_state.get("systems") or [])
     if not systems:
-        raise ValueError("editable_state.systems contains no valid rows")
-
-    values: list[int] = []
-    for row in systems:
-        raw = row.get("current_value")
-        if raw is None:
-            raw = row.get("value")
-        values.append(_safe_int(raw, 0))
-
-    deltas: list[int] = []
-    for idx in range(len(values) - 1):
-        delta = values[idx + 1] - values[idx]
-        deltas.append(max(0, int(delta)))
+        raise ValueError("editable_state.systems is missing or empty")
+    measures = _sorted_measure_rows(editable_state.get("measures") or [])
+    editable_state["systems"] = systems
+    editable_state["measures"] = measures
 
     id_to_index = {}
     for idx, row in enumerate(systems):
         sid = str(row.get("system_id") or "").strip()
         if sid:
             id_to_index[sid] = idx
+    first_measure_by_system: dict[str, dict] = {}
+    measure_ids = set()
+    for measure in measures:
+        measure_id = str(measure.get("measure_id") or "").strip()
+        if measure_id:
+            measure_ids.add(measure_id)
+        system_id = str(measure.get("system_id") or "").strip()
+        if system_id and system_id not in first_measure_by_system:
+            first_measure_by_system[system_id] = measure
 
     applied: list[dict] = []
     rejected: list[dict] = []
     labels_mode = str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY).strip().lower()
     if labels_mode not in LABELS_MODE_ALLOWED:
         labels_mode = LABELS_MODE_SYSTEM_ONLY
+    measure_overrides = _measure_number_overrides(editable_state)
 
     for raw_edit in edits:
         if not isinstance(raw_edit, dict):
@@ -1168,11 +1294,44 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
                 )
                 continue
 
-            idx = id_to_index[system_id]
-            values[idx] = int(new_value)
-            for j in range(idx + 1, len(values)):
-                values[j] = int(values[j - 1] + deltas[j - 1])
+            first_measure = first_measure_by_system.get(system_id)
+            if not isinstance(first_measure, dict):
+                rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+                continue
+            measure_id = str(first_measure.get("measure_id") or "").strip()
+            if not measure_id:
+                rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+                continue
+            measure_overrides[measure_id] = int(new_value)
             applied.append({"type": "set_system_start", "system_id": system_id, "value": int(new_value)})
+            continue
+
+        if edit_type == "set_measure_number":
+            measure_id = str(raw_edit.get("measure_id") or "").strip()
+            if not measure_id:
+                rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
+                continue
+            if measure_id not in measure_ids:
+                rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+                continue
+            try:
+                new_value = int(raw_edit.get("value"))
+            except Exception:
+                rejected.append({"edit": raw_edit, "reason": "invalid_value"})
+                continue
+            if new_value < RELABEL_MIN_VALUE or new_value > RELABEL_MAX_VALUE:
+                rejected.append(
+                    {
+                        "edit": raw_edit,
+                        "reason": "value_out_of_range",
+                        "min": RELABEL_MIN_VALUE,
+                        "max": RELABEL_MAX_VALUE,
+                    }
+                )
+                continue
+
+            measure_overrides[measure_id] = int(new_value)
+            applied.append({"type": "set_measure_number", "measure_id": measure_id, "value": int(new_value)})
             continue
 
         if edit_type == "set_labels_mode":
@@ -1193,7 +1352,6 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
             if not isinstance(measure_count, int) or measure_count < 0:
                 rejected.append({"edit": raw_edit, "reason": "invalid_measure_count"})
                 continue
-            idx = id_to_index[system_id]
             if "rest_systems" not in editable_state:
                 editable_state["rest_systems"] = {}
             # Undo previously applied rest for this staff before applying new one
@@ -1204,18 +1362,9 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
                 editable_state["rest_systems"][system_id] = measure_count
             diff = measure_count - prev_rest
             import sys
-            msg1 = f"REST_DEBUG system_id={system_id} idx={idx} measure_count={measure_count} prev_rest={prev_rest} diff={diff}"
-            msg2 = f"REST_DEBUG values_before={values}"
+            msg1 = f"REST_DEBUG system_id={system_id} measure_count={measure_count} prev_rest={prev_rest} diff={diff}"
             logger.warning(msg1)
-            logger.warning(msg2)
             print(msg1, file=sys.stderr, flush=True)
-            print(msg2, file=sys.stderr, flush=True)
-            # Shift all subsequent staffs by the difference
-            for j in range(idx + 1, len(values)):
-                values[j] += diff
-            msg3 = f"REST_DEBUG values_after={values}"
-            logger.warning(msg3)
-            print(msg3, file=sys.stderr, flush=True)
             applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
             continue
 
@@ -1239,13 +1388,13 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
 
         rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
 
-    for idx, row in enumerate(systems):
-        row["current_value"] = str(values[idx])
-        row["value"] = str(values[idx])
-        row["render_label"] = str(values[idx])
-
+    editable_state["measure_number_overrides"] = measure_overrides
+    systems, measures, _, _ = _recompute_measure_numbering(systems, measures, editable_state)
+    editable_state["systems"] = systems
+    editable_state["measures"] = measures
+    editable_state["staff_boxes"] = []
     editable_state["labels_mode"] = labels_mode
-    return systems, applied, rejected, len(values)
+    return systems, applied, rejected, len(systems)
 
 
 def _render_corrected_pdf(
@@ -1286,69 +1435,11 @@ def _render_corrected_pdf(
         page = doc[page_no - 1]
         _erase_baseline_system_label(page, page.rect, base)
 
-    # --- Shared: compute sequential measure numbers ---
-    first_start = 1
-    sorted_systems = sorted(
-        [s for s in systems if isinstance(s, dict)],
-        key=lambda s: (_safe_int(s.get("page"), 0), _safe_int(s.get("system_index"), 0)),
+    sorted_systems, ordered_measures, result_labels, _ = _recompute_measure_numbering(
+        systems,
+        measures,
+        editable_state,
     )
-    if sorted_systems:
-        first_start = _safe_int(
-            sorted_systems[0].get("current_value") or sorted_systems[0].get("value"), 1
-        )
-
-    ordered_measures = sorted(
-        [m for m in measures if isinstance(m, dict)],
-        key=lambda m: (
-            _safe_int(m.get("page"), 0),
-            _safe_int(m.get("system_index"), 0),
-            float(m.get("x_left") or 0),
-        ),
-    )
-
-    # Build sequential labels for every measure, accounting for 1st/2nd endings.
-    # 2nd-ending measures reuse the same numbers as the 1st-ending block (they replace it).
-    endings_map: dict[str, str] = editable_state.get("endings") or {}
-    rest_systems: dict[str, int] = editable_state.get("rest_systems") or {}
-    result_labels: dict[str, str] = {}    # measure_id → label string
-    seq_starts_by_system: dict[str, int] = {}
-    seq_index = 0
-    first_ending_start_offset: int | None = None
-    second_ending_local = 0
-    current_sid: str | None = None
-
-    for measure in ordered_measures:
-        mid = str(measure.get("measure_id") or "").strip()
-        sid = str(measure.get("system_id") or "").strip()
-
-        # When crossing into a new system, jump seq_index ahead by any rest on the previous system
-        if sid != current_sid:
-            if current_sid is not None:
-                rest_count = rest_systems.get(current_sid, 0)
-                if rest_count > 0:
-                    seq_index += rest_count
-            current_sid = sid
-
-        ending_type = endings_map.get(mid) if mid else None
-
-        if ending_type == "1":
-            if first_ending_start_offset is None:
-                first_ending_start_offset = seq_index
-            label = str(first_start + seq_index)
-            seq_index += 1
-        elif ending_type == "2":
-            base = first_ending_start_offset if first_ending_start_offset is not None else seq_index
-            label = str(first_start + base + second_ending_local)
-            second_ending_local += 1
-            # do NOT advance seq_index — 2nd ending reuses the same numbers
-        else:
-            label = str(first_start + seq_index)
-            seq_index += 1
-
-        if mid:
-            result_labels[mid] = label
-        if sid and sid not in seq_starts_by_system:
-            seq_starts_by_system[sid] = int(label)
 
     if labels_mode == LABELS_MODE_ALL_MEASURES:
         # Draw every measure with its computed label
@@ -1369,24 +1460,27 @@ def _render_corrected_pdf(
             _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
             drawn += 1
     else:
-        # Per Staff: draw one label per system using sequential start
-        for row in sorted_systems:
-            sid = str(row.get("system_id") or "").strip()
-            anchor = row.get("anchor") or {}
-            page_no = _safe_int(row.get("page"), 0)
+        # Staff-start mode still follows the measure sequence, but only the
+        # first measure on each system gets a visible label.
+        seen_system_ids: set[str] = set()
+        for measure in ordered_measures:
+            system_id = str(measure.get("system_id") or "").strip()
+            if not system_id or system_id in seen_system_ids:
+                continue
+            seen_system_ids.add(system_id)
+            page_no = _safe_int(measure.get("page"), 0)
             if page_no <= 0 or page_no > doc.page_count:
                 continue
             try:
-                ax = float(anchor.get("x"))
-                ay0 = float(anchor.get("y_top"))
+                x_left = float(measure.get("x_left"))
+                y_top = float(measure.get("y_top"))
             except Exception:
                 continue
-            page = doc[page_no - 1]
-            # Use sequential start if available, fall back to stored value
-            label = str(seq_starts_by_system.get(sid, _safe_int(row.get("current_value") or row.get("value"), 0)))
+            label = str(measure.get("current_value") or measure.get("render_label") or "").strip()
             if not label:
                 continue
-            _draw_measure_label(page, page.rect, ax, ay0, label)
+            page = doc[page_no - 1]
+            _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
             drawn += 1
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -1676,6 +1770,10 @@ def get_job_state(job_id: str):
     reassign_count = _reassign_measures_to_nearest_system(systems, measures)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
+    systems, measures, _, _ = _recompute_measure_numbering(systems, measures, editable_state)
+    editable_state["systems"] = systems
+    editable_state["measures"] = measures
+    editable_state["staff_boxes"] = []
 
     response = {
         "job_id": job_id,
@@ -1688,7 +1786,8 @@ def get_job_state(job_id: str):
             "qa": qa,
             "systems": systems,
             "measures": measures,
-            "staff_boxes": staff_boxes,
+            "staff_boxes": [],
+            "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
             "endings": editable_state.get("endings") or {},
         },
         "relabel_debug_summary": _summarize_relabel_debug(mapping_summary),
@@ -1831,6 +1930,21 @@ def relabel_job(job_id: str):
     if labels_mode_before not in LABELS_MODE_ALLOWED:
         labels_mode_before = LABELS_MODE_SYSTEM_ONLY
     editable_state["labels_mode"] = labels_mode_before
+    systems_before = _sorted_system_rows(editable_state.get("systems") or [])
+    measures_before = _sorted_measure_rows(editable_state.get("measures") or [])
+    reassign_count = _reassign_measures_to_nearest_system(systems_before, measures_before)
+    if reassign_count > 0:
+        print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
+    editable_state["systems"] = systems_before
+    editable_state["measures"] = measures_before
+    editable_state["staff_boxes"] = []
+    systems_before, measures_before, _, _ = _recompute_measure_numbering(
+        systems_before,
+        measures_before,
+        editable_state,
+    )
+    editable_state["systems"] = systems_before
+    editable_state["measures"] = measures_before
 
     if not isinstance(edits, list) or len(edits) == 0:
         trace = {

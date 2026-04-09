@@ -4693,20 +4693,9 @@ jobs:
                   int(item.get("measure_local_index", 0)),
               ),
           )
-          editable_staff_boxes_sorted = sorted(
-              editable_staff_boxes,
-              key=lambda item: (
-                  int(item.get("page", 0)),
-                  int(item.get("system_index", 0)),
-                  str(item.get("system_id") or ""),
-              ),
-          )
+          editable_staff_boxes_sorted = []
           for global_index, row in enumerate(editable_measures_sorted):
               row["global_index"] = int(global_index)
-
-          for key, value in staff_box_reason_counts.items():
-              if int(value) > 0:
-                  editable_reason_counts[f"staff_box_{key}"] += int(value)
 
           measure_box_reason_counts_payload = {
               "missing": int(measure_box_reason_counts.get("missing", 0)),
@@ -4717,16 +4706,7 @@ jobs:
               if str(key).startswith("parser_"):
                   measure_box_reason_counts_payload[str(key)] = int(measure_box_reason_counts.get(key, 0))
 
-          staff_box_reason_counts_payload = {
-              "staff_box_measure_bounds_missing": int(staff_box_reason_counts.get("measure_bounds_missing", 0)),
-              "staff_box_invalid_span": int(staff_box_reason_counts.get("invalid_span", 0)),
-              "staff_box_out_of_bounds": int(staff_box_reason_counts.get("out_of_bounds", 0)),
-              "staff_box_anchor_delta_large": int(staff_box_reason_counts.get("anchor_delta_large", 0)),
-              "staff_box_count_mismatch": int(staff_box_reason_counts.get("count_mismatch", 0)),
-          }
-          for key in sorted(staff_box_reason_counts.keys()):
-              if str(key).startswith("parser_"):
-                  staff_box_reason_counts_payload[str(key)] = int(staff_box_reason_counts.get(key, 0))
+          staff_box_reason_counts_payload = {}
 
           # Recompute system start values sequentially from measure counts
           # instead of trusting Audiveris OCR labels (which are often wrong)
@@ -4758,7 +4738,7 @@ jobs:
                   "warnings": [f"{k}:{v}" for k, v in sorted(editable_reason_counts.items())],
                   "total_systems": len(editable_systems),
                   "measure_boxes_count": len(editable_measures_sorted),
-                  "staff_boxes_count": len(editable_staff_boxes_sorted),
+                  "staff_boxes_count": 0,
                   "measure_box_reason_counts": measure_box_reason_counts_payload,
                   "staff_box_reason_counts": staff_box_reason_counts_payload,
               },

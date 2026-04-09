@@ -114,6 +114,20 @@ class RelabelLogicTests(unittest.TestCase):
                 {"system_id": "p1_s1", "page": 1, "system_index": 1, "current_value": "4"},
                 {"system_id": "p2_s0", "page": 2, "system_index": 0, "current_value": "10"},
             ],
+            "measures": [
+                {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 10, "y_top": 10},
+                {"measure_id": "p1_s0_m1", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 1, "x_left": 30, "y_top": 10},
+                {"measure_id": "p1_s0_m2", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 2, "x_left": 50, "y_top": 10},
+                {"measure_id": "p1_s1_m0", "system_id": "p1_s1", "page": 1, "system_index": 1, "measure_local_index": 0, "x_left": 10, "y_top": 50},
+                {"measure_id": "p1_s1_m1", "system_id": "p1_s1", "page": 1, "system_index": 1, "measure_local_index": 1, "x_left": 30, "y_top": 50},
+                {"measure_id": "p1_s1_m2", "system_id": "p1_s1", "page": 1, "system_index": 1, "measure_local_index": 2, "x_left": 50, "y_top": 50},
+                {"measure_id": "p1_s2_m0", "system_id": "p1_s2", "page": 1, "system_index": 2, "measure_local_index": 0, "x_left": 10, "y_top": 90},
+                {"measure_id": "p1_s2_m1", "system_id": "p1_s2", "page": 1, "system_index": 2, "measure_local_index": 1, "x_left": 30, "y_top": 90},
+                {"measure_id": "p1_s2_m2", "system_id": "p1_s2", "page": 1, "system_index": 2, "measure_local_index": 2, "x_left": 50, "y_top": 90},
+                {"measure_id": "p2_s0_m0", "system_id": "p2_s0", "page": 2, "system_index": 0, "measure_local_index": 0, "x_left": 10, "y_top": 10},
+                {"measure_id": "p2_s0_m1", "system_id": "p2_s0", "page": 2, "system_index": 0, "measure_local_index": 1, "x_left": 30, "y_top": 10},
+                {"measure_id": "p2_s0_m2", "system_id": "p2_s0", "page": 2, "system_index": 0, "measure_local_index": 2, "x_left": 50, "y_top": 10},
+            ],
         }
 
     def test_single_edit_reflows_forward(self):
@@ -140,6 +154,25 @@ class RelabelLogicTests(unittest.TestCase):
         values = [int(row["current_value"]) for row in systems]
         self.assertEqual(values, [1, 20, 23, 50])
 
+    def test_measure_anchor_reflows_forward(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_measure_number", "measure_id": "p1_s1_m1", "value": 20}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_measure_number", "measure_id": "p1_s1_m1", "value": 20}])
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 22, 25])
+        measure_values = {
+            row["measure_id"]: int(row["current_value"])
+            for row in state.get("measures") or []
+        }
+        self.assertEqual(measure_values["p1_s1_m0"], 4)
+        self.assertEqual(measure_values["p1_s1_m1"], 20)
+        self.assertEqual(measure_values["p1_s1_m2"], 21)
+        self.assertEqual(measure_values["p1_s2_m0"], 22)
+
     def test_unknown_system_rejected(self):
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(
             self._sample_state(),
@@ -148,6 +181,17 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(len(applied), 0)
         self.assertEqual(len(rejected), 1)
         self.assertEqual(rejected[0]["reason"], "unknown_system_id")
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 7, 10])
+
+    def test_unknown_measure_rejected(self):
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            self._sample_state(),
+            [{"type": "set_measure_number", "measure_id": "missing", "value": 12}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "unknown_measure_id")
         values = [int(row["current_value"]) for row in systems]
         self.assertEqual(values, [1, 4, 7, 10])
 
