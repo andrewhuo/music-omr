@@ -4041,7 +4041,7 @@ jobs:
           DEBUG_GUIDES: "${{ env.PIPELINE_LOG_MODE == 'debug' && '1' || '0' }}"
           DRAW_SYSTEM_GUIDES: "0"
           ENABLE_MEASURE_LABELS: "1"
-          MEASURE_LABEL_MODE: "staff_start"
+          MEASURE_LABEL_MODE: "sequential"
           MEASURE_SOURCE_POLICY: "mxl_strict"
           ENDING_LABEL_MODE: "system_only"
           MXL_PARSER_POLICY: "auto"
