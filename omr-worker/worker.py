@@ -59,7 +59,6 @@ MEASURE_TEXT_GUIDE_RIGHT_LIMIT = 6.0
 MEASURE_TEXT_BG_COLOR = (1, 1, 1)
 LABELS_MODE_SYSTEM_ONLY = "system_only"
 LABELS_MODE_ALL_MEASURES = "all_measures"
-DEFAULT_LABELS_MODE = LABELS_MODE_ALL_MEASURES
 LABELS_MODE_ALLOWED = {LABELS_MODE_SYSTEM_ONLY, LABELS_MODE_ALL_MEASURES}
 
 # In-memory correlation for workflow dispatches that do not return run_id directly.
@@ -767,7 +766,7 @@ def _label_position(anchor_x: float, anchor_y_top: float, page_width: float, pag
 def _editable_state_version(editable_state: dict) -> str:
     payload = {
         "version": editable_state.get("version"),
-        "labels_mode": str(editable_state.get("labels_mode") or DEFAULT_LABELS_MODE),
+        "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
         "systems": editable_state.get("systems") or [],
         "measures": editable_state.get("measures") or [],
         "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
@@ -1264,9 +1263,9 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
 
     applied: list[dict] = []
     rejected: list[dict] = []
-    labels_mode = str(editable_state.get("labels_mode") or DEFAULT_LABELS_MODE).strip().lower()
+    labels_mode = str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY).strip().lower()
     if labels_mode not in LABELS_MODE_ALLOWED:
-        labels_mode = DEFAULT_LABELS_MODE
+        labels_mode = LABELS_MODE_SYSTEM_ONLY
     measure_overrides = _measure_number_overrides(editable_state)
 
     for raw_edit in edits:
@@ -1782,7 +1781,7 @@ def get_job_state(job_id: str):
         "state_version": _editable_state_version(editable_state),
         "editable_state": {
             "version": str(editable_state.get("version") or "system_state_v1"),
-            "labels_mode": str(editable_state.get("labels_mode") or DEFAULT_LABELS_MODE),
+            "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
             "rest_systems": editable_state.get("rest_systems") or {},
             "qa": qa,
             "systems": systems,
@@ -1927,9 +1926,9 @@ def relabel_job(job_id: str):
             ),
             409,
         )
-    labels_mode_before = str(editable_state.get("labels_mode") or DEFAULT_LABELS_MODE).strip().lower()
+    labels_mode_before = str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY).strip().lower()
     if labels_mode_before not in LABELS_MODE_ALLOWED:
-        labels_mode_before = DEFAULT_LABELS_MODE
+        labels_mode_before = LABELS_MODE_SYSTEM_ONLY
     editable_state["labels_mode"] = labels_mode_before
     systems_before = _sorted_system_rows(editable_state.get("systems") or [])
     measures_before = _sorted_measure_rows(editable_state.get("measures") or [])
@@ -2086,7 +2085,7 @@ def relabel_job(job_id: str):
                 systems,
                 baseline_by_id,
                 list(editable_state.get("measures") or []),
-                str(editable_state.get("labels_mode") or DEFAULT_LABELS_MODE),
+                str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
                 editable_state=editable_state,
             )
             redraw_ms = int((time.time() - redraw_started) * 1000)
@@ -2160,7 +2159,7 @@ def relabel_job(job_id: str):
         "updated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "applied_edits": applied,
         "rejected_edits": rejected,
-        "labels_mode": str(editable_state.get("labels_mode") or DEFAULT_LABELS_MODE),
+        "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
         "systems_updated_count": len(systems),
         "labels_redrawn_count": labels_drawn,
         "duration_ms": int((time.time() - started) * 1000),
@@ -2221,7 +2220,7 @@ def relabel_job(job_id: str):
         "relabel": {
             "applied_edits": applied,
             "rejected_edits": rejected,
-            "labels_mode": str(editable_state.get("labels_mode") or DEFAULT_LABELS_MODE),
+            "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
             "state_version_before": state_version_before,
             "state_version_after": state_version_after,
             "updated_system_ids": updated_system_ids,
