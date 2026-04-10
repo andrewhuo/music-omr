@@ -4376,10 +4376,7 @@ jobs:
           editable_seen_ids = set()
           editable_measures: list[dict] = []
           editable_measure_ids = set()
-          editable_staff_boxes: list[dict] = []
-          editable_staff_box_ids = set()
           measure_box_reason_counts = collections.Counter()
-          staff_box_reason_counts = collections.Counter()
           baseline_mode = str(os.environ.get("BASELINE_MODE", "0")).strip() == "1"
           system_qa_policy = str(os.environ.get("SYSTEM_QA_POLICY", "warn")).strip().lower()
           if system_qa_policy not in ("warn", "strict"):
@@ -4417,7 +4414,6 @@ jobs:
                           continue
                       key = f"parser_{reason}"
                       measure_box_reason_counts[key] += int(count)
-                      staff_box_reason_counts[key] += int(count)
               system_count_drift = False
               if baseline_mode and source == "mxl" and status == "ok":
                   if system_guide_count != omr_system_count or system_labels_drawn_count != omr_system_count:
@@ -4511,7 +4507,6 @@ jobs:
                   measure_box_reason_counts["invalid"] += 1
               if len(measure_rows) == 0:
                   measure_box_reason_counts["missing"] += 1
-              page_measure_bounds: dict[str, dict] = {}
               for row in measure_rows:
                   if not isinstance(row, dict):
                       measure_box_reason_counts["invalid"] += 1
@@ -4575,91 +4570,6 @@ jobs:
                           "in_bounds": bool(in_bounds),
                       }
                   )
-                  system_id = str(row.get("system_id") or f"p{page_no}_s{system_index}").strip()
-                  if system_id:
-                      bounds = page_measure_bounds.get(system_id)
-                      if not isinstance(bounds, dict):
-                          page_measure_bounds[system_id] = {
-                              "x_left": float(x_left),
-                              "x_right": float(x_right),
-                              "y_top": float(y_top),
-                              "y_bottom": float(y_bottom),
-                          }
-                      else:
-                          bounds["x_left"] = min(float(bounds.get("x_left", x_left)), float(x_left))
-                          bounds["x_right"] = max(float(bounds.get("x_right", x_right)), float(x_right))
-                          bounds["y_top"] = min(float(bounds.get("y_top", y_top)), float(y_top))
-                          bounds["y_bottom"] = max(float(bounds.get("y_bottom", y_bottom)), float(y_bottom))
-
-              page_staff_boxes_count = 0
-              systems_with_measures = 0
-              for sys_row in page_system_rows:
-                  system_id = str(sys_row.get("system_id") or "").strip()
-                  if not system_id:
-                      staff_box_reason_counts["missing_system_id"] += 1
-                      continue
-                  bounds = page_measure_bounds.get(system_id)
-                  if not isinstance(bounds, dict):
-                      staff_box_reason_counts["measure_bounds_missing"] += 1
-                      continue
-                  systems_with_measures += 1
-                  x_left = float(bounds.get("x_left", 0.0))
-                  x_right = float(bounds.get("x_right", 0.0))
-                  anchor_y_top = float(sys_row.get("anchor_y_top", 0.0))
-                  anchor_y_bottom = float(sys_row.get("anchor_y_bottom", 0.0))
-                  measure_y_top = bounds.get("y_top")
-                  measure_y_bottom = bounds.get("y_bottom")
-                  if measure_y_top is None or measure_y_bottom is None:
-                      staff_box_reason_counts["measure_bounds_missing"] += 1
-                      continue
-                  y_top = float(measure_y_top) - 1.0
-                  y_bottom = float(measure_y_bottom) + 1.0
-                  source = "measure_bounds"
-                  anchor_delta = max(
-                      abs(float(measure_y_top) - anchor_y_top),
-                      abs(float(measure_y_bottom) - anchor_y_bottom),
-                  )
-                  if anchor_delta > 8.0:
-                      staff_box_reason_counts["anchor_delta_large"] += 1
-
-                  y_top = max(0.0, y_top)
-                  y_bottom = min(page_h if page_h > 0.0 else y_bottom, y_bottom)
-                  x_left = max(0.0, x_left)
-                  x_right = min(page_w if page_w > 0.0 else x_right, x_right)
-
-                  if x_right <= x_left or y_bottom <= y_top:
-                      staff_box_reason_counts["invalid_span"] += 1
-                      continue
-
-                  in_bounds = True
-                  if page_w > 0.0 and page_h > 0.0:
-                      in_bounds = (x_left >= 0.0 and x_right <= page_w and y_top >= 0.0 and y_bottom <= page_h)
-                      if not in_bounds:
-                          staff_box_reason_counts["out_of_bounds"] += 1
-
-                  staff_box_id = f"staff_{system_id}"
-                  if staff_box_id in editable_staff_box_ids:
-                      staff_box_reason_counts["duplicate_staff_box_id"] += 1
-                      continue
-                  editable_staff_box_ids.add(staff_box_id)
-                  editable_staff_boxes.append(
-                      {
-                          "staff_box_id": staff_box_id,
-                          "system_id": system_id,
-                          "page": page_no,
-                          "system_index": int(sys_row.get("system_index", 0)),
-                          "x_left": round(float(x_left), 3),
-                          "x_right": round(float(x_right), 3),
-                          "y_top": round(float(y_top), 3),
-                          "y_bottom": round(float(y_bottom), 3),
-                          "source": source,
-                          "in_bounds": bool(in_bounds),
-                      }
-                  )
-                  page_staff_boxes_count += 1
-
-              if page_staff_boxes_count != systems_with_measures:
-                  staff_box_reason_counts["count_mismatch"] += 1
 
           manifest_entries = None
           manifest_missing = None
@@ -4693,7 +4603,6 @@ jobs:
                   int(item.get("measure_local_index", 0)),
               ),
           )
-          editable_staff_boxes_sorted = []
           for global_index, row in enumerate(editable_measures_sorted):
               row["global_index"] = int(global_index)
 
@@ -4705,8 +4614,6 @@ jobs:
           for key in sorted(measure_box_reason_counts.keys()):
               if str(key).startswith("parser_"):
                   measure_box_reason_counts_payload[str(key)] = int(measure_box_reason_counts.get(key, 0))
-
-          staff_box_reason_counts_payload = {}
 
           # Recompute system start values sequentially from measure counts
           # instead of trusting Audiveris OCR labels (which are often wrong)
@@ -4731,16 +4638,14 @@ jobs:
               "version": "system_state_v1",
               "systems": _sorted_sys,
               "measures": editable_measures_sorted,
-              "staff_boxes": editable_staff_boxes_sorted,
+              "staff_boxes": [],
               "qa": {
                   "ok": len(editable_reason_counts) == 0,
                   "reason_counts": dict(editable_reason_counts),
                   "warnings": [f"{k}:{v}" for k, v in sorted(editable_reason_counts.items())],
                   "total_systems": len(editable_systems),
                   "measure_boxes_count": len(editable_measures_sorted),
-                  "staff_boxes_count": 0,
                   "measure_box_reason_counts": measure_box_reason_counts_payload,
-                  "staff_box_reason_counts": staff_box_reason_counts_payload,
               },
           }
 

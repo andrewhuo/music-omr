@@ -172,6 +172,7 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(measure_values["p1_s1_m1"], 20)
         self.assertEqual(measure_values["p1_s1_m2"], 21)
         self.assertEqual(measure_values["p1_s2_m0"], 22)
+        self.assertEqual(state.get("staff_boxes"), [])
 
     def test_unknown_system_rejected(self):
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(
