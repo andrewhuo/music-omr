@@ -250,6 +250,95 @@ class RelabelLogicTests(unittest.TestCase):
         values = [int(row["current_value"]) for row in systems]
         self.assertEqual(values, [1, 20, 23, 26])
 
+    def test_set_rest_staff_applied_and_reflows_following_systems(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_staff", "system_id": "p1_s1", "value": 2}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_rest_staff", "system_id": "p1_s1", "value": 2}])
+        self.assertEqual(state.get("rest_systems"), {"p1_s1": 2})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 9, 12])
+        measure_values = {
+            row["measure_id"]: int(row["current_value"])
+            for row in state.get("measures") or []
+        }
+        self.assertEqual(measure_values["p1_s2_m0"], 9)
+        self.assertEqual(measure_values["p2_s0_m0"], 12)
+
+    def test_set_rest_staff_invalid_measure_count_rejected(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_staff", "system_id": "p1_s1", "value": -1}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "invalid_measure_count")
+        self.assertEqual(state.get("rest_systems"), None)
+
+    def test_set_ending_applied_recomputes_labels(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_ending", "measure_id": "p1_s1_m1", "value": "1"},
+                {"type": "set_ending", "measure_id": "p1_s2_m0", "value": "2"},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [
+                {"type": "set_ending", "measure_id": "p1_s1_m1", "value": "1"},
+                {"type": "set_ending", "measure_id": "p1_s2_m0", "value": "2"},
+            ],
+        )
+        self.assertEqual(state.get("endings"), {"p1_s1_m1": "1", "p1_s2_m0": "2"})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 5, 9])
+        measure_values = {
+            row["measure_id"]: int(row["current_value"])
+            for row in state.get("measures") or []
+        }
+        self.assertEqual(measure_values["p1_s1_m1"], 5)
+        self.assertEqual(measure_values["p1_s1_m2"], 6)
+        self.assertEqual(measure_values["p1_s2_m0"], 5)
+        self.assertEqual(measure_values["p1_s2_m1"], 7)
+
+    def test_set_ending_clear_removes_existing_value(self):
+        state = self._sample_state()
+        state["endings"] = {"p1_s1_m1": "1"}
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_ending", "measure_id": "p1_s1_m1", "value": "none"}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_ending", "measure_id": "p1_s1_m1", "value": "none"}])
+        self.assertEqual(state.get("endings"), {})
+
+    def test_set_ending_unknown_measure_rejected(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_ending", "measure_id": "missing", "value": "1"}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "unknown_measure_id")
+
+    def test_set_ending_invalid_value_rejected(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_ending", "measure_id": "p1_s1_m1", "value": "3"}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "invalid_ending_value")
+
     def test_relabel_trace_history_cap(self):
         mapping_summary = {}
         for idx in range(55):

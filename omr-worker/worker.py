@@ -1238,6 +1238,171 @@ def _recompute_measure_numbering(
     return sorted_systems, ordered_measures, result_labels, seq_starts_by_system
 
 
+def _editable_endings_map(editable_state: dict) -> dict[str, str]:
+    endings_map = editable_state.get("endings")
+    if not isinstance(endings_map, dict):
+        editable_state["endings"] = {}
+        return editable_state["endings"]
+    return endings_map
+
+
+def _editable_rest_systems(editable_state: dict) -> dict[str, int]:
+    rest_systems = editable_state.get("rest_systems")
+    if not isinstance(rest_systems, dict):
+        editable_state["rest_systems"] = {}
+        return editable_state["rest_systems"]
+    return rest_systems
+
+
+def _relabel_number_value(raw_edit: dict, rejected: list[dict]) -> int | None:
+    try:
+        new_value = int(raw_edit.get("value"))
+    except Exception:
+        rejected.append({"edit": raw_edit, "reason": "invalid_value"})
+        return None
+    if new_value < RELABEL_MIN_VALUE or new_value > RELABEL_MAX_VALUE:
+        rejected.append(
+            {
+                "edit": raw_edit,
+                "reason": "value_out_of_range",
+                "min": RELABEL_MIN_VALUE,
+                "max": RELABEL_MAX_VALUE,
+            }
+        )
+        return None
+    return int(new_value)
+
+
+def _apply_legacy_system_start_edit(
+    raw_edit: dict,
+    system_ids: set[str],
+    first_measure_by_system: dict[str, dict],
+    measure_overrides: dict[str, int],
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    system_id = str(raw_edit.get("system_id") or "").strip()
+    if not system_id or system_id not in system_ids:
+        rejected.append({"edit": raw_edit, "reason": "unknown_system_id"})
+        return
+
+    new_value = _relabel_number_value(raw_edit, rejected)
+    if new_value is None:
+        return
+
+    first_measure = first_measure_by_system.get(system_id)
+    if not isinstance(first_measure, dict):
+        rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+
+    measure_id = str(first_measure.get("measure_id") or "").strip()
+    if not measure_id:
+        rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+
+    measure_overrides[measure_id] = int(new_value)
+    applied.append({"type": "set_system_start", "system_id": system_id, "value": int(new_value)})
+
+
+def _apply_measure_number_edit(
+    raw_edit: dict,
+    measure_ids: set[str],
+    measure_overrides: dict[str, int],
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    measure_id = str(raw_edit.get("measure_id") or "").strip()
+    if not measure_id:
+        rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
+        return
+    if measure_id not in measure_ids:
+        rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+
+    new_value = _relabel_number_value(raw_edit, rejected)
+    if new_value is None:
+        return
+
+    measure_overrides[measure_id] = int(new_value)
+    applied.append({"type": "set_measure_number", "measure_id": measure_id, "value": int(new_value)})
+
+
+def _apply_labels_mode_edit(
+    raw_edit: dict,
+    labels_mode: str,
+    applied: list[dict],
+    rejected: list[dict],
+) -> str:
+    mode = str(raw_edit.get("value") or "").strip().lower()
+    if mode not in LABELS_MODE_ALLOWED:
+        rejected.append({"edit": raw_edit, "reason": "invalid_value"})
+        return labels_mode
+
+    applied.append({"type": "set_labels_mode", "value": mode})
+    return mode
+
+
+def _apply_legacy_rest_staff_edit(
+    raw_edit: dict,
+    system_ids: set[str],
+    editable_state: dict,
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    system_id = str(raw_edit.get("system_id") or "").strip()
+    if not system_id or system_id not in system_ids:
+        rejected.append({"edit": raw_edit, "reason": "unknown_system_id"})
+        return
+
+    measure_count = raw_edit.get("value")
+    if not isinstance(measure_count, int) or measure_count < 0:
+        rejected.append({"edit": raw_edit, "reason": "invalid_measure_count"})
+        return
+
+    rest_systems = _editable_rest_systems(editable_state)
+    prev_rest = rest_systems.get(system_id, 0)
+    if measure_count == 0:
+        rest_systems.pop(system_id, None)
+    else:
+        rest_systems[system_id] = measure_count
+
+    diff = measure_count - prev_rest
+    import sys
+
+    msg1 = f"REST_DEBUG system_id={system_id} measure_count={measure_count} prev_rest={prev_rest} diff={diff}"
+    logger.warning(msg1)
+    print(msg1, file=sys.stderr, flush=True)
+    applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
+
+
+def _apply_ending_edit(
+    raw_edit: dict,
+    measure_ids: set[str],
+    editable_state: dict,
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    measure_id = str(raw_edit.get("measure_id") or "").strip()
+    ending_val = str(raw_edit.get("value") or "").strip()
+    if not measure_id:
+        rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
+        return
+    if measure_id not in measure_ids:
+        rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+
+    endings = _editable_endings_map(editable_state)
+    if ending_val in ("", "none"):
+        endings.pop(measure_id, None)
+    elif ending_val in ("1", "2"):
+        endings[measure_id] = ending_val
+    else:
+        rejected.append({"edit": raw_edit, "reason": "invalid_ending_value"})
+        return
+
+    applied.append({"type": "set_ending", "measure_id": measure_id, "value": ending_val})
+
+
 def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[dict], list[dict], list[dict], int]:
     systems = _sorted_system_rows(editable_state.get("systems") or [])
     if not systems:
@@ -1246,11 +1411,11 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
     editable_state["systems"] = systems
     editable_state["measures"] = measures
 
-    id_to_index = {}
-    for idx, row in enumerate(systems):
+    system_ids = set()
+    for row in systems:
         sid = str(row.get("system_id") or "").strip()
         if sid:
-            id_to_index[sid] = idx
+            system_ids.add(sid)
     first_measure_by_system: dict[str, dict] = {}
     measure_ids = set()
     for measure in measures:
@@ -1274,116 +1439,30 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
             continue
         edit_type = str(raw_edit.get("type") or "").strip()
         if edit_type == "set_system_start":
-            system_id = str(raw_edit.get("system_id") or "").strip()
-            if not system_id or system_id not in id_to_index:
-                rejected.append({"edit": raw_edit, "reason": "unknown_system_id"})
-                continue
-            try:
-                new_value = int(raw_edit.get("value"))
-            except Exception:
-                rejected.append({"edit": raw_edit, "reason": "invalid_value"})
-                continue
-            if new_value < RELABEL_MIN_VALUE or new_value > RELABEL_MAX_VALUE:
-                rejected.append(
-                    {
-                        "edit": raw_edit,
-                        "reason": "value_out_of_range",
-                        "min": RELABEL_MIN_VALUE,
-                        "max": RELABEL_MAX_VALUE,
-                    }
-                )
-                continue
-
-            first_measure = first_measure_by_system.get(system_id)
-            if not isinstance(first_measure, dict):
-                rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
-                continue
-            measure_id = str(first_measure.get("measure_id") or "").strip()
-            if not measure_id:
-                rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
-                continue
-            measure_overrides[measure_id] = int(new_value)
-            applied.append({"type": "set_system_start", "system_id": system_id, "value": int(new_value)})
+            _apply_legacy_system_start_edit(
+                raw_edit,
+                system_ids,
+                first_measure_by_system,
+                measure_overrides,
+                applied,
+                rejected,
+            )
             continue
 
         if edit_type == "set_measure_number":
-            measure_id = str(raw_edit.get("measure_id") or "").strip()
-            if not measure_id:
-                rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
-                continue
-            if measure_id not in measure_ids:
-                rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
-                continue
-            try:
-                new_value = int(raw_edit.get("value"))
-            except Exception:
-                rejected.append({"edit": raw_edit, "reason": "invalid_value"})
-                continue
-            if new_value < RELABEL_MIN_VALUE or new_value > RELABEL_MAX_VALUE:
-                rejected.append(
-                    {
-                        "edit": raw_edit,
-                        "reason": "value_out_of_range",
-                        "min": RELABEL_MIN_VALUE,
-                        "max": RELABEL_MAX_VALUE,
-                    }
-                )
-                continue
-
-            measure_overrides[measure_id] = int(new_value)
-            applied.append({"type": "set_measure_number", "measure_id": measure_id, "value": int(new_value)})
+            _apply_measure_number_edit(raw_edit, measure_ids, measure_overrides, applied, rejected)
             continue
 
         if edit_type == "set_labels_mode":
-            mode = str(raw_edit.get("value") or "").strip().lower()
-            if mode not in LABELS_MODE_ALLOWED:
-                rejected.append({"edit": raw_edit, "reason": "invalid_value"})
-                continue
-            labels_mode = mode
-            applied.append({"type": "set_labels_mode", "value": labels_mode})
+            labels_mode = _apply_labels_mode_edit(raw_edit, labels_mode, applied, rejected)
             continue
 
         if edit_type == "set_rest_staff":
-            system_id = str(raw_edit.get("system_id") or "").strip()
-            if not system_id or system_id not in id_to_index:
-                rejected.append({"edit": raw_edit, "reason": "unknown_system_id"})
-                continue
-            measure_count = raw_edit.get("value")
-            if not isinstance(measure_count, int) or measure_count < 0:
-                rejected.append({"edit": raw_edit, "reason": "invalid_measure_count"})
-                continue
-            if "rest_systems" not in editable_state:
-                editable_state["rest_systems"] = {}
-            # Undo previously applied rest for this staff before applying new one
-            prev_rest = editable_state["rest_systems"].get(system_id, 0)
-            if measure_count == 0:
-                editable_state["rest_systems"].pop(system_id, None)
-            else:
-                editable_state["rest_systems"][system_id] = measure_count
-            diff = measure_count - prev_rest
-            import sys
-            msg1 = f"REST_DEBUG system_id={system_id} measure_count={measure_count} prev_rest={prev_rest} diff={diff}"
-            logger.warning(msg1)
-            print(msg1, file=sys.stderr, flush=True)
-            applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
+            _apply_legacy_rest_staff_edit(raw_edit, system_ids, editable_state, applied, rejected)
             continue
 
         if edit_type == "set_ending":
-            measure_id = str(raw_edit.get("measure_id") or "").strip()
-            ending_val = str(raw_edit.get("value") or "").strip()
-            if not measure_id:
-                rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
-                continue
-            if "endings" not in editable_state:
-                editable_state["endings"] = {}
-            if ending_val in ("", "none"):
-                editable_state["endings"].pop(measure_id, None)
-            elif ending_val in ("1", "2"):
-                editable_state["endings"][measure_id] = ending_val
-            else:
-                rejected.append({"edit": raw_edit, "reason": "invalid_ending_value"})
-                continue
-            applied.append({"type": "set_ending", "measure_id": measure_id, "value": ending_val})
+            _apply_ending_edit(raw_edit, measure_ids, editable_state, applied, rejected)
             continue
 
         rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
