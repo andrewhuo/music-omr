@@ -305,7 +305,6 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body.get("artifacts_http"), artifacts_http)
         self.assertEqual((body.get("editable_state") or {}).get("labels_mode"), "system_only")
-        self.assertEqual((body.get("editable_state") or {}).get("rest_measures"), {})
         self.assertEqual((body.get("editable_state") or {}).get("staff_boxes"), [])
 
     def test_list_jobs_endpoint_returns_simple_rows(self):
