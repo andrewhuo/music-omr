@@ -279,6 +279,102 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(rejected[0]["reason"], "invalid_measure_count")
         self.assertEqual(state.get("rest_systems"), None)
 
+    def test_set_rest_measure_applied_and_reflows_from_exact_measure(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 4}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 4}])
+        self.assertEqual(state.get("rest_measures"), {"p1_s1_m1": 4})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 11, 14])
+        measure_values = {
+            row["measure_id"]: int(row["current_value"])
+            for row in state.get("measures") or []
+        }
+        self.assertEqual(measure_values["p1_s1_m0"], 4)
+        self.assertEqual(measure_values["p1_s1_m1"], 5)
+        self.assertEqual(measure_values["p1_s1_m2"], 10)
+        self.assertEqual(measure_values["p1_s2_m0"], 11)
+
+    def test_set_rest_measure_multiple_anchors_same_staff_apply_in_order(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_rest_measure", "measure_id": "p1_s1_m0", "value": 1},
+                {"type": "set_rest_measure", "measure_id": "p1_s1_m2", "value": 2},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [
+                {"type": "set_rest_measure", "measure_id": "p1_s1_m0", "value": 1},
+                {"type": "set_rest_measure", "measure_id": "p1_s1_m2", "value": 2},
+            ],
+        )
+        self.assertEqual(state.get("rest_measures"), {"p1_s1_m0": 1, "p1_s1_m2": 2})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 10, 13])
+        measure_values = {
+            row["measure_id"]: int(row["current_value"])
+            for row in state.get("measures") or []
+        }
+        self.assertEqual(measure_values["p1_s1_m0"], 4)
+        self.assertEqual(measure_values["p1_s1_m1"], 6)
+        self.assertEqual(measure_values["p1_s1_m2"], 7)
+        self.assertEqual(measure_values["p1_s2_m0"], 10)
+
+    def test_set_rest_measure_reapply_replaces_same_measure_count(self):
+        state = self._sample_state()
+        state["rest_measures"] = {"p1_s1_m1": 2}
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 4}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 4}])
+        self.assertEqual(state.get("rest_measures"), {"p1_s1_m1": 4})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 11, 14])
+
+    def test_set_rest_measure_unknown_measure_rejected(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "missing", "value": 3}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "unknown_measure_id")
+        self.assertEqual(state.get("rest_measures"), {})
+
+    def test_set_rest_measure_rejects_negative_count(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": -1}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "invalid_measure_count")
+        self.assertEqual(state.get("rest_measures"), {})
+
+    def test_measure_rest_overrides_legacy_staff_rest_on_same_system(self):
+        state = self._sample_state()
+        state["rest_systems"] = {"p1_s1": 2}
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 4}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 4}])
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 11, 14])
+
     def test_set_ending_applied_recomputes_labels(self):
         state = self._sample_state()
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(

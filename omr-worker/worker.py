@@ -770,6 +770,7 @@ def _editable_state_version(editable_state: dict) -> str:
         "systems": editable_state.get("systems") or [],
         "measures": editable_state.get("measures") or [],
         "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
+        "rest_measures": editable_state.get("rest_measures") or {},
         "rest_systems": editable_state.get("rest_systems") or {},
         "endings": editable_state.get("endings") or {},
     }
@@ -1152,6 +1153,29 @@ def _measure_number_overrides(editable_state: dict) -> dict[str, int]:
     return cleaned
 
 
+def _editable_rest_measures(editable_state: dict) -> dict[str, int]:
+    raw = editable_state.get("rest_measures")
+    if not isinstance(raw, dict):
+        editable_state["rest_measures"] = {}
+        return editable_state["rest_measures"]
+
+    cleaned: dict[str, int] = {}
+    for raw_key, raw_value in raw.items():
+        measure_id = str(raw_key or "").strip()
+        if not measure_id:
+            continue
+        try:
+            value = int(raw_value)
+        except Exception:
+            continue
+        if value <= 0:
+            continue
+        cleaned[measure_id] = value
+
+    editable_state["rest_measures"] = cleaned
+    return cleaned
+
+
 def _recompute_measure_numbering(
     systems: list[dict] | None,
     measures: list[dict] | None,
@@ -1174,7 +1198,17 @@ def _recompute_measure_numbering(
     rest_systems = editable_state.get("rest_systems")
     if not isinstance(rest_systems, dict):
         rest_systems = {}
+    rest_measures = _editable_rest_measures(editable_state)
     measure_overrides = _measure_number_overrides(editable_state)
+    systems_with_measure_rests: set[str] = set()
+
+    for measure in ordered_measures:
+        measure_id = str(measure.get("measure_id") or "").strip()
+        if not measure_id or measure_id not in rest_measures:
+            continue
+        system_id = str(measure.get("system_id") or "").strip()
+        if system_id:
+            systems_with_measure_rests.add(system_id)
 
     if ordered_measures:
         first_measure_id = str(ordered_measures[0].get("measure_id") or "").strip()
@@ -1193,7 +1227,7 @@ def _recompute_measure_numbering(
         system_id = str(measure.get("system_id") or "").strip()
 
         if system_id != current_sid:
-            if current_sid is not None:
+            if current_sid is not None and current_sid not in systems_with_measure_rests:
                 rest_count = _safe_int(rest_systems.get(current_sid), 0)
                 if rest_count > 0:
                     current_value += rest_count
@@ -1225,6 +1259,10 @@ def _recompute_measure_numbering(
         measure["value"] = label
         measure["render_label"] = label
 
+        rest_count = _safe_int(rest_measures.get(measure_id), 0)
+        if rest_count > 0:
+            current_value += rest_count
+
     for system in sorted_systems:
         system_id = str(system.get("system_id") or "").strip()
         if system_id and system_id in seq_starts_by_system:
@@ -1252,6 +1290,35 @@ def _editable_rest_systems(editable_state: dict) -> dict[str, int]:
         editable_state["rest_systems"] = {}
         return editable_state["rest_systems"]
     return rest_systems
+
+
+def _apply_measure_rest_edit(
+    raw_edit: dict,
+    measure_ids: set[str],
+    editable_state: dict,
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    measure_id = str(raw_edit.get("measure_id") or "").strip()
+    if not measure_id:
+        rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
+        return
+    if measure_id not in measure_ids:
+        rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+
+    measure_count = raw_edit.get("value")
+    if not isinstance(measure_count, int) or measure_count < 0:
+        rejected.append({"edit": raw_edit, "reason": "invalid_measure_count"})
+        return
+
+    rest_measures = _editable_rest_measures(editable_state)
+    if measure_count == 0:
+        rest_measures.pop(measure_id, None)
+    else:
+        rest_measures[measure_id] = measure_count
+
+    applied.append({"type": "set_rest_measure", "measure_id": measure_id, "value": measure_count})
 
 
 def _relabel_number_value(raw_edit: dict, rejected: list[dict]) -> int | None:
@@ -1455,6 +1522,10 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
 
         if edit_type == "set_labels_mode":
             labels_mode = _apply_labels_mode_edit(raw_edit, labels_mode, applied, rejected)
+            continue
+
+        if edit_type == "set_rest_measure":
+            _apply_measure_rest_edit(raw_edit, measure_ids, editable_state, applied, rejected)
             continue
 
         if edit_type == "set_rest_staff":
@@ -1861,6 +1932,7 @@ def get_job_state(job_id: str):
         "editable_state": {
             "version": str(editable_state.get("version") or "system_state_v1"),
             "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
+            "rest_measures": editable_state.get("rest_measures") or {},
             "rest_systems": editable_state.get("rest_systems") or {},
             "qa": qa,
             "systems": systems,
