@@ -279,6 +279,78 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(rejected[0]["reason"], "invalid_measure_count")
         self.assertEqual(state.get("rest_systems"), None)
 
+    def test_set_rest_measure_applied_passive_storage(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 3}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 3}])
+        self.assertEqual(state.get("rest_measures"), {"p1_s1_m1": 3})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 7, 10])
+        measure_values = {row["measure_id"]: int(row["current_value"]) for row in state.get("measures") or []}
+        self.assertEqual(measure_values["p1_s1_m1"], 5)
+        self.assertEqual(measure_values["p1_s2_m0"], 7)
+
+    def test_set_rest_measure_replaces_saved_count(self):
+        state = self._sample_state()
+        state["rest_measures"] = {"p1_s1_m1": 2}
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 5}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 5}])
+        self.assertEqual(state.get("rest_measures"), {"p1_s1_m1": 5})
+
+    def test_set_rest_measure_zero_removes_existing_value(self):
+        state = self._sample_state()
+        state["rest_measures"] = {"p1_s1_m1": 2}
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 0}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 0}])
+        self.assertEqual(state.get("rest_measures"), {})
+
+    def test_set_rest_measure_missing_measure_rejected(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "value": 2}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "missing_measure_id")
+        self.assertEqual(state.get("rest_measures"), None)
+
+    def test_set_rest_measure_unknown_measure_rejected(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_rest_measure", "measure_id": "missing", "value": 2}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "unknown_measure_id")
+        self.assertEqual(state.get("rest_measures"), None)
+
+    def test_set_rest_measure_rejects_invalid_or_negative_count(self):
+        for bad_value in ("x", -1):
+            with self.subTest(bad_value=bad_value):
+                state = self._sample_state()
+                _, applied, rejected, _ = WORKER._apply_relabel_edits(
+                    state,
+                    [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": bad_value}],
+                )
+                self.assertEqual(applied, [])
+                self.assertEqual(len(rejected), 1)
+                self.assertEqual(rejected[0]["reason"], "invalid_measure_count")
+                self.assertEqual(state.get("rest_measures"), None)
+
     def test_set_ending_applied_recomputes_labels(self):
         state = self._sample_state()
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(

@@ -770,6 +770,7 @@ def _editable_state_version(editable_state: dict) -> str:
         "systems": editable_state.get("systems") or [],
         "measures": editable_state.get("measures") or [],
         "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
+        "rest_measures": editable_state.get("rest_measures") or {},
         "rest_systems": editable_state.get("rest_systems") or {},
         "endings": editable_state.get("endings") or {},
     }
@@ -1254,6 +1255,29 @@ def _editable_rest_systems(editable_state: dict) -> dict[str, int]:
     return rest_systems
 
 
+def _editable_rest_measures(editable_state: dict) -> dict[str, int]:
+    raw = editable_state.get("rest_measures")
+    if not isinstance(raw, dict):
+        editable_state["rest_measures"] = {}
+        return editable_state["rest_measures"]
+
+    cleaned: dict[str, int] = {}
+    for raw_key, raw_value in raw.items():
+        measure_id = str(raw_key or "").strip()
+        if not measure_id:
+            continue
+        try:
+            value = int(raw_value)
+        except Exception:
+            continue
+        if value <= 0:
+            continue
+        cleaned[measure_id] = value
+
+    editable_state["rest_measures"] = cleaned
+    return cleaned
+
+
 def _relabel_number_value(raw_edit: dict, rejected: list[dict]) -> int | None:
     try:
         new_value = int(raw_edit.get("value"))
@@ -1375,6 +1399,35 @@ def _apply_legacy_rest_staff_edit(
     applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
 
 
+def _apply_measure_rest_edit(
+    raw_edit: dict,
+    measure_ids: set[str],
+    editable_state: dict,
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    measure_id = str(raw_edit.get("measure_id") or "").strip()
+    if not measure_id:
+        rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
+        return
+    if measure_id not in measure_ids:
+        rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+
+    measure_count = raw_edit.get("value")
+    if not isinstance(measure_count, int) or measure_count < 0:
+        rejected.append({"edit": raw_edit, "reason": "invalid_measure_count"})
+        return
+
+    rest_measures = _editable_rest_measures(editable_state)
+    if measure_count == 0:
+        rest_measures.pop(measure_id, None)
+    else:
+        rest_measures[measure_id] = measure_count
+
+    applied.append({"type": "set_rest_measure", "measure_id": measure_id, "value": measure_count})
+
+
 def _apply_ending_edit(
     raw_edit: dict,
     measure_ids: set[str],
@@ -1455,6 +1508,10 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
 
         if edit_type == "set_labels_mode":
             labels_mode = _apply_labels_mode_edit(raw_edit, labels_mode, applied, rejected)
+            continue
+
+        if edit_type == "set_rest_measure":
+            _apply_measure_rest_edit(raw_edit, measure_ids, editable_state, applied, rejected)
             continue
 
         if edit_type == "set_rest_staff":
@@ -1846,6 +1903,7 @@ def get_job_state(job_id: str):
     if not isinstance(qa, dict):
         qa = {}
 
+    _editable_rest_measures(editable_state)
     reassign_count = _reassign_measures_to_nearest_system(systems, measures)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
@@ -1861,6 +1919,7 @@ def get_job_state(job_id: str):
         "editable_state": {
             "version": str(editable_state.get("version") or "system_state_v1"),
             "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
+            "rest_measures": editable_state.get("rest_measures") or {},
             "rest_systems": editable_state.get("rest_systems") or {},
             "qa": qa,
             "systems": systems,
@@ -2011,6 +2070,7 @@ def relabel_job(job_id: str):
     editable_state["labels_mode"] = labels_mode_before
     systems_before = _sorted_system_rows(editable_state.get("systems") or [])
     measures_before = _sorted_measure_rows(editable_state.get("measures") or [])
+    _editable_rest_measures(editable_state)
     reassign_count = _reassign_measures_to_nearest_system(systems_before, measures_before)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
