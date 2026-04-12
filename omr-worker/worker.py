@@ -1175,7 +1175,17 @@ def _recompute_measure_numbering(
     rest_systems = editable_state.get("rest_systems")
     if not isinstance(rest_systems, dict):
         rest_systems = {}
+    rest_measures = _editable_rest_measures(editable_state)
     measure_overrides = _measure_number_overrides(editable_state)
+
+    exact_rest_system_ids: set[str] = set()
+    for measure in ordered_measures:
+        measure_id = str(measure.get("measure_id") or "").strip()
+        system_id = str(measure.get("system_id") or "").strip()
+        if not measure_id or not system_id:
+            continue
+        if _safe_int(rest_measures.get(measure_id), 0) > 0:
+            exact_rest_system_ids.add(system_id)
 
     if ordered_measures:
         first_measure_id = str(ordered_measures[0].get("measure_id") or "").strip()
@@ -1196,7 +1206,7 @@ def _recompute_measure_numbering(
         if system_id != current_sid:
             if current_sid is not None:
                 rest_count = _safe_int(rest_systems.get(current_sid), 0)
-                if rest_count > 0:
+                if current_sid not in exact_rest_system_ids and rest_count > 0:
                     current_value += rest_count
             current_sid = system_id
 
@@ -1225,6 +1235,10 @@ def _recompute_measure_numbering(
         measure["current_value"] = label
         measure["value"] = label
         measure["render_label"] = label
+
+        exact_rest_count = _safe_int(rest_measures.get(measure_id), 0) if measure_id else 0
+        if exact_rest_count > 0:
+            current_value = int(label_value) + 1 + exact_rest_count
 
     for system in sorted_systems:
         system_id = str(system.get("system_id") or "").strip()
