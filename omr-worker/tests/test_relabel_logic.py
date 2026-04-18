@@ -174,6 +174,41 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(measure_values["p1_s2_m0"], 22)
         self.assertEqual(state.get("staff_boxes"), [])
 
+    def test_clear_measure_number_removes_override_and_restores_sequence(self):
+        state = self._sample_state()
+        state["measure_number_overrides"] = {"p1_s1_m1": 20}
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "clear_measure_number", "measure_id": "p1_s1_m1"}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "clear_measure_number", "measure_id": "p1_s1_m1"}])
+        self.assertEqual(state.get("measure_number_overrides"), {})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 7, 10])
+        measure_values = {
+            row["measure_id"]: int(row["current_value"])
+            for row in state.get("measures") or []
+        }
+        self.assertEqual(measure_values["p1_s1_m0"], 4)
+        self.assertEqual(measure_values["p1_s1_m1"], 5)
+        self.assertEqual(measure_values["p1_s1_m2"], 6)
+        self.assertEqual(measure_values["p1_s2_m0"], 7)
+
+    def test_clear_measure_number_unknown_measure_rejected(self):
+        state = self._sample_state()
+        state["measure_number_overrides"] = {"p1_s1_m1": 20}
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "clear_measure_number", "measure_id": "missing"}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "unknown_measure_id")
+        self.assertEqual(state.get("measure_number_overrides"), {"p1_s1_m1": 20})
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 22, 25])
+
     def test_unknown_system_rejected(self):
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(
             self._sample_state(),

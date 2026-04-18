@@ -1365,6 +1365,25 @@ def _apply_measure_number_edit(
     applied.append({"type": "set_measure_number", "measure_id": measure_id, "value": int(new_value)})
 
 
+def _apply_clear_measure_number_edit(
+    raw_edit: dict,
+    measure_ids: set[str],
+    measure_overrides: dict[str, int],
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    measure_id = str(raw_edit.get("measure_id") or "").strip()
+    if not measure_id:
+        rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
+        return
+    if measure_id not in measure_ids:
+        rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+
+    measure_overrides.pop(measure_id, None)
+    applied.append({"type": "clear_measure_number", "measure_id": measure_id})
+
+
 def _apply_labels_mode_edit(
     raw_edit: dict,
     labels_mode: str,
@@ -1518,6 +1537,10 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
 
         if edit_type == "set_measure_number":
             _apply_measure_number_edit(raw_edit, measure_ids, measure_overrides, applied, rejected)
+            continue
+
+        if edit_type == "clear_measure_number":
+            _apply_clear_measure_number_edit(raw_edit, measure_ids, measure_overrides, applied, rejected)
             continue
 
         if edit_type == "set_labels_mode":
