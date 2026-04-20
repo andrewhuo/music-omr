@@ -771,6 +771,7 @@ def _editable_state_version(editable_state: dict) -> str:
         "measures": editable_state.get("measures") or [],
         "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
         "rest_measures": editable_state.get("rest_measures") or {},
+        "pickup_measures": editable_state.get("pickup_measures") or {},
         "rest_systems": editable_state.get("rest_systems") or {},
         "endings": editable_state.get("endings") or {},
     }
@@ -1292,6 +1293,24 @@ def _editable_rest_measures(editable_state: dict) -> dict[str, int]:
     return cleaned
 
 
+def _editable_pickup_measures(editable_state: dict) -> dict[str, bool]:
+    raw = editable_state.get("pickup_measures")
+    if not isinstance(raw, dict):
+        editable_state["pickup_measures"] = {}
+        return editable_state["pickup_measures"]
+
+    cleaned: dict[str, bool] = {}
+    for raw_key, raw_value in raw.items():
+        measure_id = str(raw_key or "").strip()
+        if not measure_id:
+            continue
+        if _safe_bool(raw_value, False):
+            cleaned[measure_id] = True
+
+    editable_state["pickup_measures"] = cleaned
+    return cleaned
+
+
 def _relabel_number_value(raw_edit: dict, rejected: list[dict]) -> int | None:
     try:
         new_value = int(raw_edit.get("value"))
@@ -1461,6 +1480,46 @@ def _apply_measure_rest_edit(
     applied.append({"type": "set_rest_measure", "measure_id": measure_id, "value": measure_count})
 
 
+def _apply_measure_pickup_edit(
+    raw_edit: dict,
+    measure_ids: set[str],
+    measure_rows_by_id: dict[str, dict],
+    editable_state: dict,
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    measure_id = str(raw_edit.get("measure_id") or "").strip()
+    if not measure_id:
+        rejected.append({"edit": raw_edit, "reason": "missing_measure_id"})
+        return
+    if measure_id not in measure_ids:
+        rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+
+    value = raw_edit.get("value")
+    if not isinstance(value, bool):
+        rejected.append({"edit": raw_edit, "reason": "invalid_value"})
+        return
+
+    pickup_measures = _editable_pickup_measures(editable_state)
+    if value:
+        target_row = measure_rows_by_id.get(measure_id) or {}
+        target_system_id = str(target_row.get("system_id") or "").strip()
+        if target_system_id:
+            to_remove = [
+                saved_measure_id
+                for saved_measure_id in pickup_measures.keys()
+                if str((measure_rows_by_id.get(saved_measure_id) or {}).get("system_id") or "").strip() == target_system_id
+            ]
+            for saved_measure_id in to_remove:
+                pickup_measures.pop(saved_measure_id, None)
+        pickup_measures[measure_id] = True
+    else:
+        pickup_measures.pop(measure_id, None)
+
+    applied.append({"type": "set_pickup_measure", "measure_id": measure_id, "value": value})
+
+
 def _apply_ending_edit(
     raw_edit: dict,
     measure_ids: set[str],
@@ -1504,10 +1563,12 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
             system_ids.add(sid)
     first_measure_by_system: dict[str, dict] = {}
     measure_ids = set()
+    measure_rows_by_id: dict[str, dict] = {}
     for measure in measures:
         measure_id = str(measure.get("measure_id") or "").strip()
         if measure_id:
             measure_ids.add(measure_id)
+            measure_rows_by_id[measure_id] = measure
         system_id = str(measure.get("system_id") or "").strip()
         if system_id and system_id not in first_measure_by_system:
             first_measure_by_system[system_id] = measure
@@ -1518,6 +1579,7 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
     if labels_mode not in LABELS_MODE_ALLOWED:
         labels_mode = LABELS_MODE_SYSTEM_ONLY
     measure_overrides = _measure_number_overrides(editable_state)
+    _editable_pickup_measures(editable_state)
 
     for raw_edit in edits:
         if not isinstance(raw_edit, dict):
@@ -1549,6 +1611,10 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
 
         if edit_type == "set_rest_measure":
             _apply_measure_rest_edit(raw_edit, measure_ids, editable_state, applied, rejected)
+            continue
+
+        if edit_type == "set_pickup_measure":
+            _apply_measure_pickup_edit(raw_edit, measure_ids, measure_rows_by_id, editable_state, applied, rejected)
             continue
 
         if edit_type == "set_rest_staff":
@@ -1941,6 +2007,7 @@ def get_job_state(job_id: str):
         qa = {}
 
     _editable_rest_measures(editable_state)
+    _editable_pickup_measures(editable_state)
     reassign_count = _reassign_measures_to_nearest_system(systems, measures)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
@@ -1957,6 +2024,7 @@ def get_job_state(job_id: str):
             "version": str(editable_state.get("version") or "system_state_v1"),
             "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
             "rest_measures": editable_state.get("rest_measures") or {},
+            "pickup_measures": editable_state.get("pickup_measures") or {},
             "rest_systems": editable_state.get("rest_systems") or {},
             "qa": qa,
             "systems": systems,
@@ -2108,6 +2176,7 @@ def relabel_job(job_id: str):
     systems_before = _sorted_system_rows(editable_state.get("systems") or [])
     measures_before = _sorted_measure_rows(editable_state.get("measures") or [])
     _editable_rest_measures(editable_state)
+    _editable_pickup_measures(editable_state)
     reassign_count = _reassign_measures_to_nearest_system(systems_before, measures_before)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")

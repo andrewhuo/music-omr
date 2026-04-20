@@ -388,6 +388,92 @@ class RelabelLogicTests(unittest.TestCase):
                 self.assertEqual(rejected[0]["reason"], "invalid_measure_count")
                 self.assertEqual(state.get("rest_measures"), {})
 
+    def test_set_pickup_measure_saves_exact_anchor(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_pickup_measure", "measure_id": "p1_s1_m1", "value": True}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_pickup_measure", "measure_id": "p1_s1_m1", "value": True}])
+        self.assertEqual(state.get("pickup_measures"), {"p1_s1_m1": True})
+
+    def test_set_pickup_measure_replaces_existing_anchor_on_same_system(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {"p1_s1_m1": True}
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_pickup_measure", "measure_id": "p1_s1_m2", "value": True}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_pickup_measure", "measure_id": "p1_s1_m2", "value": True}])
+        self.assertEqual(state.get("pickup_measures"), {"p1_s1_m2": True})
+
+    def test_set_pickup_measure_allows_saved_anchors_on_different_systems(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_pickup_measure", "measure_id": "p1_s1_m1", "value": True},
+                {"type": "set_pickup_measure", "measure_id": "p1_s2_m1", "value": True},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [
+                {"type": "set_pickup_measure", "measure_id": "p1_s1_m1", "value": True},
+                {"type": "set_pickup_measure", "measure_id": "p1_s2_m1", "value": True},
+            ],
+        )
+        self.assertEqual(state.get("pickup_measures"), {"p1_s1_m1": True, "p1_s2_m1": True})
+
+    def test_set_pickup_measure_false_removes_existing_value(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {"p1_s1_m1": True}
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_pickup_measure", "measure_id": "p1_s1_m1", "value": False}],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "set_pickup_measure", "measure_id": "p1_s1_m1", "value": False}])
+        self.assertEqual(state.get("pickup_measures"), {})
+
+    def test_set_pickup_measure_missing_measure_rejected(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_pickup_measure", "value": True}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "missing_measure_id")
+        self.assertEqual(state.get("pickup_measures"), {})
+
+    def test_set_pickup_measure_unknown_measure_rejected(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_pickup_measure", "measure_id": "missing", "value": True}],
+        )
+        self.assertEqual(applied, [])
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["reason"], "unknown_measure_id")
+        self.assertEqual(state.get("pickup_measures"), {})
+
+    def test_set_pickup_measure_non_boolean_value_rejected(self):
+        for bad_value in ("true", 1, 0, None):
+            with self.subTest(bad_value=bad_value):
+                state = self._sample_state()
+                _, applied, rejected, _ = WORKER._apply_relabel_edits(
+                    state,
+                    [{"type": "set_pickup_measure", "measure_id": "p1_s1_m1", "value": bad_value}],
+                )
+                self.assertEqual(applied, [])
+                self.assertEqual(len(rejected), 1)
+                self.assertEqual(rejected[0]["reason"], "invalid_value")
+                self.assertEqual(state.get("pickup_measures"), {})
+
     def test_set_measure_number_and_rest_measure_compose_from_anchor_label(self):
         state = self._sample_state()
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(
