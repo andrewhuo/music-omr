@@ -474,6 +474,44 @@ class RelabelLogicTests(unittest.TestCase):
                 self.assertEqual(rejected[0]["reason"], "invalid_value")
                 self.assertEqual(state.get("pickup_measures"), {})
 
+    def test_pickup_measure_in_middle_of_system_resets_following_sequence_to_one(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {"p1_s1_m1": True}
+        systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
+        values = [str(row["current_value"]) for row in systems]
+        self.assertEqual(values, ["1", "4", "2", "5"])
+        measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
+        self.assertEqual(measure_values["p1_s1_m0"], "4")
+        self.assertEqual(measure_values["p1_s1_m1"], "")
+        self.assertEqual(measure_values["p1_s1_m2"], "1")
+        self.assertEqual(measure_values["p1_s2_m0"], "2")
+        self.assertEqual(measure_values["p2_s0_m0"], "5")
+
+    def test_pickup_measure_at_end_of_system_resets_next_system_to_one(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {"p1_s1_m2": True}
+        systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
+        values = [str(row["current_value"]) for row in systems]
+        self.assertEqual(values, ["1", "4", "1", "4"])
+        measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
+        self.assertEqual(measure_values["p1_s1_m1"], "5")
+        self.assertEqual(measure_values["p1_s1_m2"], "")
+        self.assertEqual(measure_values["p1_s2_m0"], "1")
+        self.assertEqual(measure_values["p2_s0_m0"], "4")
+
+    def test_pickup_measure_at_start_of_system_skips_that_measure_and_starts_next_at_one(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {"p1_s1_m0": True}
+        systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
+        values = [str(row["current_value"]) for row in systems]
+        self.assertEqual(values, ["1", "1", "3", "6"])
+        measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
+        self.assertEqual(measure_values["p1_s1_m0"], "")
+        self.assertEqual(measure_values["p1_s1_m1"], "1")
+        self.assertEqual(measure_values["p1_s1_m2"], "2")
+        self.assertEqual(measure_values["p1_s2_m0"], "3")
+        self.assertEqual(measure_values["p2_s0_m0"], "6")
+
     def test_set_measure_number_and_rest_measure_compose_from_anchor_label(self):
         state = self._sample_state()
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(

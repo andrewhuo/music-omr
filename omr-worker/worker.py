@@ -1177,6 +1177,7 @@ def _recompute_measure_numbering(
     if not isinstance(rest_systems, dict):
         rest_systems = {}
     rest_measures = _editable_rest_measures(editable_state)
+    pickup_measures = _editable_pickup_measures(editable_state)
     measure_overrides = _measure_number_overrides(editable_state)
 
     exact_rest_system_ids: set[str] = set()
@@ -1210,6 +1211,19 @@ def _recompute_measure_numbering(
                 if current_sid not in exact_rest_system_ids and rest_count > 0:
                     current_value += rest_count
             current_sid = system_id
+
+        pickup_active = bool(pickup_measures.get(measure_id)) if measure_id else False
+        if pickup_active:
+            label = ""
+            if measure_id:
+                result_labels[measure_id] = label
+            measure["current_value"] = label
+            measure["value"] = label
+            measure["render_label"] = label
+            current_value = 1
+            first_ending_start_value = None
+            second_ending_local = 0
+            continue
 
         if measure_id and measure_id in measure_overrides:
             current_value = int(measure_overrides[measure_id])
