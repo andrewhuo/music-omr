@@ -1212,6 +1212,9 @@ def _recompute_measure_numbering(
                     current_value += rest_count
             current_sid = system_id
 
+        if measure_id and measure_id in measure_overrides:
+            current_value = int(measure_overrides[measure_id])
+
         pickup_active = bool(pickup_measures.get(measure_id)) if measure_id else False
         if pickup_active:
             label = ""
@@ -1220,13 +1223,7 @@ def _recompute_measure_numbering(
             measure["current_value"] = label
             measure["value"] = label
             measure["render_label"] = label
-            current_value = 1
-            first_ending_start_value = None
-            second_ending_local = 0
             continue
-
-        if measure_id and measure_id in measure_overrides:
-            current_value = int(measure_overrides[measure_id])
 
         ending_type = str(endings_map.get(measure_id) or "").strip() if measure_id else ""
         if ending_type == "1":
