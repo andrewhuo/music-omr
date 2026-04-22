@@ -1234,6 +1234,17 @@ def _apply_post_measure_rest(
     return int(current_value)
 
 
+def _apply_pickup_measure_rest(
+    current_value: int,
+    measure_id: str,
+    rest_measures: dict[str, int],
+) -> int:
+    exact_rest_count = _safe_int(rest_measures.get(measure_id), 0) if measure_id else 0
+    if exact_rest_count > 0:
+        return int(current_value) + exact_rest_count
+    return int(current_value)
+
+
 def _recompute_measure_numbering(
     systems: list[dict] | None,
     measures: list[dict] | None,
@@ -1308,6 +1319,11 @@ def _recompute_measure_numbering(
                 "",
                 result_labels,
                 seq_starts_by_system,
+            )
+            current_value = _apply_pickup_measure_rest(
+                current_value,
+                measure_id,
+                rest_measures,
             )
             continue
 
