@@ -512,18 +512,18 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(measure_values["p1_s2_m0"], "6")
         self.assertEqual(measure_values["p2_s0_m0"], "9")
 
-    def test_measure_number_override_still_anchors_when_same_measure_is_pickup(self):
+    def test_pickup_wins_over_same_measure_number_override(self):
         state = self._sample_state()
         state["measure_number_overrides"] = {"p1_s1_m1": 20}
         state["pickup_measures"] = {"p1_s1_m1": True}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "21", "24"])
+        self.assertEqual(values, ["1", "4", "6", "9"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s1_m0"], "4")
         self.assertEqual(measure_values["p1_s1_m1"], "")
-        self.assertEqual(measure_values["p1_s1_m2"], "20")
-        self.assertEqual(measure_values["p1_s2_m0"], "21")
+        self.assertEqual(measure_values["p1_s1_m2"], "5")
+        self.assertEqual(measure_values["p1_s2_m0"], "6")
 
     def test_set_measure_number_and_rest_measure_compose_from_anchor_label(self):
         state = self._sample_state()

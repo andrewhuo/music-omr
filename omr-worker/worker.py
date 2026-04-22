@@ -1299,14 +1299,7 @@ def _recompute_measure_numbering(
         # Stage 2: determine whether this physical measure is marked as pickup.
         pickup_active = _pickup_active_for_measure(measure_id, pickup_measures)
 
-        # Stage 3: apply the current numbering anchor for this measure.
-        current_value = _apply_measure_override_anchor(
-            current_value,
-            measure_id,
-            measure_overrides,
-        )
-
-        # Step 1a keeps the existing pickup+override behavior intact while making the stage order explicit.
+        # Stage 3: pickup wins over same-measure numbering anchors.
         if pickup_active:
             _apply_measure_label(
                 measure,
@@ -1318,7 +1311,14 @@ def _recompute_measure_numbering(
             )
             continue
 
-        # Stage 4: resolve the final local label for this counted measure.
+        # Stage 4: apply the current numbering anchor for this counted measure.
+        current_value = _apply_measure_override_anchor(
+            current_value,
+            measure_id,
+            measure_overrides,
+        )
+
+        # Stage 5: resolve the final local label for this counted measure.
         ending_type = str(endings_map.get(measure_id) or "").strip() if measure_id else ""
         label_value, current_value, first_ending_start_value, second_ending_local = _resolve_ending_stage(
             current_value,
@@ -1337,7 +1337,7 @@ def _recompute_measure_numbering(
             seq_starts_by_system,
         )
 
-        # Stage 5: apply any exact measure rest after the local label is finalized.
+        # Stage 6: apply any exact measure rest after the local label is finalized.
         current_value = _apply_post_measure_rest(
             current_value,
             label_value,
