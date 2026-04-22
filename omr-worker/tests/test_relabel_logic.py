@@ -678,6 +678,99 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(measure_values["p1_s2_m0"], 5)
         self.assertEqual(measure_values["p1_s2_m1"], 7)
 
+    def test_set_measure_number_and_ending_use_forced_local_number(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_measure_number", "measure_id": "p1_s1_m1", "value": 20},
+                {"type": "set_ending", "measure_id": "p1_s1_m1", "value": "1"},
+                {"type": "set_ending", "measure_id": "p1_s2_m0", "value": "2"},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [
+                {"type": "set_measure_number", "measure_id": "p1_s1_m1", "value": 20},
+                {"type": "set_ending", "measure_id": "p1_s1_m1", "value": "1"},
+                {"type": "set_ending", "measure_id": "p1_s2_m0", "value": "2"},
+            ],
+        )
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 20, 24])
+        measure_values = {
+            row["measure_id"]: int(row["current_value"])
+            for row in state.get("measures") or []
+        }
+        self.assertEqual(measure_values["p1_s1_m1"], 20)
+        self.assertEqual(measure_values["p1_s1_m2"], 21)
+        self.assertEqual(measure_values["p1_s2_m0"], 20)
+        self.assertEqual(measure_values["p1_s2_m1"], 22)
+
+    def test_ending_and_rest_shift_from_ending_resolved_label(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_ending", "measure_id": "p1_s1_m1", "value": "1"},
+                {"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 2},
+                {"type": "set_ending", "measure_id": "p1_s2_m0", "value": "2"},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [
+                {"type": "set_ending", "measure_id": "p1_s1_m1", "value": "1"},
+                {"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 2},
+                {"type": "set_ending", "measure_id": "p1_s2_m0", "value": "2"},
+            ],
+        )
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 5, 11])
+        measure_values = {
+            row["measure_id"]: int(row["current_value"])
+            for row in state.get("measures") or []
+        }
+        self.assertEqual(measure_values["p1_s1_m1"], 5)
+        self.assertEqual(measure_values["p1_s1_m2"], 8)
+        self.assertEqual(measure_values["p1_s2_m0"], 5)
+        self.assertEqual(measure_values["p2_s0_m0"], 11)
+
+    def test_set_measure_number_ending_and_rest_cross_system_keep_downstream_labels_correct(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_measure_number", "measure_id": "p1_s2_m0", "value": 30},
+                {"type": "set_ending", "measure_id": "p1_s2_m0", "value": "1"},
+                {"type": "set_rest_measure", "measure_id": "p1_s2_m0", "value": 2},
+                {"type": "set_ending", "measure_id": "p2_s0_m0", "value": "2"},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [
+                {"type": "set_measure_number", "measure_id": "p1_s2_m0", "value": 30},
+                {"type": "set_ending", "measure_id": "p1_s2_m0", "value": "1"},
+                {"type": "set_rest_measure", "measure_id": "p1_s2_m0", "value": 2},
+                {"type": "set_ending", "measure_id": "p2_s0_m0", "value": "2"},
+            ],
+        )
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 30, 30])
+        measure_values = {
+            row["measure_id"]: int(row["current_value"])
+            for row in state.get("measures") or []
+        }
+        self.assertEqual(measure_values["p1_s2_m0"], 30)
+        self.assertEqual(measure_values["p1_s2_m1"], 33)
+        self.assertEqual(measure_values["p1_s2_m2"], 34)
+        self.assertEqual(measure_values["p2_s0_m0"], 30)
+        self.assertEqual(measure_values["p2_s0_m1"], 35)
+
     def test_set_ending_clear_removes_existing_value(self):
         state = self._sample_state()
         state["endings"] = {"p1_s1_m1": "1"}
