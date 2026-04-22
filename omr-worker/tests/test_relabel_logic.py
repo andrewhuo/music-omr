@@ -622,6 +622,54 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(len(rejected), 1)
         self.assertEqual(rejected[0]["reason"], "invalid_ending_value")
 
+    def test_numbering_baseline_scenarios_remain_stable_after_refactor(self):
+        scenarios = [
+            (
+                "plain sequential",
+                {},
+                ["1", "4", "7", "10"],
+                {"p1_s1_m1": "5", "p1_s2_m0": "7"},
+            ),
+            (
+                "one measure-number override",
+                {"measure_number_overrides": {"p1_s1_m1": 20}},
+                ["1", "4", "22", "25"],
+                {"p1_s1_m1": "20", "p1_s1_m2": "21"},
+            ),
+            (
+                "one pickup",
+                {"pickup_measures": {"p1_s1_m1": True}},
+                ["1", "4", "6", "9"],
+                {"p1_s1_m1": "", "p1_s1_m2": "5"},
+            ),
+            (
+                "one exact rest",
+                {"rest_measures": {"p1_s1_m1": 3}},
+                ["1", "4", "10", "13"],
+                {"p1_s1_m1": "5", "p1_s1_m2": "9"},
+            ),
+            (
+                "one ending branch pair",
+                {"endings": {"p1_s1_m1": "1", "p1_s2_m0": "2"}},
+                ["1", "4", "5", "9"],
+                {"p1_s1_m1": "5", "p1_s2_m0": "5"},
+            ),
+        ]
+
+        for name, updates, expected_systems, expected_measures in scenarios:
+            with self.subTest(name=name):
+                state = self._sample_state()
+                state.update(updates)
+                systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
+                self.assertEqual([str(row["current_value"]) for row in systems], expected_systems)
+
+                measure_values = {
+                    row["measure_id"]: str(row.get("current_value") or "")
+                    for row in state.get("measures") or []
+                }
+                for measure_id, expected_value in expected_measures.items():
+                    self.assertEqual(measure_values[measure_id], expected_value)
+
     def test_relabel_trace_history_cap(self):
         mapping_summary = {}
         for idx in range(55):

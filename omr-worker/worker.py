@@ -1154,6 +1154,86 @@ def _measure_number_overrides(editable_state: dict) -> dict[str, int]:
     return cleaned
 
 
+def _apply_legacy_system_rest_carryover(
+    current_value: int,
+    system_id: str | None,
+    rest_systems: dict[str, int],
+    exact_rest_system_ids: set[str],
+) -> int:
+    if not system_id or system_id in exact_rest_system_ids:
+        return int(current_value)
+    rest_count = _safe_int(rest_systems.get(system_id), 0)
+    if rest_count <= 0:
+        return int(current_value)
+    return int(current_value) + rest_count
+
+
+def _apply_measure_override_anchor(
+    current_value: int,
+    measure_id: str,
+    measure_overrides: dict[str, int],
+) -> int:
+    if measure_id and measure_id in measure_overrides:
+        return int(measure_overrides[measure_id])
+    return int(current_value)
+
+
+def _pickup_active_for_measure(measure_id: str, pickup_measures: dict[str, bool]) -> bool:
+    return bool(pickup_measures.get(measure_id)) if measure_id else False
+
+
+def _resolve_ending_stage(
+    current_value: int,
+    ending_type: str,
+    first_ending_start_value: int | None,
+    second_ending_local: int,
+) -> tuple[int, int, int | None, int]:
+    if ending_type == "1":
+        if first_ending_start_value is None:
+            first_ending_start_value = int(current_value)
+        label_value = int(current_value)
+        return label_value, int(current_value) + 1, first_ending_start_value, second_ending_local
+
+    if ending_type == "2":
+        base = first_ending_start_value if first_ending_start_value is not None else int(current_value)
+        label_value = int(base + second_ending_local)
+        return label_value, int(current_value), first_ending_start_value, second_ending_local + 1
+
+    label_value = int(current_value)
+    return label_value, int(current_value) + 1, first_ending_start_value, second_ending_local
+
+
+def _apply_measure_label(
+    measure: dict,
+    measure_id: str,
+    system_id: str,
+    label: str,
+    result_labels: dict[str, str],
+    seq_starts_by_system: dict[str, int],
+) -> None:
+    if measure_id:
+        result_labels[measure_id] = label
+    if label:
+        label_value = int(label)
+        if system_id and system_id not in seq_starts_by_system:
+            seq_starts_by_system[system_id] = label_value
+    measure["current_value"] = label
+    measure["value"] = label
+    measure["render_label"] = label
+
+
+def _apply_post_measure_rest(
+    current_value: int,
+    label_value: int,
+    measure_id: str,
+    rest_measures: dict[str, int],
+) -> int:
+    exact_rest_count = _safe_int(rest_measures.get(measure_id), 0) if measure_id else 0
+    if exact_rest_count > 0:
+        return int(label_value) + 1 + exact_rest_count
+    return int(current_value)
+
+
 def _recompute_measure_numbering(
     systems: list[dict] | None,
     measures: list[dict] | None,
@@ -1205,52 +1285,65 @@ def _recompute_measure_numbering(
         measure_id = str(measure.get("measure_id") or "").strip()
         system_id = str(measure.get("system_id") or "").strip()
 
+        # Stage 1: apply any legacy staff-level carryover when crossing a system boundary.
         if system_id != current_sid:
             if current_sid is not None:
-                rest_count = _safe_int(rest_systems.get(current_sid), 0)
-                if current_sid not in exact_rest_system_ids and rest_count > 0:
-                    current_value += rest_count
+                current_value = _apply_legacy_system_rest_carryover(
+                    current_value,
+                    current_sid,
+                    rest_systems,
+                    exact_rest_system_ids,
+                )
             current_sid = system_id
 
-        if measure_id and measure_id in measure_overrides:
-            current_value = int(measure_overrides[measure_id])
+        # Stage 2: determine whether this physical measure is marked as pickup.
+        pickup_active = _pickup_active_for_measure(measure_id, pickup_measures)
 
-        pickup_active = bool(pickup_measures.get(measure_id)) if measure_id else False
+        # Stage 3: apply the current numbering anchor for this measure.
+        current_value = _apply_measure_override_anchor(
+            current_value,
+            measure_id,
+            measure_overrides,
+        )
+
+        # Step 1a keeps the existing pickup+override behavior intact while making the stage order explicit.
         if pickup_active:
-            label = ""
-            if measure_id:
-                result_labels[measure_id] = label
-            measure["current_value"] = label
-            measure["value"] = label
-            measure["render_label"] = label
+            _apply_measure_label(
+                measure,
+                measure_id,
+                system_id,
+                "",
+                result_labels,
+                seq_starts_by_system,
+            )
             continue
 
+        # Stage 4: resolve the final local label for this counted measure.
         ending_type = str(endings_map.get(measure_id) or "").strip() if measure_id else ""
-        if ending_type == "1":
-            if first_ending_start_value is None:
-                first_ending_start_value = current_value
-            label_value = int(current_value)
-            current_value += 1
-        elif ending_type == "2":
-            base = first_ending_start_value if first_ending_start_value is not None else current_value
-            label_value = int(base + second_ending_local)
-            second_ending_local += 1
-        else:
-            label_value = int(current_value)
-            current_value += 1
+        label_value, current_value, first_ending_start_value, second_ending_local = _resolve_ending_stage(
+            current_value,
+            ending_type,
+            first_ending_start_value,
+            second_ending_local,
+        )
 
-        label = str(label_value)
-        if measure_id:
-            result_labels[measure_id] = label
-        if system_id and system_id not in seq_starts_by_system:
-            seq_starts_by_system[system_id] = label_value
-        measure["current_value"] = label
-        measure["value"] = label
-        measure["render_label"] = label
+        final_label = str(label_value)
+        _apply_measure_label(
+            measure,
+            measure_id,
+            system_id,
+            final_label,
+            result_labels,
+            seq_starts_by_system,
+        )
 
-        exact_rest_count = _safe_int(rest_measures.get(measure_id), 0) if measure_id else 0
-        if exact_rest_count > 0:
-            current_value = int(label_value) + 1 + exact_rest_count
+        # Stage 5: apply any exact measure rest after the local label is finalized.
+        current_value = _apply_post_measure_rest(
+            current_value,
+            label_value,
+            measure_id,
+            rest_measures,
+        )
 
     for system in sorted_systems:
         system_id = str(system.get("system_id") or "").strip()
