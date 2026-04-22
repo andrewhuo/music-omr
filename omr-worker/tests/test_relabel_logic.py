@@ -588,6 +588,55 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(measure_values["p1_s2_m0"], 25)
         self.assertEqual(measure_values["p2_s0_m0"], 28)
 
+    def test_set_measure_number_and_rest_measure_near_system_boundary_shift_downstream_systems(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_measure_number", "measure_id": "p1_s2_m2", "value": 30},
+                {"type": "set_rest_measure", "measure_id": "p1_s2_m2", "value": 2},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [
+                {"type": "set_measure_number", "measure_id": "p1_s2_m2", "value": 30},
+                {"type": "set_rest_measure", "measure_id": "p1_s2_m2", "value": 2},
+            ],
+        )
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 4, 7, 33])
+        measure_values = {row["measure_id"]: int(row["current_value"]) for row in state.get("measures") or []}
+        self.assertEqual(measure_values["p1_s2_m2"], 30)
+        self.assertEqual(measure_values["p2_s0_m0"], 33)
+        self.assertEqual(measure_values["p2_s0_m1"], 34)
+
+    def test_set_measure_number_and_larger_rest_follow_forced_number_not_natural_sequence(self):
+        state = self._sample_state()
+        systems, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "set_measure_number", "measure_id": "p1_s0_m2", "value": 40},
+                {"type": "set_rest_measure", "measure_id": "p1_s0_m2", "value": 5},
+            ],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [
+                {"type": "set_measure_number", "measure_id": "p1_s0_m2", "value": 40},
+                {"type": "set_rest_measure", "measure_id": "p1_s0_m2", "value": 5},
+            ],
+        )
+        values = [int(row["current_value"]) for row in systems]
+        self.assertEqual(values, [1, 46, 49, 52])
+        measure_values = {row["measure_id"]: int(row["current_value"]) for row in state.get("measures") or []}
+        self.assertEqual(measure_values["p1_s0_m2"], 40)
+        self.assertEqual(measure_values["p1_s1_m0"], 46)
+        self.assertEqual(measure_values["p1_s1_m1"], 47)
+        self.assertEqual(measure_values["p1_s1_m2"], 48)
+
     def test_exact_rest_measure_wins_over_legacy_rest_staff_on_same_system(self):
         state = self._sample_state()
         state["rest_systems"] = {"p1_s1": 2}
