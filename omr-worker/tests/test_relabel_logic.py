@@ -563,6 +563,36 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(measure_values["p1_s2_m2"], "")
         self.assertEqual(measure_values["p2_s0_m0"], "11")
 
+    def test_pickup_set_measure_number_and_rest_same_measure_follow_pickup_then_rest(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {"p1_s1_m1": True}
+        state["measure_number_overrides"] = {"p1_s1_m1": 20}
+        state["rest_measures"] = {"p1_s1_m1": 2}
+        systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
+        values = [str(row["current_value"]) for row in systems]
+        self.assertEqual(values, ["1", "4", "8", "11"])
+        measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
+        self.assertEqual(measure_values["p1_s1_m0"], "4")
+        self.assertEqual(measure_values["p1_s1_m1"], "")
+        self.assertEqual(measure_values["p1_s1_m2"], "7")
+        self.assertEqual(measure_values["p1_s2_m0"], "8")
+        self.assertEqual(measure_values["p2_s0_m0"], "11")
+
+    def test_pickup_set_measure_number_ending_and_rest_same_measure_ignore_set_and_ending_but_keep_rest(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {"p1_s2_m2": True}
+        state["measure_number_overrides"] = {"p1_s2_m2": 30}
+        state["endings"] = {"p1_s2_m2": "1"}
+        state["rest_measures"] = {"p1_s2_m2": 2}
+        systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
+        values = [str(row["current_value"]) for row in systems]
+        self.assertEqual(values, ["1", "4", "7", "11"])
+        measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
+        self.assertEqual(measure_values["p1_s2_m1"], "8")
+        self.assertEqual(measure_values["p1_s2_m2"], "")
+        self.assertEqual(measure_values["p2_s0_m0"], "11")
+        self.assertEqual(measure_values["p2_s0_m1"], "12")
+
     def test_set_measure_number_and_rest_measure_compose_from_anchor_label(self):
         state = self._sample_state()
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(
