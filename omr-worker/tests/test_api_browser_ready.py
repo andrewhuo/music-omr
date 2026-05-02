@@ -3,6 +3,7 @@ import os
 import sys
 import types
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -138,6 +139,60 @@ class BrowserReadyApiTests(unittest.TestCase):
         WORKER.request = SimpleNamespace(path="", method="GET", headers={}, files={}, json={})
         WORKER._PENDING_DISPATCHES.clear()
 
+    def _sample_artifacts(self):
+        return {
+            "audiveris_out_pdf": "gs://x/output/audiveris_out.pdf",
+            "audiveris_out_corrected_pdf": "gs://x/output/audiveris_out_corrected.pdf",
+            "run_info": "gs://x/output/artifacts/run_info.json",
+            "mapping_summary": "gs://x/output/artifacts/mapping_summary.json",
+        }
+
+    def _sample_mapping_summary(self):
+        return {
+            "editable_state": {
+                "version": "system_state_v1",
+                "systems": [
+                    {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1", "anchor": {"x": 10, "y_top": 20, "y_bottom": 60}},
+                    {"system_id": "p1_s1", "page": 1, "system_index": 1, "current_value": "3", "anchor": {"x": 10, "y_top": 80, "y_bottom": 120}},
+                ],
+                "measures": [
+                    {
+                        "measure_id": "p1_s0_m0",
+                        "system_id": "p1_s0",
+                        "page": 1,
+                        "system_index": 0,
+                        "measure_local_index": 0,
+                        "global_index": 0,
+                        "x_left": 30,
+                        "y_top": 20,
+                        "y_bottom": 40,
+                    },
+                    {
+                        "measure_id": "p1_s0_m1",
+                        "system_id": "p1_s0",
+                        "page": 1,
+                        "system_index": 0,
+                        "measure_local_index": 1,
+                        "global_index": 1,
+                        "x_left": 90,
+                        "y_top": 20,
+                        "y_bottom": 40,
+                    },
+                    {
+                        "measure_id": "p1_s1_m0",
+                        "system_id": "p1_s1",
+                        "page": 1,
+                        "system_index": 1,
+                        "measure_local_index": 0,
+                        "global_index": 2,
+                        "x_left": 30,
+                        "y_top": 80,
+                        "y_bottom": 100,
+                    },
+                ],
+            }
+        }
+
     def test_cors_allowed_and_disallowed(self):
         self.assertTrue(WORKER._origin_allowed("http://localhost:5173"))
         self.assertFalse(WORKER._origin_allowed("https://evil.example"))
@@ -234,12 +289,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertGreater(int(body.get("size_bytes") or 0), 0)
 
     def test_artifacts_http_present_on_responses(self):
-        artifacts = {
-            "audiveris_out_pdf": "gs://x/output/audiveris_out.pdf",
-            "audiveris_out_corrected_pdf": "gs://x/output/audiveris_out_corrected.pdf",
-            "run_info": "gs://x/output/artifacts/run_info.json",
-            "mapping_summary": "gs://x/output/artifacts/mapping_summary.json",
-        }
+        artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
 
         with (
@@ -308,6 +358,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("editable_state") or {}).get("rest_measures"), {})
         self.assertEqual((body.get("editable_state") or {}).get("pickup_measures"), {})
         self.assertEqual((body.get("editable_state") or {}).get("staff_boxes"), [])
+        self.assertIsNone(body.get("ai_suggestions"))
 
     def test_list_jobs_endpoint_returns_simple_rows(self):
         now = WORKER._utc_now()
@@ -357,12 +408,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(len(body.get("jobs") or []), 2)
 
     def test_relabel_set_labels_mode_all_measures(self):
-        artifacts = {
-            "audiveris_out_pdf": "gs://x/output/audiveris_out.pdf",
-            "audiveris_out_corrected_pdf": "gs://x/output/audiveris_out_corrected.pdf",
-            "run_info": "gs://x/output/artifacts/run_info.json",
-            "mapping_summary": "gs://x/output/artifacts/mapping_summary.json",
-        }
+        artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
         mapping_summary = {
             "editable_state": {
@@ -400,6 +446,170 @@ class BrowserReadyApiTests(unittest.TestCase):
         relabel = body.get("relabel") or {}
         self.assertEqual(relabel.get("labels_mode"), "all_measures")
         self.assertEqual(relabel.get("labels_redrawn_count"), 2)
+
+    def test_ai_suggest_success_persists_filtered_suggestions(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        raw_result = {
+            "provider": "claude",
+            "model": "claude-test",
+            "suggestions": [
+                {"measure_id": "p1_s0_m0", "label": "pickup", "rest_count": None, "confidence": "medium"},
+                {"measure_id": "p1_s0_m1", "label": "normal", "rest_count": None, "confidence": "high"},
+                {
+                    "measure_id": "p1_s1_m0",
+                    "label": "uncertain",
+                    "rest_count": None,
+                    "confidence": "low",
+                    "maybe_label": "multi_measure_rest",
+                    "maybe_rest_count": 2,
+                },
+            ],
+            "warnings": [{"type": "low_confidence_page", "system_id": "p1_s1", "system_index": 1, "message": "check m2"}],
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_generate_ai_suggestions_for_job", return_value=raw_result),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("status"), "succeeded")
+        ai_suggestions = body.get("ai_suggestions") or {}
+        by_measure_id = ai_suggestions.get("by_measure_id") or {}
+        self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0", "p1_s1_m0"])
+        self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "pickup")
+        self.assertEqual((by_measure_id.get("p1_s1_m0") or {}).get("maybe_label"), "multi_measure_rest")
+        self.assertEqual((by_measure_id.get("p1_s1_m0") or {}).get("maybe_rest_count"), 2)
+        summary = ai_suggestions.get("summary") or {}
+        self.assertEqual(summary.get("measures_seen"), 3)
+        self.assertEqual(summary.get("suggestions_kept"), 2)
+        self.assertEqual(summary.get("normal_measures_omitted"), 1)
+        self.assertIn("ai_suggestions", mapping_summary)
+
+    def test_ai_suggest_failure_keeps_prior_suggestions(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = {
+            "version": "ai_suggestions_v1",
+            "generated_at_utc": "2026-04-30T12:00:00Z",
+            "provider": "claude",
+            "model": "old",
+            "source_run_id": 111,
+            "by_measure_id": {"p1_s0_m1": {"label": "pickup", "rest_count": None, "confidence": "medium"}},
+            "warnings": [],
+            "summary": {"systems_processed": 2, "measures_seen": 3, "suggestions_kept": 1, "normal_measures_omitted": 2},
+        }
+        original = deepcopy(mapping_summary["ai_suggestions"])
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(
+                WORKER,
+                "_generate_ai_suggestions_for_job",
+                side_effect=WORKER.AiSuggestError(provider_status=504, detail="timeout"),
+            ),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 504)
+        self.assertEqual(body.get("status"), "failed")
+        self.assertEqual(((body.get("error") or {}).get("detail")), "timeout")
+        self.assertEqual(mapping_summary.get("ai_suggestions"), original)
+
+    def test_dismiss_ai_suggestion_removes_only_target(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = {
+            "version": "ai_suggestions_v1",
+            "generated_at_utc": "2026-04-30T12:00:00Z",
+            "provider": "claude",
+            "model": "test",
+            "source_run_id": 111,
+            "by_measure_id": {
+                "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"},
+                "p1_s1_m0": {"label": "uncertain", "rest_count": None, "confidence": "low"},
+            },
+            "warnings": [],
+            "summary": {"systems_processed": 2, "measures_seen": 3, "suggestions_kept": 2, "normal_measures_omitted": 1},
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggestions/p1_s0_m0/dismiss", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.dismiss_ai_suggestion("111", "p1_s0_m0"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("dismissed_measure_id"), "p1_s0_m0")
+        by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
+        self.assertEqual(sorted(by_measure_id.keys()), ["p1_s1_m0"])
+        self.assertEqual(((body.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept"), 1)
+
+    def test_relabel_clears_touched_ai_suggestion(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = {
+            "version": "ai_suggestions_v1",
+            "generated_at_utc": "2026-04-30T12:00:00Z",
+            "provider": "claude",
+            "model": "test",
+            "source_run_id": 111,
+            "by_measure_id": {
+                "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"},
+                "p1_s1_m0": {"label": "uncertain", "rest_count": None, "confidence": "low"},
+            },
+            "warnings": [],
+            "summary": {"systems_processed": 2, "measures_seen": 3, "suggestions_kept": 2, "normal_measures_omitted": 1},
+        }
+
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={"edits": [{"type": "set_pickup_measure", "measure_id": "p1_s0_m0", "value": True}]},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER, "_render_corrected_pdf", return_value=2),
+            patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 200)
+        remaining = ((mapping_summary.get("ai_suggestions") or {}).get("by_measure_id") or {})
+        self.assertEqual(sorted(remaining.keys()), ["p1_s1_m0"])
+        self.assertEqual((((mapping_summary.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
+
+    def test_parse_anthropic_suggestions_message_accepts_json_fence(self):
+        message = {
+            "model": "claude-sonnet-4-20250514",
+            "content": [
+                {
+                    "type": "text",
+                    "text": """```json
+{"suggestions":[{"measure_id":"p1_s0_m0","label":"pickup","rest_count":null,"confidence":"medium"}],"warnings":[]}
+```""",
+                }
+            ],
+        }
+        parsed = WORKER._parse_anthropic_suggestions_message(message)
+        self.assertEqual(parsed.get("provider"), "claude")
+        self.assertEqual(parsed.get("model"), "claude-sonnet-4-20250514")
+        self.assertEqual(((parsed.get("suggestions") or [])[0] or {}).get("measure_id"), "p1_s0_m0")
 
 
 

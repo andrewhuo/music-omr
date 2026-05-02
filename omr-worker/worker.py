@@ -6,6 +6,7 @@ import time
 import threading
 import uuid
 import hashlib
+import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -51,6 +52,16 @@ JOB_STORE_COLLECTION = str(os.environ.get("JOB_STORE_COLLECTION", "omr_jobs") or
 ALLOW_LEGACY_ARTIFACT_FALLBACK = (
     str(os.environ.get("ALLOW_LEGACY_ARTIFACT_FALLBACK", "1")).strip().lower() not in ("0", "false", "no")
 )
+ANTHROPIC_API_BASE = os.environ.get("ANTHROPIC_API_BASE", "https://api.anthropic.com").rstrip("/")
+ANTHROPIC_MODEL = str(os.environ.get("ANTHROPIC_MODEL", "") or "").strip()
+ANTHROPIC_VERSION = str(os.environ.get("ANTHROPIC_VERSION", "2023-06-01") or "2023-06-01").strip() or "2023-06-01"
+ANTHROPIC_TIMEOUT_SEC = max(5.0, float(os.environ.get("ANTHROPIC_TIMEOUT_SEC", "90") or "90"))
+ANTHROPIC_MAX_TOKENS = max(256, int(os.environ.get("ANTHROPIC_MAX_TOKENS", "1800") or "1800"))
+AI_MEASURE_CROP_SCALE = max(1.0, float(os.environ.get("AI_MEASURE_CROP_SCALE", "2.0") or "2.0"))
+AI_MEASURE_CROP_X_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_X_PAD_RATIO", "0.08") or "0.08"))
+AI_MEASURE_CROP_Y_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_Y_PAD_RATIO", "0.15") or "0.15"))
+AI_MEASURE_CROP_MIN_X_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_X_PAD", "8") or "8"))
+AI_MEASURE_CROP_MIN_Y_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_Y_PAD", "10") or "10"))
 
 MEASURE_TEXT_COLOR = (0, 0, 0)
 MEASURE_TEXT_SIZE = 10.0
@@ -60,6 +71,10 @@ MEASURE_TEXT_BG_COLOR = (1, 1, 1)
 LABELS_MODE_SYSTEM_ONLY = "system_only"
 LABELS_MODE_ALL_MEASURES = "all_measures"
 LABELS_MODE_ALLOWED = {LABELS_MODE_SYSTEM_ONLY, LABELS_MODE_ALL_MEASURES}
+AI_SUGGESTIONS_VERSION = "ai_suggestions_v1"
+AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
+AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
+AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
 
 # In-memory correlation for workflow dispatches that do not return run_id directly.
 _PENDING_DISPATCHES: dict[str, dict] = {}
@@ -84,6 +99,24 @@ class StaleArtifactsError(RuntimeError):
         )
         self.requested_run_id = int(requested_run_id)
         self.artifact_run_id = int(artifact_run_id)
+
+
+class AiSuggestError(RuntimeError):
+    def __init__(
+        self,
+        message: str = "Claude suggestion request failed.",
+        *,
+        code: str = "ai_suggest_failed",
+        retryable: bool = True,
+        provider_status: int = 502,
+        detail: str = "",
+    ):
+        super().__init__(message)
+        self.message = str(message or "Claude suggestion request failed.")
+        self.code = str(code or "ai_suggest_failed")
+        self.retryable = bool(retryable)
+        self.provider_status = int(provider_status)
+        self.detail = str(detail or "")
 
 
 def _storage_mode_for_artifacts(artifacts: dict[str, str] | None) -> str:
@@ -888,6 +921,498 @@ def _persist_relabel_trace(mapping_summary: dict, mapping_uri: str, trace: dict,
         return False
 
 
+def _current_ai_suggestions(mapping_summary: dict | None) -> dict | None:
+    ai_suggestions = (mapping_summary or {}).get("ai_suggestions")
+    return ai_suggestions if isinstance(ai_suggestions, dict) else None
+
+
+def _refresh_ai_suggestions_summary(ai_suggestions: dict | None) -> dict:
+    if not isinstance(ai_suggestions, dict):
+        return {}
+    by_measure_id = ai_suggestions.get("by_measure_id")
+    if not isinstance(by_measure_id, dict):
+        by_measure_id = {}
+        ai_suggestions["by_measure_id"] = by_measure_id
+    summary = ai_suggestions.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    summary["systems_processed"] = max(0, _safe_int(summary.get("systems_processed"), 0))
+    summary["measures_seen"] = max(0, _safe_int(summary.get("measures_seen"), 0))
+    summary["suggestions_kept"] = len(by_measure_id)
+    summary["normal_measures_omitted"] = max(0, _safe_int(summary.get("normal_measures_omitted"), 0))
+    ai_suggestions["summary"] = summary
+    return summary
+
+
+def _remove_ai_suggestion_entries(mapping_summary: dict | None, measure_ids: set[str] | list[str] | tuple[str, ...]) -> list[str]:
+    ai_suggestions = _current_ai_suggestions(mapping_summary)
+    if not isinstance(ai_suggestions, dict):
+        return []
+    by_measure_id = ai_suggestions.get("by_measure_id")
+    if not isinstance(by_measure_id, dict):
+        return []
+    removed: list[str] = []
+    for measure_id in measure_ids or []:
+        mid = str(measure_id or "").strip()
+        if not mid:
+            continue
+        if mid in by_measure_id:
+            by_measure_id.pop(mid, None)
+            removed.append(mid)
+    if removed:
+        _refresh_ai_suggestions_summary(ai_suggestions)
+    return removed
+
+
+def _normalize_ai_suggest_warnings(raw_warnings) -> list[dict]:
+    if raw_warnings is None:
+        return []
+    if not isinstance(raw_warnings, list):
+        raise AiSuggestError(detail="malformed_response: warnings must be an array")
+    clean: list[dict] = []
+    for row in raw_warnings:
+        if not isinstance(row, dict):
+            raise AiSuggestError(detail="malformed_response: warning entry must be an object")
+        warning_type = str(row.get("type") or "").strip()
+        message = str(row.get("message") or "").strip()
+        if not warning_type or not message:
+            raise AiSuggestError(detail="malformed_response: warning missing type or message")
+        warning = {
+            "type": warning_type,
+            "message": message,
+        }
+        system_id = str(row.get("system_id") or "").strip()
+        if system_id:
+            warning["system_id"] = system_id
+        if row.get("system_index") is not None:
+            warning["system_index"] = _safe_int(row.get("system_index"), 0)
+        clean.append(warning)
+    return clean
+
+
+def _normalize_ai_suggestions_result(
+    raw_result: dict,
+    editable_state: dict,
+    run_id: int,
+    source_state_version: str | None = None,
+) -> dict:
+    if not isinstance(raw_result, dict):
+        raise AiSuggestError(detail="malformed_response: root must be an object")
+
+    ordered_measures = _sorted_measure_rows(editable_state.get("measures") or [])
+    measure_rows_by_id = {
+        str(row.get("measure_id") or "").strip(): row
+        for row in ordered_measures
+        if isinstance(row, dict) and str(row.get("measure_id") or "").strip()
+    }
+    expected_measure_ids = set(measure_rows_by_id.keys())
+    raw_suggestions = raw_result.get("suggestions")
+    if not isinstance(raw_suggestions, list):
+        raise AiSuggestError(detail="malformed_response: suggestions must be an array")
+
+    seen_measure_ids: set[str] = set()
+    kept_by_measure_id: dict[str, dict] = {}
+    normal_measures_omitted = 0
+
+    for row in raw_suggestions:
+        if not isinstance(row, dict):
+            raise AiSuggestError(detail="malformed_response: suggestion entry must be an object")
+
+        measure_id = str(row.get("measure_id") or "").strip()
+        if not measure_id:
+            raise AiSuggestError(detail="malformed_response: suggestion missing measure_id")
+        if measure_id not in expected_measure_ids:
+            raise AiSuggestError(detail=f"malformed_response: unknown measure_id {measure_id}")
+        if measure_id in seen_measure_ids:
+            raise AiSuggestError(detail=f"malformed_response: duplicate measure_id {measure_id}")
+        seen_measure_ids.add(measure_id)
+
+        label = str(row.get("label") or "").strip()
+        if label not in AI_SUGGESTION_LABELS_ALLOWED:
+            raise AiSuggestError(detail=f"malformed_response: invalid label for {measure_id}")
+        confidence = str(row.get("confidence") or "").strip().lower()
+        if confidence not in AI_SUGGESTION_CONFIDENCE_ALLOWED:
+            raise AiSuggestError(detail=f"malformed_response: invalid confidence for {measure_id}")
+
+        rest_count = row.get("rest_count")
+        maybe_label = row.get("maybe_label")
+        maybe_rest_count = row.get("maybe_rest_count")
+
+        if label == "normal":
+            if rest_count is not None or maybe_label is not None or maybe_rest_count is not None:
+                raise AiSuggestError(detail=f"malformed_response: normal suggestion must not include extras for {measure_id}")
+            normal_measures_omitted += 1
+            continue
+
+        measure_row = measure_rows_by_id[measure_id]
+        entry = {
+            "label": label,
+            "rest_count": None,
+            "confidence": confidence,
+            "system_id": str(measure_row.get("system_id") or "").strip(),
+            "order_index_in_system": _safe_int(measure_row.get("measure_local_index"), 0),
+            "is_first_measure_of_score": _safe_int(measure_row.get("global_index"), -1) == 0,
+        }
+
+        if label == "pickup":
+            if rest_count is not None or maybe_label is not None or maybe_rest_count is not None:
+                raise AiSuggestError(detail=f"malformed_response: pickup suggestion must not include rest fields for {measure_id}")
+        elif label == "multi_measure_rest":
+            if not isinstance(rest_count, int) or int(rest_count) <= 0:
+                raise AiSuggestError(detail=f"malformed_response: multi_measure_rest requires positive rest_count for {measure_id}")
+            if maybe_label is not None or maybe_rest_count is not None:
+                raise AiSuggestError(detail=f"malformed_response: multi_measure_rest must not include maybe fields for {measure_id}")
+            entry["rest_count"] = int(rest_count)
+        else:
+            if rest_count is not None:
+                raise AiSuggestError(detail=f"malformed_response: uncertain suggestion must not include rest_count for {measure_id}")
+            if maybe_label is not None:
+                maybe_label = str(maybe_label or "").strip()
+                if maybe_label not in AI_SUGGESTION_MAYBE_LABELS_ALLOWED:
+                    raise AiSuggestError(detail=f"malformed_response: invalid maybe_label for {measure_id}")
+                entry["maybe_label"] = maybe_label
+                if maybe_label == "multi_measure_rest":
+                    if not isinstance(maybe_rest_count, int) or int(maybe_rest_count) <= 0:
+                        raise AiSuggestError(detail=f"malformed_response: maybe_rest_count required for {measure_id}")
+                    entry["maybe_rest_count"] = int(maybe_rest_count)
+                elif maybe_rest_count is not None:
+                    raise AiSuggestError(detail=f"malformed_response: maybe_rest_count only allowed for maybe multi_measure_rest on {measure_id}")
+            elif maybe_rest_count is not None:
+                raise AiSuggestError(detail=f"malformed_response: maybe_rest_count without maybe_label for {measure_id}")
+
+        kept_by_measure_id[measure_id] = entry
+
+    if seen_measure_ids != expected_measure_ids:
+        missing = sorted(expected_measure_ids - seen_measure_ids)
+        extra = sorted(seen_measure_ids - expected_measure_ids)
+        detail_bits = []
+        if missing:
+            detail_bits.append(f"missing_measure_ids={','.join(missing[:10])}")
+        if extra:
+            detail_bits.append(f"unexpected_measure_ids={','.join(extra[:10])}")
+        raise AiSuggestError(detail=f"malformed_response: incomplete suggestions {' '.join(detail_bits).strip()}".strip())
+
+    provider = str(raw_result.get("provider") or "claude").strip() or "claude"
+    model = str(raw_result.get("model") or "unknown").strip() or "unknown"
+    systems_processed = len(_sorted_system_rows(editable_state.get("systems") or []))
+    ai_suggestions = {
+        "version": AI_SUGGESTIONS_VERSION,
+        "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+        "provider": provider,
+        "model": model,
+        "source_run_id": int(run_id),
+        "by_measure_id": kept_by_measure_id,
+        "warnings": _normalize_ai_suggest_warnings(raw_result.get("warnings")),
+        "summary": {
+            "systems_processed": systems_processed,
+            "measures_seen": len(ordered_measures),
+            "suggestions_kept": len(kept_by_measure_id),
+            "normal_measures_omitted": normal_measures_omitted,
+        },
+    }
+    source_state_version_txt = str(source_state_version or "").strip()
+    if source_state_version_txt:
+        ai_suggestions["source_state_version"] = source_state_version_txt
+    return ai_suggestions
+
+
+def _anthropic_api_key() -> str:
+    return str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip()
+
+
+def _anthropic_messages_create(payload: dict) -> dict:
+    api_key = _anthropic_api_key()
+    if not api_key:
+        raise AiSuggestError(provider_status=503, detail="provider_not_configured")
+    req = urlrequest.Request(
+        f"{ANTHROPIC_API_BASE}/v1/messages",
+        method="POST",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        },
+        data=json.dumps(payload).encode("utf-8"),
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=ANTHROPIC_TIMEOUT_SEC) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise AiSuggestError(provider_status=502, detail="malformed_provider_response")
+            return data
+    except urlerror.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        detail = body.strip() or _safe_error_text(exc)
+        raise AiSuggestError(provider_status=int(getattr(exc, "code", 502) or 502), detail=detail)
+    except urlerror.URLError as exc:
+        raise AiSuggestError(provider_status=504, detail=_safe_error_text(exc))
+    except TimeoutError as exc:
+        raise AiSuggestError(provider_status=504, detail=_safe_error_text(exc))
+
+
+def _strip_json_fences(text: str) -> str:
+    txt = str(text or "").strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", txt)
+        txt = re.sub(r"\s*```$", "", txt)
+    return txt.strip()
+
+
+def _extract_json_object_text(text: str) -> str:
+    txt = _strip_json_fences(text)
+    if txt.startswith("{") and txt.endswith("}"):
+        return txt
+    start = txt.find("{")
+    end = txt.rfind("}")
+    if start >= 0 and end > start:
+        return txt[start : end + 1]
+    raise AiSuggestError(detail="malformed_response: missing json object")
+
+
+def _parse_anthropic_suggestions_message(message: dict) -> dict:
+    if not isinstance(message, dict):
+        raise AiSuggestError(detail="malformed_provider_response")
+    content = message.get("content")
+    if not isinstance(content, list):
+        raise AiSuggestError(detail="malformed_provider_response: content missing")
+    text_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("type") or "").strip() == "text":
+            text_parts.append(str(block.get("text") or ""))
+    if not text_parts:
+        raise AiSuggestError(detail="malformed_response: no text content")
+    try:
+        parsed = json.loads(_extract_json_object_text("\n".join(text_parts)))
+    except json.JSONDecodeError as exc:
+        raise AiSuggestError(detail=f"malformed_response: invalid json {_safe_error_text(exc)}")
+    if not isinstance(parsed, dict):
+        raise AiSuggestError(detail="malformed_response: root must be object")
+    parsed.setdefault("provider", "claude")
+    parsed.setdefault("model", str(message.get("model") or ANTHROPIC_MODEL or "unknown"))
+    return parsed
+
+
+def _measure_crop_rect(page_rect, measure_row: dict, next_measure_row: dict | None, system_row: dict | None) -> fitz.Rect:
+    x_left = float(measure_row.get("x_left") or 0.0)
+    x_right_raw = measure_row.get("x_right")
+    if x_right_raw is None and isinstance(next_measure_row, dict):
+        x_right_raw = next_measure_row.get("x_left")
+    if x_right_raw is None:
+        x_right_raw = page_rect.width
+    x_right = float(x_right_raw or 0.0)
+
+    y_top_raw = measure_row.get("y_top")
+    if y_top_raw is None and isinstance(system_row, dict):
+        y_top_raw = ((system_row.get("anchor") or {}) if isinstance(system_row.get("anchor"), dict) else {}).get("y_top")
+    y_bottom_raw = measure_row.get("y_bottom")
+    if y_bottom_raw is None and isinstance(system_row, dict):
+        y_bottom_raw = ((system_row.get("anchor") or {}) if isinstance(system_row.get("anchor"), dict) else {}).get("y_bottom")
+    y_top = float(y_top_raw or 0.0)
+    y_bottom = float(y_bottom_raw or 0.0)
+
+    if x_right <= x_left:
+        x_right = min(float(page_rect.width), x_left + 40.0)
+    if y_bottom <= y_top:
+        y_bottom = min(float(page_rect.height), y_top + 40.0)
+
+    width = max(1.0, x_right - x_left)
+    height = max(1.0, y_bottom - y_top)
+    x_pad = max(AI_MEASURE_CROP_MIN_X_PAD, width * AI_MEASURE_CROP_X_PAD_RATIO)
+    y_pad = max(AI_MEASURE_CROP_MIN_Y_PAD, height * AI_MEASURE_CROP_Y_PAD_RATIO)
+
+    clip = fitz.Rect(
+        max(0.0, x_left - x_pad),
+        max(0.0, y_top - y_pad),
+        min(float(page_rect.width), x_right + x_pad),
+        min(float(page_rect.height), y_bottom + y_pad),
+    )
+    if clip.x1 <= clip.x0 or clip.y1 <= clip.y0:
+        raise AiSuggestError(provider_status=500, detail="invalid_measure_crop")
+    return clip
+
+
+def _render_measure_crop_png(page, clip: fitz.Rect) -> bytes:
+    pix = page.get_pixmap(matrix=fitz.Matrix(AI_MEASURE_CROP_SCALE, AI_MEASURE_CROP_SCALE), clip=clip, alpha=False)
+    return bytes(pix.tobytes("png"))
+
+
+def _build_system_measure_request(job_id: str, run_id: int, system_row: dict, measure_rows: list[dict], page) -> dict:
+    content: list[dict] = []
+    system_id = str(system_row.get("system_id") or "").strip()
+    page_number = _safe_int(system_row.get("page"), _safe_int((measure_rows[0] if measure_rows else {}).get("page"), 1))
+    intro = {
+        "job_id": str(job_id),
+        "run_id": int(run_id),
+        "system_id": system_id,
+        "page_number": int(page_number),
+        "instructions": {
+            "task": "Classify each already-detected sheet-music measure conservatively.",
+            "allowed_labels": ["normal", "pickup", "multi_measure_rest", "uncertain"],
+            "rules": [
+                "Each image contains exactly one already-detected measure.",
+                "Do not infer additional measures from internal rhythmic groupings, repeat dots, or barline decorations.",
+                "Only label pickup when is_first_measure_of_score is true.",
+                "If not confident, use uncertain rather than guessing.",
+                "If label is multi_measure_rest, include positive integer rest_count.",
+                "If label is uncertain and you have a tentative guess, maybe_label may be pickup or multi_measure_rest, and maybe_rest_count is only allowed for maybe_label multi_measure_rest.",
+                "Return JSON only.",
+            ],
+            "output_shape": {
+                "provider": "claude",
+                "model": "string",
+                "suggestions": [
+                    {
+                        "measure_id": "string",
+                        "label": "normal|pickup|multi_measure_rest|uncertain",
+                        "rest_count": "integer|null",
+                        "confidence": "low|medium|high",
+                        "maybe_label": "pickup|multi_measure_rest|null",
+                        "maybe_rest_count": "integer|null",
+                    }
+                ],
+                "warnings": [{"type": "string", "system_id": "string", "system_index": "integer", "message": "string"}],
+            },
+        },
+        "measures": [
+            {
+                "measure_id": str(row.get("measure_id") or "").strip(),
+                "order_index_in_system": _safe_int(row.get("measure_local_index"), idx),
+                "is_first_measure_of_score": _safe_int(row.get("global_index"), -1) == 0,
+            }
+            for idx, row in enumerate(measure_rows)
+        ],
+    }
+    content.append({"type": "text", "text": json.dumps(intro, ensure_ascii=True)})
+
+    for idx, row in enumerate(measure_rows):
+        next_row = measure_rows[idx + 1] if idx + 1 < len(measure_rows) else None
+        clip = _measure_crop_rect(page.rect, row, next_row, system_row)
+        image_bytes = _render_measure_crop_png(page, clip)
+        content.append(
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "measure_id": str(row.get("measure_id") or "").strip(),
+                        "order_index_in_system": _safe_int(row.get("measure_local_index"), idx),
+                        "is_first_measure_of_score": _safe_int(row.get("global_index"), -1) == 0,
+                    },
+                    ensure_ascii=True,
+                ),
+            }
+        )
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                },
+            }
+        )
+
+    return {
+        "model": str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip(),
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "messages": [{"role": "user", "content": content}],
+    }
+
+
+def _generate_ai_suggestions_for_job(
+    job_id: str,
+    run_id: int,
+    editable_state: dict,
+    mapping_summary: dict,
+    artifacts: dict,
+) -> dict:
+    model_name = str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
+    if not model_name or not _anthropic_api_key():
+        raise AiSuggestError(provider_status=503, detail="provider_not_configured")
+
+    systems = _sorted_system_rows(editable_state.get("systems") or [])
+    measures = _sorted_measure_rows(editable_state.get("measures") or [])
+    grouped_measures: dict[str, list[dict]] = {}
+    for row in measures:
+        system_id = str(row.get("system_id") or "").strip()
+        if not system_id:
+            continue
+        grouped_measures.setdefault(system_id, []).append(row)
+
+    warnings: list[dict] = []
+    suggestions: list[dict] = []
+    baseline_pdf_uri = str((artifacts or {}).get("audiveris_out_pdf") or "").strip()
+    if not baseline_pdf_uri:
+        raise AiSuggestError(provider_status=500, detail="baseline_pdf_missing")
+
+    with TemporaryDirectory(prefix="omr-ai-suggest-") as tmp:
+        tmpdir = Path(tmp)
+        in_pdf = tmpdir / "audiveris_out.pdf"
+        _download_gcs_to_file(baseline_pdf_uri, in_pdf)
+        doc = fitz.open(str(in_pdf))
+        try:
+            for system_row in systems:
+                system_id = str(system_row.get("system_id") or "").strip()
+                system_measures = grouped_measures.get(system_id) or []
+                if not system_id or not system_measures:
+                    continue
+                page_number = _safe_int(system_row.get("page"), _safe_int(system_measures[0].get("page"), 1))
+                page_index = max(0, int(page_number) - 1)
+                if page_index >= len(doc):
+                    raise AiSuggestError(provider_status=500, detail=f"invalid_page_index:{page_number}")
+                page = doc[page_index]
+                payload = _build_system_measure_request(job_id, int(run_id), system_row, system_measures, page)
+                message = _anthropic_messages_create(payload)
+                parsed = _parse_anthropic_suggestions_message(message)
+                system_suggestions = parsed.get("suggestions")
+                if not isinstance(system_suggestions, list):
+                    raise AiSuggestError(detail=f"malformed_response: suggestions missing for {system_id}")
+                expected_ids = {str(row.get("measure_id") or "").strip() for row in system_measures}
+                seen_ids: set[str] = set()
+                for row in system_suggestions:
+                    if not isinstance(row, dict):
+                        raise AiSuggestError(detail=f"malformed_response: suggestion entry must be object for {system_id}")
+                    measure_id = str(row.get("measure_id") or "").strip()
+                    if measure_id not in expected_ids:
+                        raise AiSuggestError(detail=f"malformed_response: unknown measure_id {measure_id} for {system_id}")
+                    if measure_id in seen_ids:
+                        raise AiSuggestError(detail=f"malformed_response: duplicate measure_id {measure_id} for {system_id}")
+                    seen_ids.add(measure_id)
+                    suggestions.append(row)
+                if seen_ids != expected_ids:
+                    missing = sorted(expected_ids - seen_ids)
+                    raise AiSuggestError(detail=f"malformed_response: missing_measure_ids={','.join(missing[:10])} for {system_id}")
+
+                system_warnings = parsed.get("warnings")
+                if isinstance(system_warnings, list):
+                    for warning in system_warnings:
+                        if not isinstance(warning, dict):
+                            continue
+                        if not str(warning.get("system_id") or "").strip():
+                            warning = dict(warning)
+                            warning["system_id"] = system_id
+                        if warning.get("system_index") is None:
+                            warning = dict(warning)
+                            warning["system_index"] = _safe_int(system_row.get("system_index"), 0)
+                        warnings.append(warning)
+        finally:
+            doc.close()
+
+    return {
+        "provider": "claude",
+        "model": model_name,
+        "suggestions": suggestions,
+        "warnings": warnings,
+    }
+
+
 def _draw_measure_label(page: fitz.Page, page_rect: fitz.Rect, anchor_x: float, anchor_y_top: float, text: str) -> None:
     x_text, y_text, tw = _label_position(anchor_x, anchor_y_top, float(page_rect.width), float(page_rect.height), text)
     th = float(MEASURE_TEXT_SIZE + 2.0)
@@ -1178,29 +1703,199 @@ def _apply_measure_override_anchor(
     return int(current_value)
 
 
+def _measure_override_value(
+    measure_id: str,
+    measure_overrides: dict[str, int],
+) -> int | None:
+    if measure_id and measure_id in measure_overrides:
+        return int(measure_overrides[measure_id])
+    return None
+
+
 def _pickup_active_for_measure(measure_id: str, pickup_measures: dict[str, bool]) -> bool:
     return bool(pickup_measures.get(measure_id)) if measure_id else False
 
 
-def _resolve_ending_stage(
+def _relabel_has_ending_debug(editable_state: dict | None, edits: list[dict] | None) -> bool:
+    for raw_edit in edits or []:
+        if isinstance(raw_edit, dict) and str(raw_edit.get("type") or "").strip() == "set_ending":
+            return True
+    endings_map = (editable_state or {}).get("endings")
+    return bool(endings_map) if isinstance(endings_map, dict) else False
+
+
+def _log_relabel_ending_debug(
+    trace_id: str,
+    job_id: str,
+    run_id: int,
+    stage: str,
+    payload: dict | None = None,
+) -> None:
+    row = {
+        "trace_id": trace_id,
+        "job_id": job_id,
+        "run_id": int(run_id),
+        "stage": str(stage or "").strip(),
+    }
+    if isinstance(payload, dict):
+        row.update(payload)
+    print(f"RELABEL_ENDING_DEBUG {json.dumps(row, separators=(',', ':'), sort_keys=True, default=str)}")
+
+
+def _build_ending_group_debug_snapshot(
+    ordered_measures: list[dict],
+    endings_map: dict[str, str],
+    pickup_measures: dict[str, bool],
+) -> dict:
+    entries: dict[str, dict] = {}
+    raw_rows: list[dict] = []
+    ignored_rows: list[dict] = []
+    groups: list[dict] = []
+    pending_first_rows: list[dict] = []
+    pending_second_rows: list[dict] = []
+    group_id = 0
+
+    def _base_row(measure: dict, raw_kind: str, pickup_active: bool) -> dict:
+        return {
+            "measure_id": str(measure.get("measure_id") or "").strip(),
+            "kind": str(raw_kind or "").strip(),
+            "page": _safe_int(measure.get("page"), 0),
+            "system_id": str(measure.get("system_id") or "").strip(),
+            "system_index": _safe_int(measure.get("system_index"), 0),
+            "measure_local_index": _safe_int(measure.get("measure_local_index"), 0),
+            "pickup_active": bool(pickup_active),
+        }
+
+    def _mark_pending_as_ignored(reason: str) -> None:
+        nonlocal pending_first_rows, pending_second_rows
+        for row in pending_first_rows:
+            ignored_rows.append({**row, "reason": reason})
+        for row in pending_second_rows:
+            ignored_rows.append({**row, "reason": reason})
+
+    def _flush_pending(reason_if_invalid: str = "incomplete_group") -> None:
+        nonlocal pending_first_rows, pending_second_rows, group_id
+        if pending_first_rows and pending_second_rows:
+            groups.append(
+                {
+                    "group_id": group_id,
+                    "ending1_ids": [row["measure_id"] for row in pending_first_rows],
+                    "ending2_ids": [row["measure_id"] for row in pending_second_rows],
+                }
+            )
+            for index, row in enumerate(pending_first_rows):
+                entries[row["measure_id"]] = {
+                    "group_id": group_id,
+                    "kind": "1",
+                    "branch_index": index,
+                    "first_len": len(pending_first_rows),
+                    "second_len": len(pending_second_rows),
+                }
+            for index, row in enumerate(pending_second_rows):
+                entries[row["measure_id"]] = {
+                    "group_id": group_id,
+                    "kind": "2",
+                    "branch_index": index,
+                    "first_len": len(pending_first_rows),
+                    "second_len": len(pending_second_rows),
+                }
+            group_id += 1
+        elif pending_first_rows or pending_second_rows:
+            _mark_pending_as_ignored(reason_if_invalid)
+        pending_first_rows = []
+        pending_second_rows = []
+
+    for measure in ordered_measures:
+        measure_id = str(measure.get("measure_id") or "").strip()
+        raw_kind = str(endings_map.get(measure_id) or "").strip() if measure_id else ""
+        if not raw_kind:
+            _flush_pending()
+            continue
+
+        pickup_active = _pickup_active_for_measure(measure_id, pickup_measures)
+        base_row = _base_row(measure, raw_kind, pickup_active)
+        raw_rows.append(base_row)
+
+        if raw_kind not in ("1", "2"):
+            _flush_pending()
+            ignored_rows.append({**base_row, "reason": "invalid_kind"})
+            continue
+
+        if pickup_active:
+            _flush_pending()
+            ignored_rows.append({**base_row, "reason": "pickup_blocked"})
+            continue
+
+        if raw_kind == "1":
+            if pending_second_rows:
+                _flush_pending()
+            pending_first_rows.append(base_row)
+            continue
+
+        if pending_first_rows:
+            pending_second_rows.append(base_row)
+            continue
+
+        ignored_rows.append({**base_row, "reason": "orphan_ending2"})
+
+    _flush_pending()
+    return {
+        "entries": entries,
+        "groups": groups,
+        "raw_rows": raw_rows,
+        "ignored_rows": ignored_rows,
+    }
+
+
+def _ending_group_entries_by_measure_id(
+    ordered_measures: list[dict],
+    endings_map: dict[str, str],
+    pickup_measures: dict[str, bool],
+) -> dict[str, dict]:
+    snapshot = _build_ending_group_debug_snapshot(ordered_measures, endings_map, pickup_measures)
+    return snapshot.get("entries") or {}
+
+
+def _close_numbering_ending_group(current_value: int, group_state: dict | None) -> int:
+    if not group_state:
+        return int(current_value)
+    next_values = [int(current_value)]
+    first_next = group_state.get("first_next_value")
+    second_next = group_state.get("second_next_value")
+    if first_next is not None:
+        next_values.append(int(first_next))
+    if second_next is not None:
+        next_values.append(int(second_next))
+    return max(next_values)
+
+
+def _resolve_grouped_ending_label(
     current_value: int,
-    ending_type: str,
-    first_ending_start_value: int | None,
-    second_ending_local: int,
-) -> tuple[int, int, int | None, int]:
-    if ending_type == "1":
-        if first_ending_start_value is None:
-            first_ending_start_value = int(current_value)
-        label_value = int(current_value)
-        return label_value, int(current_value) + 1, first_ending_start_value, second_ending_local
+    measure_override_value: int | None,
+    ending_entry: dict,
+    group_state: dict,
+) -> tuple[int, int, dict]:
+    kind = str(ending_entry.get("kind") or "")
+    branch_index = _safe_int(ending_entry.get("branch_index"), 0)
 
-    if ending_type == "2":
-        base = first_ending_start_value if first_ending_start_value is not None else int(current_value)
-        label_value = int(base + second_ending_local)
-        return label_value, int(current_value), first_ending_start_value, second_ending_local + 1
+    if group_state.get("start_value") is None:
+        group_state["start_value"] = int(measure_override_value) if measure_override_value is not None else int(current_value)
+    start_value = int(group_state["start_value"])
 
-    label_value = int(current_value)
-    return label_value, int(current_value) + 1, first_ending_start_value, second_ending_local
+    if kind == "2":
+        if group_state.get("second_next_value") is None:
+            group_state["second_next_value"] = int(start_value)
+        branch_value = int(group_state["second_next_value"])
+        label_value = int(measure_override_value) if measure_override_value is not None else branch_value
+        group_state["second_next_value"] = int(label_value) + 1
+        return label_value, int(current_value), group_state
+
+    if group_state.get("first_next_value") is None:
+        group_state["first_next_value"] = int(start_value) + int(branch_index)
+    branch_value = int(group_state["first_next_value"])
+    label_value = int(measure_override_value) if measure_override_value is not None else branch_value
+    group_state["first_next_value"] = int(label_value) + 1
+    return label_value, int(group_state["first_next_value"]), group_state
 
 
 def _apply_measure_label(
@@ -1249,6 +1944,7 @@ def _recompute_measure_numbering(
     systems: list[dict] | None,
     measures: list[dict] | None,
     editable_state: dict | None = None,
+    ending_debug_ctx: dict | None = None,
 ) -> tuple[list[dict], list[dict], dict[str, str], dict[str, int]]:
     editable_state = editable_state or {}
     sorted_systems = _sorted_system_rows(systems)
@@ -1270,6 +1966,22 @@ def _recompute_measure_numbering(
     rest_measures = _editable_rest_measures(editable_state)
     pickup_measures = _editable_pickup_measures(editable_state)
     measure_overrides = _measure_number_overrides(editable_state)
+    ending_snapshot = _build_ending_group_debug_snapshot(ordered_measures, endings_map, pickup_measures)
+    ending_entries = ending_snapshot.get("entries") or {}
+
+    if isinstance(ending_debug_ctx, dict):
+        _log_relabel_ending_debug(
+            str(ending_debug_ctx.get("trace_id") or ""),
+            str(ending_debug_ctx.get("job_id") or ""),
+            _safe_int(ending_debug_ctx.get("run_id"), 0),
+            "groups",
+            {
+                "saved_endings": dict(sorted(endings_map.items())),
+                "ordered_measures": ending_snapshot.get("raw_rows") or [],
+                "groups": ending_snapshot.get("groups") or [],
+                "ignored": ending_snapshot.get("ignored_rows") or [],
+            },
+        )
 
     exact_rest_system_ids: set[str] = set()
     for measure in ordered_measures:
@@ -1288,13 +2000,37 @@ def _recompute_measure_numbering(
     result_labels: dict[str, str] = {}
     seq_starts_by_system: dict[str, int] = {}
     current_value = int(first_start)
-    first_ending_start_value: int | None = None
-    second_ending_local = 0
+    active_ending_group_id: int | None = None
+    active_ending_group_state: dict | None = None
     current_sid: str | None = None
 
     for measure in ordered_measures:
         measure_id = str(measure.get("measure_id") or "").strip()
         system_id = str(measure.get("system_id") or "").strip()
+        ending_entry = ending_entries.get(measure_id) if measure_id else None
+        ending_group_id = _safe_int(ending_entry.get("group_id"), -1) if ending_entry else None
+
+        if active_ending_group_id is not None and ending_group_id != active_ending_group_id:
+            close_state = dict(active_ending_group_state or {})
+            resumed_value = _close_numbering_ending_group(current_value, active_ending_group_state)
+            if isinstance(ending_debug_ctx, dict):
+                _log_relabel_ending_debug(
+                    str(ending_debug_ctx.get("trace_id") or ""),
+                    str(ending_debug_ctx.get("job_id") or ""),
+                    _safe_int(ending_debug_ctx.get("run_id"), 0),
+                    "close",
+                    {
+                        "group_id": int(active_ending_group_id),
+                        "next_measure_id": measure_id,
+                        "resume_value": int(resumed_value),
+                        "first_next_value": _safe_int(close_state.get("first_next_value"), 0) if close_state.get("first_next_value") is not None else None,
+                        "second_next_value": _safe_int(close_state.get("second_next_value"), 0) if close_state.get("second_next_value") is not None else None,
+                        "start_value": _safe_int(close_state.get("start_value"), 0) if close_state.get("start_value") is not None else None,
+                    },
+                )
+            current_value = resumed_value
+            active_ending_group_id = None
+            active_ending_group_state = None
 
         # Stage 1: apply any legacy staff-level carryover when crossing a system boundary.
         if system_id != current_sid:
@@ -1327,21 +2063,25 @@ def _recompute_measure_numbering(
             )
             continue
 
-        # Stage 4: apply the current numbering anchor for this counted measure.
-        current_value = _apply_measure_override_anchor(
-            current_value,
-            measure_id,
-            measure_overrides,
-        )
+        # Stage 4: compute the local numbering anchor for this counted measure.
+        measure_override_value = _measure_override_value(measure_id, measure_overrides)
+        current_value_before_label = int(current_value)
 
         # Stage 5: resolve the final local label for this counted measure.
-        ending_type = str(endings_map.get(measure_id) or "").strip() if measure_id else ""
-        label_value, current_value, first_ending_start_value, second_ending_local = _resolve_ending_stage(
-            current_value,
-            ending_type,
-            first_ending_start_value,
-            second_ending_local,
-        )
+        ending_type = str(ending_entry.get("kind") or "").strip() if ending_entry else ""
+        if ending_entry:
+            if active_ending_group_id != ending_group_id:
+                active_ending_group_id = ending_group_id
+                active_ending_group_state = {}
+            label_value, current_value, active_ending_group_state = _resolve_grouped_ending_label(
+                current_value,
+                measure_override_value,
+                ending_entry,
+                active_ending_group_state or {},
+            )
+        else:
+            label_value = int(measure_override_value) if measure_override_value is not None else int(current_value)
+            current_value = int(label_value) + 1
 
         final_label = str(label_value)
         _apply_measure_label(
@@ -1354,12 +2094,71 @@ def _recompute_measure_numbering(
         )
 
         # Stage 6: apply any exact measure rest after the local label is finalized.
-        current_value = _apply_post_measure_rest(
-            current_value,
-            label_value,
-            measure_id,
-            rest_measures,
-        )
+        if ending_type == "2":
+            if active_ending_group_state is not None:
+                active_ending_group_state["second_next_value"] = _apply_post_measure_rest(
+                    active_ending_group_state.get("second_next_value") or current_value,
+                    label_value,
+                    measure_id,
+                    rest_measures,
+                )
+        elif ending_type == "1":
+            if active_ending_group_state is not None:
+                active_ending_group_state["first_next_value"] = _apply_post_measure_rest(
+                    active_ending_group_state.get("first_next_value") or current_value,
+                    label_value,
+                    measure_id,
+                    rest_measures,
+                )
+                current_value = int(active_ending_group_state["first_next_value"])
+        else:
+            current_value = _apply_post_measure_rest(
+                current_value,
+                label_value,
+                measure_id,
+                rest_measures,
+            )
+
+        if ending_entry and isinstance(ending_debug_ctx, dict):
+            _log_relabel_ending_debug(
+                str(ending_debug_ctx.get("trace_id") or ""),
+                str(ending_debug_ctx.get("job_id") or ""),
+                _safe_int(ending_debug_ctx.get("run_id"), 0),
+                "numbering",
+                {
+                    "group_id": int(ending_group_id),
+                    "measure_id": measure_id,
+                    "kind": ending_type,
+                    "branch_index": _safe_int(ending_entry.get("branch_index"), 0),
+                    "current_value_before": int(current_value_before_label),
+                    "override_value": int(measure_override_value) if measure_override_value is not None else None,
+                    "group_start_value": _safe_int(active_ending_group_state.get("start_value"), 0) if active_ending_group_state and active_ending_group_state.get("start_value") is not None else None,
+                    "assigned_label": int(label_value),
+                    "first_next_value": _safe_int(active_ending_group_state.get("first_next_value"), 0) if active_ending_group_state and active_ending_group_state.get("first_next_value") is not None else None,
+                    "second_next_value": _safe_int(active_ending_group_state.get("second_next_value"), 0) if active_ending_group_state and active_ending_group_state.get("second_next_value") is not None else None,
+                    "current_value_after": int(current_value),
+                },
+            )
+
+    if active_ending_group_id is not None:
+        close_state = dict(active_ending_group_state or {})
+        resumed_value = _close_numbering_ending_group(current_value, active_ending_group_state)
+        if isinstance(ending_debug_ctx, dict):
+            _log_relabel_ending_debug(
+                str(ending_debug_ctx.get("trace_id") or ""),
+                str(ending_debug_ctx.get("job_id") or ""),
+                _safe_int(ending_debug_ctx.get("run_id"), 0),
+                "close",
+                {
+                    "group_id": int(active_ending_group_id),
+                    "next_measure_id": "",
+                    "resume_value": int(resumed_value),
+                    "first_next_value": _safe_int(close_state.get("first_next_value"), 0) if close_state.get("first_next_value") is not None else None,
+                    "second_next_value": _safe_int(close_state.get("second_next_value"), 0) if close_state.get("second_next_value") is not None else None,
+                    "start_value": _safe_int(close_state.get("start_value"), 0) if close_state.get("start_value") is not None else None,
+                },
+            )
+        current_value = resumed_value
 
     for system in sorted_systems:
         system_id = str(system.get("system_id") or "").strip()
@@ -1668,7 +2467,11 @@ def _apply_ending_edit(
     applied.append({"type": "set_ending", "measure_id": measure_id, "value": ending_val})
 
 
-def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[dict], list[dict], list[dict], int]:
+def _apply_relabel_edits(
+    editable_state: dict,
+    edits: list[dict],
+    ending_debug_ctx: dict | None = None,
+) -> tuple[list[dict], list[dict], list[dict], int]:
     systems = _sorted_system_rows(editable_state.get("systems") or [])
     if not systems:
         raise ValueError("editable_state.systems is missing or empty")
@@ -1748,7 +2551,12 @@ def _apply_relabel_edits(editable_state: dict, edits: list[dict]) -> tuple[list[
         rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
 
     editable_state["measure_number_overrides"] = measure_overrides
-    systems, measures, _, _ = _recompute_measure_numbering(systems, measures, editable_state)
+    systems, measures, _, _ = _recompute_measure_numbering(
+        systems,
+        measures,
+        editable_state,
+        ending_debug_ctx=ending_debug_ctx,
+    )
     editable_state["systems"] = systems
     editable_state["measures"] = measures
     editable_state["staff_boxes"] = []
@@ -2153,11 +2961,189 @@ def get_job_state(job_id: str):
             "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
             "endings": editable_state.get("endings") or {},
         },
+        "ai_suggestions": _current_ai_suggestions(mapping_summary),
         "relabel_debug_summary": _summarize_relabel_debug(mapping_summary),
         "artifacts": artifacts,
         "artifacts_http": _artifact_http_uris_for_run(int(run_id), artifacts),
         "storage_mode": _storage_mode_for_artifacts(artifacts),
     }
+    return jsonify(response), 200
+
+
+@app.route("/api/omr/jobs/<job_id>/ai-suggest", methods=["POST"])
+def ai_suggest_job(job_id: str):
+    started = time.time()
+    run_id, rec, err = _resolve_run_id_from_job_id(job_id)
+    if err:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": str(err),
+                        "retryable": True,
+                        "provider_status": 409,
+                        "detail": "state_load_failed",
+                    },
+                }
+            ),
+            409,
+        )
+
+    artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
+    try:
+        artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
+    except StaleArtifactsError as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(exc.requested_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": "requested job_id does not match single-latest artifacts",
+                        "retryable": True,
+                        "provider_status": 409,
+                        "detail": "stale_run_mismatch",
+                    },
+                }
+            ),
+            409,
+        )
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": "failed to load state for AI suggestions",
+                        "retryable": True,
+                        "provider_status": 502,
+                        "detail": _safe_error_text(exc),
+                    },
+                }
+            ),
+            502,
+        )
+
+    editable_state = mapping_summary.get("editable_state") or {}
+    if not isinstance(editable_state, dict):
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": "editable_state missing in mapping_summary",
+                        "retryable": True,
+                        "provider_status": 409,
+                        "detail": "editable_state_missing",
+                    },
+                }
+            ),
+            409,
+        )
+
+    systems = editable_state.get("systems")
+    if not isinstance(systems, list):
+        systems = []
+    measures = editable_state.get("measures")
+    if not isinstance(measures, list):
+        measures = []
+    _editable_rest_measures(editable_state)
+    _editable_pickup_measures(editable_state)
+    reassign_count = _reassign_measures_to_nearest_system(systems, measures)
+    if reassign_count > 0:
+        print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
+    systems, measures, _, _ = _recompute_measure_numbering(systems, measures, editable_state)
+    editable_state["systems"] = systems
+    editable_state["measures"] = measures
+    editable_state["staff_boxes"] = []
+
+    source_state_version = _editable_state_version(editable_state)
+    try:
+        raw_result = _generate_ai_suggestions_for_job(job_id, int(artifact_run_id), editable_state, mapping_summary, artifacts)
+        ai_suggestions = _normalize_ai_suggestions_result(raw_result, editable_state, int(artifact_run_id), source_state_version)
+    except AiSuggestError as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                        "retryable": exc.retryable,
+                        "provider_status": exc.provider_status,
+                        "detail": exc.detail,
+                    },
+                }
+            ),
+            max(400, int(exc.provider_status)),
+        )
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": "Claude suggestion request failed.",
+                        "retryable": True,
+                        "provider_status": 500,
+                        "detail": _safe_error_text(exc),
+                    },
+                }
+            ),
+            500,
+        )
+
+    mapping_summary["editable_state"] = editable_state
+    mapping_summary["ai_suggestions"] = ai_suggestions
+    try:
+        _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": "failed to persist AI suggestions",
+                        "retryable": True,
+                        "provider_status": 500,
+                        "detail": _safe_error_text(exc),
+                    },
+                }
+            ),
+            500,
+        )
+
+    response = {
+        "job_id": job_id,
+        "run_id": int(artifact_run_id),
+        "status": "succeeded",
+        "ai_suggestions": ai_suggestions,
+        "storage_mode": _storage_mode_for_artifacts(artifacts),
+        "artifacts": artifacts,
+        "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+        "duration_ms": int((time.time() - started) * 1000),
+    }
+    if rec and isinstance(rec, dict) and rec.get("pdf_gcs_uri"):
+        response["pdf_gcs_uri"] = rec.get("pdf_gcs_uri")
     return jsonify(response), 200
 
 
@@ -2349,6 +3335,35 @@ def relabel_job(job_id: str):
         )
 
     state_version_before = _editable_state_version(editable_state)
+    ending_debug_ctx: dict | None = None
+    if _relabel_has_ending_debug(editable_state, edits if isinstance(edits, list) else []):
+        ending_debug_ctx = {
+            "trace_id": trace_id,
+            "job_id": job_id,
+            "run_id": int(run_id),
+        }
+        _log_relabel_ending_debug(
+            trace_id,
+            job_id,
+            int(run_id),
+            "input",
+            {
+                "saved_endings_count": len(editable_state.get("endings") or {}) if isinstance(editable_state.get("endings"), dict) else 0,
+                "all_edit_types": [
+                    str(raw_edit.get("type") or "").strip()
+                    for raw_edit in edits
+                    if isinstance(raw_edit, dict)
+                ],
+                "ending_edits": [
+                    {
+                        "measure_id": str(raw_edit.get("measure_id") or "").strip(),
+                        "value": str(raw_edit.get("value") or "").strip(),
+                    }
+                    for raw_edit in edits
+                    if isinstance(raw_edit, dict) and str(raw_edit.get("type") or "").strip() == "set_ending"
+                ],
+            },
+        )
 
     try:
         baseline_systems = list(editable_state.get("systems") or [])
@@ -2357,7 +3372,11 @@ def relabel_job(job_id: str):
             for row in baseline_systems
             if isinstance(row, dict) and str(row.get("system_id") or "").strip()
         }
-        systems, applied, rejected, total_systems = _apply_relabel_edits(editable_state, edits)
+        systems, applied, rejected, total_systems = _apply_relabel_edits(
+            editable_state,
+            edits,
+            ending_debug_ctx=ending_debug_ctx,
+        )
     except ValueError as exc:
         reason = "invalid_payload"
         if "unknown_system_id" in str(exc):
@@ -2503,6 +3522,13 @@ def relabel_job(job_id: str):
         qa = {}
         editable_state["qa"] = qa
     qa["total_systems"] = len(systems)
+    applied_measure_ids = {
+        str(row.get("measure_id") or "").strip()
+        for row in applied
+        if isinstance(row, dict) and str(row.get("measure_id") or "").strip()
+    }
+    if applied_measure_ids:
+        _remove_ai_suggestion_entries(mapping_summary, applied_measure_ids)
     state_version_after = _editable_state_version(editable_state)
 
     before_values = {}
@@ -2602,6 +3628,105 @@ def relabel_job(job_id: str):
     if rec and isinstance(rec, dict) and rec.get("pdf_gcs_uri"):
         response["pdf_gcs_uri"] = rec.get("pdf_gcs_uri")
     return jsonify(response), 200
+
+
+@app.route("/api/omr/jobs/<job_id>/ai-suggestions/<measure_id>/dismiss", methods=["POST"])
+def dismiss_ai_suggestion(job_id: str, measure_id: str):
+    run_id, rec, err = _resolve_run_id_from_job_id(job_id)
+    if err:
+        return jsonify({"error": err, "job_id": job_id}), 409
+    artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
+
+    try:
+        _, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
+    except StaleArtifactsError as exc:
+        return (
+            jsonify(
+                {
+                    "error": "requested job_id does not match single-latest artifacts",
+                    "job_id": job_id,
+                    "requested_run_id": exc.requested_run_id,
+                    "artifact_run_id": exc.artifact_run_id,
+                }
+            ),
+            409,
+        )
+    except Exception as exc:
+        return jsonify({"error": f"failed to load state: {exc}", "job_id": job_id, "run_id": run_id}), 502
+
+    ai_suggestions = _current_ai_suggestions(mapping_summary)
+    target_measure_id = str(measure_id or "").strip()
+    if not target_measure_id or not isinstance(ai_suggestions, dict):
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "suggestion_not_found",
+                        "message": "AI suggestion not found for measure.",
+                        "retryable": False,
+                        "detail": target_measure_id or "missing_measure_id",
+                    },
+                }
+            ),
+            404,
+        )
+
+    by_measure_id = ai_suggestions.get("by_measure_id")
+    if not isinstance(by_measure_id, dict) or target_measure_id not in by_measure_id:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "suggestion_not_found",
+                        "message": "AI suggestion not found for measure.",
+                        "retryable": False,
+                        "detail": target_measure_id,
+                    },
+                }
+            ),
+            404,
+        )
+
+    _remove_ai_suggestion_entries(mapping_summary, {target_measure_id})
+    try:
+        artifacts = _artifact_uris_for_existing_run(int(artifact_run_id), artifact_key=artifact_key)
+        _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggestion_dismiss_failed",
+                        "message": "failed to dismiss AI suggestion",
+                        "retryable": True,
+                        "detail": _safe_error_text(exc),
+                    },
+                }
+            ),
+            500,
+        )
+
+    return (
+        jsonify(
+            {
+                "job_id": job_id,
+                "run_id": int(artifact_run_id),
+                "status": "succeeded",
+                "dismissed_measure_id": target_measure_id,
+                "ai_suggestions": mapping_summary.get("ai_suggestions"),
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/api/omr/jobs/<job_id>/cleanup", methods=["POST"])
