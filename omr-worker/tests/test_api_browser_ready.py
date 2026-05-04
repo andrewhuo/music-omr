@@ -510,12 +510,12 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         padding = spec["padding"]
         clip = spec["clip"]
-        self.assertAlmostEqual(padding.get("top"), 20.8)
-        self.assertEqual(padding.get("bottom"), 10.0)
+        self.assertAlmostEqual(padding.get("top"), 52.0)
+        self.assertAlmostEqual(padding.get("bottom"), 20.8)
         self.assertEqual(padding.get("left"), 8.0)
         self.assertEqual(padding.get("right"), 8.0)
         self.assertAlmostEqual(clip.y0, 100.0)
-        self.assertAlmostEqual(clip.y1, 182.0)
+        self.assertAlmostEqual(clip.y1, 190.0)
 
     def test_measure_crop_spec_keeps_room_for_high_first_measure(self):
         page_rect = _FakeRect(0, 0, 240, 180)
@@ -528,7 +528,8 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         clip = spec["clip"]
         padding = spec["padding"]
-        self.assertEqual(padding.get("top"), 20.0)
+        self.assertEqual(padding.get("top"), 24.0)
+        self.assertEqual(padding.get("bottom"), 10.0)
         self.assertEqual(clip.y0, 0.0)
         self.assertEqual(clip.y1, 48.0)
 
