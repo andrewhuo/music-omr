@@ -59,9 +59,14 @@ ANTHROPIC_TIMEOUT_SEC = max(5.0, float(os.environ.get("ANTHROPIC_TIMEOUT_SEC", "
 ANTHROPIC_MAX_TOKENS = max(256, int(os.environ.get("ANTHROPIC_MAX_TOKENS", "1800") or "1800"))
 AI_MEASURE_CROP_SCALE = max(1.0, float(os.environ.get("AI_MEASURE_CROP_SCALE", "2.0") or "2.0"))
 AI_MEASURE_CROP_X_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_X_PAD_RATIO", "0.08") or "0.08"))
-AI_MEASURE_CROP_Y_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_Y_PAD_RATIO", "0.15") or "0.15"))
 AI_MEASURE_CROP_MIN_X_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_X_PAD", "8") or "8"))
-AI_MEASURE_CROP_MIN_Y_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_Y_PAD", "10") or "10"))
+AI_MEASURE_CROP_TOP_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_TOP_PAD_RATIO", "0.40") or "0.40"))
+AI_MEASURE_CROP_BOTTOM_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_BOTTOM_PAD_RATIO", "0.15") or "0.15"))
+AI_MEASURE_CROP_MIN_TOP_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_TOP_PAD", "20") or "20"))
+AI_MEASURE_CROP_MIN_BOTTOM_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_BOTTOM_PAD", "10") or "10"))
+AI_SUGGEST_SAVE_DEBUG_CROPS = (
+    str(os.environ.get("AI_SUGGEST_SAVE_DEBUG_CROPS", "0")).strip().lower() not in ("0", "false", "no", "")
+)
 
 MEASURE_TEXT_COLOR = (0, 0, 0)
 MEASURE_TEXT_SIZE = 10.0
@@ -110,6 +115,7 @@ class AiSuggestError(RuntimeError):
         retryable: bool = True,
         provider_status: int = 502,
         detail: str = "",
+        debug_crops: dict | None = None,
     ):
         super().__init__(message)
         self.message = str(message or "Claude suggestion request failed.")
@@ -117,6 +123,7 @@ class AiSuggestError(RuntimeError):
         self.retryable = bool(retryable)
         self.provider_status = int(provider_status)
         self.detail = str(detail or "")
+        self.debug_crops = dict(debug_crops) if isinstance(debug_crops, dict) else None
 
 
 def _storage_mode_for_artifacts(artifacts: dict[str, str] | None) -> str:
@@ -655,6 +662,13 @@ def _upload_file_to_gcs(src_path: Path, dest_uri: str, content_type: str | None 
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
     blob.upload_from_filename(str(src_path), content_type=content_type)
+
+
+def _upload_bytes_to_gcs(data: bytes, dest_uri: str, content_type: str | None = None) -> None:
+    bucket_name, blob_name = _parse_gs_uri(dest_uri)
+    bucket = _gcs_client().bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(data, content_type=content_type or "application/octet-stream")
 
 
 def _upload_json_to_gcs(data: dict, dest_uri: str) -> None:
@@ -1199,7 +1213,30 @@ def _parse_anthropic_suggestions_message(message: dict) -> dict:
     return parsed
 
 
-def _measure_crop_rect(page_rect, measure_row: dict, next_measure_row: dict | None, system_row: dict | None) -> fitz.Rect:
+def _ai_suggest_debug_enabled() -> bool:
+    return bool(AI_SUGGEST_SAVE_DEBUG_CROPS)
+
+
+def _ai_debug_crops_prefix(artifacts: dict) -> str:
+    mapping_uri = str((artifacts or {}).get("mapping_summary") or "").strip()
+    if not mapping_uri:
+        raise ValueError("mapping_summary artifact missing")
+    bucket_name, blob_name = _parse_gs_uri(mapping_uri)
+    base_dir = blob_name.rsplit("/", 1)[0].rstrip("/")
+    return f"gs://{bucket_name}/{base_dir}/ai_debug_crops"
+
+
+def _ai_debug_crop_manifest_uri(artifacts: dict) -> str:
+    return f"{_ai_debug_crops_prefix(artifacts)}/manifest.json"
+
+
+def _ai_debug_crop_measure_uri(artifacts: dict, system_id: str, measure_id: str) -> str:
+    safe_system = _normalize_artifact_key(system_id) or "system"
+    safe_measure = _normalize_artifact_key(measure_id) or "measure"
+    return f"{_ai_debug_crops_prefix(artifacts)}/{safe_system}/{safe_measure}.png"
+
+
+def _measure_crop_spec(page_rect, measure_row: dict, next_measure_row: dict | None, system_row: dict | None) -> dict:
     x_left = float(measure_row.get("x_left") or 0.0)
     x_right_raw = measure_row.get("x_right")
     if x_right_raw is None and isinstance(next_measure_row, dict):
@@ -1225,17 +1262,58 @@ def _measure_crop_rect(page_rect, measure_row: dict, next_measure_row: dict | No
     width = max(1.0, x_right - x_left)
     height = max(1.0, y_bottom - y_top)
     x_pad = max(AI_MEASURE_CROP_MIN_X_PAD, width * AI_MEASURE_CROP_X_PAD_RATIO)
-    y_pad = max(AI_MEASURE_CROP_MIN_Y_PAD, height * AI_MEASURE_CROP_Y_PAD_RATIO)
+    pad_top = max(AI_MEASURE_CROP_MIN_TOP_PAD, height * AI_MEASURE_CROP_TOP_PAD_RATIO)
+    pad_bottom = max(AI_MEASURE_CROP_MIN_BOTTOM_PAD, height * AI_MEASURE_CROP_BOTTOM_PAD_RATIO)
+
+    page_top = 0.0
+    page_bottom = float(page_rect.height)
+    system_top = page_top
+    system_bottom = page_bottom
+    if isinstance(system_row, dict):
+        anchor = system_row.get("anchor")
+        if isinstance(anchor, dict):
+            try:
+                anchor_top = float(anchor.get("y_top"))
+                anchor_bottom = float(anchor.get("y_bottom"))
+                if anchor_bottom > anchor_top:
+                    system_top = max(page_top, min(anchor_top, page_bottom))
+                    system_bottom = min(page_bottom, max(anchor_bottom, system_top))
+            except Exception:
+                pass
 
     clip = fitz.Rect(
         max(0.0, x_left - x_pad),
-        max(0.0, y_top - y_pad),
+        max(system_top, y_top - pad_top),
         min(float(page_rect.width), x_right + x_pad),
-        min(float(page_rect.height), y_bottom + y_pad),
+        min(system_bottom, y_bottom + pad_bottom),
     )
     if clip.x1 <= clip.x0 or clip.y1 <= clip.y0:
         raise AiSuggestError(provider_status=500, detail="invalid_measure_crop")
-    return clip
+    return {
+        "clip": clip,
+        "measure_bounds": {
+            "left": float(x_left),
+            "right": float(x_right),
+            "top": float(y_top),
+            "bottom": float(y_bottom),
+            "width": float(width),
+            "height": float(height),
+        },
+        "padding": {
+            "left": float(x_pad),
+            "right": float(x_pad),
+            "top": float(pad_top),
+            "bottom": float(pad_bottom),
+        },
+        "system_bounds": {
+            "top": float(system_top),
+            "bottom": float(system_bottom),
+        },
+    }
+
+
+def _measure_crop_rect(page_rect, measure_row: dict, next_measure_row: dict | None, system_row: dict | None) -> fitz.Rect:
+    return _measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)["clip"]
 
 
 def _render_measure_crop_png(page, clip: fitz.Rect) -> bytes:
@@ -1243,7 +1321,40 @@ def _render_measure_crop_png(page, clip: fitz.Rect) -> bytes:
     return bytes(pix.tobytes("png"))
 
 
-def _build_system_measure_request(job_id: str, run_id: int, system_row: dict, measure_rows: list[dict], page) -> dict:
+def _build_ai_debug_crops_manifest(
+    job_id: str,
+    run_id: int,
+    artifacts: dict,
+    crop_rows: list[dict],
+) -> dict:
+    manifest_uri = _ai_debug_crop_manifest_uri(artifacts)
+    payload = {
+        "version": "ai_debug_crops_v1",
+        "enabled": True,
+        "job_id": str(job_id),
+        "run_id": int(run_id),
+        "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+        "count": len(crop_rows),
+        "crops": crop_rows,
+    }
+    _upload_json_to_gcs(payload, manifest_uri)
+    return {
+        "enabled": True,
+        "manifest_uri": manifest_uri,
+        "manifest_http": _signed_http_url_for_gs(manifest_uri),
+        "count": len(crop_rows),
+    }
+
+
+def _build_system_measure_request(
+    job_id: str,
+    run_id: int,
+    system_row: dict,
+    measure_rows: list[dict],
+    page,
+    artifacts: dict | None = None,
+    debug_crop_rows: list[dict] | None = None,
+) -> dict:
     content: list[dict] = []
     system_id = str(system_row.get("system_id") or "").strip()
     page_number = _safe_int(system_row.get("page"), _safe_int((measure_rows[0] if measure_rows else {}).get("page"), 1))
@@ -1293,8 +1404,31 @@ def _build_system_measure_request(job_id: str, run_id: int, system_row: dict, me
 
     for idx, row in enumerate(measure_rows):
         next_row = measure_rows[idx + 1] if idx + 1 < len(measure_rows) else None
-        clip = _measure_crop_rect(page.rect, row, next_row, system_row)
+        crop_spec = _measure_crop_spec(page.rect, row, next_row, system_row)
+        clip = crop_spec["clip"]
         image_bytes = _render_measure_crop_png(page, clip)
+        if artifacts is not None and debug_crop_rows is not None:
+            measure_id = str(row.get("measure_id") or "").strip()
+            crop_uri = _ai_debug_crop_measure_uri(artifacts, system_id, measure_id)
+            _upload_bytes_to_gcs(image_bytes, crop_uri, content_type="image/png")
+            debug_crop_rows.append(
+                {
+                    "measure_id": measure_id,
+                    "system_id": system_id,
+                    "page_number": int(page_number),
+                    "order_index_in_system": _safe_int(row.get("measure_local_index"), idx),
+                    "crop_uri": crop_uri,
+                    "clip_rect": {
+                        "x0": float(clip.x0),
+                        "y0": float(clip.y0),
+                        "x1": float(clip.x1),
+                        "y1": float(clip.y1),
+                    },
+                    "measure_bounds": crop_spec["measure_bounds"],
+                    "padding": crop_spec["padding"],
+                    "system_bounds": crop_spec["system_bounds"],
+                }
+            )
         content.append(
             {
                 "type": "text",
@@ -1351,6 +1485,13 @@ def _generate_ai_suggestions_for_job(
     baseline_pdf_uri = str((artifacts or {}).get("audiveris_out_pdf") or "").strip()
     if not baseline_pdf_uri:
         raise AiSuggestError(provider_status=500, detail="baseline_pdf_missing")
+    debug_enabled = _ai_suggest_debug_enabled()
+    debug_crop_rows: list[dict] = []
+
+    def _finalize_debug_crops() -> dict | None:
+        if not debug_enabled or not debug_crop_rows:
+            return None
+        return _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows)
 
     with TemporaryDirectory(prefix="omr-ai-suggest-") as tmp:
         tmpdir = Path(tmp)
@@ -1368,7 +1509,15 @@ def _generate_ai_suggestions_for_job(
                 if page_index >= len(doc):
                     raise AiSuggestError(provider_status=500, detail=f"invalid_page_index:{page_number}")
                 page = doc[page_index]
-                payload = _build_system_measure_request(job_id, int(run_id), system_row, system_measures, page)
+                payload = _build_system_measure_request(
+                    job_id,
+                    int(run_id),
+                    system_row,
+                    system_measures,
+                    page,
+                    artifacts=artifacts if debug_enabled else None,
+                    debug_crop_rows=debug_crop_rows if debug_enabled else None,
+                )
                 message = _anthropic_messages_create(payload)
                 parsed = _parse_anthropic_suggestions_message(message)
                 system_suggestions = parsed.get("suggestions")
@@ -1402,15 +1551,27 @@ def _generate_ai_suggestions_for_job(
                             warning = dict(warning)
                             warning["system_index"] = _safe_int(system_row.get("system_index"), 0)
                         warnings.append(warning)
+        except AiSuggestError as exc:
+            debug_crops = _finalize_debug_crops()
+            if debug_crops is not None:
+                exc.debug_crops = debug_crops
+            raise
+        except Exception as exc:
+            debug_crops = _finalize_debug_crops()
+            raise AiSuggestError(provider_status=500, detail=_safe_error_text(exc), debug_crops=debug_crops) from exc
         finally:
             doc.close()
 
-    return {
+    result = {
         "provider": "claude",
         "model": model_name,
         "suggestions": suggestions,
         "warnings": warnings,
     }
+    debug_crops = _finalize_debug_crops()
+    if debug_crops is not None:
+        result["debug_crops"] = debug_crops
+    return result
 
 
 def _draw_measure_label(page: fitz.Page, page_rect: fitz.Rect, anchor_x: float, anchor_y_top: float, text: str) -> None:
@@ -2973,6 +3134,7 @@ def get_job_state(job_id: str):
 @app.route("/api/omr/jobs/<job_id>/ai-suggest", methods=["POST"])
 def ai_suggest_job(job_id: str):
     started = time.time()
+    raw_debug_crops = None
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     if err:
         return (
@@ -3071,41 +3233,45 @@ def ai_suggest_job(job_id: str):
     source_state_version = _editable_state_version(editable_state)
     try:
         raw_result = _generate_ai_suggestions_for_job(job_id, int(artifact_run_id), editable_state, mapping_summary, artifacts)
+        if isinstance(raw_result, dict):
+            raw_debug_crops = raw_result.get("debug_crops")
         ai_suggestions = _normalize_ai_suggestions_result(raw_result, editable_state, int(artifact_run_id), source_state_version)
     except AiSuggestError as exc:
+        response = {
+            "job_id": job_id,
+            "run_id": int(artifact_run_id),
+            "status": "failed",
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "retryable": exc.retryable,
+                "provider_status": exc.provider_status,
+                "detail": exc.detail,
+            },
+        }
+        if isinstance(exc.debug_crops, dict):
+            response["debug_crops"] = exc.debug_crops
         return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(artifact_run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": exc.code,
-                        "message": exc.message,
-                        "retryable": exc.retryable,
-                        "provider_status": exc.provider_status,
-                        "detail": exc.detail,
-                    },
-                }
-            ),
+            jsonify(response),
             max(400, int(exc.provider_status)),
         )
     except Exception as exc:
+        response = {
+            "job_id": job_id,
+            "run_id": int(artifact_run_id),
+            "status": "failed",
+            "error": {
+                "code": "ai_suggest_failed",
+                "message": "Claude suggestion request failed.",
+                "retryable": True,
+                "provider_status": 500,
+                "detail": _safe_error_text(exc),
+            },
+        }
+        if isinstance(raw_debug_crops, dict):
+            response["debug_crops"] = raw_debug_crops
         return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(artifact_run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": "Claude suggestion request failed.",
-                        "retryable": True,
-                        "provider_status": 500,
-                        "detail": _safe_error_text(exc),
-                    },
-                }
-            ),
+            jsonify(response),
             500,
         )
 
@@ -3114,21 +3280,22 @@ def ai_suggest_job(job_id: str):
     try:
         _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
     except Exception as exc:
+        response = {
+            "job_id": job_id,
+            "run_id": int(artifact_run_id),
+            "status": "failed",
+            "error": {
+                "code": "ai_suggest_failed",
+                "message": "failed to persist AI suggestions",
+                "retryable": True,
+                "provider_status": 500,
+                "detail": _safe_error_text(exc),
+            },
+        }
+        if isinstance(raw_debug_crops, dict):
+            response["debug_crops"] = raw_debug_crops
         return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(artifact_run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": "failed to persist AI suggestions",
-                        "retryable": True,
-                        "provider_status": 500,
-                        "detail": _safe_error_text(exc),
-                    },
-                }
-            ),
+            jsonify(response),
             500,
         )
 
@@ -3142,6 +3309,8 @@ def ai_suggest_job(job_id: str):
         "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
         "duration_ms": int((time.time() - started) * 1000),
     }
+    if isinstance(raw_debug_crops, dict):
+        response["debug_crops"] = raw_debug_crops
     if rec and isinstance(rec, dict) and rec.get("pdf_gcs_uri"):
         response["pdf_gcs_uri"] = rec.get("pdf_gcs_uri")
     return jsonify(response), 200

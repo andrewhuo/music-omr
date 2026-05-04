@@ -122,6 +122,22 @@ def _unpack(result):
 WORKER = _load_worker_module()
 
 
+class _FakeRect:
+    def __init__(self, x0: float, y0: float, x1: float, y1: float):
+        self.x0 = float(x0)
+        self.y0 = float(y0)
+        self.x1 = float(x1)
+        self.y1 = float(y1)
+
+    @property
+    def width(self) -> float:
+        return self.x1 - self.x0
+
+    @property
+    def height(self) -> float:
+        return self.y1 - self.y0
+
+
 class _FakeUploadFile:
     def __init__(self, filename: str, content_type: str, data: bytes):
         self.filename = filename
@@ -447,6 +463,91 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(relabel.get("labels_mode"), "all_measures")
         self.assertEqual(relabel.get("labels_redrawn_count"), 2)
 
+    def test_measure_crop_spec_uses_asymmetric_vertical_padding(self):
+        page_rect = _FakeRect(0, 0, 200, 160)
+        measure_row = {"x_left": 30, "y_top": 40, "y_bottom": 60}
+        next_measure_row = {"x_left": 90}
+        system_row = {"anchor": {"y_top": 20, "y_bottom": 90}}
+
+        with patch.object(WORKER.fitz, "Rect", _FakeRect):
+            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+
+        clip = spec["clip"]
+        padding = spec["padding"]
+        self.assertEqual(padding.get("left"), 8.0)
+        self.assertEqual(padding.get("right"), 8.0)
+        self.assertEqual(padding.get("top"), 20.0)
+        self.assertEqual(padding.get("bottom"), 10.0)
+        self.assertGreater(padding.get("top"), padding.get("bottom"))
+        self.assertEqual(clip.x0, 22.0)
+        self.assertEqual(clip.x1, 98.0)
+        self.assertEqual(clip.y0, 20.0)
+        self.assertEqual(clip.y1, 70.0)
+
+    def test_measure_crop_spec_clamps_to_system_bounds(self):
+        page_rect = _FakeRect(0, 0, 220, 200)
+        measure_row = {"x_left": 25, "y_top": 95, "y_bottom": 125}
+        next_measure_row = {"x_left": 110}
+        system_row = {"anchor": {"y_top": 88, "y_bottom": 130}}
+
+        with patch.object(WORKER.fitz, "Rect", _FakeRect):
+            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+
+        clip = spec["clip"]
+        self.assertEqual(clip.y0, 88.0)
+        self.assertEqual(clip.y1, 130.0)
+        self.assertEqual((spec.get("system_bounds") or {}).get("top"), 88.0)
+        self.assertEqual((spec.get("system_bounds") or {}).get("bottom"), 130.0)
+
+    def test_measure_crop_spec_handles_piano_measure_scale(self):
+        page_rect = _FakeRect(0, 0, 260, 260)
+        measure_row = {"x_left": 40, "y_top": 120, "y_bottom": 172}
+        next_measure_row = {"x_left": 130}
+        system_row = {"anchor": {"y_top": 100, "y_bottom": 190}}
+
+        with patch.object(WORKER.fitz, "Rect", _FakeRect):
+            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+
+        padding = spec["padding"]
+        clip = spec["clip"]
+        self.assertAlmostEqual(padding.get("top"), 20.8)
+        self.assertEqual(padding.get("bottom"), 10.0)
+        self.assertEqual(padding.get("left"), 8.0)
+        self.assertEqual(padding.get("right"), 8.0)
+        self.assertAlmostEqual(clip.y0, 100.0)
+        self.assertAlmostEqual(clip.y1, 182.0)
+
+    def test_measure_crop_spec_keeps_room_for_high_first_measure(self):
+        page_rect = _FakeRect(0, 0, 240, 180)
+        measure_row = {"x_left": 18, "y_top": 14, "y_bottom": 38}
+        next_measure_row = {"x_left": 70}
+        system_row = {"anchor": {"y_top": 0, "y_bottom": 72}}
+
+        with patch.object(WORKER.fitz, "Rect", _FakeRect):
+            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+
+        clip = spec["clip"]
+        padding = spec["padding"]
+        self.assertEqual(padding.get("top"), 20.0)
+        self.assertEqual(clip.y0, 0.0)
+        self.assertEqual(clip.y1, 48.0)
+
+    def test_measure_crop_spec_old_style_multi_rest_stays_generous_above(self):
+        page_rect = _FakeRect(0, 0, 220, 180)
+        measure_row = {"x_left": 24, "y_top": 86, "y_bottom": 104}
+        next_measure_row = {"x_left": 76}
+        system_row = {"anchor": {"y_top": 70, "y_bottom": 118}}
+
+        with patch.object(WORKER.fitz, "Rect", _FakeRect):
+            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+
+        clip = spec["clip"]
+        padding = spec["padding"]
+        self.assertEqual(padding.get("top"), 20.0)
+        self.assertEqual(padding.get("bottom"), 10.0)
+        self.assertEqual(clip.y0, 70.0)
+        self.assertEqual(clip.y1, 114.0)
+
     def test_ai_suggest_success_persists_filtered_suggestions(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
@@ -467,6 +568,12 @@ class BrowserReadyApiTests(unittest.TestCase):
                 },
             ],
             "warnings": [{"type": "low_confidence_page", "system_id": "p1_s1", "system_index": 1, "message": "check m2"}],
+            "debug_crops": {
+                "enabled": True,
+                "manifest_uri": "gs://x/output/artifacts/ai_debug_crops/manifest.json",
+                "manifest_http": "https://signed/debug-manifest",
+                "count": 3,
+            },
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest", method="POST", headers={}, files={}, json={})
         with (
@@ -490,6 +597,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(summary.get("measures_seen"), 3)
         self.assertEqual(summary.get("suggestions_kept"), 2)
         self.assertEqual(summary.get("normal_measures_omitted"), 1)
+        self.assertEqual((body.get("debug_crops") or {}).get("count"), 3)
         self.assertIn("ai_suggestions", mapping_summary)
 
     def test_ai_suggest_failure_keeps_prior_suggestions(self):
@@ -513,7 +621,16 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(
                 WORKER,
                 "_generate_ai_suggestions_for_job",
-                side_effect=WORKER.AiSuggestError(provider_status=504, detail="timeout"),
+                side_effect=WORKER.AiSuggestError(
+                    provider_status=504,
+                    detail="timeout",
+                    debug_crops={
+                        "enabled": True,
+                        "manifest_uri": "gs://x/output/artifacts/ai_debug_crops/manifest.json",
+                        "manifest_http": "https://signed/debug-manifest",
+                        "count": 2,
+                    },
+                ),
             ),
         ):
             body, status = _unpack(WORKER.ai_suggest_job("111"))
@@ -521,7 +638,40 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 504)
         self.assertEqual(body.get("status"), "failed")
         self.assertEqual(((body.get("error") or {}).get("detail")), "timeout")
+        self.assertEqual((body.get("debug_crops") or {}).get("count"), 2)
         self.assertEqual(mapping_summary.get("ai_suggestions"), original)
+
+    def test_ai_suggest_persist_failure_returns_debug_crops(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        raw_result = {
+            "provider": "claude",
+            "model": "claude-test",
+            "suggestions": [
+                {"measure_id": "p1_s0_m0", "label": "pickup", "rest_count": None, "confidence": "medium"},
+                {"measure_id": "p1_s0_m1", "label": "normal", "rest_count": None, "confidence": "high"},
+                {"measure_id": "p1_s1_m0", "label": "normal", "rest_count": None, "confidence": "high"},
+            ],
+            "warnings": [],
+            "debug_crops": {
+                "enabled": True,
+                "manifest_uri": "gs://x/output/artifacts/ai_debug_crops/manifest.json",
+                "manifest_http": "https://signed/debug-manifest",
+                "count": 1,
+            },
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_generate_ai_suggestions_for_job", return_value=raw_result),
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=RuntimeError("persist failed")),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 500)
+        self.assertEqual((body.get("debug_crops") or {}).get("count"), 1)
+        self.assertEqual(((body.get("error") or {}).get("message")), "failed to persist AI suggestions")
 
     def test_dismiss_ai_suggestion_removes_only_target(self):
         artifacts = self._sample_artifacts()
