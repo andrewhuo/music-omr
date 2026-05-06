@@ -77,6 +77,10 @@ LABELS_MODE_SYSTEM_ONLY = "system_only"
 LABELS_MODE_ALL_MEASURES = "all_measures"
 LABELS_MODE_ALLOWED = {LABELS_MODE_SYSTEM_ONLY, LABELS_MODE_ALL_MEASURES}
 AI_SUGGESTIONS_VERSION = "ai_suggestions_v1"
+AI_SUGGEST_RUN_STATUS_IDLE = "idle"
+AI_SUGGEST_RUN_STATUS_RUNNING = "running"
+AI_SUGGEST_RUN_STATUS_COMPLETED = "completed"
+AI_SUGGEST_RUN_STATUS_FAILED = "failed"
 AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
@@ -940,6 +944,156 @@ def _current_ai_suggestions(mapping_summary: dict | None) -> dict | None:
     return ai_suggestions if isinstance(ai_suggestions, dict) else None
 
 
+def _current_ai_suggest_run(
+    mapping_summary: dict | None,
+    run_id: int | None = None,
+    source_state_version: str | None = None,
+) -> dict:
+    raw = (mapping_summary or {}).get("ai_suggest_run")
+    row = dict(raw) if isinstance(raw, dict) else {}
+    status = str(row.get("status") or AI_SUGGEST_RUN_STATUS_IDLE).strip().lower()
+    if status not in {
+        AI_SUGGEST_RUN_STATUS_IDLE,
+        AI_SUGGEST_RUN_STATUS_RUNNING,
+        AI_SUGGEST_RUN_STATUS_COMPLETED,
+        AI_SUGGEST_RUN_STATUS_FAILED,
+    }:
+        status = AI_SUGGEST_RUN_STATUS_IDLE
+    clean = {
+        "status": status,
+        "started_at_utc": str(row.get("started_at_utc") or "").strip() or None,
+        "updated_at_utc": str(row.get("updated_at_utc") or "").strip() or None,
+        "completed_at_utc": str(row.get("completed_at_utc") or "").strip() or None,
+        "failed_at_utc": str(row.get("failed_at_utc") or "").strip() or None,
+        "systems_total": max(0, _safe_int(row.get("systems_total"), 0)),
+        "systems_completed": max(0, _safe_int(row.get("systems_completed"), 0)),
+        "next_system_index": max(0, _safe_int(row.get("next_system_index"), 0)),
+        "source_run_id": int(run_id) if isinstance(run_id, int) and run_id > 0 else _safe_int(row.get("source_run_id"), 0),
+        "source_state_version": str(row.get("source_state_version") or source_state_version or "").strip() or None,
+        "last_error": row.get("last_error") if isinstance(row.get("last_error"), dict) else None,
+    }
+    return clean
+
+
+def _empty_ai_suggestions_state(
+    run_id: int,
+    source_state_version: str | None,
+    measures_seen: int,
+) -> dict:
+    ai_suggestions = {
+        "version": AI_SUGGESTIONS_VERSION,
+        "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+        "provider": "claude",
+        "model": str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "unknown").strip() or "unknown",
+        "source_run_id": int(run_id),
+        "by_measure_id": {},
+        "warnings": [],
+        "summary": {
+            "systems_processed": 0,
+            "measures_seen": max(0, int(measures_seen)),
+            "suggestions_kept": 0,
+            "normal_measures_omitted": 0,
+        },
+    }
+    source_state_version_txt = str(source_state_version or "").strip()
+    if source_state_version_txt:
+        ai_suggestions["source_state_version"] = source_state_version_txt
+    return ai_suggestions
+
+
+def _new_ai_suggest_run_state(
+    run_id: int,
+    source_state_version: str | None,
+    systems_total: int,
+    status: str = AI_SUGGEST_RUN_STATUS_RUNNING,
+) -> dict:
+    now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+    row = {
+        "status": status,
+        "started_at_utc": now_txt if status in {AI_SUGGEST_RUN_STATUS_RUNNING, AI_SUGGEST_RUN_STATUS_COMPLETED} else None,
+        "updated_at_utc": now_txt,
+        "completed_at_utc": now_txt if status == AI_SUGGEST_RUN_STATUS_COMPLETED else None,
+        "failed_at_utc": now_txt if status == AI_SUGGEST_RUN_STATUS_FAILED else None,
+        "systems_total": max(0, int(systems_total)),
+        "systems_completed": max(0, int(systems_total)) if status == AI_SUGGEST_RUN_STATUS_COMPLETED else 0,
+        "next_system_index": max(0, int(systems_total)) if status == AI_SUGGEST_RUN_STATUS_COMPLETED else 0,
+        "source_run_id": int(run_id),
+        "source_state_version": str(source_state_version or "").strip() or None,
+        "last_error": None,
+    }
+    return row
+
+
+def _ai_suggest_system_batches(editable_state: dict) -> list[tuple[dict, list[dict]]]:
+    systems = _sorted_system_rows(editable_state.get("systems") or [])
+    measures = _sorted_measure_rows(editable_state.get("measures") or [])
+    grouped_measures: dict[str, list[dict]] = {}
+    for row in measures:
+        system_id = str(row.get("system_id") or "").strip()
+        if not system_id:
+            continue
+        grouped_measures.setdefault(system_id, []).append(row)
+    batches: list[tuple[dict, list[dict]]] = []
+    for system_row in systems:
+        system_id = str(system_row.get("system_id") or "").strip()
+        system_measures = grouped_measures.get(system_id) or []
+        if not system_id or not system_measures:
+            continue
+        batches.append((system_row, system_measures))
+    return batches
+
+
+def _merge_ai_suggestions_state(
+    existing: dict | None,
+    system_suggestions: dict,
+    run_id: int,
+    source_state_version: str | None,
+) -> dict:
+    base = dict(existing) if isinstance(existing, dict) else _empty_ai_suggestions_state(run_id, source_state_version, 0)
+    by_measure_id = dict(base.get("by_measure_id") or {})
+    by_measure_id.update(dict(system_suggestions.get("by_measure_id") or {}))
+    warnings = list(base.get("warnings") or [])
+    warnings.extend(list(system_suggestions.get("warnings") or []))
+    base["version"] = AI_SUGGESTIONS_VERSION
+    base["generated_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
+    base["provider"] = str(system_suggestions.get("provider") or base.get("provider") or "claude").strip() or "claude"
+    base["model"] = str(system_suggestions.get("model") or base.get("model") or "unknown").strip() or "unknown"
+    base["source_run_id"] = int(run_id)
+    source_state_version_txt = str(source_state_version or "").strip()
+    if source_state_version_txt:
+        base["source_state_version"] = source_state_version_txt
+    base["by_measure_id"] = by_measure_id
+    base["warnings"] = warnings
+    summary = base.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    system_summary = system_suggestions.get("summary") if isinstance(system_suggestions.get("summary"), dict) else {}
+    summary["systems_processed"] = max(0, _safe_int(summary.get("systems_processed"), 0)) + max(0, _safe_int(system_summary.get("systems_processed"), 0))
+    summary["measures_seen"] = max(0, _safe_int(summary.get("measures_seen"), 0)) + max(0, _safe_int(system_summary.get("measures_seen"), 0))
+    summary["normal_measures_omitted"] = max(0, _safe_int(summary.get("normal_measures_omitted"), 0)) + max(0, _safe_int(system_summary.get("normal_measures_omitted"), 0))
+    summary["suggestions_kept"] = len(by_measure_id)
+    base["summary"] = summary
+    return base
+
+
+def _ai_suggest_error_payload(exc: AiSuggestError | Exception, default_message: str = "Claude suggestion request failed.") -> dict:
+    if isinstance(exc, AiSuggestError):
+        return {
+            "code": exc.code,
+            "message": exc.message,
+            "retryable": exc.retryable,
+            "provider_status": exc.provider_status,
+            "detail": exc.detail,
+        }
+    return {
+        "code": "ai_suggest_failed",
+        "message": default_message,
+        "retryable": True,
+        "provider_status": 500,
+        "detail": _safe_error_text(exc),
+    }
+
+
 def _refresh_ai_suggestions_summary(ai_suggestions: dict | None) -> dict:
     if not isinstance(ai_suggestions, dict):
         return {}
@@ -1458,6 +1612,91 @@ def _build_system_measure_request(
         "max_tokens": ANTHROPIC_MAX_TOKENS,
         "messages": [{"role": "user", "content": content}],
     }
+
+
+def _generate_ai_suggestions_for_system_batch(
+    job_id: str,
+    run_id: int,
+    system_row: dict,
+    system_measures: list[dict],
+    source_state_version: str | None,
+    artifacts: dict,
+) -> dict:
+    model_name = str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
+    if not model_name or not _anthropic_api_key():
+        raise AiSuggestError(provider_status=503, detail="provider_not_configured")
+    baseline_pdf_uri = str((artifacts or {}).get("audiveris_out_pdf") or "").strip()
+    if not baseline_pdf_uri:
+        raise AiSuggestError(provider_status=500, detail="baseline_pdf_missing")
+
+    debug_enabled = _ai_suggest_debug_enabled()
+    debug_crop_rows: list[dict] = []
+
+    def _finalize_debug_crops() -> dict | None:
+        if not debug_enabled or not debug_crop_rows:
+            return None
+        return _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows)
+
+    with TemporaryDirectory(prefix="omr-ai-suggest-step-") as tmp:
+        tmpdir = Path(tmp)
+        in_pdf = tmpdir / "audiveris_out.pdf"
+        _download_gcs_to_file(baseline_pdf_uri, in_pdf)
+        doc = fitz.open(str(in_pdf))
+        try:
+            page_number = _safe_int(system_row.get("page"), _safe_int(system_measures[0].get("page"), 1))
+            page_index = max(0, int(page_number) - 1)
+            if page_index >= len(doc):
+                raise AiSuggestError(provider_status=500, detail=f"invalid_page_index:{page_number}")
+            page = doc[page_index]
+            payload = _build_system_measure_request(
+                job_id,
+                int(run_id),
+                system_row,
+                system_measures,
+                page,
+                artifacts=artifacts if debug_enabled else None,
+                debug_crop_rows=debug_crop_rows if debug_enabled else None,
+            )
+            message = _anthropic_messages_create(payload)
+            parsed = _parse_anthropic_suggestions_message(message)
+            system_suggestions = parsed.get("suggestions")
+            if not isinstance(system_suggestions, list):
+                raise AiSuggestError(detail=f"malformed_response: suggestions missing for {system_row.get('system_id')}")
+            expected_ids = {str(row.get("measure_id") or "").strip() for row in system_measures}
+            seen_ids: set[str] = set()
+            for row in system_suggestions:
+                if not isinstance(row, dict):
+                    raise AiSuggestError(detail=f"malformed_response: suggestion entry must be object for {system_row.get('system_id')}")
+                measure_id = str(row.get("measure_id") or "").strip()
+                if measure_id not in expected_ids:
+                    raise AiSuggestError(detail=f"malformed_response: unknown measure_id {measure_id} for {system_row.get('system_id')}")
+                if measure_id in seen_ids:
+                    raise AiSuggestError(detail=f"malformed_response: duplicate measure_id {measure_id} for {system_row.get('system_id')}")
+                seen_ids.add(measure_id)
+            if seen_ids != expected_ids:
+                missing = sorted(expected_ids - seen_ids)
+                raise AiSuggestError(detail=f"malformed_response: missing_measure_ids={','.join(missing[:10])} for {system_row.get('system_id')}")
+
+            normalized = _normalize_ai_suggestions_result(
+                parsed,
+                {"systems": [system_row], "measures": list(system_measures)},
+                int(run_id),
+                source_state_version,
+            )
+            debug_crops = _finalize_debug_crops()
+            if debug_crops is not None:
+                normalized["debug_crops"] = debug_crops
+            return normalized
+        except AiSuggestError as exc:
+            debug_crops = _finalize_debug_crops()
+            if debug_crops is not None:
+                exc.debug_crops = debug_crops
+            raise
+        except Exception as exc:
+            debug_crops = _finalize_debug_crops()
+            raise AiSuggestError(provider_status=500, detail=_safe_error_text(exc), debug_crops=debug_crops) from exc
+        finally:
+            doc.close()
 
 
 def _generate_ai_suggestions_for_job(
@@ -3123,6 +3362,7 @@ def get_job_state(job_id: str):
             "endings": editable_state.get("endings") or {},
         },
         "ai_suggestions": _current_ai_suggestions(mapping_summary),
+        "ai_suggest_run": _current_ai_suggest_run(mapping_summary, int(run_id), _editable_state_version(editable_state)),
         "relabel_debug_summary": _summarize_relabel_debug(mapping_summary),
         "artifacts": artifacts,
         "artifacts_http": _artifact_http_uris_for_run(int(run_id), artifacts),
@@ -3134,7 +3374,6 @@ def get_job_state(job_id: str):
 @app.route("/api/omr/jobs/<job_id>/ai-suggest", methods=["POST"])
 def ai_suggest_job(job_id: str):
     started = time.time()
-    raw_debug_crops = None
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     if err:
         return (
@@ -3231,89 +3470,354 @@ def ai_suggest_job(job_id: str):
     editable_state["staff_boxes"] = []
 
     source_state_version = _editable_state_version(editable_state)
-    try:
-        raw_result = _generate_ai_suggestions_for_job(job_id, int(artifact_run_id), editable_state, mapping_summary, artifacts)
-        if isinstance(raw_result, dict):
-            raw_debug_crops = raw_result.get("debug_crops")
-        ai_suggestions = _normalize_ai_suggestions_result(raw_result, editable_state, int(artifact_run_id), source_state_version)
-    except AiSuggestError as exc:
-        response = {
-            "job_id": job_id,
-            "run_id": int(artifact_run_id),
-            "status": "failed",
-            "error": {
-                "code": exc.code,
-                "message": exc.message,
-                "retryable": exc.retryable,
-                "provider_status": exc.provider_status,
-                "detail": exc.detail,
-            },
-        }
-        if isinstance(exc.debug_crops, dict):
-            response["debug_crops"] = exc.debug_crops
-        return (
-            jsonify(response),
-            max(400, int(exc.provider_status)),
-        )
-    except Exception as exc:
-        response = {
-            "job_id": job_id,
-            "run_id": int(artifact_run_id),
-            "status": "failed",
-            "error": {
-                "code": "ai_suggest_failed",
-                "message": "Claude suggestion request failed.",
-                "retryable": True,
-                "provider_status": 500,
-                "detail": _safe_error_text(exc),
-            },
-        }
-        if isinstance(raw_debug_crops, dict):
-            response["debug_crops"] = raw_debug_crops
-        return (
-            jsonify(response),
-            500,
-        )
-
     mapping_summary["editable_state"] = editable_state
-    mapping_summary["ai_suggestions"] = ai_suggestions
+    mapping_summary["ai_suggestions"] = _empty_ai_suggestions_state(
+        int(artifact_run_id),
+        source_state_version,
+        len(_sorted_measure_rows(editable_state.get("measures") or [])),
+    )
+    system_batches = _ai_suggest_system_batches(editable_state)
+    run_status = AI_SUGGEST_RUN_STATUS_RUNNING if system_batches else AI_SUGGEST_RUN_STATUS_COMPLETED
+    mapping_summary["ai_suggest_run"] = _new_ai_suggest_run_state(
+        int(artifact_run_id),
+        source_state_version,
+        len(system_batches),
+        status=run_status,
+    )
     try:
         _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
     except Exception as exc:
-        response = {
-            "job_id": job_id,
-            "run_id": int(artifact_run_id),
-            "status": "failed",
-            "error": {
-                "code": "ai_suggest_failed",
-                "message": "failed to persist AI suggestions",
-                "retryable": True,
-                "provider_status": 500,
-                "detail": _safe_error_text(exc),
-            },
-        }
-        if isinstance(raw_debug_crops, dict):
-            response["debug_crops"] = raw_debug_crops
         return (
-            jsonify(response),
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": "failed to initialize AI suggestion run",
+                        "retryable": True,
+                        "provider_status": 500,
+                        "detail": _safe_error_text(exc),
+                    },
+                }
+            ),
             500,
         )
 
     response = {
         "job_id": job_id,
         "run_id": int(artifact_run_id),
-        "status": "succeeded",
-        "ai_suggestions": ai_suggestions,
+        "status": run_status,
+        "ai_suggestions": mapping_summary["ai_suggestions"],
+        "ai_suggest_run": mapping_summary["ai_suggest_run"],
         "storage_mode": _storage_mode_for_artifacts(artifacts),
         "artifacts": artifacts,
         "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
         "duration_ms": int((time.time() - started) * 1000),
     }
-    if isinstance(raw_debug_crops, dict):
-        response["debug_crops"] = raw_debug_crops
     if rec and isinstance(rec, dict) and rec.get("pdf_gcs_uri"):
         response["pdf_gcs_uri"] = rec.get("pdf_gcs_uri")
     return jsonify(response), 200
+
+
+@app.route("/api/omr/jobs/<job_id>/ai-suggest/step", methods=["POST"])
+def ai_suggest_job_step(job_id: str):
+    started = time.time()
+    run_id, rec, err = _resolve_run_id_from_job_id(job_id)
+    if err:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": str(err),
+                        "retryable": True,
+                        "provider_status": 409,
+                        "detail": "state_load_failed",
+                    },
+                }
+            ),
+            409,
+        )
+
+    artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
+    try:
+        artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
+    except StaleArtifactsError as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(exc.requested_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": "requested job_id does not match single-latest artifacts",
+                        "retryable": True,
+                        "provider_status": 409,
+                        "detail": "stale_run_mismatch",
+                    },
+                }
+            ),
+            409,
+        )
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": "failed to load state for AI suggestions",
+                        "retryable": True,
+                        "provider_status": 502,
+                        "detail": _safe_error_text(exc),
+                    },
+                }
+            ),
+            502,
+        )
+
+    editable_state = mapping_summary.get("editable_state") or {}
+    if not isinstance(editable_state, dict):
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_failed",
+                        "message": "editable_state missing in mapping_summary",
+                        "retryable": True,
+                        "provider_status": 409,
+                        "detail": "editable_state_missing",
+                    },
+                }
+            ),
+            409,
+        )
+
+    systems = editable_state.get("systems")
+    if not isinstance(systems, list):
+        systems = []
+    measures = editable_state.get("measures")
+    if not isinstance(measures, list):
+        measures = []
+    _editable_rest_measures(editable_state)
+    _editable_pickup_measures(editable_state)
+    reassign_count = _reassign_measures_to_nearest_system(systems, measures)
+    if reassign_count > 0:
+        print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
+    systems, measures, _, _ = _recompute_measure_numbering(systems, measures, editable_state)
+    editable_state["systems"] = systems
+    editable_state["measures"] = measures
+    editable_state["staff_boxes"] = []
+
+    source_state_version = _editable_state_version(editable_state)
+    mapping_summary["editable_state"] = editable_state
+    ai_suggestions = _current_ai_suggestions(mapping_summary)
+    if not isinstance(ai_suggestions, dict):
+        ai_suggestions = _empty_ai_suggestions_state(
+            int(artifact_run_id),
+            source_state_version,
+            len(_sorted_measure_rows(editable_state.get("measures") or [])),
+        )
+        mapping_summary["ai_suggestions"] = ai_suggestions
+    ai_suggest_run = _current_ai_suggest_run(mapping_summary, int(artifact_run_id), source_state_version)
+    system_batches = _ai_suggest_system_batches(editable_state)
+    systems_total = len(system_batches)
+    ai_suggest_run["systems_total"] = systems_total
+
+    if ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_IDLE:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": AI_SUGGEST_RUN_STATUS_IDLE,
+                    "ai_suggestions": ai_suggestions,
+                    "ai_suggest_run": ai_suggest_run,
+                    "error": {
+                        "code": "ai_suggest_not_started",
+                        "message": "AI suggestion run has not been started.",
+                        "retryable": True,
+                        "provider_status": 409,
+                        "detail": "ai_suggest_not_started",
+                    },
+                }
+            ),
+            409,
+        )
+
+    if ai_suggest_run.get("source_state_version") and ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_RUNNING:
+        if str(ai_suggest_run.get("source_state_version") or "") != str(source_state_version or ""):
+            now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+            error_payload = {
+                "code": "ai_suggest_failed",
+                "message": "AI suggestion source state changed during generation.",
+                "retryable": True,
+                "provider_status": 409,
+                "detail": "source_state_version_mismatch",
+            }
+            ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_FAILED
+            ai_suggest_run["updated_at_utc"] = now_txt
+            ai_suggest_run["failed_at_utc"] = now_txt
+            ai_suggest_run["last_error"] = error_payload
+            mapping_summary["ai_suggest_run"] = ai_suggest_run
+            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+            return (
+                jsonify(
+                    {
+                        "job_id": job_id,
+                        "run_id": int(artifact_run_id),
+                        "status": AI_SUGGEST_RUN_STATUS_FAILED,
+                        "ai_suggestions": ai_suggestions,
+                        "ai_suggest_run": ai_suggest_run,
+                        "error": error_payload,
+                        "storage_mode": _storage_mode_for_artifacts(artifacts),
+                        "artifacts": artifacts,
+                        "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+                        "duration_ms": int((time.time() - started) * 1000),
+                    }
+                ),
+                200,
+            )
+
+    if ai_suggest_run.get("status") in {AI_SUGGEST_RUN_STATUS_COMPLETED, AI_SUGGEST_RUN_STATUS_FAILED}:
+        response = {
+            "job_id": job_id,
+            "run_id": int(artifact_run_id),
+            "status": str(ai_suggest_run.get("status") or AI_SUGGEST_RUN_STATUS_IDLE),
+            "ai_suggestions": ai_suggestions,
+            "ai_suggest_run": ai_suggest_run,
+            "storage_mode": _storage_mode_for_artifacts(artifacts),
+            "artifacts": artifacts,
+            "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+            "duration_ms": int((time.time() - started) * 1000),
+        }
+        if isinstance(ai_suggest_run.get("last_error"), dict):
+            response["error"] = ai_suggest_run.get("last_error")
+        return jsonify(response), 200
+
+    next_system_index = max(0, _safe_int(ai_suggest_run.get("next_system_index"), 0))
+    if systems_total == 0 or next_system_index >= systems_total:
+        now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+        ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_COMPLETED
+        ai_suggest_run["updated_at_utc"] = now_txt
+        ai_suggest_run["completed_at_utc"] = now_txt
+        ai_suggest_run["systems_completed"] = systems_total
+        ai_suggest_run["next_system_index"] = systems_total
+        ai_suggest_run["last_error"] = None
+        mapping_summary["ai_suggest_run"] = ai_suggest_run
+        _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": AI_SUGGEST_RUN_STATUS_COMPLETED,
+                    "ai_suggestions": ai_suggestions,
+                    "ai_suggest_run": ai_suggest_run,
+                    "storage_mode": _storage_mode_for_artifacts(artifacts),
+                    "artifacts": artifacts,
+                    "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+                    "duration_ms": int((time.time() - started) * 1000),
+                }
+            ),
+            200,
+        )
+
+    system_row, system_measures = system_batches[next_system_index]
+    debug_crops = None
+    try:
+        system_result = _generate_ai_suggestions_for_system_batch(
+            job_id,
+            int(artifact_run_id),
+            system_row,
+            system_measures,
+            source_state_version,
+            artifacts,
+        )
+        if isinstance(system_result, dict):
+            debug_crops = system_result.pop("debug_crops", None)
+        ai_suggestions = _merge_ai_suggestions_state(ai_suggestions, system_result, int(artifact_run_id), source_state_version)
+        now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+        completed_count = min(systems_total, next_system_index + 1)
+        ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_COMPLETED if completed_count >= systems_total else AI_SUGGEST_RUN_STATUS_RUNNING
+        ai_suggest_run["updated_at_utc"] = now_txt
+        ai_suggest_run["systems_completed"] = completed_count
+        ai_suggest_run["next_system_index"] = completed_count
+        ai_suggest_run["last_error"] = None
+        ai_suggest_run["failed_at_utc"] = None
+        if completed_count >= systems_total:
+            ai_suggest_run["completed_at_utc"] = now_txt
+        mapping_summary["ai_suggestions"] = ai_suggestions
+        mapping_summary["ai_suggest_run"] = ai_suggest_run
+        _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        response = {
+            "job_id": job_id,
+            "run_id": int(artifact_run_id),
+            "status": str(ai_suggest_run.get("status") or AI_SUGGEST_RUN_STATUS_RUNNING),
+            "ai_suggestions": ai_suggestions,
+            "ai_suggest_run": ai_suggest_run,
+            "storage_mode": _storage_mode_for_artifacts(artifacts),
+            "artifacts": artifacts,
+            "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+            "duration_ms": int((time.time() - started) * 1000),
+        }
+        if isinstance(debug_crops, dict):
+            response["debug_crops"] = debug_crops
+        return jsonify(response), 200
+    except Exception as exc:
+        error_payload = _ai_suggest_error_payload(exc)
+        now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+        ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_FAILED
+        ai_suggest_run["updated_at_utc"] = now_txt
+        ai_suggest_run["failed_at_utc"] = now_txt
+        ai_suggest_run["last_error"] = error_payload
+        mapping_summary["ai_suggest_run"] = ai_suggest_run
+        mapping_summary["ai_suggestions"] = ai_suggestions
+        try:
+            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        except Exception as persist_exc:
+            return (
+                jsonify(
+                    {
+                        "job_id": job_id,
+                        "run_id": int(artifact_run_id),
+                        "status": "failed",
+                        "error": {
+                            "code": "ai_suggest_failed",
+                            "message": "failed to persist AI suggestion failure state",
+                            "retryable": True,
+                            "provider_status": 500,
+                            "detail": _safe_error_text(persist_exc),
+                        },
+                    }
+                ),
+                500,
+            )
+        response = {
+            "job_id": job_id,
+            "run_id": int(artifact_run_id),
+            "status": AI_SUGGEST_RUN_STATUS_FAILED,
+            "ai_suggestions": ai_suggestions,
+            "ai_suggest_run": ai_suggest_run,
+            "error": error_payload,
+            "storage_mode": _storage_mode_for_artifacts(artifacts),
+            "artifacts": artifacts,
+            "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+            "duration_ms": int((time.time() - started) * 1000),
+        }
+        if isinstance(getattr(exc, "debug_crops", None), dict):
+            response["debug_crops"] = getattr(exc, "debug_crops")
+        return jsonify(response), 200
 
 
 @app.route("/api/omr/jobs/<job_id>/relabel", methods=["POST"])
