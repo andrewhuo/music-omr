@@ -84,6 +84,7 @@ AI_SUGGEST_RUN_STATUS_FAILED = "failed"
 AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
+AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
 
 # In-memory correlation for workflow dispatches that do not return run_id directly.
 _PENDING_DISPATCHES: dict[str, dict] = {}
@@ -944,6 +945,14 @@ def _current_ai_suggestions(mapping_summary: dict | None) -> dict | None:
     return ai_suggestions if isinstance(ai_suggestions, dict) else None
 
 
+def _configured_anthropic_model_name() -> str:
+    return str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
+
+
+def _requested_anthropic_model_name() -> str:
+    return _configured_anthropic_model_name() or "unknown"
+
+
 def _current_ai_suggest_run(
     mapping_summary: dict | None,
     run_id: int | None = None,
@@ -970,6 +979,7 @@ def _current_ai_suggest_run(
         "next_system_index": max(0, _safe_int(row.get("next_system_index"), 0)),
         "source_run_id": int(run_id) if isinstance(run_id, int) and run_id > 0 else _safe_int(row.get("source_run_id"), 0),
         "source_state_version": str(row.get("source_state_version") or source_state_version or "").strip() or None,
+        "model": str(row.get("model") or _requested_anthropic_model_name()).strip() or "unknown",
         "last_error": row.get("last_error") if isinstance(row.get("last_error"), dict) else None,
     }
     return clean
@@ -984,7 +994,7 @@ def _empty_ai_suggestions_state(
         "version": AI_SUGGESTIONS_VERSION,
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "provider": "claude",
-        "model": str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "unknown").strip() or "unknown",
+        "model": _requested_anthropic_model_name(),
         "source_run_id": int(run_id),
         "by_measure_id": {},
         "warnings": [],
@@ -1019,6 +1029,7 @@ def _new_ai_suggest_run_state(
         "next_system_index": max(0, int(systems_total)) if status == AI_SUGGEST_RUN_STATUS_COMPLETED else 0,
         "source_run_id": int(run_id),
         "source_state_version": str(source_state_version or "").strip() or None,
+        "model": _requested_anthropic_model_name(),
         "last_error": None,
     }
     return row
@@ -1078,13 +1089,17 @@ def _merge_ai_suggestions_state(
 
 def _ai_suggest_error_payload(exc: AiSuggestError | Exception, default_message: str = "Claude suggestion request failed.") -> dict:
     if isinstance(exc, AiSuggestError):
-        return {
+        payload = {
             "code": exc.code,
             "message": exc.message,
             "retryable": exc.retryable,
             "provider_status": exc.provider_status,
             "detail": exc.detail,
         }
+        retry_attempts = getattr(exc, "retry_attempts", None)
+        if isinstance(retry_attempts, int) and retry_attempts > 0:
+            payload["retry_attempts"] = retry_attempts
+        return payload
     return {
         "code": "ai_suggest_failed",
         "message": default_message,
@@ -1288,7 +1303,16 @@ def _anthropic_api_key() -> str:
     return str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip()
 
 
-def _anthropic_messages_create(payload: dict) -> dict:
+def _is_anthropic_overload_error(exc: AiSuggestError | Exception) -> bool:
+    if not isinstance(exc, AiSuggestError):
+        return False
+    if int(getattr(exc, "provider_status", 0) or 0) == 529:
+        return True
+    detail = str(getattr(exc, "detail", "") or "").lower()
+    return "overloaded_error" in detail
+
+
+def _anthropic_messages_create_once(payload: dict) -> dict:
     api_key = _anthropic_api_key()
     if not api_key:
         raise AiSuggestError(provider_status=503, detail="provider_not_configured")
@@ -1321,6 +1345,35 @@ def _anthropic_messages_create(payload: dict) -> dict:
         raise AiSuggestError(provider_status=504, detail=_safe_error_text(exc))
     except TimeoutError as exc:
         raise AiSuggestError(provider_status=504, detail=_safe_error_text(exc))
+
+
+def _anthropic_messages_create(payload: dict) -> dict:
+    delays = tuple(float(delay) for delay in AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC if float(delay) > 0)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _anthropic_messages_create_once(payload)
+        except AiSuggestError as exc:
+            if not _is_anthropic_overload_error(exc):
+                raise
+            if attempt > len(delays):
+                detail = str(exc.detail or "").strip()
+                delay_txt = ",".join(str(int(delay) if float(delay).is_integer() else delay) for delay in delays)
+                suffix = f" overload_retry_attempts={attempt}"
+                if delay_txt:
+                    suffix += f" overload_retry_delays_sec={delay_txt}"
+                exc.detail = f"{detail}{suffix}" if detail else suffix.strip()
+                exc.retry_attempts = attempt
+                raise
+            delay_sec = delays[attempt - 1]
+            logger.warning(
+                "AI_SUGGEST_OVERLOAD_RETRY attempt=%s next_delay_sec=%s model=%s",
+                attempt,
+                delay_sec,
+                str(payload.get("model") or _requested_anthropic_model_name()),
+            )
+            time.sleep(delay_sec)
 
 
 def _strip_json_fences(text: str) -> str:

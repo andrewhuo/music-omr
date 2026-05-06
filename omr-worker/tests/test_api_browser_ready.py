@@ -152,6 +152,7 @@ class _FakeUploadFile:
 class BrowserReadyApiTests(unittest.TestCase):
     def setUp(self):
         os.environ["CORS_ALLOW_ORIGINS"] = "http://localhost:5173"
+        os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-6"
         WORKER.request = SimpleNamespace(path="", method="GET", headers={}, files={}, json={})
         WORKER._PENDING_DISPATCHES.clear()
 
@@ -574,6 +575,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_total"), 2)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "claude-sonnet-4-6")
         self.assertIn("ai_suggestions", mapping_summary)
         self.assertEqual(((mapping_summary.get("ai_suggest_run") or {}).get("status")), "running")
 
@@ -740,6 +742,49 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(((body.get("error") or {}).get("detail")), "timeout")
         self.assertEqual(mapping_summary.get("ai_suggestions"), original)
         self.assertEqual((((mapping_summary.get("ai_suggest_run") or {}).get("status"))), "failed")
+
+    def test_anthropic_messages_create_retries_overload_then_succeeds(self):
+        overload_1 = WORKER.AiSuggestError(provider_status=529, detail='{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')
+        overload_2 = WORKER.AiSuggestError(provider_status=529, detail='{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')
+        success = {"content": [{"type": "text", "text": "{}"}], "model": "claude-sonnet-4-6"}
+        with (
+            patch.object(WORKER, "_anthropic_messages_create_once", side_effect=[overload_1, overload_2, success]) as create_once,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            result = WORKER._anthropic_messages_create({"model": "claude-sonnet-4-6"})
+
+        self.assertEqual(result, success)
+        self.assertEqual(create_once.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [2.0, 5.0])
+
+    def test_anthropic_messages_create_fails_after_overload_retries(self):
+        overload_1 = WORKER.AiSuggestError(provider_status=529, detail='{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')
+        overload_2 = WORKER.AiSuggestError(provider_status=529, detail='{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')
+        overload_3 = WORKER.AiSuggestError(provider_status=529, detail='{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')
+        with (
+            patch.object(WORKER, "_anthropic_messages_create_once", side_effect=[overload_1, overload_2, overload_3]) as create_once,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            with self.assertRaises(WORKER.AiSuggestError) as ctx:
+                WORKER._anthropic_messages_create({"model": "claude-sonnet-4-6"})
+
+        self.assertEqual(create_once.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [2.0, 5.0])
+        self.assertEqual(ctx.exception.provider_status, 529)
+        self.assertEqual(getattr(ctx.exception, "retry_attempts", None), 3)
+        self.assertIn("overload_retry_attempts=3", ctx.exception.detail)
+
+    def test_anthropic_messages_create_does_not_retry_non_overload_error(self):
+        malformed = WORKER.AiSuggestError(provider_status=502, detail="malformed_response: invalid json")
+        with (
+            patch.object(WORKER, "_anthropic_messages_create_once", side_effect=malformed) as create_once,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            with self.assertRaises(WORKER.AiSuggestError):
+                WORKER._anthropic_messages_create({"model": "claude-sonnet-4-6"})
+
+        self.assertEqual(create_once.call_count, 1)
+        self.assertEqual(sleep_mock.call_count, 0)
 
     def test_dismiss_ai_suggestion_removes_only_target(self):
         artifacts = self._sample_artifacts()
