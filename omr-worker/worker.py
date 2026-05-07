@@ -1068,7 +1068,7 @@ def _merge_ai_suggestions_state(
     base["version"] = AI_SUGGESTIONS_VERSION
     base["generated_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
     base["provider"] = str(system_suggestions.get("provider") or base.get("provider") or "claude").strip() or "claude"
-    base["model"] = str(system_suggestions.get("model") or base.get("model") or "unknown").strip() or "unknown"
+    base["model"] = _requested_anthropic_model_name()
     base["source_run_id"] = int(run_id)
     source_state_version_txt = str(source_state_version or "").strip()
     if source_state_version_txt:
@@ -1148,22 +1148,23 @@ def _remove_ai_suggestion_entries(mapping_summary: dict | None, measure_ids: set
 
 
 def _normalize_ai_suggest_warnings(raw_warnings) -> list[dict]:
-    if raw_warnings is None:
+    if raw_warnings is None or not isinstance(raw_warnings, list):
         return []
-    if not isinstance(raw_warnings, list):
-        raise AiSuggestError(detail="malformed_response: warnings must be an array")
     clean: list[dict] = []
     for row in raw_warnings:
         if not isinstance(row, dict):
-            raise AiSuggestError(detail="malformed_response: warning entry must be an object")
+            continue
         warning_type = str(row.get("type") or "").strip()
         message = str(row.get("message") or "").strip()
         if not warning_type or not message:
-            raise AiSuggestError(detail="malformed_response: warning missing type or message")
+            continue
         warning = {
             "type": warning_type,
             "message": message,
         }
+        measure_id = str(row.get("measure_id") or "").strip()
+        if measure_id:
+            warning["measure_id"] = measure_id
         system_id = str(row.get("system_id") or "").strip()
         if system_id:
             warning["system_id"] = system_id
@@ -1171,6 +1172,23 @@ def _normalize_ai_suggest_warnings(raw_warnings) -> list[dict]:
             warning["system_index"] = _safe_int(row.get("system_index"), 0)
         clean.append(warning)
     return clean
+
+
+def _ai_suggest_normalization_warning(measure_row: dict | None, message: str) -> dict:
+    warning = {
+        "type": "normalization_adjusted",
+        "message": message,
+    }
+    if isinstance(measure_row, dict):
+        measure_id = str(measure_row.get("measure_id") or "").strip()
+        if measure_id:
+            warning["measure_id"] = measure_id
+        system_id = str(measure_row.get("system_id") or "").strip()
+        if system_id:
+            warning["system_id"] = system_id
+        if measure_row.get("system_index") is not None:
+            warning["system_index"] = _safe_int(measure_row.get("system_index"), 0)
+    return warning
 
 
 def _normalize_ai_suggestions_result(
@@ -1196,6 +1214,7 @@ def _normalize_ai_suggestions_result(
     seen_measure_ids: set[str] = set()
     kept_by_measure_id: dict[str, dict] = {}
     normal_measures_omitted = 0
+    normalization_warnings: list[dict] = []
 
     for row in raw_suggestions:
         if not isinstance(row, dict):
@@ -1214,8 +1233,15 @@ def _normalize_ai_suggestions_result(
         if label not in AI_SUGGESTION_LABELS_ALLOWED:
             raise AiSuggestError(detail=f"malformed_response: invalid label for {measure_id}")
         confidence = str(row.get("confidence") or "").strip().lower()
+        measure_row = measure_rows_by_id[measure_id]
         if confidence not in AI_SUGGESTION_CONFIDENCE_ALLOWED:
-            raise AiSuggestError(detail=f"malformed_response: invalid confidence for {measure_id}")
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_row,
+                    f"Invalid confidence for {measure_id}; defaulted to low.",
+                )
+            )
+            confidence = "low"
 
         rest_count = row.get("rest_count")
         maybe_label = row.get("maybe_label")
@@ -1223,11 +1249,15 @@ def _normalize_ai_suggestions_result(
 
         if label == "normal":
             if rest_count is not None or maybe_label is not None or maybe_rest_count is not None:
-                raise AiSuggestError(detail=f"malformed_response: normal suggestion must not include extras for {measure_id}")
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Ignored extra fields on normal suggestion for {measure_id}.",
+                    )
+                )
             normal_measures_omitted += 1
             continue
 
-        measure_row = measure_rows_by_id[measure_id]
         entry = {
             "label": label,
             "rest_count": None,
@@ -1239,29 +1269,77 @@ def _normalize_ai_suggestions_result(
 
         if label == "pickup":
             if rest_count is not None or maybe_label is not None or maybe_rest_count is not None:
-                raise AiSuggestError(detail=f"malformed_response: pickup suggestion must not include rest fields for {measure_id}")
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Ignored extra fields on pickup suggestion for {measure_id}.",
+                    )
+                )
         elif label == "multi_measure_rest":
-            if not isinstance(rest_count, int) or int(rest_count) <= 0:
-                raise AiSuggestError(detail=f"malformed_response: multi_measure_rest requires positive rest_count for {measure_id}")
+            if not isinstance(rest_count, int) or int(rest_count) <= 1:
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Downgraded multi_measure_rest to uncertain for {measure_id} because rest_count was missing or invalid.",
+                    )
+                )
+                entry["label"] = "uncertain"
+                kept_by_measure_id[measure_id] = entry
+                continue
             if maybe_label is not None or maybe_rest_count is not None:
-                raise AiSuggestError(detail=f"malformed_response: multi_measure_rest must not include maybe fields for {measure_id}")
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Ignored maybe fields on multi_measure_rest suggestion for {measure_id}.",
+                    )
+                )
             entry["rest_count"] = int(rest_count)
         else:
             if rest_count is not None:
-                raise AiSuggestError(detail=f"malformed_response: uncertain suggestion must not include rest_count for {measure_id}")
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Ignored rest_count on uncertain suggestion for {measure_id}.",
+                    )
+                )
             if maybe_label is not None:
                 maybe_label = str(maybe_label or "").strip()
                 if maybe_label not in AI_SUGGESTION_MAYBE_LABELS_ALLOWED:
-                    raise AiSuggestError(detail=f"malformed_response: invalid maybe_label for {measure_id}")
-                entry["maybe_label"] = maybe_label
+                    normalization_warnings.append(
+                        _ai_suggest_normalization_warning(
+                            measure_row,
+                            f"Dropped invalid maybe_label on uncertain suggestion for {measure_id}.",
+                        )
+                    )
+                    maybe_label = None
+                if maybe_label is not None:
+                    entry["maybe_label"] = maybe_label
                 if maybe_label == "multi_measure_rest":
-                    if not isinstance(maybe_rest_count, int) or int(maybe_rest_count) <= 0:
-                        raise AiSuggestError(detail=f"malformed_response: maybe_rest_count required for {measure_id}")
-                    entry["maybe_rest_count"] = int(maybe_rest_count)
+                    if not isinstance(maybe_rest_count, int) or int(maybe_rest_count) <= 1:
+                        normalization_warnings.append(
+                            _ai_suggest_normalization_warning(
+                                measure_row,
+                                f"Downgraded uncertain multi_measure_rest guess to plain uncertain for {measure_id} because maybe_rest_count was missing or invalid.",
+                            )
+                        )
+                        entry.pop("maybe_label", None)
+                    else:
+                        entry["maybe_rest_count"] = int(maybe_rest_count)
                 elif maybe_rest_count is not None:
-                    raise AiSuggestError(detail=f"malformed_response: maybe_rest_count only allowed for maybe multi_measure_rest on {measure_id}")
+                    normalization_warnings.append(
+                        _ai_suggest_normalization_warning(
+                            measure_row,
+                            f"Dropped invalid maybe fields on uncertain suggestion for {measure_id}.",
+                        )
+                    )
+                    entry.pop("maybe_label", None)
             elif maybe_rest_count is not None:
-                raise AiSuggestError(detail=f"malformed_response: maybe_rest_count without maybe_label for {measure_id}")
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Dropped maybe_rest_count without maybe_label for {measure_id}.",
+                    )
+                )
 
         kept_by_measure_id[measure_id] = entry
 
@@ -1276,8 +1354,10 @@ def _normalize_ai_suggestions_result(
         raise AiSuggestError(detail=f"malformed_response: incomplete suggestions {' '.join(detail_bits).strip()}".strip())
 
     provider = str(raw_result.get("provider") or "claude").strip() or "claude"
-    model = str(raw_result.get("model") or "unknown").strip() or "unknown"
+    model = _requested_anthropic_model_name()
     systems_processed = len(_sorted_system_rows(editable_state.get("systems") or []))
+    warnings = _normalize_ai_suggest_warnings(raw_result.get("warnings"))
+    warnings.extend(normalization_warnings)
     ai_suggestions = {
         "version": AI_SUGGESTIONS_VERSION,
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
@@ -1285,7 +1365,7 @@ def _normalize_ai_suggestions_result(
         "model": model,
         "source_run_id": int(run_id),
         "by_measure_id": kept_by_measure_id,
-        "warnings": _normalize_ai_suggest_warnings(raw_result.get("warnings")),
+        "warnings": warnings,
         "summary": {
             "systems_processed": systems_processed,
             "measures_seen": len(ordered_measures),
@@ -1416,7 +1496,7 @@ def _parse_anthropic_suggestions_message(message: dict) -> dict:
     if not isinstance(parsed, dict):
         raise AiSuggestError(detail="malformed_response: root must be object")
     parsed.setdefault("provider", "claude")
-    parsed.setdefault("model", str(message.get("model") or ANTHROPIC_MODEL or "unknown"))
+    parsed.pop("model", None)
     return parsed
 
 
@@ -1583,11 +1663,11 @@ def _build_system_measure_request(
                 "A confident multi_measure_rest label requires a clearly readable count number of 2 or more. Without a visible count number, return uncertain.",
                 "If label is multi_measure_rest, include integer rest_count of 2 or more. A visible count of 1 means the measure is normal, not multi_measure_rest.",
                 "If label is uncertain and you have a tentative guess, maybe_label may be pickup or multi_measure_rest, and maybe_rest_count is only allowed for maybe_label multi_measure_rest.",
+                "If maybe_label is multi_measure_rest, always include maybe_rest_count if the count number is at all readable. Only omit maybe_rest_count if the number is completely unreadable.",
                 "Return JSON only.",
             ],
             "output_shape": {
                 "provider": "claude",
-                "model": "string",
                 "suggestions": [
                     {
                         "measure_id": "string",

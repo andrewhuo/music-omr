@@ -629,6 +629,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
 
     def test_ai_suggest_step_final_system_marks_completed(self):
@@ -692,6 +693,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 2)
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0", "p1_s1_m0"])
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 2)
 
     def test_ai_suggest_step_failure_marks_failed_and_keeps_partial_suggestions(self):
@@ -857,6 +859,112 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(remaining.keys()), ["p1_s1_m0"])
         self.assertEqual((((mapping_summary.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
 
+    def test_normalize_ai_suggestions_result_salvages_missing_maybe_rest_count_and_bad_warnings(self):
+        editable_state = (self._sample_mapping_summary().get("editable_state") or {})
+        raw_result = {
+            "provider": "claude",
+            "model": "claude-opus-4-5",
+            "suggestions": [
+                {
+                    "measure_id": "p1_s0_m0",
+                    "label": "uncertain",
+                    "rest_count": None,
+                    "confidence": "medium",
+                    "maybe_label": "multi_measure_rest",
+                },
+                {
+                    "measure_id": "p1_s0_m1",
+                    "label": "normal",
+                    "rest_count": 4,
+                    "confidence": "high",
+                },
+                {
+                    "measure_id": "p1_s1_m0",
+                    "label": "pickup",
+                    "rest_count": None,
+                    "confidence": "medium",
+                    "maybe_label": "pickup",
+                },
+            ],
+            "warnings": [
+                "bad-row",
+                {"type": "", "message": "missing type"},
+                {"type": "note", "message": "kept"},
+            ],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertEqual(normalized.get("model"), "claude-sonnet-4-6")
+        by_measure_id = normalized.get("by_measure_id") or {}
+        self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "uncertain")
+        self.assertNotIn("maybe_label", by_measure_id.get("p1_s0_m0") or {})
+        self.assertEqual((by_measure_id.get("p1_s1_m0") or {}).get("label"), "pickup")
+        warnings = normalized.get("warnings") or []
+        self.assertTrue(any((row or {}).get("type") == "note" for row in warnings))
+        self.assertTrue(any((row or {}).get("type") == "normalization_adjusted" for row in warnings))
+        self.assertEqual(((normalized.get("summary") or {}).get("normal_measures_omitted")), 1)
+
+    def test_normalize_ai_suggestions_result_downgrades_bad_multirest_and_invalid_confidence(self):
+        editable_state = (self._sample_mapping_summary().get("editable_state") or {})
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "p1_s0_m0",
+                    "label": "multi_measure_rest",
+                    "rest_count": 1,
+                    "confidence": "bad-confidence",
+                },
+                {
+                    "measure_id": "p1_s0_m1",
+                    "label": "uncertain",
+                    "rest_count": None,
+                    "confidence": "low",
+                    "maybe_label": "pickup",
+                    "maybe_rest_count": 3,
+                },
+                {
+                    "measure_id": "p1_s1_m0",
+                    "label": "normal",
+                    "rest_count": None,
+                    "confidence": "medium",
+                },
+            ],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        by_measure_id = normalized.get("by_measure_id") or {}
+        first = by_measure_id.get("p1_s0_m0") or {}
+        self.assertEqual(first.get("label"), "uncertain")
+        self.assertEqual(first.get("confidence"), "low")
+        second = by_measure_id.get("p1_s0_m1") or {}
+        self.assertEqual(second.get("label"), "uncertain")
+        self.assertNotIn("maybe_label", second)
+        warnings = normalized.get("warnings") or []
+        self.assertGreaterEqual(
+            len([row for row in warnings if (row or {}).get("type") == "normalization_adjusted"]),
+            2,
+        )
+
+    def test_parse_anthropic_suggestions_message_drops_model_field(self):
+        message = {
+            "model": "claude-sonnet-4-20250514",
+            "content": [
+                {
+                    "type": "text",
+                    "text": """```json
+{"model":"claude-opus-4-5","suggestions":[{"measure_id":"p1_s0_m0","label":"pickup","rest_count":null,"confidence":"medium"}],"warnings":[]}
+```""",
+                }
+            ],
+        }
+        parsed = WORKER._parse_anthropic_suggestions_message(message)
+        self.assertEqual(parsed.get("provider"), "claude")
+        self.assertNotIn("model", parsed)
+        self.assertEqual(((parsed.get("suggestions") or [])[0] or {}).get("measure_id"), "p1_s0_m0")
+
     def test_parse_anthropic_suggestions_message_accepts_json_fence(self):
         message = {
             "model": "claude-sonnet-4-20250514",
@@ -871,7 +979,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         }
         parsed = WORKER._parse_anthropic_suggestions_message(message)
         self.assertEqual(parsed.get("provider"), "claude")
-        self.assertEqual(parsed.get("model"), "claude-sonnet-4-20250514")
+        self.assertNotIn("model", parsed)
         self.assertEqual(((parsed.get("suggestions") or [])[0] or {}).get("measure_id"), "p1_s0_m0")
 
 
