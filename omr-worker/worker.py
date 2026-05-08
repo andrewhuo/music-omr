@@ -61,9 +61,13 @@ AI_MEASURE_CROP_SCALE = max(1.0, float(os.environ.get("AI_MEASURE_CROP_SCALE", "
 AI_MEASURE_CROP_X_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_X_PAD_RATIO", "0.08") or "0.08"))
 AI_MEASURE_CROP_MIN_X_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_X_PAD", "8") or "8"))
 AI_MEASURE_CROP_TOP_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_TOP_PAD_RATIO", "1.00") or "1.00"))
-AI_MEASURE_CROP_BOTTOM_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_BOTTOM_PAD_RATIO", "0.40") or "0.40"))
+AI_MEASURE_CROP_BOTTOM_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_BOTTOM_PAD_RATIO", "1.00") or "1.00"))
 AI_MEASURE_CROP_MIN_TOP_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_TOP_PAD", "20") or "20"))
 AI_MEASURE_CROP_MIN_BOTTOM_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_BOTTOM_PAD", "10") or "10"))
+AI_MEASURE_CROP_SYSTEM_GAP_CLAMP_RATIO = max(
+    0.0,
+    min(1.0, float(os.environ.get("AI_MEASURE_CROP_SYSTEM_GAP_CLAMP_RATIO", "0.75") or "0.75")),
+)
 AI_SUGGEST_SAVE_DEBUG_CROPS = (
     str(os.environ.get("AI_SUGGEST_SAVE_DEBUG_CROPS", "0")).strip().lower() not in ("0", "false", "no", "")
 )
@@ -1054,6 +1058,36 @@ def _ai_suggest_system_batches(editable_state: dict) -> list[tuple[dict, list[di
     return batches
 
 
+def _same_page_neighbor_systems(systems: list[dict], current_system_row: dict) -> tuple[dict | None, dict | None]:
+    current_id = str((current_system_row or {}).get("system_id") or "").strip()
+    current_page = _safe_int((current_system_row or {}).get("page"), 0)
+    current_top, _ = _system_anchor_bounds(current_system_row)
+    page_systems: list[tuple[float, dict]] = []
+    for row in systems:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("system_id") or "").strip() == current_id:
+            continue
+        if _safe_int(row.get("page"), 0) != current_page:
+            continue
+        row_top, _ = _system_anchor_bounds(row)
+        if row_top is None:
+            continue
+        page_systems.append((row_top, row))
+    page_systems.sort(key=lambda item: item[0])
+    prev_system_row = None
+    next_system_row = None
+    if current_top is None:
+        return (None, None)
+    for row_top, row in page_systems:
+        if row_top < current_top:
+            prev_system_row = row
+        elif next_system_row is None and row_top > current_top:
+            next_system_row = row
+            break
+    return (prev_system_row, next_system_row)
+
+
 def _merge_ai_suggestions_state(
     existing: dict | None,
     system_suggestions: dict,
@@ -1523,7 +1557,66 @@ def _ai_debug_crop_measure_uri(artifacts: dict, system_id: str, measure_id: str)
     return f"{_ai_debug_crops_prefix(artifacts)}/{safe_system}/{safe_measure}.png"
 
 
-def _measure_crop_spec(page_rect, measure_row: dict, next_measure_row: dict | None, system_row: dict | None) -> dict:
+def _system_anchor_bounds(system_row: dict | None) -> tuple[float | None, float | None]:
+    if not isinstance(system_row, dict):
+        return (None, None)
+    anchor = system_row.get("anchor")
+    if not isinstance(anchor, dict):
+        return (None, None)
+    try:
+        top = float(anchor.get("y_top"))
+        bottom = float(anchor.get("y_bottom"))
+    except Exception:
+        return (None, None)
+    if bottom <= top:
+        return (None, None)
+    return (top, bottom)
+
+
+def _system_gap_clamp_bounds(
+    page_rect,
+    system_row: dict | None,
+    prev_system_row: dict | None = None,
+    next_system_row: dict | None = None,
+) -> tuple[float, float]:
+    page_top = 0.0
+    page_bottom = float(page_rect.height)
+    system_top_raw, system_bottom_raw = _system_anchor_bounds(system_row)
+    if system_top_raw is None or system_bottom_raw is None:
+        return (page_top, page_bottom)
+
+    system_top = max(page_top, min(system_top_raw, page_bottom))
+    system_bottom = min(page_bottom, max(system_bottom_raw, system_top))
+    clamp_top = system_top
+    clamp_bottom = system_bottom
+
+    prev_top_raw, prev_bottom_raw = _system_anchor_bounds(prev_system_row)
+    if prev_top_raw is not None and prev_bottom_raw is not None and prev_bottom_raw < system_top:
+        gap_above = max(0.0, system_top - prev_bottom_raw)
+        clamp_top = max(page_top, system_top - (gap_above * AI_MEASURE_CROP_SYSTEM_GAP_CLAMP_RATIO))
+    else:
+        clamp_top = page_top
+
+    next_top_raw, next_bottom_raw = _system_anchor_bounds(next_system_row)
+    if next_top_raw is not None and next_bottom_raw is not None and next_top_raw > system_bottom:
+        gap_below = max(0.0, next_top_raw - system_bottom)
+        clamp_bottom = min(page_bottom, system_bottom + (gap_below * AI_MEASURE_CROP_SYSTEM_GAP_CLAMP_RATIO))
+    else:
+        clamp_bottom = page_bottom
+
+    if clamp_bottom <= clamp_top:
+        return (page_top, page_bottom)
+    return (clamp_top, clamp_bottom)
+
+
+def _measure_crop_spec(
+    page_rect,
+    measure_row: dict,
+    next_measure_row: dict | None,
+    system_row: dict | None,
+    prev_system_row: dict | None = None,
+    next_system_row: dict | None = None,
+) -> dict:
     x_left = float(measure_row.get("x_left") or 0.0)
     x_right_raw = measure_row.get("x_right")
     if x_right_raw is None and isinstance(next_measure_row, dict):
@@ -1554,19 +1647,7 @@ def _measure_crop_spec(page_rect, measure_row: dict, next_measure_row: dict | No
 
     page_top = 0.0
     page_bottom = float(page_rect.height)
-    system_top = page_top
-    system_bottom = page_bottom
-    if isinstance(system_row, dict):
-        anchor = system_row.get("anchor")
-        if isinstance(anchor, dict):
-            try:
-                anchor_top = float(anchor.get("y_top"))
-                anchor_bottom = float(anchor.get("y_bottom"))
-                if anchor_bottom > anchor_top:
-                    system_top = max(page_top, min(anchor_top, page_bottom))
-                    system_bottom = min(page_bottom, max(anchor_bottom, system_top))
-            except Exception:
-                pass
+    system_top, system_bottom = _system_gap_clamp_bounds(page_rect, system_row, prev_system_row, next_system_row)
 
     clip = fitz.Rect(
         max(0.0, x_left - x_pad),
@@ -1599,8 +1680,15 @@ def _measure_crop_spec(page_rect, measure_row: dict, next_measure_row: dict | No
     }
 
 
-def _measure_crop_rect(page_rect, measure_row: dict, next_measure_row: dict | None, system_row: dict | None) -> fitz.Rect:
-    return _measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)["clip"]
+def _measure_crop_rect(
+    page_rect,
+    measure_row: dict,
+    next_measure_row: dict | None,
+    system_row: dict | None,
+    prev_system_row: dict | None = None,
+    next_system_row: dict | None = None,
+) -> fitz.Rect:
+    return _measure_crop_spec(page_rect, measure_row, next_measure_row, system_row, prev_system_row, next_system_row)["clip"]
 
 
 def _render_measure_crop_png(page, clip: fitz.Rect) -> bytes:
@@ -1639,6 +1727,8 @@ def _build_system_measure_request(
     system_row: dict,
     measure_rows: list[dict],
     page,
+    prev_system_row: dict | None = None,
+    next_system_row: dict | None = None,
     artifacts: dict | None = None,
     debug_crop_rows: list[dict] | None = None,
 ) -> dict:
@@ -1694,7 +1784,7 @@ def _build_system_measure_request(
 
     for idx, row in enumerate(measure_rows):
         next_row = measure_rows[idx + 1] if idx + 1 < len(measure_rows) else None
-        crop_spec = _measure_crop_spec(page.rect, row, next_row, system_row)
+        crop_spec = _measure_crop_spec(page.rect, row, next_row, system_row, prev_system_row, next_system_row)
         clip = crop_spec["clip"]
         image_bytes = _render_measure_crop_png(page, clip)
         if artifacts is not None and debug_crop_rows is not None:
@@ -1779,6 +1869,8 @@ def _generate_ai_suggestions_for_system_batch(
         _download_gcs_to_file(baseline_pdf_uri, in_pdf)
         doc = fitz.open(str(in_pdf))
         try:
+            systems = _sorted_system_rows(editable_state.get("systems") or [])
+            prev_system_row, next_system_row = _same_page_neighbor_systems(systems, system_row)
             page_number = _safe_int(system_row.get("page"), _safe_int(system_measures[0].get("page"), 1))
             page_index = max(0, int(page_number) - 1)
             if page_index >= len(doc):
@@ -1790,6 +1882,8 @@ def _generate_ai_suggestions_for_system_batch(
                 system_row,
                 system_measures,
                 page,
+                prev_system_row=prev_system_row,
+                next_system_row=next_system_row,
                 artifacts=artifacts if debug_enabled else None,
                 debug_crop_rows=debug_crop_rows if debug_enabled else None,
             )
@@ -1879,6 +1973,7 @@ def _generate_ai_suggestions_for_job(
                 system_measures = grouped_measures.get(system_id) or []
                 if not system_id or not system_measures:
                     continue
+                prev_system_row, next_system_row = _same_page_neighbor_systems(systems, system_row)
                 page_number = _safe_int(system_row.get("page"), _safe_int(system_measures[0].get("page"), 1))
                 page_index = max(0, int(page_number) - 1)
                 if page_index >= len(doc):
@@ -1890,6 +1985,8 @@ def _generate_ai_suggestions_for_job(
                     system_row,
                     system_measures,
                     page,
+                    prev_system_row=prev_system_row,
+                    next_system_row=next_system_row,
                     artifacts=artifacts if debug_enabled else None,
                     debug_crop_rows=debug_crop_rows if debug_enabled else None,
                 )

@@ -465,91 +465,134 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(relabel.get("labels_mode"), "all_measures")
         self.assertEqual(relabel.get("labels_redrawn_count"), 2)
 
-    def test_measure_crop_spec_uses_asymmetric_vertical_padding(self):
+    def test_measure_crop_spec_uses_full_vertical_padding_when_room_exists(self):
         page_rect = _FakeRect(0, 0, 200, 160)
         measure_row = {"x_left": 30, "y_top": 40, "y_bottom": 60}
         next_measure_row = {"x_left": 90}
-        system_row = {"anchor": {"y_top": 20, "y_bottom": 90}}
+        system_row = {"anchor": {"y_top": 40, "y_bottom": 60}}
+        prev_system_row = {"anchor": {"y_top": 0, "y_bottom": 20}}
+        next_system_row = {"anchor": {"y_top": 100, "y_bottom": 120}}
 
         with patch.object(WORKER.fitz, "Rect", _FakeRect):
-            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+            spec = WORKER._measure_crop_spec(
+                page_rect,
+                measure_row,
+                next_measure_row,
+                system_row,
+                prev_system_row,
+                next_system_row,
+            )
 
         clip = spec["clip"]
         padding = spec["padding"]
         self.assertEqual(padding.get("left"), 8.0)
         self.assertEqual(padding.get("right"), 8.0)
         self.assertEqual(padding.get("top"), 20.0)
-        self.assertEqual(padding.get("bottom"), 10.0)
-        self.assertGreater(padding.get("top"), padding.get("bottom"))
+        self.assertEqual(padding.get("bottom"), 20.0)
         self.assertEqual(clip.x0, 22.0)
         self.assertEqual(clip.x1, 98.0)
-        self.assertEqual(clip.y0, 20.0)
-        self.assertEqual(clip.y1, 70.0)
+        self.assertEqual(clip.y0, 25.0)
+        self.assertEqual(clip.y1, 80.0)
 
-    def test_measure_crop_spec_clamps_to_system_bounds(self):
+    def test_measure_crop_spec_uses_75_percent_gap_clamp(self):
         page_rect = _FakeRect(0, 0, 220, 200)
         measure_row = {"x_left": 25, "y_top": 95, "y_bottom": 125}
         next_measure_row = {"x_left": 110}
-        system_row = {"anchor": {"y_top": 88, "y_bottom": 130}}
+        system_row = {"anchor": {"y_top": 90, "y_bottom": 130}}
+        prev_system_row = {"anchor": {"y_top": 40, "y_bottom": 70}}
+        next_system_row = {"anchor": {"y_top": 170, "y_bottom": 190}}
 
         with patch.object(WORKER.fitz, "Rect", _FakeRect):
-            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+            spec = WORKER._measure_crop_spec(
+                page_rect,
+                measure_row,
+                next_measure_row,
+                system_row,
+                prev_system_row,
+                next_system_row,
+            )
 
         clip = spec["clip"]
-        self.assertEqual(clip.y0, 88.0)
-        self.assertEqual(clip.y1, 130.0)
-        self.assertEqual((spec.get("system_bounds") or {}).get("top"), 88.0)
-        self.assertEqual((spec.get("system_bounds") or {}).get("bottom"), 130.0)
+        self.assertEqual(clip.y0, 75.0)
+        self.assertEqual(clip.y1, 155.0)
+        self.assertEqual((spec.get("system_bounds") or {}).get("top"), 75.0)
+        self.assertEqual((spec.get("system_bounds") or {}).get("bottom"), 160.0)
 
     def test_measure_crop_spec_handles_piano_measure_scale(self):
         page_rect = _FakeRect(0, 0, 260, 260)
         measure_row = {"x_left": 40, "y_top": 120, "y_bottom": 172}
         next_measure_row = {"x_left": 130}
-        system_row = {"anchor": {"y_top": 100, "y_bottom": 190}}
+        system_row = {"anchor": {"y_top": 118, "y_bottom": 172}}
+        prev_system_row = {"anchor": {"y_top": 60, "y_bottom": 92}}
+        next_system_row = {"anchor": {"y_top": 210, "y_bottom": 238}}
 
         with patch.object(WORKER.fitz, "Rect", _FakeRect):
-            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+            spec = WORKER._measure_crop_spec(
+                page_rect,
+                measure_row,
+                next_measure_row,
+                system_row,
+                prev_system_row,
+                next_system_row,
+            )
 
         padding = spec["padding"]
         clip = spec["clip"]
         self.assertAlmostEqual(padding.get("top"), 52.0)
-        self.assertAlmostEqual(padding.get("bottom"), 20.8)
+        self.assertAlmostEqual(padding.get("bottom"), 52.0)
         self.assertEqual(padding.get("left"), 8.0)
         self.assertEqual(padding.get("right"), 8.0)
-        self.assertAlmostEqual(clip.y0, 100.0)
-        self.assertAlmostEqual(clip.y1, 190.0)
+        self.assertAlmostEqual(clip.y0, 98.5)
+        self.assertAlmostEqual(clip.y1, 200.5)
 
     def test_measure_crop_spec_keeps_room_for_high_first_measure(self):
         page_rect = _FakeRect(0, 0, 240, 180)
         measure_row = {"x_left": 18, "y_top": 14, "y_bottom": 38}
         next_measure_row = {"x_left": 70}
-        system_row = {"anchor": {"y_top": 0, "y_bottom": 72}}
+        system_row = {"anchor": {"y_top": 14, "y_bottom": 38}}
+        next_system_row = {"anchor": {"y_top": 90, "y_bottom": 120}}
 
         with patch.object(WORKER.fitz, "Rect", _FakeRect):
-            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+            spec = WORKER._measure_crop_spec(
+                page_rect,
+                measure_row,
+                next_measure_row,
+                system_row,
+                None,
+                next_system_row,
+            )
 
         clip = spec["clip"]
         padding = spec["padding"]
         self.assertEqual(padding.get("top"), 24.0)
-        self.assertEqual(padding.get("bottom"), 10.0)
+        self.assertEqual(padding.get("bottom"), 24.0)
         self.assertEqual(clip.y0, 0.0)
-        self.assertEqual(clip.y1, 48.0)
+        self.assertEqual(clip.y1, 62.0)
 
     def test_measure_crop_spec_old_style_multi_rest_stays_generous_above(self):
         page_rect = _FakeRect(0, 0, 220, 180)
         measure_row = {"x_left": 24, "y_top": 86, "y_bottom": 104}
         next_measure_row = {"x_left": 76}
-        system_row = {"anchor": {"y_top": 70, "y_bottom": 118}}
+        system_row = {"anchor": {"y_top": 86, "y_bottom": 104}}
+        prev_system_row = {"anchor": {"y_top": 38, "y_bottom": 62}}
+        next_system_row = {"anchor": {"y_top": 138, "y_bottom": 160}}
 
         with patch.object(WORKER.fitz, "Rect", _FakeRect):
-            spec = WORKER._measure_crop_spec(page_rect, measure_row, next_measure_row, system_row)
+            spec = WORKER._measure_crop_spec(
+                page_rect,
+                measure_row,
+                next_measure_row,
+                system_row,
+                prev_system_row,
+                next_system_row,
+            )
 
         clip = spec["clip"]
         padding = spec["padding"]
         self.assertEqual(padding.get("top"), 20.0)
-        self.assertEqual(padding.get("bottom"), 10.0)
-        self.assertEqual(clip.y0, 70.0)
-        self.assertEqual(clip.y1, 114.0)
+        self.assertEqual(padding.get("bottom"), 18.0)
+        self.assertEqual(clip.y0, 68.0)
+        self.assertEqual(clip.y1, 122.0)
 
     def test_ai_suggest_start_initializes_running_state(self):
         artifacts = self._sample_artifacts()
