@@ -512,6 +512,89 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(measure_values["p1_s2_m0"], "6")
         self.assertEqual(measure_values["p2_s0_m0"], "9")
 
+    def test_system_start_anchor_measures_uses_first_visible_numbered_measure(self):
+        state = self._sample_state()
+        systems, measures, result_labels, _ = WORKER._recompute_measure_numbering(
+            state.get("systems"),
+            state.get("measures"),
+            state,
+        )
+        anchors = WORKER._system_start_anchor_measures(measures, result_labels)
+
+        self.assertEqual(
+            [(row["measure_id"], label) for row, label in anchors],
+            [
+                ("p1_s0_m0", "1"),
+                ("p1_s1_m0", "4"),
+                ("p1_s2_m0", "7"),
+                ("p2_s0_m0", "10"),
+            ],
+        )
+
+    def test_system_start_anchor_measures_skips_pickup_at_start_of_system(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {"p1_s1_m0": True}
+        systems, measures, result_labels, _ = WORKER._recompute_measure_numbering(
+            state.get("systems"),
+            state.get("measures"),
+            state,
+        )
+        anchors = WORKER._system_start_anchor_measures(measures, result_labels)
+
+        self.assertEqual(
+            [(row["measure_id"], label) for row, label in anchors],
+            [
+                ("p1_s0_m0", "1"),
+                ("p1_s1_m1", "4"),
+                ("p1_s2_m0", "6"),
+                ("p2_s0_m0", "9"),
+            ],
+        )
+
+    def test_system_start_anchor_measures_skips_pickup_and_rest_blank_measure(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {"p1_s1_m0": True}
+        state["rest_measures"] = {"p1_s1_m0": 2}
+        systems, measures, result_labels, _ = WORKER._recompute_measure_numbering(
+            state.get("systems"),
+            state.get("measures"),
+            state,
+        )
+        anchors = WORKER._system_start_anchor_measures(measures, result_labels)
+
+        self.assertEqual(
+            [(row["measure_id"], label) for row, label in anchors],
+            [
+                ("p1_s0_m0", "1"),
+                ("p1_s1_m1", "6"),
+                ("p1_s2_m0", "8"),
+                ("p2_s0_m0", "11"),
+            ],
+        )
+
+    def test_system_start_anchor_measures_skips_system_with_no_visible_numbers(self):
+        state = self._sample_state()
+        state["pickup_measures"] = {
+            "p1_s1_m0": True,
+            "p1_s1_m1": True,
+            "p1_s1_m2": True,
+        }
+        systems, measures, result_labels, _ = WORKER._recompute_measure_numbering(
+            state.get("systems"),
+            state.get("measures"),
+            state,
+        )
+        anchors = WORKER._system_start_anchor_measures(measures, result_labels)
+
+        self.assertEqual(
+            [(row["measure_id"], label) for row, label in anchors],
+            [
+                ("p1_s0_m0", "1"),
+                ("p1_s2_m0", "4"),
+                ("p2_s0_m0", "7"),
+            ],
+        )
+
     def test_pickup_wins_over_same_measure_number_override(self):
         state = self._sample_state()
         state["measure_number_overrides"] = {"p1_s1_m1": 20}

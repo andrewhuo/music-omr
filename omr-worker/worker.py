@@ -2563,6 +2563,28 @@ def _apply_post_measure_rest(
     return int(current_value)
 
 
+def _system_start_anchor_measures(
+    ordered_measures: list[dict] | None,
+    result_labels: dict[str, str] | None,
+) -> list[tuple[dict, str]]:
+    anchors: list[tuple[dict, str]] = []
+    seen_system_ids: set[str] = set()
+    labels = result_labels if isinstance(result_labels, dict) else {}
+    for measure in ordered_measures or []:
+        if not isinstance(measure, dict):
+            continue
+        system_id = str(measure.get("system_id") or "").strip()
+        if not system_id or system_id in seen_system_ids:
+            continue
+        measure_id = str(measure.get("measure_id") or "").strip()
+        label = str(labels.get(measure_id) or "").strip()
+        if not label:
+            continue
+        seen_system_ids.add(system_id)
+        anchors.append((measure, label))
+    return anchors
+
+
 def _apply_pickup_measure_rest(
     current_value: int,
     measure_id: str,
@@ -3261,14 +3283,9 @@ def _render_corrected_pdf(
             _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
             drawn += 1
     else:
-        # Staff-start mode still follows the measure sequence, but only the
-        # first measure on each system gets a visible label.
-        seen_system_ids: set[str] = set()
-        for measure in ordered_measures:
-            system_id = str(measure.get("system_id") or "").strip()
-            if not system_id or system_id in seen_system_ids:
-                continue
-            seen_system_ids.add(system_id)
+        # Staff-start mode reuses the same computed measure labels, but only
+        # draws the first visible numbered measure on each system.
+        for measure, label in _system_start_anchor_measures(ordered_measures, result_labels):
             page_no = _safe_int(measure.get("page"), 0)
             if page_no <= 0 or page_no > doc.page_count:
                 continue
@@ -3276,9 +3293,6 @@ def _render_corrected_pdf(
                 x_left = float(measure.get("x_left"))
                 y_top = float(measure.get("y_top"))
             except Exception:
-                continue
-            label = str(measure.get("current_value") or measure.get("render_label") or "").strip()
-            if not label:
                 continue
             page = doc[page_no - 1]
             _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
