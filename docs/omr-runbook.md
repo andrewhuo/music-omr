@@ -321,6 +321,17 @@ Worker logs include grep-friendly lines:
 - `RELABEL_TRACE_RESULT ...`
 - `RELABEL_TRACE_ERROR ...`
 
+For ending investigations, also grep Cloud Run `omr-trigger` logs for:
+
+- `RELABEL_ENDING_DEBUG ...`
+
+Those lines use the same `trace_id` and include:
+
+- `stage=input`: raw ending edits requested
+- `stage=groups`: saved ending map, ordered ending measures, inferred groups, ignored fragments
+- `stage=numbering`: per ending-measure numbering decision
+- `stage=close`: final value used when an ending group closes
+
 ## Fast relabel smoke test
 
 Use the helper script:
