@@ -1843,6 +1843,7 @@ def _build_system_measure_request(
 def _generate_ai_suggestions_for_system_batch(
     job_id: str,
     run_id: int,
+    systems: list[dict] | None,
     system_row: dict,
     system_measures: list[dict],
     source_state_version: str | None,
@@ -1869,8 +1870,8 @@ def _generate_ai_suggestions_for_system_batch(
         _download_gcs_to_file(baseline_pdf_uri, in_pdf)
         doc = fitz.open(str(in_pdf))
         try:
-            systems = _sorted_system_rows(editable_state.get("systems") or [])
-            prev_system_row, next_system_row = _same_page_neighbor_systems(systems, system_row)
+            ordered_systems = _sorted_system_rows(systems or [])
+            prev_system_row, next_system_row = _same_page_neighbor_systems(ordered_systems, system_row)
             page_number = _safe_int(system_row.get("page"), _safe_int(system_measures[0].get("page"), 1))
             page_index = max(0, int(page_number) - 1)
             if page_index >= len(doc):
@@ -3972,6 +3973,7 @@ def ai_suggest_job_step(job_id: str):
         system_result = _generate_ai_suggestions_for_system_batch(
             job_id,
             int(artifact_run_id),
+            systems,
             system_row,
             system_measures,
             source_state_version,

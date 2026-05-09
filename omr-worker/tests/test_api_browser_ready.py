@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -138,6 +139,25 @@ class _FakeRect:
         return self.y1 - self.y0
 
 
+class _FakePage:
+    def __init__(self, rect: _FakeRect):
+        self.rect = rect
+
+
+class _FakeDoc:
+    def __init__(self, pages):
+        self._pages = list(pages)
+
+    def __len__(self):
+        return len(self._pages)
+
+    def __getitem__(self, index):
+        return self._pages[index]
+
+    def close(self):
+        return None
+
+
 class _FakeUploadFile:
     def __init__(self, filename: str, content_type: str, data: bytes):
         self.filename = filename
@@ -153,6 +173,7 @@ class BrowserReadyApiTests(unittest.TestCase):
     def setUp(self):
         os.environ["CORS_ALLOW_ORIGINS"] = "http://localhost:5173"
         os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-6"
+        os.environ["ANTHROPIC_API_KEY"] = "test-key"
         WORKER.request = SimpleNamespace(path="", method="GET", headers={}, files={}, json={})
         WORKER._PENDING_DISPATCHES.clear()
 
@@ -674,6 +695,115 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
+
+    def test_generate_ai_suggestions_for_system_batch_uses_neighbor_systems_without_crashing(self):
+        artifacts = self._sample_artifacts()
+        editable_state = self._sample_mapping_summary().get("editable_state") or {}
+        system_batches = WORKER._ai_suggest_system_batches(editable_state)
+        system_row, system_measures = system_batches[0]
+        systems = editable_state.get("systems") or []
+        fake_doc = _FakeDoc([_FakePage(_FakeRect(0, 0, 200, 160))])
+        provider_payload = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "p1_s0_m0",
+                    "label": "pickup",
+                    "rest_count": None,
+                    "confidence": "medium",
+                },
+                {
+                    "measure_id": "p1_s0_m1",
+                    "label": "normal",
+                    "rest_count": None,
+                    "confidence": "high",
+                },
+            ],
+            "warnings": [],
+        }
+        message = {"content": [{"type": "text", "text": json.dumps(provider_payload)}]}
+
+        with (
+            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
+            patch.object(WORKER, "_anthropic_messages_create", return_value=message),
+            patch.object(WORKER.fitz, "open", return_value=fake_doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+        ):
+            result = WORKER._generate_ai_suggestions_for_system_batch(
+                "111",
+                111,
+                systems,
+                system_row,
+                system_measures,
+                "test-state",
+                artifacts,
+            )
+
+        by_measure_id = result.get("by_measure_id") or {}
+        self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
+        self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "pickup")
+        self.assertEqual((result.get("model") or ""), "claude-sonnet-4-6")
+
+    def test_ai_suggest_step_real_system_batch_path_no_longer_crashes(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggest_run"] = {
+            "status": "running",
+            "started_at_utc": "2026-05-05T00:00:00Z",
+            "updated_at_utc": "2026-05-05T00:00:00Z",
+            "completed_at_utc": None,
+            "failed_at_utc": None,
+            "systems_total": 2,
+            "systems_completed": 0,
+            "next_system_index": 0,
+            "source_run_id": 111,
+            "source_state_version": "test-state",
+            "last_error": None,
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
+        provider_payload = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "p1_s0_m0",
+                    "label": "pickup",
+                    "rest_count": None,
+                    "confidence": "medium",
+                },
+                {
+                    "measure_id": "p1_s0_m1",
+                    "label": "normal",
+                    "rest_count": None,
+                    "confidence": "high",
+                },
+            ],
+            "warnings": [],
+        }
+        message = {"content": [{"type": "text", "text": json.dumps(provider_payload)}]}
+        fake_doc = _FakeDoc([_FakePage(_FakeRect(0, 0, 200, 160))])
+
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
+            patch.object(WORKER, "_anthropic_messages_create", return_value=message),
+            patch.object(WORKER.fitz, "open", return_value=fake_doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job_step("111"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("status"), "running")
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
+        self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
 
     def test_ai_suggest_step_final_system_marks_completed(self):
         artifacts = self._sample_artifacts()
