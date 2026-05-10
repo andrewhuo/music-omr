@@ -1371,6 +1371,35 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertNotIn("model", parsed)
         self.assertEqual(((parsed.get("suggestions") or [])[0] or {}).get("measure_id"), "p1_s0_m0")
 
+    def test_build_system_measure_request_includes_stronger_pickup_rules(self):
+        mapping_summary = self._sample_mapping_summary()
+        editable_state = mapping_summary.get("editable_state") or {}
+        system_row = (editable_state.get("systems") or [])[0]
+        measure_rows = [row for row in (editable_state.get("measures") or []) if row.get("system_id") == "p1_s0"]
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+
+        with (
+            patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+        ):
+            payload = WORKER._build_system_measure_request(
+                "111",
+                111,
+                system_row,
+                measure_rows,
+                page,
+                pdf_source="corrected",
+            )
+
+        content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
+        intro = json.loads((content[0] or {}).get("text") or "{}")
+        rules = ((intro.get("instructions") or {}).get("rules")) or []
+        rules_text = "\n".join(str(row) for row in rules)
+        self.assertIn("Use the visible time signature in the crop to judge completeness.", rules_text)
+        self.assertIn("If the first measure is clearly too short for the visible time signature, label pickup.", rules_text)
+        self.assertIn("Examples: in 2/4, one quarter note in the first measure is pickup;", rules_text)
+        self.assertIn("If the time signature is unclear but the first measure looks short, label uncertain with maybe_label pickup.", rules_text)
+
 
 
 if __name__ == "__main__":
