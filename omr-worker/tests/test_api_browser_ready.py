@@ -643,6 +643,97 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("ai_suggestions", mapping_summary)
         self.assertEqual(((mapping_summary.get("ai_suggest_run") or {}).get("status")), "running")
 
+    def test_build_ai_batch_trace_payload_records_statuses_and_order(self):
+        systems = [
+            {"system_id": "p1_s0", "page": 1, "system_index": 0},
+            {"system_id": "p1_s1", "page": 1, "system_index": 1},
+        ]
+        measures = [
+            {
+                "measure_id": "m0",
+                "page": 1,
+                "system_id": "p1_s0",
+                "system_index": 0,
+                "measure_local_index": 0,
+                "x_left": 10,
+                "y_top": 20,
+                "y_bottom": 40,
+            },
+            {
+                "measure_id": "m1",
+                "page": 1,
+                "system_id": "p1_s1",
+                "system_index": 1,
+                "measure_local_index": 0,
+                "x_left": 50,
+                "y_top": 20,
+                "y_bottom": 40,
+            },
+            {
+                "measure_id": "m2",
+                "page": 1,
+                "system_id": "",
+                "system_index": 0,
+                "measure_local_index": 0,
+                "x_left": 90,
+                "y_top": 20,
+                "y_bottom": 40,
+            },
+            {
+                "measure_id": "m3",
+                "page": 1,
+                "system_id": "missing_system",
+                "system_index": 9,
+                "measure_local_index": 0,
+                "x_left": 130,
+                "y_top": 20,
+                "y_bottom": 40,
+            },
+            {
+                "measure_id": "m4",
+                "page": 1,
+                "system_id": "missing_after_reassign",
+                "system_index": 9,
+                "measure_local_index": 0,
+                "x_left": 170,
+                "y_top": 20,
+                "y_bottom": 40,
+            },
+        ]
+        before_snapshot = [
+            {"system_id_before_reassign": "p1_s0", "system_index_before_reassign": 0},
+            {"system_id_before_reassign": "p1_s0", "system_index_before_reassign": 0},
+            {"system_id_before_reassign": "", "system_index_before_reassign": 0},
+            {"system_id_before_reassign": "missing_system", "system_index_before_reassign": 9},
+            {"system_id_before_reassign": "p1_s0", "system_index_before_reassign": 0},
+        ]
+        system_batches = [
+            (systems[0], [measures[0]]),
+            (systems[1], [measures[1]]),
+        ]
+
+        payload = WORKER._build_ai_batch_trace_payload(
+            "job-1",
+            111,
+            systems,
+            measures,
+            system_batches,
+            before_snapshot=before_snapshot,
+        )
+
+        rows = {str(row.get("measure_id")): row for row in (payload.get("measures") or [])}
+        self.assertEqual((rows.get("m0") or {}).get("status"), "batched")
+        self.assertEqual((rows.get("m1") or {}).get("status"), "reassigned_and_batched")
+        self.assertEqual((rows.get("m2") or {}).get("status"), "skipped_missing_system_id")
+        self.assertEqual((rows.get("m3") or {}).get("status"), "skipped_no_matching_system")
+        self.assertEqual((rows.get("m4") or {}).get("status"), "reassigned_but_unbatched")
+        self.assertEqual(payload.get("measure_count"), 5)
+        self.assertEqual(payload.get("batched_count"), 2)
+        self.assertEqual(payload.get("skipped_count"), 3)
+        systems_summary = {str(row.get("system_id")): row for row in (payload.get("systems") or [])}
+        self.assertEqual((systems_summary.get("p1_s0") or {}).get("measure_ids_batched"), ["m0"])
+        self.assertEqual((systems_summary.get("p1_s1") or {}).get("measure_ids_batched"), ["m1"])
+
     def test_ai_suggest_step_persists_one_system_and_advances_progress(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
@@ -695,6 +786,61 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
+
+    def test_ai_suggest_step_returns_debug_batch_trace_when_enabled(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggest_run"] = {
+            "status": "running",
+            "started_at_utc": "2026-05-05T00:00:00Z",
+            "updated_at_utc": "2026-05-05T00:00:00Z",
+            "completed_at_utc": None,
+            "failed_at_utc": None,
+            "systems_total": 2,
+            "systems_completed": 0,
+            "next_system_index": 0,
+            "source_run_id": 111,
+            "source_state_version": "test-state",
+            "last_error": None,
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(
+                WORKER,
+                "_generate_ai_suggestions_for_system_batch",
+                return_value={
+                    "version": "ai_suggestions_v1",
+                    "generated_at_utc": "2026-05-05T00:00:01Z",
+                    "provider": "claude",
+                    "model": "claude-test",
+                    "source_run_id": 111,
+                    "by_measure_id": {
+                        "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"}
+                    },
+                    "warnings": [],
+                    "summary": {"systems_processed": 1, "measures_seen": 2, "suggestions_kept": 1, "normal_measures_omitted": 1},
+                },
+            ),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(WORKER, "_signed_http_url_for_gs", return_value="https://signed/debug"),
+            patch.object(WORKER, "_gcs_uri_exists", return_value=False),
+            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=True),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job_step("111"))
+
+        self.assertEqual(status, 200)
+        debug_batch_trace = body.get("debug_batch_trace") or {}
+        self.assertEqual(debug_batch_trace.get("enabled"), True)
+        self.assertEqual(debug_batch_trace.get("measure_count"), 3)
+        self.assertEqual(debug_batch_trace.get("batched_count"), 3)
+        self.assertEqual(debug_batch_trace.get("skipped_count"), 0)
+        self.assertEqual(debug_batch_trace.get("trace_http"), "https://signed/debug")
 
     def test_generate_ai_suggestions_for_system_batch_uses_neighbor_systems_without_crashing(self):
         artifacts = self._sample_artifacts()

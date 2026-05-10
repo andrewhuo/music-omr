@@ -1551,6 +1551,10 @@ def _ai_debug_crop_manifest_uri(artifacts: dict) -> str:
     return f"{_ai_debug_crops_prefix(artifacts)}/manifest.json"
 
 
+def _ai_debug_batch_trace_uri(artifacts: dict) -> str:
+    return f"{_ai_debug_crops_prefix(artifacts)}/ai_batch_trace.json"
+
+
 def _ai_debug_crop_measure_uri(artifacts: dict, system_id: str, measure_id: str) -> str:
     safe_system = _normalize_artifact_key(system_id) or "system"
     safe_measure = _normalize_artifact_key(measure_id) or "measure"
@@ -1719,6 +1723,195 @@ def _build_ai_debug_crops_manifest(
         "manifest_http": _signed_http_url_for_gs(manifest_uri),
         "count": len(crop_rows),
     }
+
+
+def _ai_batch_trace_before_snapshot(measures: list[dict] | None) -> list[dict | None]:
+    snapshot: list[dict | None] = []
+    for row in measures or []:
+        if not isinstance(row, dict):
+            snapshot.append(None)
+            continue
+        snapshot.append(
+            {
+                "system_id_before_reassign": str(row.get("system_id") or "").strip(),
+                "system_index_before_reassign": _safe_int(row.get("system_index"), 0),
+            }
+        )
+    return snapshot
+
+
+def _build_ai_batch_trace_payload(
+    job_id: str,
+    run_id: int,
+    systems: list[dict] | None,
+    measures: list[dict] | None,
+    system_batches: list[tuple[dict, list[dict]]] | None,
+    before_snapshot: list[dict | None] | None = None,
+    processed_system_ids: list[str] | None = None,
+) -> dict:
+    ordered_systems = _sorted_system_rows(systems or [])
+    ordered_measures = list(measures or [])
+    before_rows = list(before_snapshot or [])
+    valid_system_ids = {
+        str(row.get("system_id") or "").strip()
+        for row in ordered_systems
+        if isinstance(row, dict) and str(row.get("system_id") or "").strip()
+    }
+
+    batched_measure_to_system: dict[str, str] = {}
+    system_summaries: list[dict] = []
+    processed_lookup = {
+        str(system_id or "").strip()
+        for system_id in (processed_system_ids or [])
+        if str(system_id or "").strip()
+    }
+
+    for system_row, system_measures in system_batches or []:
+        if not isinstance(system_row, dict):
+            continue
+        system_id = str(system_row.get("system_id") or "").strip()
+        if not system_id:
+            continue
+        measure_ids_batched: list[str] = []
+        for row in system_measures or []:
+            if not isinstance(row, dict):
+                continue
+            measure_id = str(row.get("measure_id") or "").strip()
+            if not measure_id:
+                continue
+            batched_measure_to_system[measure_id] = system_id
+            measure_ids_batched.append(measure_id)
+        system_summaries.append(
+            {
+                "system_id": system_id,
+                "page": _safe_int(system_row.get("page"), 0),
+                "measure_ids_batched": measure_ids_batched,
+                "count": len(measure_ids_batched),
+                "processed": system_id in processed_lookup,
+            }
+        )
+
+    trace_rows: list[dict] = []
+    batched_count = 0
+    skipped_count = 0
+
+    for index, row in enumerate(ordered_measures):
+        if not isinstance(row, dict):
+            continue
+        before_row = before_rows[index] if index < len(before_rows) else None
+        before_system_id = str((before_row or {}).get("system_id_before_reassign") or str(row.get("system_id") or "")).strip()
+        before_system_index = _safe_int((before_row or {}).get("system_index_before_reassign"), _safe_int(row.get("system_index"), 0))
+        measure_id = str(row.get("measure_id") or "").strip()
+        after_system_id = str(row.get("system_id") or "").strip()
+        after_system_index = _safe_int(row.get("system_index"), 0)
+        batch_system_id = str(batched_measure_to_system.get(measure_id) or "").strip() or None
+        changed = before_system_id != after_system_id or before_system_index != after_system_index
+
+        if batch_system_id:
+            status = "reassigned_and_batched" if changed else "batched"
+            batched_count += 1
+        elif not after_system_id:
+            status = "skipped_missing_system_id"
+            skipped_count += 1
+        elif after_system_id not in valid_system_ids:
+            status = "reassigned_but_unbatched" if changed else "skipped_no_matching_system"
+            skipped_count += 1
+        else:
+            status = "reassigned_but_unbatched" if changed else "skipped_no_matching_system"
+            skipped_count += 1
+
+        trace_rows.append(
+            {
+                "measure_id": measure_id,
+                "page": _safe_int(row.get("page"), 0),
+                "system_id_before_reassign": before_system_id or None,
+                "system_index_before_reassign": before_system_index,
+                "system_id_after_reassign": after_system_id or None,
+                "system_index_after_reassign": after_system_index,
+                "measure_local_index": _safe_int(row.get("measure_local_index"), 0),
+                "x_left": float(row.get("x_left") or 0.0),
+                "y_top": float(row.get("y_top") or 0.0),
+                "y_bottom": float(row.get("y_bottom") or 0.0),
+                "batch_system_id": batch_system_id,
+                "status": status,
+                "processed": bool(batch_system_id and batch_system_id in processed_lookup),
+            }
+        )
+
+    return {
+        "version": "ai_batch_trace_v1",
+        "enabled": True,
+        "job_id": str(job_id),
+        "run_id": int(run_id),
+        "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+        "updated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+        "measure_count": len(trace_rows),
+        "batched_count": batched_count,
+        "skipped_count": skipped_count,
+        "processed_system_ids": sorted(processed_lookup),
+        "systems": system_summaries,
+        "measures": trace_rows,
+    }
+
+
+def _mark_ai_batch_trace_processed(
+    payload: dict,
+    system_row: dict | None,
+    system_measures: list[dict] | None,
+) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    updated = json.loads(json.dumps(payload))
+    system_id = str((system_row or {}).get("system_id") or "").strip()
+    if not system_id:
+        return updated
+    processed_ids = [
+        str(item or "").strip()
+        for item in updated.get("processed_system_ids") or []
+        if str(item or "").strip()
+    ]
+    if system_id not in processed_ids:
+        processed_ids.append(system_id)
+    updated["processed_system_ids"] = processed_ids
+
+    for summary in updated.get("systems") or []:
+        if isinstance(summary, dict) and str(summary.get("system_id") or "").strip() == system_id:
+            summary["processed"] = True
+
+    target_measure_ids = {
+        str(row.get("measure_id") or "").strip()
+        for row in system_measures or []
+        if isinstance(row, dict) and str(row.get("measure_id") or "").strip()
+    }
+    for row in updated.get("measures") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("measure_id") or "").strip() in target_measure_ids:
+            row["processed"] = True
+
+    updated["updated_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
+    return updated
+
+
+def _write_ai_debug_batch_trace(payload: dict, artifacts: dict) -> dict:
+    trace_uri = _ai_debug_batch_trace_uri(artifacts)
+    _upload_json_to_gcs(payload, trace_uri)
+    return {
+        "enabled": True,
+        "trace_uri": trace_uri,
+        "trace_http": _signed_http_url_for_gs(trace_uri),
+        "measure_count": max(0, _safe_int(payload.get("measure_count"), 0)),
+        "batched_count": max(0, _safe_int(payload.get("batched_count"), 0)),
+        "skipped_count": max(0, _safe_int(payload.get("skipped_count"), 0)),
+    }
+
+
+def _load_ai_debug_batch_trace(artifacts: dict) -> dict | None:
+    trace_uri = _ai_debug_batch_trace_uri(artifacts)
+    if not _gcs_uri_exists(trace_uri):
+        return None
+    payload = _download_gcs_json(trace_uri)
+    return payload if isinstance(payload, dict) else None
 
 
 def _build_system_measure_request(
@@ -3707,6 +3900,7 @@ def ai_suggest_job(job_id: str):
     measures = editable_state.get("measures")
     if not isinstance(measures, list):
         measures = []
+    batch_trace_before_rows = _ai_batch_trace_before_snapshot(measures) if _ai_suggest_debug_enabled() else None
     _editable_rest_measures(editable_state)
     _editable_pickup_measures(editable_state)
     reassign_count = _reassign_measures_to_nearest_system(systems, measures)
@@ -3725,6 +3919,7 @@ def ai_suggest_job(job_id: str):
         len(_sorted_measure_rows(editable_state.get("measures") or [])),
     )
     system_batches = _ai_suggest_system_batches(editable_state)
+    debug_batch_trace = None
     run_status = AI_SUGGEST_RUN_STATUS_RUNNING if system_batches else AI_SUGGEST_RUN_STATUS_COMPLETED
     mapping_summary["ai_suggest_run"] = _new_ai_suggest_run_state(
         int(artifact_run_id),
@@ -3753,6 +3948,20 @@ def ai_suggest_job(job_id: str):
             500,
         )
 
+    if _ai_suggest_debug_enabled():
+        try:
+            payload = _build_ai_batch_trace_payload(
+                job_id,
+                int(artifact_run_id),
+                systems,
+                measures,
+                system_batches,
+                before_snapshot=batch_trace_before_rows,
+            )
+            debug_batch_trace = _write_ai_debug_batch_trace(payload, artifacts)
+        except Exception as exc:
+            logger.warning("AI_BATCH_TRACE_START_WARN job_id=%s detail=%s", job_id, _safe_error_text(exc))
+
     response = {
         "job_id": job_id,
         "run_id": int(artifact_run_id),
@@ -3764,6 +3973,8 @@ def ai_suggest_job(job_id: str):
         "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
         "duration_ms": int((time.time() - started) * 1000),
     }
+    if isinstance(debug_batch_trace, dict):
+        response["debug_batch_trace"] = debug_batch_trace
     if rec and isinstance(rec, dict) and rec.get("pdf_gcs_uri"):
         response["pdf_gcs_uri"] = rec.get("pdf_gcs_uri")
     return jsonify(response), 200
@@ -3857,6 +4068,7 @@ def ai_suggest_job_step(job_id: str):
     measures = editable_state.get("measures")
     if not isinstance(measures, list):
         measures = []
+    batch_trace_before_rows = _ai_batch_trace_before_snapshot(measures) if _ai_suggest_debug_enabled() else None
     _editable_rest_measures(editable_state)
     _editable_pickup_measures(editable_state)
     reassign_count = _reassign_measures_to_nearest_system(systems, measures)
@@ -3881,27 +4093,42 @@ def ai_suggest_job_step(job_id: str):
     system_batches = _ai_suggest_system_batches(editable_state)
     systems_total = len(system_batches)
     ai_suggest_run["systems_total"] = systems_total
+    debug_batch_trace = None
+    debug_batch_trace_payload = None
+    if _ai_suggest_debug_enabled():
+        try:
+            debug_batch_trace_payload = _load_ai_debug_batch_trace(artifacts)
+            if not isinstance(debug_batch_trace_payload, dict):
+                debug_batch_trace_payload = _build_ai_batch_trace_payload(
+                    job_id,
+                    int(artifact_run_id),
+                    systems,
+                    measures,
+                    system_batches,
+                    before_snapshot=batch_trace_before_rows,
+                )
+            debug_batch_trace = _write_ai_debug_batch_trace(debug_batch_trace_payload, artifacts)
+        except Exception as exc:
+            logger.warning("AI_BATCH_TRACE_STEP_WARN job_id=%s detail=%s", job_id, _safe_error_text(exc))
 
     if ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_IDLE:
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(artifact_run_id),
-                    "status": AI_SUGGEST_RUN_STATUS_IDLE,
-                    "ai_suggestions": ai_suggestions,
-                    "ai_suggest_run": ai_suggest_run,
-                    "error": {
-                        "code": "ai_suggest_not_started",
-                        "message": "AI suggestion run has not been started.",
-                        "retryable": True,
-                        "provider_status": 409,
-                        "detail": "ai_suggest_not_started",
-                    },
-                }
-            ),
-            409,
-        )
+        response = {
+            "job_id": job_id,
+            "run_id": int(artifact_run_id),
+            "status": AI_SUGGEST_RUN_STATUS_IDLE,
+            "ai_suggestions": ai_suggestions,
+            "ai_suggest_run": ai_suggest_run,
+            "error": {
+                "code": "ai_suggest_not_started",
+                "message": "AI suggestion run has not been started.",
+                "retryable": True,
+                "provider_status": 409,
+                "detail": "ai_suggest_not_started",
+            },
+        }
+        if isinstance(debug_batch_trace, dict):
+            response["debug_batch_trace"] = debug_batch_trace
+        return jsonify(response), 409
 
     if ai_suggest_run.get("source_state_version") and ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_RUNNING:
         if str(ai_suggest_run.get("source_state_version") or "") != str(source_state_version or ""):
@@ -3932,6 +4159,7 @@ def ai_suggest_job_step(job_id: str):
                         "artifacts": artifacts,
                         "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
                         "duration_ms": int((time.time() - started) * 1000),
+                        **({"debug_batch_trace": debug_batch_trace} if isinstance(debug_batch_trace, dict) else {}),
                     }
                 ),
                 200,
@@ -3949,6 +4177,8 @@ def ai_suggest_job_step(job_id: str):
             "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
             "duration_ms": int((time.time() - started) * 1000),
         }
+        if isinstance(debug_batch_trace, dict):
+            response["debug_batch_trace"] = debug_batch_trace
         if isinstance(ai_suggest_run.get("last_error"), dict):
             response["error"] = ai_suggest_run.get("last_error")
         return jsonify(response), 200
@@ -3976,6 +4206,7 @@ def ai_suggest_job_step(job_id: str):
                     "artifacts": artifacts,
                     "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
                     "duration_ms": int((time.time() - started) * 1000),
+                    **({"debug_batch_trace": debug_batch_trace} if isinstance(debug_batch_trace, dict) else {}),
                 }
             ),
             200,
@@ -3996,6 +4227,16 @@ def ai_suggest_job_step(job_id: str):
         if isinstance(system_result, dict):
             debug_crops = system_result.pop("debug_crops", None)
         ai_suggestions = _merge_ai_suggestions_state(ai_suggestions, system_result, int(artifact_run_id), source_state_version)
+        if isinstance(debug_batch_trace_payload, dict):
+            try:
+                debug_batch_trace_payload = _mark_ai_batch_trace_processed(
+                    debug_batch_trace_payload,
+                    system_row,
+                    system_measures,
+                )
+                debug_batch_trace = _write_ai_debug_batch_trace(debug_batch_trace_payload, artifacts)
+            except Exception as exc:
+                logger.warning("AI_BATCH_TRACE_MARK_WARN job_id=%s detail=%s", job_id, _safe_error_text(exc))
         now_txt = _utc_now().isoformat().replace("+00:00", "Z")
         completed_count = min(systems_total, next_system_index + 1)
         ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_COMPLETED if completed_count >= systems_total else AI_SUGGEST_RUN_STATUS_RUNNING
@@ -4022,6 +4263,8 @@ def ai_suggest_job_step(job_id: str):
         }
         if isinstance(debug_crops, dict):
             response["debug_crops"] = debug_crops
+        if isinstance(debug_batch_trace, dict):
+            response["debug_batch_trace"] = debug_batch_trace
         return jsonify(response), 200
     except Exception as exc:
         error_payload = _ai_suggest_error_payload(exc)
@@ -4066,6 +4309,8 @@ def ai_suggest_job_step(job_id: str):
         }
         if isinstance(getattr(exc, "debug_crops", None), dict):
             response["debug_crops"] = getattr(exc, "debug_crops")
+        if isinstance(debug_batch_trace, dict):
+            response["debug_batch_trace"] = debug_batch_trace
         return jsonify(response), 200
 
 
