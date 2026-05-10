@@ -1740,6 +1740,14 @@ def _ai_batch_trace_before_snapshot(measures: list[dict] | None) -> list[dict | 
     return snapshot
 
 
+def _debug_display_system_number(system_index: object) -> int:
+    return max(1, _safe_int(system_index, 0) + 1)
+
+
+def _debug_display_measure_number(measure_local_index: object) -> int:
+    return max(1, _safe_int(measure_local_index, 0) + 1)
+
+
 def _build_ai_batch_trace_payload(
     job_id: str,
     run_id: int,
@@ -1785,6 +1793,8 @@ def _build_ai_batch_trace_payload(
             {
                 "system_id": system_id,
                 "page": _safe_int(system_row.get("page"), 0),
+                "display_system_number": _debug_display_system_number(system_row.get("system_index")),
+                "display_location": f"Page {_safe_int(system_row.get('page'), 0)}, Staff {_debug_display_system_number(system_row.get('system_index'))}",
                 "measure_ids_batched": measure_ids_batched,
                 "count": len(measure_ids_batched),
                 "processed": system_id in processed_lookup,
@@ -1804,6 +1814,8 @@ def _build_ai_batch_trace_payload(
         measure_id = str(row.get("measure_id") or "").strip()
         after_system_id = str(row.get("system_id") or "").strip()
         after_system_index = _safe_int(row.get("system_index"), 0)
+        display_system_number = _debug_display_system_number(after_system_index)
+        display_measure_number = _debug_display_measure_number(row.get("measure_local_index"))
         batch_system_id = str(batched_measure_to_system.get(measure_id) or "").strip() or None
         changed = before_system_id != after_system_id or before_system_index != after_system_index
 
@@ -1824,6 +1836,9 @@ def _build_ai_batch_trace_payload(
             {
                 "measure_id": measure_id,
                 "page": _safe_int(row.get("page"), 0),
+                "display_system_number": display_system_number,
+                "display_measure_number": display_measure_number,
+                "display_location": f"Page {_safe_int(row.get('page'), 0)}, Staff {display_system_number}, Measure {display_measure_number}",
                 "system_id_before_reassign": before_system_id or None,
                 "system_index_before_reassign": before_system_index,
                 "system_id_after_reassign": after_system_id or None,
@@ -1989,6 +2004,13 @@ def _build_system_measure_request(
                     "measure_id": measure_id,
                     "system_id": system_id,
                     "page_number": int(page_number),
+                    "display_system_number": _debug_display_system_number(system_row.get("system_index")),
+                    "display_measure_number": _debug_display_measure_number(row.get("measure_local_index")),
+                    "display_location": (
+                        f"Page {int(page_number)}, "
+                        f"Staff {_debug_display_system_number(system_row.get('system_index'))}, "
+                        f"Measure {_debug_display_measure_number(row.get('measure_local_index'))}"
+                    ),
                     "order_index_in_system": _safe_int(row.get("measure_local_index"), idx),
                     "crop_uri": crop_uri,
                     "clip_rect": {

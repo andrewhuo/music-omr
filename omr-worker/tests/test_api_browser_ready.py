@@ -723,7 +723,11 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         rows = {str(row.get("measure_id")): row for row in (payload.get("measures") or [])}
         self.assertEqual((rows.get("m0") or {}).get("status"), "batched")
+        self.assertEqual((rows.get("m0") or {}).get("display_system_number"), 1)
+        self.assertEqual((rows.get("m0") or {}).get("display_measure_number"), 1)
         self.assertEqual((rows.get("m1") or {}).get("status"), "reassigned_and_batched")
+        self.assertEqual((rows.get("m1") or {}).get("display_system_number"), 2)
+        self.assertEqual((rows.get("m1") or {}).get("display_measure_number"), 1)
         self.assertEqual((rows.get("m2") or {}).get("status"), "skipped_missing_system_id")
         self.assertEqual((rows.get("m3") or {}).get("status"), "skipped_no_matching_system")
         self.assertEqual((rows.get("m4") or {}).get("status"), "reassigned_but_unbatched")
@@ -733,6 +737,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         systems_summary = {str(row.get("system_id")): row for row in (payload.get("systems") or [])}
         self.assertEqual((systems_summary.get("p1_s0") or {}).get("measure_ids_batched"), ["m0"])
         self.assertEqual((systems_summary.get("p1_s1") or {}).get("measure_ids_batched"), ["m1"])
+        self.assertEqual((systems_summary.get("p1_s0") or {}).get("display_system_number"), 1)
+        self.assertEqual((systems_summary.get("p1_s1") or {}).get("display_system_number"), 2)
 
     def test_ai_suggest_step_persists_one_system_and_advances_progress(self):
         artifacts = self._sample_artifacts()
