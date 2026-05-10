@@ -1561,6 +1561,32 @@ def _ai_debug_crop_measure_uri(artifacts: dict, system_id: str, measure_id: str)
     return f"{_ai_debug_crops_prefix(artifacts)}/{safe_system}/{safe_measure}.png"
 
 
+def _resolve_ai_crop_pdf_source(artifacts: dict, tmpdir: Path) -> tuple[Path, str]:
+    corrected_pdf_uri = str((artifacts or {}).get("audiveris_out_corrected_pdf") or "").strip()
+    baseline_pdf_uri = str((artifacts or {}).get("audiveris_out_pdf") or "").strip()
+    if not baseline_pdf_uri:
+        raise AiSuggestError(provider_status=500, detail="baseline_pdf_missing")
+
+    if corrected_pdf_uri:
+        corrected_pdf = tmpdir / "audiveris_out_corrected.pdf"
+        try:
+            _download_gcs_to_file(corrected_pdf_uri, corrected_pdf)
+            return corrected_pdf, "corrected"
+        except Exception as exc:
+            logger.warning("AI_CROP_PDF_FALLBACK detail=%s", _safe_error_text(exc))
+
+    baseline_pdf = tmpdir / "audiveris_out.pdf"
+    _download_gcs_to_file(baseline_pdf_uri, baseline_pdf)
+    return baseline_pdf, "baseline"
+
+
+def _current_ai_crop_pdf_source_label(artifacts: dict) -> str:
+    corrected_pdf_uri = str((artifacts or {}).get("audiveris_out_corrected_pdf") or "").strip()
+    if corrected_pdf_uri and _gcs_uri_exists(corrected_pdf_uri):
+        return "corrected"
+    return "baseline"
+
+
 def _system_anchor_bounds(system_row: dict | None) -> tuple[float | None, float | None]:
     if not isinstance(system_row, dict):
         return (None, None)
@@ -1705,6 +1731,7 @@ def _build_ai_debug_crops_manifest(
     run_id: int,
     artifacts: dict,
     crop_rows: list[dict],
+    pdf_source: str | None = None,
 ) -> dict:
     manifest_uri = _ai_debug_crop_manifest_uri(artifacts)
     payload = {
@@ -1712,6 +1739,7 @@ def _build_ai_debug_crops_manifest(
         "enabled": True,
         "job_id": str(job_id),
         "run_id": int(run_id),
+        "pdf_source": str(pdf_source or "baseline"),
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "count": len(crop_rows),
         "crops": crop_rows,
@@ -1721,6 +1749,7 @@ def _build_ai_debug_crops_manifest(
         "enabled": True,
         "manifest_uri": manifest_uri,
         "manifest_http": _signed_http_url_for_gs(manifest_uri),
+        "pdf_source": str(pdf_source or "baseline"),
         "count": len(crop_rows),
     }
 
@@ -1756,6 +1785,7 @@ def _build_ai_batch_trace_payload(
     system_batches: list[tuple[dict, list[dict]]] | None,
     before_snapshot: list[dict | None] | None = None,
     processed_system_ids: list[str] | None = None,
+    pdf_source: str | None = None,
 ) -> dict:
     ordered_systems = _sorted_system_rows(systems or [])
     ordered_measures = list(measures or [])
@@ -1858,6 +1888,7 @@ def _build_ai_batch_trace_payload(
         "enabled": True,
         "job_id": str(job_id),
         "run_id": int(run_id),
+        "pdf_source": str(pdf_source or "baseline"),
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "updated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
         "measure_count": len(trace_rows),
@@ -1915,6 +1946,7 @@ def _write_ai_debug_batch_trace(payload: dict, artifacts: dict) -> dict:
         "enabled": True,
         "trace_uri": trace_uri,
         "trace_http": _signed_http_url_for_gs(trace_uri),
+        "pdf_source": str(payload.get("pdf_source") or "baseline"),
         "measure_count": max(0, _safe_int(payload.get("measure_count"), 0)),
         "batched_count": max(0, _safe_int(payload.get("batched_count"), 0)),
         "skipped_count": max(0, _safe_int(payload.get("skipped_count"), 0)),
@@ -1935,6 +1967,7 @@ def _build_system_measure_request(
     system_row: dict,
     measure_rows: list[dict],
     page,
+    pdf_source: str = "baseline",
     prev_system_row: dict | None = None,
     next_system_row: dict | None = None,
     artifacts: dict | None = None,
@@ -2004,6 +2037,7 @@ def _build_system_measure_request(
                     "measure_id": measure_id,
                     "system_id": system_id,
                     "page_number": int(page_number),
+                    "pdf_source": pdf_source,
                     "display_system_number": _debug_display_system_number(system_row.get("system_index")),
                     "display_measure_number": _debug_display_measure_number(row.get("measure_local_index")),
                     "display_location": (
@@ -2032,6 +2066,7 @@ def _build_system_measure_request(
                         "measure_id": str(row.get("measure_id") or "").strip(),
                         "order_index_in_system": _safe_int(row.get("measure_local_index"), idx),
                         "is_first_measure_of_score": _safe_int(row.get("global_index"), -1) == 0,
+                        "pdf_source": pdf_source,
                     },
                     ensure_ascii=True,
                 ),
@@ -2067,22 +2102,19 @@ def _generate_ai_suggestions_for_system_batch(
     model_name = str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
     if not model_name or not _anthropic_api_key():
         raise AiSuggestError(provider_status=503, detail="provider_not_configured")
-    baseline_pdf_uri = str((artifacts or {}).get("audiveris_out_pdf") or "").strip()
-    if not baseline_pdf_uri:
-        raise AiSuggestError(provider_status=500, detail="baseline_pdf_missing")
 
     debug_enabled = _ai_suggest_debug_enabled()
     debug_crop_rows: list[dict] = []
+    pdf_source = "baseline"
 
     def _finalize_debug_crops() -> dict | None:
         if not debug_enabled or not debug_crop_rows:
             return None
-        return _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows)
+        return _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows, pdf_source=pdf_source)
 
     with TemporaryDirectory(prefix="omr-ai-suggest-step-") as tmp:
         tmpdir = Path(tmp)
-        in_pdf = tmpdir / "audiveris_out.pdf"
-        _download_gcs_to_file(baseline_pdf_uri, in_pdf)
+        in_pdf, pdf_source = _resolve_ai_crop_pdf_source(artifacts, tmpdir)
         doc = fitz.open(str(in_pdf))
         try:
             ordered_systems = _sorted_system_rows(systems or [])
@@ -2098,6 +2130,7 @@ def _generate_ai_suggestions_for_system_batch(
                 system_row,
                 system_measures,
                 page,
+                pdf_source=pdf_source,
                 prev_system_row=prev_system_row,
                 next_system_row=next_system_row,
                 artifacts=artifacts if debug_enabled else None,
@@ -2129,6 +2162,7 @@ def _generate_ai_suggestions_for_system_batch(
                 int(run_id),
                 source_state_version,
             )
+            normalized["pdf_source"] = pdf_source
             debug_crops = _finalize_debug_crops()
             if debug_crops is not None:
                 normalized["debug_crops"] = debug_crops
@@ -2167,21 +2201,18 @@ def _generate_ai_suggestions_for_job(
 
     warnings: list[dict] = []
     suggestions: list[dict] = []
-    baseline_pdf_uri = str((artifacts or {}).get("audiveris_out_pdf") or "").strip()
-    if not baseline_pdf_uri:
-        raise AiSuggestError(provider_status=500, detail="baseline_pdf_missing")
     debug_enabled = _ai_suggest_debug_enabled()
     debug_crop_rows: list[dict] = []
+    pdf_source = "baseline"
 
     def _finalize_debug_crops() -> dict | None:
         if not debug_enabled or not debug_crop_rows:
             return None
-        return _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows)
+        return _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows, pdf_source=pdf_source)
 
     with TemporaryDirectory(prefix="omr-ai-suggest-") as tmp:
         tmpdir = Path(tmp)
-        in_pdf = tmpdir / "audiveris_out.pdf"
-        _download_gcs_to_file(baseline_pdf_uri, in_pdf)
+        in_pdf, pdf_source = _resolve_ai_crop_pdf_source(artifacts, tmpdir)
         doc = fitz.open(str(in_pdf))
         try:
             for system_row in systems:
@@ -2201,6 +2232,7 @@ def _generate_ai_suggestions_for_job(
                     system_row,
                     system_measures,
                     page,
+                    pdf_source=pdf_source,
                     prev_system_row=prev_system_row,
                     next_system_row=next_system_row,
                     artifacts=artifacts if debug_enabled else None,
@@ -2255,6 +2287,7 @@ def _generate_ai_suggestions_for_job(
         "model": model_name,
         "suggestions": suggestions,
         "warnings": warnings,
+        "pdf_source": pdf_source,
     }
     debug_crops = _finalize_debug_crops()
     if debug_crops is not None:
@@ -3979,6 +4012,7 @@ def ai_suggest_job(job_id: str):
                 measures,
                 system_batches,
                 before_snapshot=batch_trace_before_rows,
+                pdf_source=_current_ai_crop_pdf_source_label(artifacts),
             )
             debug_batch_trace = _write_ai_debug_batch_trace(payload, artifacts)
         except Exception as exc:
@@ -4128,6 +4162,7 @@ def ai_suggest_job_step(job_id: str):
                     measures,
                     system_batches,
                     before_snapshot=batch_trace_before_rows,
+                    pdf_source=_current_ai_crop_pdf_source_label(artifacts),
                 )
             debug_batch_trace = _write_ai_debug_batch_trace(debug_batch_trace_payload, artifacts)
         except Exception as exc:

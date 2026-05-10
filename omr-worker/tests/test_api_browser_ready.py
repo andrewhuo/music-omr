@@ -5,6 +5,8 @@ import sys
 import types
 import unittest
 from copy import deepcopy
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -848,6 +850,48 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(debug_batch_trace.get("skipped_count"), 0)
         self.assertEqual(debug_batch_trace.get("trace_http"), "https://signed/debug")
 
+    def test_resolve_ai_crop_pdf_source_prefers_corrected_pdf(self):
+        artifacts = self._sample_artifacts()
+        with TemporaryDirectory(prefix="ai-crop-source-test-") as tmp:
+            tmpdir = Path(tmp)
+            download_calls: list[str] = []
+
+            def _fake_download(uri, dest):
+                download_calls.append(str(uri))
+                Path(dest).write_bytes(b"%PDF-1.4\n")
+
+            with patch.object(WORKER, "_download_gcs_to_file", side_effect=_fake_download):
+                pdf_path, pdf_source = WORKER._resolve_ai_crop_pdf_source(artifacts, tmpdir)
+
+        self.assertEqual(pdf_source, "corrected")
+        self.assertTrue(str(pdf_path).endswith("audiveris_out_corrected.pdf"))
+        self.assertEqual(download_calls, ["gs://x/output/audiveris_out_corrected.pdf"])
+
+    def test_resolve_ai_crop_pdf_source_falls_back_to_baseline(self):
+        artifacts = self._sample_artifacts()
+        with TemporaryDirectory(prefix="ai-crop-source-test-") as tmp:
+            tmpdir = Path(tmp)
+            download_calls: list[str] = []
+
+            def _fake_download(uri, dest):
+                download_calls.append(str(uri))
+                if str(uri).endswith("audiveris_out_corrected.pdf"):
+                    raise RuntimeError("missing corrected")
+                Path(dest).write_bytes(b"%PDF-1.4\n")
+
+            with patch.object(WORKER, "_download_gcs_to_file", side_effect=_fake_download):
+                pdf_path, pdf_source = WORKER._resolve_ai_crop_pdf_source(artifacts, tmpdir)
+
+        self.assertEqual(pdf_source, "baseline")
+        self.assertTrue(str(pdf_path).endswith("audiveris_out.pdf"))
+        self.assertEqual(
+            download_calls,
+            [
+                "gs://x/output/audiveris_out_corrected.pdf",
+                "gs://x/output/audiveris_out.pdf",
+            ],
+        )
+
     def test_generate_ai_suggestions_for_system_batch_uses_neighbor_systems_without_crashing(self):
         artifacts = self._sample_artifacts()
         editable_state = self._sample_mapping_summary().get("editable_state") or {}
@@ -876,7 +920,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         message = {"content": [{"type": "text", "text": json.dumps(provider_payload)}]}
 
         with (
-            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER, "_resolve_ai_crop_pdf_source", return_value=(Path("/tmp/audiveris_out_corrected.pdf"), "corrected")),
             patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
             patch.object(WORKER, "_anthropic_messages_create", return_value=message),
             patch.object(WORKER.fitz, "open", return_value=fake_doc),
@@ -896,6 +940,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "pickup")
         self.assertEqual((result.get("model") or ""), "claude-sonnet-4-6")
+        self.assertEqual((result.get("pdf_source") or ""), "corrected")
 
     def test_ai_suggest_step_real_system_batch_path_no_longer_crashes(self):
         artifacts = self._sample_artifacts()
@@ -943,11 +988,29 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_editable_state_version", return_value="test-state"),
             patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
             patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
-            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER, "_resolve_ai_crop_pdf_source", return_value=(Path("/tmp/audiveris_out_corrected.pdf"), "corrected")),
             patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
             patch.object(WORKER, "_anthropic_messages_create", return_value=message),
             patch.object(WORKER.fitz, "open", return_value=fake_doc),
             patch.object(WORKER.fitz, "Rect", _FakeRect),
+            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=True),
+            patch.object(WORKER, "_signed_http_url_for_gs", return_value="https://signed/debug"),
+            patch.object(WORKER, "_load_ai_debug_batch_trace", return_value=None),
+            patch.object(WORKER, "_current_ai_crop_pdf_source_label", return_value="corrected"),
+            patch.object(WORKER, "_upload_bytes_to_gcs", return_value=None),
+            patch.object(
+                WORKER,
+                "_write_ai_debug_batch_trace",
+                side_effect=lambda payload, _artifacts: {
+                    "enabled": True,
+                    "trace_uri": "gs://x/output/artifacts/ai_debug_crops/ai_batch_trace.json",
+                    "trace_http": "https://signed/debug-trace",
+                    "pdf_source": str(payload.get("pdf_source") or "baseline"),
+                    "measure_count": int(payload.get("measure_count") or 0),
+                    "batched_count": int(payload.get("batched_count") or 0),
+                    "skipped_count": int(payload.get("skipped_count") or 0),
+                },
+            ),
         ):
             body, status = _unpack(WORKER.ai_suggest_job_step("111"))
 
@@ -956,6 +1019,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
+        self.assertEqual(((body.get("debug_crops") or {}).get("pdf_source")), "corrected")
 
     def test_ai_suggest_step_final_system_marks_completed(self):
         artifacts = self._sample_artifacts()
