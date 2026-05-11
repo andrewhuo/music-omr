@@ -2033,7 +2033,7 @@ def _build_system_measure_request(
     next_system_row: dict | None = None,
     artifacts: dict | None = None,
     debug_crop_rows: list[dict] | None = None,
-) -> dict:
+) -> tuple[dict, int]:
     content: list[dict] = []
     system_id = str(system_row.get("system_id") or "").strip()
     page_number = _safe_int(system_row.get("page"), _safe_int((measure_rows[0] if measure_rows else {}).get("page"), 1))
@@ -2155,12 +2155,14 @@ def _build_system_measure_request(
             }
         )
 
-    return {
-        "model": str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip(),
-        "max_tokens": ANTHROPIC_MAX_TOKENS,
-        "messages": [{"role": "user", "content": content}],
-        "reference_examples_attached": int(reference_examples_attached),
-    }
+    return (
+        {
+            "model": str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip(),
+            "max_tokens": ANTHROPIC_MAX_TOKENS,
+            "messages": [{"role": "user", "content": content}],
+        },
+        int(reference_examples_attached),
+    )
 
 
 def _generate_ai_suggestions_for_system_batch(
@@ -2200,7 +2202,7 @@ def _generate_ai_suggestions_for_system_batch(
             if page_index >= len(doc):
                 raise AiSuggestError(provider_status=500, detail=f"invalid_page_index:{page_number}")
             page = doc[page_index]
-            payload = _build_system_measure_request(
+            payload, reference_examples_attached = _build_system_measure_request(
                 job_id,
                 int(run_id),
                 system_row,
@@ -2212,7 +2214,6 @@ def _generate_ai_suggestions_for_system_batch(
                 artifacts=artifacts if debug_enabled else None,
                 debug_crop_rows=debug_crop_rows if debug_enabled else None,
             )
-            reference_examples_attached = _safe_int(payload.get("reference_examples_attached"), 0)
             message = _anthropic_messages_create(payload)
             parsed = _parse_anthropic_suggestions_message(message)
             system_suggestions = parsed.get("suggestions")
@@ -2307,7 +2308,7 @@ def _generate_ai_suggestions_for_job(
                 if page_index >= len(doc):
                     raise AiSuggestError(provider_status=500, detail=f"invalid_page_index:{page_number}")
                 page = doc[page_index]
-                payload = _build_system_measure_request(
+                payload, payload_reference_examples_attached = _build_system_measure_request(
                     job_id,
                     int(run_id),
                     system_row,
@@ -2321,7 +2322,7 @@ def _generate_ai_suggestions_for_job(
                 )
                 reference_examples_attached = max(
                     int(reference_examples_attached),
-                    _safe_int(payload.get("reference_examples_attached"), 0),
+                    int(payload_reference_examples_attached),
                 )
                 message = _anthropic_messages_create(payload)
                 parsed = _parse_anthropic_suggestions_message(message)

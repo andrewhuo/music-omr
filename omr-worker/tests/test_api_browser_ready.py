@@ -1384,7 +1384,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
             patch.object(WORKER.fitz, "Rect", _FakeRect),
         ):
-            payload = WORKER._build_system_measure_request(
+            payload, reference_examples_attached = WORKER._build_system_measure_request(
                 "111",
                 111,
                 system_row,
@@ -1393,7 +1393,8 @@ class BrowserReadyApiTests(unittest.TestCase):
                 pdf_source="corrected",
             )
 
-        self.assertEqual(payload.get("reference_examples_attached"), 2)
+        self.assertEqual(reference_examples_attached, 2)
+        self.assertNotIn("reference_examples_attached", payload)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         intro = json.loads((content[0] or {}).get("text") or "{}")
         rules = ((intro.get("instructions") or {}).get("rules")) or []
@@ -1414,7 +1415,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
             patch.object(WORKER.fitz, "Rect", _FakeRect),
         ):
-            payload = WORKER._build_system_measure_request(
+            payload, _reference_examples_attached = WORKER._build_system_measure_request(
                 "111",
                 111,
                 system_row,
@@ -1448,7 +1449,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                 patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
                 patch.object(WORKER.fitz, "Rect", _FakeRect),
             ):
-                payload = WORKER._build_system_measure_request(
+                payload, reference_examples_attached = WORKER._build_system_measure_request(
                     "111",
                     111,
                     system_row,
@@ -1457,7 +1458,8 @@ class BrowserReadyApiTests(unittest.TestCase):
                     pdf_source="corrected",
                 )
 
-        self.assertEqual(payload.get("reference_examples_attached"), 2)
+        self.assertEqual(reference_examples_attached, 2)
+        self.assertNotIn("reference_examples_attached", payload)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         self.assertEqual((content[0] or {}).get("type"), "text")
         self.assertIn("Reference examples for old-style multi-measure rest recognition.", (content[1] or {}).get("text") or "")
@@ -1481,7 +1483,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                 patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
                 patch.object(WORKER.fitz, "Rect", _FakeRect),
             ):
-                payload = WORKER._build_system_measure_request(
+                payload, reference_examples_attached = WORKER._build_system_measure_request(
                     "111",
                     111,
                     system_row,
@@ -1490,10 +1492,70 @@ class BrowserReadyApiTests(unittest.TestCase):
                     pdf_source="corrected",
                 )
 
-        self.assertEqual(payload.get("reference_examples_attached"), 0)
+        self.assertEqual(reference_examples_attached, 0)
+        self.assertNotIn("reference_examples_attached", payload)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         self.assertEqual(json.loads((content[1] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
         self.assertEqual(len([row for row in content if (row or {}).get("type") == "image"]), len(measure_rows))
+
+    def test_generate_ai_suggestions_system_batch_does_not_send_local_debug_field_to_provider(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        editable_state = mapping_summary.get("editable_state") or {}
+        systems = editable_state.get("systems") or []
+        system_row = systems[0]
+        system_measures = [row for row in (editable_state.get("measures") or []) if row.get("system_id") == "p1_s0"]
+        fake_doc = _FakeDoc([_FakePage(_FakeRect(0, 0, 200, 160))])
+        provider_payload = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "p1_s0_m0",
+                    "label": "pickup",
+                    "rest_count": None,
+                    "confidence": "medium",
+                },
+                {
+                    "measure_id": "p1_s0_m1",
+                    "label": "normal",
+                    "rest_count": None,
+                    "confidence": "high",
+                },
+            ],
+            "warnings": [],
+        }
+        message = {"content": [{"type": "text", "text": json.dumps(provider_payload)}]}
+        captured_payloads: list[dict] = []
+
+        def _capture_payload(payload):
+            captured_payloads.append(payload)
+            return message
+
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
+            (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
+            with (
+                patch.object(WORKER, "AI_REFERENCE_EXAMPLES_DIR", tmp_path),
+                patch.object(WORKER, "_resolve_ai_crop_pdf_source", return_value=(Path("/tmp/audiveris_out_corrected.pdf"), "corrected")),
+                patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
+                patch.object(WORKER, "_anthropic_messages_create", side_effect=_capture_payload),
+                patch.object(WORKER.fitz, "open", return_value=fake_doc),
+                patch.object(WORKER.fitz, "Rect", _FakeRect),
+            ):
+                result = WORKER._generate_ai_suggestions_for_system_batch(
+                    "111",
+                    111,
+                    systems,
+                    system_row,
+                    system_measures,
+                    "test-state",
+                    artifacts,
+                )
+
+        self.assertEqual(len(captured_payloads), 1)
+        self.assertNotIn("reference_examples_attached", captured_payloads[0])
+        self.assertEqual(result.get("reference_examples_attached"), 2)
 
 
 
