@@ -1400,6 +1400,35 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Examples: in 2/4, one quarter note in the first measure is pickup;", rules_text)
         self.assertIn("If the time signature is unclear but the first measure looks short, label uncertain with maybe_label pickup.", rules_text)
 
+    def test_build_system_measure_request_includes_old_style_multi_rest_guidance(self):
+        mapping_summary = self._sample_mapping_summary()
+        editable_state = mapping_summary.get("editable_state") or {}
+        system_row = (editable_state.get("systems") or [])[0]
+        measure_rows = [row for row in (editable_state.get("measures") or []) if row.get("system_id") == "p1_s0"]
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+
+        with (
+            patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+        ):
+            payload = WORKER._build_system_measure_request(
+                "111",
+                111,
+                system_row,
+                measure_rows,
+                page,
+                pdf_source="corrected",
+            )
+
+        content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
+        intro = json.loads((content[0] or {}).get("text") or "{}")
+        rules = ((intro.get("instructions") or {}).get("rules")) or []
+        rules_text = "\n".join(str(row) for row in rules)
+        self.assertIn("A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.", rules_text)
+        self.assertIn("In the older style, the vertical bars may be short or long, and there may be more than one.", rules_text)
+        self.assertIn("A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.", rules_text)
+        self.assertIn("A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.", rules_text)
+
 
 
 if __name__ == "__main__":
