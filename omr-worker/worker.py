@@ -1972,7 +1972,7 @@ def _load_ai_debug_batch_trace(artifacts: dict) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _build_old_style_multi_rest_reference_content() -> list[dict]:
+def _build_old_style_multi_rest_reference_content() -> tuple[list[dict], int]:
     content: list[dict] = []
     example_rows: list[dict] = []
     for row in AI_OLD_STYLE_REFERENCE_EXAMPLES:
@@ -1995,7 +1995,7 @@ def _build_old_style_multi_rest_reference_content() -> list[dict]:
             }
         )
     if not example_rows:
-        return content
+        return content, 0
     content.append(
         {
             "type": "text",
@@ -2019,7 +2019,7 @@ def _build_old_style_multi_rest_reference_content() -> list[dict]:
                 },
             }
         )
-    return content
+    return content, len(example_rows)
 
 
 def _build_system_measure_request(
@@ -2092,7 +2092,8 @@ def _build_system_measure_request(
         ],
     }
     content.append({"type": "text", "text": json.dumps(intro, ensure_ascii=True)})
-    content.extend(_build_old_style_multi_rest_reference_content())
+    reference_content, reference_examples_attached = _build_old_style_multi_rest_reference_content()
+    content.extend(reference_content)
 
     for idx, row in enumerate(measure_rows):
         next_row = measure_rows[idx + 1] if idx + 1 < len(measure_rows) else None
@@ -2158,6 +2159,7 @@ def _build_system_measure_request(
         "model": str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip(),
         "max_tokens": ANTHROPIC_MAX_TOKENS,
         "messages": [{"role": "user", "content": content}],
+        "reference_examples_attached": int(reference_examples_attached),
     }
 
 
@@ -2177,11 +2179,14 @@ def _generate_ai_suggestions_for_system_batch(
     debug_enabled = _ai_suggest_debug_enabled()
     debug_crop_rows: list[dict] = []
     pdf_source = "baseline"
+    reference_examples_attached = 0
 
     def _finalize_debug_crops() -> dict | None:
         if not debug_enabled or not debug_crop_rows:
             return None
-        return _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows, pdf_source=pdf_source)
+        payload = _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows, pdf_source=pdf_source)
+        payload["reference_examples_attached"] = int(reference_examples_attached)
+        return payload
 
     with TemporaryDirectory(prefix="omr-ai-suggest-step-") as tmp:
         tmpdir = Path(tmp)
@@ -2207,6 +2212,7 @@ def _generate_ai_suggestions_for_system_batch(
                 artifacts=artifacts if debug_enabled else None,
                 debug_crop_rows=debug_crop_rows if debug_enabled else None,
             )
+            reference_examples_attached = _safe_int(payload.get("reference_examples_attached"), 0)
             message = _anthropic_messages_create(payload)
             parsed = _parse_anthropic_suggestions_message(message)
             system_suggestions = parsed.get("suggestions")
@@ -2234,6 +2240,7 @@ def _generate_ai_suggestions_for_system_batch(
                 source_state_version,
             )
             normalized["pdf_source"] = pdf_source
+            normalized["reference_examples_attached"] = int(reference_examples_attached)
             debug_crops = _finalize_debug_crops()
             if debug_crops is not None:
                 normalized["debug_crops"] = debug_crops
@@ -2275,11 +2282,14 @@ def _generate_ai_suggestions_for_job(
     debug_enabled = _ai_suggest_debug_enabled()
     debug_crop_rows: list[dict] = []
     pdf_source = "baseline"
+    reference_examples_attached = 0
 
     def _finalize_debug_crops() -> dict | None:
         if not debug_enabled or not debug_crop_rows:
             return None
-        return _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows, pdf_source=pdf_source)
+        payload = _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows, pdf_source=pdf_source)
+        payload["reference_examples_attached"] = int(reference_examples_attached)
+        return payload
 
     with TemporaryDirectory(prefix="omr-ai-suggest-") as tmp:
         tmpdir = Path(tmp)
@@ -2308,6 +2318,10 @@ def _generate_ai_suggestions_for_job(
                     next_system_row=next_system_row,
                     artifacts=artifacts if debug_enabled else None,
                     debug_crop_rows=debug_crop_rows if debug_enabled else None,
+                )
+                reference_examples_attached = max(
+                    int(reference_examples_attached),
+                    _safe_int(payload.get("reference_examples_attached"), 0),
                 )
                 message = _anthropic_messages_create(payload)
                 parsed = _parse_anthropic_suggestions_message(message)
@@ -2359,6 +2373,7 @@ def _generate_ai_suggestions_for_job(
         "suggestions": suggestions,
         "warnings": warnings,
         "pdf_source": pdf_source,
+        "reference_examples_attached": int(reference_examples_attached),
     }
     debug_crops = _finalize_debug_crops()
     if debug_crops is not None:
@@ -4342,6 +4357,7 @@ def ai_suggest_job_step(job_id: str):
 
     system_row, system_measures = system_batches[next_system_index]
     debug_crops = None
+    reference_examples_attached = 0
     try:
         system_result = _generate_ai_suggestions_for_system_batch(
             job_id,
@@ -4354,6 +4370,7 @@ def ai_suggest_job_step(job_id: str):
         )
         if isinstance(system_result, dict):
             debug_crops = system_result.pop("debug_crops", None)
+            reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
         ai_suggestions = _merge_ai_suggestions_state(ai_suggestions, system_result, int(artifact_run_id), source_state_version)
         if isinstance(debug_batch_trace_payload, dict):
             try:
@@ -4384,6 +4401,7 @@ def ai_suggest_job_step(job_id: str):
             "status": str(ai_suggest_run.get("status") or AI_SUGGEST_RUN_STATUS_RUNNING),
             "ai_suggestions": ai_suggestions,
             "ai_suggest_run": ai_suggest_run,
+            "reference_examples_attached": int(reference_examples_attached),
             "storage_mode": _storage_mode_for_artifacts(artifacts),
             "artifacts": artifacts,
             "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),

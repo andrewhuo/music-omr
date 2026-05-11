@@ -1018,8 +1018,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(body.get("status"), "running")
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
+        self.assertEqual(body.get("reference_examples_attached"), 2)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
         self.assertEqual(((body.get("debug_crops") or {}).get("pdf_source")), "corrected")
+        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 2)
 
     def test_ai_suggest_step_final_system_marks_completed(self):
         artifacts = self._sample_artifacts()
@@ -1391,6 +1393,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                 pdf_source="corrected",
             )
 
+        self.assertEqual(payload.get("reference_examples_attached"), 2)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         intro = json.loads((content[0] or {}).get("text") or "{}")
         rules = ((intro.get("instructions") or {}).get("rules")) or []
@@ -1454,6 +1457,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     pdf_source="corrected",
                 )
 
+        self.assertEqual(payload.get("reference_examples_attached"), 2)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         self.assertEqual((content[0] or {}).get("type"), "text")
         self.assertIn("Reference examples for old-style multi-measure rest recognition.", (content[1] or {}).get("text") or "")
@@ -1486,6 +1490,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     pdf_source="corrected",
                 )
 
+        self.assertEqual(payload.get("reference_examples_attached"), 0)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         self.assertEqual(json.loads((content[1] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
         self.assertEqual(len([row for row in content if (row or {}).get("type") == "image"]), len(measure_rows))
