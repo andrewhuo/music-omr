@@ -89,6 +89,17 @@ AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncer
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
 AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
+AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
+AI_OLD_STYLE_REFERENCE_EXAMPLES = (
+    {
+        "filename": "old_style_rest_negative_1.png",
+        "caption": "Reference example A: visible count 1 with an old-style-looking symbol. This is normal, not multi_measure_rest.",
+    },
+    {
+        "filename": "old_style_rest_positive_3.png",
+        "caption": "Reference example B: visible count 3 with an old-style symbol. This is multi_measure_rest.",
+    },
+)
 
 # In-memory correlation for workflow dispatches that do not return run_id directly.
 _PENDING_DISPATCHES: dict[str, dict] = {}
@@ -1961,6 +1972,56 @@ def _load_ai_debug_batch_trace(artifacts: dict) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _build_old_style_multi_rest_reference_content() -> list[dict]:
+    content: list[dict] = []
+    example_rows: list[dict] = []
+    for row in AI_OLD_STYLE_REFERENCE_EXAMPLES:
+        filename = str((row or {}).get("filename") or "").strip()
+        if not filename:
+            continue
+        image_path = AI_REFERENCE_EXAMPLES_DIR / filename
+        try:
+            image_bytes = image_path.read_bytes()
+        except FileNotFoundError:
+            logger.warning("AI_REFERENCE_EXAMPLE_MISSING path=%s", image_path)
+            continue
+        except Exception as exc:
+            logger.warning("AI_REFERENCE_EXAMPLE_LOAD_FAILED path=%s detail=%s", image_path, exc)
+            continue
+        example_rows.append(
+            {
+                "caption": str((row or {}).get("caption") or "").strip(),
+                "image_bytes": image_bytes,
+            }
+        )
+    if not example_rows:
+        return content
+    content.append(
+        {
+            "type": "text",
+            "text": (
+                "Reference examples for old-style multi-measure rest recognition. "
+                "The next example images are references only; the real measure crops follow after them."
+            ),
+        }
+    )
+    for row in example_rows:
+        caption = str((row or {}).get("caption") or "").strip()
+        if caption:
+            content.append({"type": "text", "text": caption})
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(row["image_bytes"]).decode("ascii"),
+                },
+            }
+        )
+    return content
+
+
 def _build_system_measure_request(
     job_id: str,
     run_id: int,
@@ -2031,6 +2092,7 @@ def _build_system_measure_request(
         ],
     }
     content.append({"type": "text", "text": json.dumps(intro, ensure_ascii=True)})
+    content.extend(_build_old_style_multi_rest_reference_content())
 
     for idx, row in enumerate(measure_rows):
         next_row = measure_rows[idx + 1] if idx + 1 < len(measure_rows) else None

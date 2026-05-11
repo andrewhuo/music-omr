@@ -1429,6 +1429,67 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.", rules_text)
         self.assertIn("A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.", rules_text)
 
+    def test_build_system_measure_request_includes_reference_examples_before_real_measures(self):
+        mapping_summary = self._sample_mapping_summary()
+        editable_state = mapping_summary.get("editable_state") or {}
+        system_row = (editable_state.get("systems") or [])[0]
+        measure_rows = [row for row in (editable_state.get("measures") or []) if row.get("system_id") == "p1_s0"]
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
+            (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
+            with (
+                patch.object(WORKER, "AI_REFERENCE_EXAMPLES_DIR", tmp_path),
+                patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
+                patch.object(WORKER.fitz, "Rect", _FakeRect),
+            ):
+                payload = WORKER._build_system_measure_request(
+                    "111",
+                    111,
+                    system_row,
+                    measure_rows,
+                    page,
+                    pdf_source="corrected",
+                )
+
+        content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
+        self.assertEqual((content[0] or {}).get("type"), "text")
+        self.assertIn("Reference examples for old-style multi-measure rest recognition.", (content[1] or {}).get("text") or "")
+        self.assertIn("visible count 1", (content[2] or {}).get("text") or "")
+        self.assertEqual((content[3] or {}).get("type"), "image")
+        self.assertIn("visible count 3", (content[4] or {}).get("text") or "")
+        self.assertEqual((content[5] or {}).get("type"), "image")
+        self.assertEqual(json.loads((content[6] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
+
+    def test_build_system_measure_request_skips_missing_reference_examples(self):
+        mapping_summary = self._sample_mapping_summary()
+        editable_state = mapping_summary.get("editable_state") or {}
+        system_row = (editable_state.get("systems") or [])[0]
+        measure_rows = [row for row in (editable_state.get("measures") or []) if row.get("system_id") == "p1_s0"]
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with (
+                patch.object(WORKER, "AI_REFERENCE_EXAMPLES_DIR", tmp_path),
+                patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
+                patch.object(WORKER.fitz, "Rect", _FakeRect),
+            ):
+                payload = WORKER._build_system_measure_request(
+                    "111",
+                    111,
+                    system_row,
+                    measure_rows,
+                    page,
+                    pdf_source="corrected",
+                )
+
+        content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
+        self.assertEqual(json.loads((content[1] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
+        self.assertEqual(len([row for row in content if (row or {}).get("type") == "image"]), len(measure_rows))
+
 
 
 if __name__ == "__main__":
