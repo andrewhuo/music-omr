@@ -1129,6 +1129,321 @@ def _safe_float(s: str | None) -> float | None:
         return None
 
 
+def _extract_barline_geom(el: ET.Element) -> tuple[float, float, float, float] | None:
+    b = el.find("bounds")
+    if b is None:
+        return None
+    bx = _safe_float(b.get("x"))
+    if bx is None:
+        return None
+
+    med = el.find("median")
+    if med is not None:
+        p1 = med.find("p1")
+        p2 = med.find("p2")
+        if p1 is not None and p2 is not None:
+            x1 = _safe_float(p1.get("x"))
+            y1 = _safe_float(p1.get("y"))
+            x2 = _safe_float(p2.get("x"))
+            y2 = _safe_float(p2.get("y"))
+            if x1 is not None and y1 is not None and x2 is not None and y2 is not None:
+                return (float(bx), float(min(y1, y2)), float(max(y1, y2)), abs(float(x2 - x1)))
+
+    by = _safe_float(b.get("y"))
+    bh = _safe_float(b.get("h"))
+    bw = _safe_float(b.get("w"))
+    if by is None or bh is None or bh <= 0:
+        return None
+    dx_abs = abs(float(bw)) if bw is not None else 0.0
+    return (float(bx), float(by), float(by + bh), dx_abs)
+
+
+def _barline_xs_for_staff_from_omr(
+    system_inters: ET.Element | None,
+    inter_by_id: dict[int, ET.Element],
+    expected_spacing: float,
+    staff_id: str,
+    y_top: float,
+    y_bot: float,
+    staff_barline_ids: list[str],
+    staff_left: float | None,
+    staff_right: float | None,
+    *,
+    allow_supplement: bool = False,
+    relaxed: bool = False,
+) -> tuple[list[float], str]:
+    if system_inters is None:
+        return ([], "none")
+
+    explicit_candidates: list[ET.Element] = []
+    for bid in staff_barline_ids:
+        try:
+            bid_int = int(bid)
+        except Exception:
+            continue
+        bel = inter_by_id.get(bid_int)
+        if bel is None:
+            continue
+        if (bel.tag or "").lower() != "barline":
+            continue
+        explicit_candidates.append(bel)
+
+    candidate_source = "staff_ids" if explicit_candidates else "overlap_scan"
+    candidate_elements: list[ET.Element] = list(explicit_candidates)
+    seen_ids = {id(el) for el in candidate_elements}
+
+    if allow_supplement or not candidate_elements:
+        for el in system_inters.iter():
+            if (el.tag or "").lower() != "barline":
+                continue
+            el_staff = el.get("staff")
+            if el_staff and staff_id and el_staff != staff_id:
+                continue
+            if id(el) in seen_ids:
+                continue
+            candidate_elements.append(el)
+            seen_ids.add(id(el))
+        if allow_supplement and explicit_candidates and len(candidate_elements) > len(explicit_candidates):
+            candidate_source = "staff_ids_plus_overlap"
+
+    if not candidate_elements:
+        return ([], candidate_source)
+
+    staff_h = max(1.0, float(y_bot - y_top))
+    if candidate_source == "staff_ids":
+        vertical_min_ratio = 0.20
+        vertical_tol = None
+        x_margin = None
+    elif candidate_source == "staff_ids_plus_overlap":
+        vertical_min_ratio = 0.20 if not relaxed else 0.15
+        vertical_tol = None if not relaxed else max(5.0, (0.28 * expected_spacing) if expected_spacing > 0 else 5.0)
+        x_margin = None if not relaxed else max(12.0, (1.10 * expected_spacing) if expected_spacing > 0 else 12.0)
+    else:
+        vertical_min_ratio = 0.80 if not relaxed else 0.60
+        vertical_tol = max(3.0, (0.18 * expected_spacing) if expected_spacing > 0 else 3.0)
+        if relaxed:
+            vertical_tol = max(5.0, (0.28 * expected_spacing) if expected_spacing > 0 else 5.0)
+        x_margin = max(8.0, (0.70 * expected_spacing) if expected_spacing > 0 else 8.0)
+        if relaxed:
+            x_margin = max(12.0, (1.10 * expected_spacing) if expected_spacing > 0 else 12.0)
+
+    xs: list[float] = []
+    for el in candidate_elements:
+        geom = _extract_barline_geom(el)
+        if geom is None:
+            continue
+        bx, by0, by1, dx_abs = geom
+        if by1 <= by0:
+            continue
+
+        overlap = max(0.0, min(by1, y_bot) - max(by0, y_top))
+        if (overlap / staff_h) < vertical_min_ratio:
+            continue
+
+        if vertical_tol is not None and dx_abs > vertical_tol:
+            continue
+
+        if x_margin is not None:
+            if staff_left is not None and bx < (float(staff_left) - x_margin):
+                continue
+            if staff_right is not None and bx > (float(staff_right) + x_margin):
+                continue
+        xs.append(float(bx))
+
+    if not xs:
+        return ([], candidate_source)
+
+    merge_tol = max(2.0, (0.20 * expected_spacing) if expected_spacing > 0 else 2.5)
+    if relaxed:
+        merge_tol = max(1.0, (0.12 * expected_spacing) if expected_spacing > 0 else 1.5)
+    return (_dedupe_sorted(xs, merge_tol), candidate_source)
+
+
+def _select_measure_rows_for_system(
+    system_measure_rows_px: list[dict],
+    measure_box_filter_reason_counts: dict[str, int] | None = None,
+) -> list[dict]:
+    selected_measure_rows = [
+        row for row in system_measure_rows_px if str(row.get("y_source") or "") == "staff_lines"
+    ]
+    if selected_measure_rows:
+        return selected_measure_rows
+
+    if isinstance(measure_box_filter_reason_counts, dict):
+        measure_box_filter_reason_counts["no_staff_line_rows"] = (
+            int(measure_box_filter_reason_counts.get("no_staff_line_rows") or 0) + 1
+        )
+
+    selected_measure_rows = [
+        row for row in system_measure_rows_px if int(row.get("barline_count") or 0) > 0
+    ]
+    if selected_measure_rows:
+        if isinstance(measure_box_filter_reason_counts, dict):
+            measure_box_filter_reason_counts["fallback_barline_rows_used"] = (
+                int(measure_box_filter_reason_counts.get("fallback_barline_rows_used") or 0) + 1
+            )
+        return selected_measure_rows
+
+    if isinstance(measure_box_filter_reason_counts, dict):
+        measure_box_filter_reason_counts["no_rows_with_barlines"] = (
+            int(measure_box_filter_reason_counts.get("no_rows_with_barlines") or 0) + 1
+        )
+    return []
+
+
+def _build_measure_starts_for_system(
+    selected_measure_rows: list[dict],
+    expected_spacing: float,
+    pic_w: float,
+    *,
+    relaxed: bool = False,
+) -> dict:
+    system_y_top = min(float(row["y_top"]) for row in selected_measure_rows) if selected_measure_rows else 0.0
+    system_y_bottom = max(float(row["y_bottom"]) for row in selected_measure_rows) if selected_measure_rows else 0.0
+    if system_y_bottom <= system_y_top:
+        return {
+            "measure_starts": [],
+            "system_y_top": system_y_top,
+            "system_y_bottom": system_y_bottom,
+            "row_tail": 0.0,
+        }
+
+    merge_tol = max(2.0, (0.20 * expected_spacing) if expected_spacing > 0 else 2.5)
+    if relaxed:
+        merge_tol = max(1.0, (0.12 * expected_spacing) if expected_spacing > 0 else 1.5)
+    start_candidates: list[float] = []
+    boundary_candidates: list[float] = []
+    staff_right_candidates: list[float] = []
+
+    for row in selected_measure_rows:
+        start_candidates.append(float(row["x_start"]))
+        for x in row.get("barline_xs") or []:
+            boundary_candidates.append(float(x))
+        staff_right = row.get("staff_right")
+        if staff_right is not None:
+            staff_right_candidates.append(float(staff_right))
+
+    measure_starts = _dedupe_sorted(start_candidates + boundary_candidates, merge_tol)
+    if not measure_starts:
+        return {
+            "measure_starts": [],
+            "system_y_top": system_y_top,
+            "system_y_bottom": system_y_bottom,
+            "row_tail": 0.0,
+        }
+
+    previous_spans = [
+        float(measure_starts[i + 1] - measure_starts[i])
+        for i in range(len(measure_starts) - 1)
+        if (measure_starts[i + 1] - measure_starts[i]) >= 6.0
+    ]
+    median_prev_span = _median(previous_spans)
+    default_tail_span = (
+        float(median_prev_span)
+        if median_prev_span is not None
+        else max(24.0, (4.0 * expected_spacing) if expected_spacing > 0 else 48.0)
+    )
+    if staff_right_candidates:
+        row_tail = float(max(staff_right_candidates))
+    else:
+        row_tail = float(measure_starts[-1] + default_tail_span)
+    row_tail = min(float(pic_w), max(float(measure_starts[-1] + 6.0), row_tail))
+    return {
+        "measure_starts": measure_starts,
+        "system_y_top": system_y_top,
+        "system_y_bottom": system_y_bottom,
+        "row_tail": row_tail,
+    }
+
+
+def _append_measure_outputs_for_system(
+    measure_box_rows_px: list[dict],
+    measure_marks_px: list[tuple[float, float, float, str]],
+    *,
+    page_id: str,
+    system_id: str,
+    system_index: int,
+    measure_starts_info: dict,
+) -> None:
+    measure_starts = list(measure_starts_info.get("measure_starts") or [])
+    system_y_top = float(measure_starts_info.get("system_y_top") or 0.0)
+    system_y_bottom = float(measure_starts_info.get("system_y_bottom") or 0.0)
+    row_tail = float(measure_starts_info.get("row_tail") or 0.0)
+    if not measure_starts or system_y_bottom <= system_y_top:
+        return
+
+    for measure_num, bx in enumerate(measure_starts, start=1):
+        measure_marks_px.append((float(bx), system_y_top, system_y_bottom, str(measure_num)))
+
+    for local_idx, x_left in enumerate(measure_starts):
+        if local_idx + 1 < len(measure_starts):
+            x_right = float(measure_starts[local_idx + 1])
+        else:
+            x_right = float(row_tail)
+        if (x_right - x_left) < 6.0:
+            continue
+        if (system_y_bottom - system_y_top) <= 0.0:
+            continue
+        measure_box_rows_px.append(
+            {
+                "page_id": page_id,
+                "system_id": system_id,
+                "system_index": int(system_index),
+                "measure_local_index": int(local_idx),
+                "x_left": float(x_left),
+                "x_right": float(x_right),
+                "y_top": float(system_y_top),
+                "y_bottom": float(system_y_bottom),
+                "raw_measure_number": str(local_idx + 1),
+                "source": "omr",
+            }
+        )
+
+
+def _neighbor_median_measure_count(system_rows: list[dict], target_index: int) -> float | None:
+    if target_index < 0 or target_index >= len(system_rows):
+        return None
+    candidate_counts: list[float] = []
+    for idx, row in enumerate(system_rows):
+        if idx == target_index:
+            continue
+        count = int(row.get("first_pass_measure_count") or 0)
+        if count <= 0:
+            continue
+        system_width = float(row.get("system_width") or 0.0)
+        if system_width < 24.0:
+            continue
+        candidate_counts.append(float(count))
+    if len(candidate_counts) < 2:
+        return None
+    return _median(candidate_counts)
+
+
+def _is_under_split_suspect(first_pass_measure_count: int, neighbor_median_count: float | None) -> bool:
+    if neighbor_median_count is None:
+        return False
+    threshold = max(2, int(neighbor_median_count * 0.4))
+    return int(first_pass_measure_count) <= int(threshold)
+
+
+def _should_accept_second_pass(
+    first_pass_measure_count: int,
+    second_pass_measure_count: int,
+    neighbor_median_count: float | None,
+) -> bool:
+    if neighbor_median_count is None:
+        return False
+    if int(second_pass_measure_count) <= int(first_pass_measure_count):
+        return False
+    first_delta = abs(float(first_pass_measure_count) - float(neighbor_median_count))
+    second_delta = abs(float(second_pass_measure_count) - float(neighbor_median_count))
+    if second_delta >= first_delta:
+        return False
+    if float(second_pass_measure_count) > max(3.0, float(neighbor_median_count) * 1.6):
+        return False
+    return True
+
+
 def _bounds_of(el: ET.Element) -> tuple[float, float, float, float] | None:
     b = el.find("bounds")
     if b is None:
@@ -1458,6 +1773,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     system_guides_px_aligned: list[tuple[float, float, float] | None] = []
     measure_box_rows_px: list[dict] = []
     omr_fallback_rows: list[dict] = []
+    omr_system_recovery_rows: list[dict] = []
     measure_box_filter_reason_counts: dict[str, int] = {}
 
     pages = root.findall("page")
@@ -1473,6 +1789,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             system_guides_px_aligned,
             measure_box_rows_px,
             omr_fallback_rows,
+            omr_system_recovery_rows,
             measure_box_filter_reason_counts,
         )
 
@@ -1484,6 +1801,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         systems = page.findall(".//system")
         if not systems:
             systems = page.findall("system")
+        page_system_entries: list[dict] = []
 
         for sys_index, system in enumerate(systems):
             page_id = page.get("id") or "?"
@@ -1492,6 +1810,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             system_staff_counts.append(len(staff_nodes))
             system_guide_rows_px: list[tuple[float, float, float]] = []
             system_measure_rows_px: list[dict] = []
+            staff_contexts: list[dict] = []
 
             # FIX: SIG is per-system; prefer system-local inters
             system_inters = system.find(".//sig/inters")
@@ -1560,119 +1879,6 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 if best_any is not None:
                     return (best_any[1], best_any[2])
                 return None
-
-            def barline_xs_for_staff(
-                staff_id: str,
-                y_top: float,
-                y_bot: float,
-                staff_barline_ids: list[str],
-                staff_left: float | None,
-                staff_right: float | None,
-            ) -> tuple[list[float], str]:
-                if system_inters is None:
-                    return ([], "none")
-
-                def _extract_barline_geom(el) -> tuple[float, float, float, float] | None:
-                    b = el.find("bounds")
-                    if b is None:
-                        return None
-                    bx = _safe_float(b.get("x"))
-                    if bx is None:
-                        return None
-
-                    med = el.find("median")
-                    if med is not None:
-                        p1 = med.find("p1")
-                        p2 = med.find("p2")
-                        if p1 is not None and p2 is not None:
-                            x1 = _safe_float(p1.get("x"))
-                            y1 = _safe_float(p1.get("y"))
-                            x2 = _safe_float(p2.get("x"))
-                            y2 = _safe_float(p2.get("y"))
-                            if x1 is not None and y1 is not None and x2 is not None and y2 is not None:
-                                return (float(bx), float(min(y1, y2)), float(max(y1, y2)), abs(float(x2 - x1)))
-
-                    by = _safe_float(b.get("y"))
-                    bh = _safe_float(b.get("h"))
-                    bw = _safe_float(b.get("w"))
-                    if by is None or bh is None or bh <= 0:
-                        return None
-                    # Bounds-only fallback: treat width as a weak verticality proxy.
-                    dx_abs = abs(float(bw)) if bw is not None else 0.0
-                    return (float(bx), float(by), float(by + bh), dx_abs)
-
-                # Prefer explicit staff barline ids from staff XML.
-                candidate_elements: list = []
-                for bid in staff_barline_ids:
-                    try:
-                        bid_int = int(bid)
-                    except Exception:
-                        continue
-                    bel = inter_by_id.get(bid_int)
-                    if bel is None:
-                        continue
-                    if (bel.tag or "").lower() != "barline":
-                        continue
-                    candidate_elements.append(bel)
-                candidate_source = "staff_ids" if candidate_elements else "overlap_scan"
-
-                if not candidate_elements:
-                    for el in system_inters.iter():
-                        if (el.tag or "").lower() != "barline":
-                            continue
-                        el_staff = el.get("staff")
-                        if el_staff and staff_id and el_staff != staff_id:
-                            continue
-                        candidate_elements.append(el)
-
-                if not candidate_elements:
-                    return ([], candidate_source)
-
-                staff_h = max(1.0, float(y_bot - y_top))
-                if candidate_source == "staff_ids":
-                    # Trust staff-declared barlines; keep filtering very light.
-                    vertical_min_ratio = 0.20
-                    vertical_tol = None
-                    x_margin = None
-                else:
-                    vertical_min_ratio = 0.80
-                    vertical_tol = max(3.0, (0.18 * expected_spacing) if expected_spacing > 0 else 3.0)
-                    x_margin = max(8.0, (0.70 * expected_spacing) if expected_spacing > 0 else 8.0)
-
-                xs: list[float] = []
-                for el in candidate_elements:
-                    geom = _extract_barline_geom(el)
-                    if geom is None:
-                        continue
-                    bx, by0, by1, dx_abs = geom
-                    if by1 <= by0:
-                        continue
-
-                    overlap = max(0.0, min(by1, y_bot) - max(by0, y_top))
-                    if (overlap / staff_h) < vertical_min_ratio:
-                        continue
-
-                    if vertical_tol is not None and dx_abs > vertical_tol:
-                        continue
-
-                    if x_margin is not None:
-                        if staff_left is not None and bx < (float(staff_left) - x_margin):
-                            continue
-                        if staff_right is not None and bx > (float(staff_right) + x_margin):
-                            continue
-                    xs.append(float(bx))
-
-                if not xs:
-                    return ([], candidate_source)
-
-                xs.sort()
-                deduped: list[float] = []
-                merge_tol = max(2.0, (0.20 * expected_spacing) if expected_spacing > 0 else 2.5)
-                for x in xs:
-                    if deduped and abs(x - deduped[-1]) <= merge_tol:
-                        continue
-                    deduped.append(x)
-                return (deduped, candidate_source)
 
             for staff in staff_nodes:
                 staff_total += 1
@@ -1860,7 +2066,10 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 system_guide_rows_px.append((x_postpad, y_top, y_bot))
                 staff_barline_ids_raw = (staff.findtext("barlines") or "").strip()
                 staff_barline_ids = [tok for tok in staff_barline_ids_raw.split() if tok]
-                staff_barline_xs, candidate_source = barline_xs_for_staff(
+                staff_barline_xs, candidate_source = _barline_xs_for_staff_from_omr(
+                    system_inters=system_inters,
+                    inter_by_id=inter_by_id,
+                    expected_spacing=expected_spacing,
                     staff_id=staff_id,
                     y_top=y_top,
                     y_bot=y_bot,
@@ -1939,91 +2148,52 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         "staff_right": float(staff_right_effective) if staff_right_effective is not None else None,
                         "barline_xs": [float(x) for x in staff_barline_xs],
                         "barline_count": int(len(staff_barline_xs)),
+                        "candidate_source": candidate_source,
+                        "y_source": y_source,
+                    }
+                )
+                staff_contexts.append(
+                    {
+                        "staff_id": staff_id,
+                        "y_top": float(y_top),
+                        "y_bottom": float(y_bot),
+                        "staff_barline_ids": list(staff_barline_ids),
+                        "staff_left": staff_left_raw,
+                        "staff_right": staff_right_effective,
+                        "x_start": float(x_postpad),
                         "y_source": y_source,
                     }
                 )
 
-                for measure_num, bx in enumerate(staff_barline_xs, start=1):
-                    measure_marks_px.append((bx, y_top, y_bot, str(measure_num)))
-
-            if system_measure_rows_px:
-                selected_measure_rows = [
-                    row for row in system_measure_rows_px if str(row.get("y_source") or "") == "staff_lines"
-                ]
-                if not selected_measure_rows:
-                    measure_box_filter_reason_counts["no_staff_line_rows"] = (
-                        int(measure_box_filter_reason_counts.get("no_staff_line_rows") or 0) + 1
-                    )
-                    selected_measure_rows = [
-                        row for row in system_measure_rows_px if int(row.get("barline_count") or 0) > 0
-                    ]
-                    if selected_measure_rows:
-                        measure_box_filter_reason_counts["fallback_barline_rows_used"] = (
-                            int(measure_box_filter_reason_counts.get("fallback_barline_rows_used") or 0) + 1
-                        )
-                    else:
-                        measure_box_filter_reason_counts["no_rows_with_barlines"] = (
-                            int(measure_box_filter_reason_counts.get("no_rows_with_barlines") or 0) + 1
-                        )
-
-                system_y_top = min(float(row["y_top"]) for row in selected_measure_rows) if selected_measure_rows else 0.0
-                system_y_bottom = max(float(row["y_bottom"]) for row in selected_measure_rows) if selected_measure_rows else 0.0
-                if system_y_bottom > system_y_top:
-                    merge_tol = max(2.0, (0.20 * expected_spacing) if expected_spacing > 0 else 2.5)
-                    start_candidates: list[float] = []
-                    boundary_candidates: list[float] = []
-                    staff_right_candidates: list[float] = []
-
-                    for row in selected_measure_rows:
-                        start_candidates.append(float(row["x_start"]))
-                        for x in row.get("barline_xs") or []:
-                            boundary_candidates.append(float(x))
-                        staff_right = row.get("staff_right")
-                        if staff_right is not None:
-                            staff_right_candidates.append(float(staff_right))
-
-                    measure_starts = _dedupe_sorted(start_candidates + boundary_candidates, merge_tol)
-                    if measure_starts:
-                        previous_spans = [
-                            float(measure_starts[i + 1] - measure_starts[i])
-                            for i in range(len(measure_starts) - 1)
-                            if (measure_starts[i + 1] - measure_starts[i]) >= 6.0
-                        ]
-                        median_prev_span = _median(previous_spans)
-                        default_tail_span = (
-                            float(median_prev_span)
-                            if median_prev_span is not None
-                            else max(24.0, (4.0 * expected_spacing) if expected_spacing > 0 else 48.0)
-                        )
-                        if staff_right_candidates:
-                            row_tail = float(max(staff_right_candidates))
-                        else:
-                            row_tail = float(measure_starts[-1] + default_tail_span)
-                        row_tail = min(float(pic_w), max(float(measure_starts[-1] + 6.0), row_tail))
-
-                        for local_idx, x_left in enumerate(measure_starts):
-                            if local_idx + 1 < len(measure_starts):
-                                x_right = float(measure_starts[local_idx + 1])
-                            else:
-                                x_right = float(row_tail)
-                            if (x_right - x_left) < 6.0:
-                                continue
-                            if (system_y_bottom - system_y_top) <= 0.0:
-                                continue
-                            measure_box_rows_px.append(
-                                {
-                                    "page_id": page_id,
-                                    "system_id": system_id,
-                                    "system_index": int(sys_index),
-                                    "measure_local_index": int(local_idx),
-                                    "x_left": float(x_left),
-                                    "x_right": float(x_right),
-                                    "y_top": float(system_y_top),
-                                    "y_bottom": float(system_y_bottom),
-                                    "raw_measure_number": str(local_idx + 1),
-                                    "source": "omr",
-                                }
-                            )
+            selected_measure_rows = _select_measure_rows_for_system(
+                system_measure_rows_px,
+                measure_box_filter_reason_counts,
+            )
+            first_pass_starts_info = _build_measure_starts_for_system(
+                selected_measure_rows,
+                expected_spacing,
+                pic_w,
+            )
+            first_pass_measure_count = len(first_pass_starts_info.get("measure_starts") or [])
+            system_width = 0.0
+            if first_pass_measure_count > 0:
+                first_start = float((first_pass_starts_info.get("measure_starts") or [0.0])[0])
+                system_width = max(0.0, float(first_pass_starts_info.get("row_tail") or 0.0) - first_start)
+            page_system_entries.append(
+                {
+                    "page_id": page_id,
+                    "system_id": system_id,
+                    "system_index": int(sys_index),
+                    "staff_contexts": staff_contexts,
+                    "system_measure_rows_px": system_measure_rows_px,
+                    "selected_measure_rows": selected_measure_rows,
+                    "first_pass_starts_info": first_pass_starts_info,
+                    "first_pass_measure_count": int(first_pass_measure_count),
+                    "system_width": float(system_width),
+                    "system_inters": system_inters,
+                    "inter_by_id": inter_by_id,
+                }
+            )
 
             if system_guide_rows_px:
                 sx = float(min(r[0] for r in system_guide_rows_px))
@@ -2032,6 +2202,109 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 system_guides_px_aligned.append((sx, sy0, sy1))
             else:
                 system_guides_px_aligned.append(None)
+
+        for entry_idx, entry in enumerate(page_system_entries):
+            system_id = str(entry.get("system_id") or "?")
+            system_index = int(entry.get("system_index") or 0)
+            page_id = str(entry.get("page_id") or "?")
+            first_pass_starts_info = dict(entry.get("first_pass_starts_info") or {})
+            first_pass_measure_count = int(entry.get("first_pass_measure_count") or 0)
+            neighbor_median_count = _neighbor_median_measure_count(page_system_entries, entry_idx)
+            under_split_suspect = _is_under_split_suspect(first_pass_measure_count, neighbor_median_count)
+            recovery_attempted = False
+            recovery_result = "first_pass"
+            second_pass_measure_count: int | None = None
+            chosen_starts_info = first_pass_starts_info
+
+            if under_split_suspect:
+                recovery_attempted = True
+                recovered_measure_rows_px: list[dict] = []
+                candidate_sources_second_pass: list[str] = []
+                for staff_ctx in entry.get("staff_contexts") or []:
+                    if not isinstance(staff_ctx, dict):
+                        continue
+                    staff_id = str(staff_ctx.get("staff_id") or "").strip()
+                    second_pass_xs, second_pass_source = _barline_xs_for_staff_from_omr(
+                        system_inters=entry.get("system_inters"),
+                        inter_by_id=entry.get("inter_by_id") or {},
+                        expected_spacing=expected_spacing,
+                        staff_id=staff_id,
+                        y_top=float(staff_ctx.get("y_top") or 0.0),
+                        y_bot=float(staff_ctx.get("y_bottom") or 0.0),
+                        staff_barline_ids=list(staff_ctx.get("staff_barline_ids") or []),
+                        staff_left=staff_ctx.get("staff_left"),
+                        staff_right=staff_ctx.get("staff_right"),
+                        allow_supplement=True,
+                        relaxed=True,
+                    )
+                    candidate_sources_second_pass.append(str(second_pass_source))
+                    recovered_measure_rows_px.append(
+                        {
+                            "page_id": page_id,
+                            "system_id": system_id,
+                            "system_index": system_index,
+                            "x_start": float(staff_ctx.get("x_start") or 0.0),
+                            "y_top": float(staff_ctx.get("y_top") or 0.0),
+                            "y_bottom": float(staff_ctx.get("y_bottom") or 0.0),
+                            "staff_right": float(staff_ctx.get("staff_right")) if staff_ctx.get("staff_right") is not None else None,
+                            "barline_xs": [float(x) for x in second_pass_xs],
+                            "barline_count": int(len(second_pass_xs)),
+                            "y_source": str(staff_ctx.get("y_source") or ""),
+                            "candidate_source": str(second_pass_source),
+                        }
+                    )
+
+                second_selected_rows = _select_measure_rows_for_system(recovered_measure_rows_px)
+                second_pass_starts_info = _build_measure_starts_for_system(
+                    second_selected_rows,
+                    expected_spacing,
+                    pic_w,
+                    relaxed=True,
+                )
+                second_pass_measure_count = len(second_pass_starts_info.get("measure_starts") or [])
+
+                if _should_accept_second_pass(
+                    first_pass_measure_count,
+                    second_pass_measure_count,
+                    neighbor_median_count,
+                ):
+                    chosen_starts_info = second_pass_starts_info
+                    recovery_result = "second_pass_recovered"
+                else:
+                    recovery_result = "second_pass_rejected"
+            else:
+                candidate_sources_second_pass = []
+
+            _append_measure_outputs_for_system(
+                measure_box_rows_px,
+                measure_marks_px,
+                page_id=page_id,
+                system_id=system_id,
+                system_index=system_index,
+                measure_starts_info=chosen_starts_info,
+            )
+
+            first_pass_sources = [
+                str(row.get("candidate_source") or "")
+                for row in (entry.get("system_measure_rows_px") or [])
+                if isinstance(row, dict)
+            ]
+            omr_system_recovery_rows.append(
+                {
+                    "page_id": page_id,
+                    "system_id": system_id,
+                    "system_index": system_index,
+                    "system_width": float(entry.get("system_width") or 0.0),
+                    "first_pass_measure_count": int(first_pass_measure_count),
+                    "neighbor_median_measure_count": float(neighbor_median_count) if neighbor_median_count is not None else None,
+                    "under_split_suspect": bool(under_split_suspect),
+                    "recovery_attempted": bool(recovery_attempted),
+                    "recovery_result": recovery_result,
+                    "second_pass_measure_count": int(second_pass_measure_count) if second_pass_measure_count is not None else None,
+                    "first_pass_candidate_sources": first_pass_sources,
+                    "second_pass_candidate_sources": candidate_sources_second_pass,
+                }
+            )
 
     return (
         pic_w,
@@ -2044,6 +2317,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
         system_guides_px_aligned,
         measure_box_rows_px,
         omr_fallback_rows,
+        omr_system_recovery_rows,
         measure_box_filter_reason_counts,
     )
 
@@ -2323,6 +2597,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 system_guides_px_aligned,
                 measure_box_rows_px,
                 omr_fallback_rows,
+                omr_system_recovery_rows,
                 measure_box_filter_reason_counts,
             ) = _parse_sheet(z, sheet_xml_path)
             if pic_w <= 0 or pic_h <= 0:
@@ -2771,6 +3046,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "xml_confidence_tier": xml_confidence_tier,
                     "xml_low_confidence_used": xml_low_confidence_used,
                     "omr_fallback_rows": omr_fallback_rows,
+                    "omr_system_recovery_rows": omr_system_recovery_rows,
                     "assigned_labels": [t[3] for t in staff_start_labels_pdf],
                     "staff_start_candidate_count": len(staff_start_labels_pdf),
                     "system_label_candidate_count": system_label_candidate_count,
