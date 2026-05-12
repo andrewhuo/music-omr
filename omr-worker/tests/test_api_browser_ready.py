@@ -1557,6 +1557,105 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertNotIn("reference_examples_attached", captured_payloads[0])
         self.assertEqual(result.get("reference_examples_attached"), 2)
 
+    def test_profile_system_layouts_flags_short_partial_staff(self):
+        systems = [
+            {"system_id": "p1_s0", "page": 1, "system_index": 0, "anchor": {"y_top": 0, "y_bottom": 40}},
+            {"system_id": "p1_s1", "page": 1, "system_index": 1, "anchor": {"y_top": 50, "y_bottom": 70}},
+            {"system_id": "p1_s2", "page": 1, "system_index": 2, "anchor": {"y_top": 80, "y_bottom": 120}},
+        ]
+
+        profile = WORKER._profile_system_layouts(systems)
+
+        self.assertEqual(profile.get("suspicious_system_ids"), {"p1_s1"})
+        self.assertFalse(bool(systems[0].get("suspicious_partial_staff")))
+        self.assertTrue(bool(systems[1].get("suspicious_partial_staff")))
+        self.assertFalse(bool(systems[2].get("suspicious_partial_staff")))
+
+    def test_reassign_measures_prefers_normal_system_over_suspicious_partial_staff(self):
+        systems = [
+            {"system_id": "p1_s0", "page": 1, "system_index": 0, "anchor": {"y_top": 0, "y_bottom": 40}},
+            {"system_id": "p1_s1", "page": 1, "system_index": 1, "anchor": {"y_top": 30, "y_bottom": 50}},
+            {"system_id": "p1_s2", "page": 1, "system_index": 2, "anchor": {"y_top": 80, "y_bottom": 120}},
+        ]
+        measures = [
+            {
+                "measure_id": "p1_s1_m0",
+                "system_id": "p1_s1",
+                "page": 1,
+                "system_index": 1,
+                "measure_local_index": 0,
+                "x_left": 25,
+                "y_top": 32,
+                "y_bottom": 38,
+            }
+        ]
+
+        reassigned = WORKER._reassign_measures_to_nearest_system(systems, measures)
+
+        self.assertEqual(reassigned, 1)
+        self.assertEqual(measures[0].get("system_id"), "p1_s0")
+        self.assertEqual(measures[0].get("system_index"), 0)
+        self.assertEqual(measures[0].get("measure_id"), "p1_s0_m0")
+
+    def test_refresh_editable_state_qa_warns_for_empty_suspicious_system(self):
+        editable_state = {
+            "systems": [
+                {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1", "anchor": {"y_top": 0, "y_bottom": 40}},
+                {"system_id": "p1_s1", "page": 1, "system_index": 1, "current_value": "5", "anchor": {"y_top": 50, "y_bottom": 70}},
+                {"system_id": "p1_s2", "page": 1, "system_index": 2, "current_value": "9", "anchor": {"y_top": 80, "y_bottom": 120}},
+            ],
+            "measures": [
+                {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 10, "y_top": 0, "y_bottom": 20},
+                {"measure_id": "p1_s2_m0", "system_id": "p1_s2", "page": 1, "system_index": 2, "measure_local_index": 0, "x_left": 10, "y_top": 80, "y_bottom": 100},
+            ],
+        }
+
+        qa = WORKER._refresh_editable_state_qa(editable_state, editable_state["systems"], editable_state["measures"])
+        warning_types = {(row or {}).get("type") for row in (qa.get("warnings") or [])}
+
+        self.assertEqual(qa.get("status"), "warning")
+        self.assertIn("suspicious_partial_staff", warning_types)
+        self.assertIn("system_has_no_measures", warning_types)
+        self.assertEqual(qa.get("warning_pages"), [1])
+
+    def test_refresh_editable_state_qa_warns_on_duplicate_later_system_starts(self):
+        editable_state = {
+            "systems": [
+                {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1", "anchor": {"y_top": 0, "y_bottom": 40}},
+                {"system_id": "p1_s1", "page": 1, "system_index": 1, "current_value": "42", "anchor": {"y_top": 50, "y_bottom": 90}},
+                {"system_id": "p1_s2", "page": 1, "system_index": 2, "current_value": "42", "anchor": {"y_top": 100, "y_bottom": 140}},
+                {"system_id": "p1_s3", "page": 1, "system_index": 3, "current_value": "42", "anchor": {"y_top": 150, "y_bottom": 190}},
+            ],
+            "measures": [
+                {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 10, "y_top": 0, "y_bottom": 20},
+                {"measure_id": "p1_s1_m0", "system_id": "p1_s1", "page": 1, "system_index": 1, "measure_local_index": 0, "x_left": 10, "y_top": 50, "y_bottom": 70},
+                {"measure_id": "p1_s2_m0", "system_id": "p1_s2", "page": 1, "system_index": 2, "measure_local_index": 0, "x_left": 10, "y_top": 100, "y_bottom": 120},
+                {"measure_id": "p1_s3_m0", "system_id": "p1_s3", "page": 1, "system_index": 3, "measure_local_index": 0, "x_left": 10, "y_top": 150, "y_bottom": 170},
+            ],
+        }
+
+        qa = WORKER._refresh_editable_state_qa(editable_state, editable_state["systems"], editable_state["measures"])
+        warning_types = {(row or {}).get("type") for row in (qa.get("warnings") or [])}
+
+        self.assertEqual(qa.get("status"), "warning")
+        self.assertIn("duplicate_later_system_start", warning_types)
+        self.assertEqual(qa.get("warning_pages"), [1])
+
+    def test_refresh_editable_state_systems_and_measures_keeps_clean_pages_quiet(self):
+        mapping_summary = deepcopy(self._sample_mapping_summary())
+        editable_state = mapping_summary.get("editable_state") or {}
+
+        systems, measures, reassign_count, qa = WORKER._refresh_editable_state_systems_and_measures(editable_state)
+
+        self.assertEqual(reassign_count, 0)
+        self.assertEqual(len(systems), 2)
+        self.assertEqual(len(measures), 3)
+        self.assertEqual(qa.get("status"), "ok")
+        self.assertEqual(qa.get("warning_count"), 0)
+        self.assertEqual(qa.get("warning_pages"), [])
+        self.assertEqual(qa.get("warnings"), [])
+        self.assertTrue(all(not row.get("suspicious_partial_staff") for row in systems))
+
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import hashlib
 import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from tempfile import TemporaryDirectory
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -68,6 +69,7 @@ AI_MEASURE_CROP_SYSTEM_GAP_CLAMP_RATIO = max(
     0.0,
     min(1.0, float(os.environ.get("AI_MEASURE_CROP_SYSTEM_GAP_CLAMP_RATIO", "0.75") or "0.75")),
 )
+SUSPICIOUS_PARTIAL_STAFF_HEIGHT_RATIO = 0.65
 AI_SUGGEST_SAVE_DEBUG_CROPS = (
     str(os.environ.get("AI_SUGGEST_SAVE_DEBUG_CROPS", "0")).strip().lower() not in ("0", "false", "no", "")
 )
@@ -816,6 +818,13 @@ def _safe_bool(value, default: bool = False) -> bool:
     if txt in ("0", "false", "no", "n", "off"):
         return False
     return bool(default)
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
 
 
 def _label_position(anchor_x: float, anchor_y_top: float, page_width: float, page_height: float, text: str) -> tuple[float, float, float]:
@@ -2517,8 +2526,11 @@ def _reassign_measures_to_nearest_system(systems: list[dict], measures: list[dic
 
     Returns the number of measures that were reassigned.
     """
+    layout_profile = _profile_system_layouts(systems)
+    suspicious_system_ids = set(layout_profile.get("suspicious_system_ids") or set())
+
     # Step 1: Build per-page system lookup from anchors.
-    page_systems: dict[int, list[tuple[str, int, float, float]]] = {}  # page -> [(system_id, system_index, y_top, y_bot)]
+    page_systems: dict[int, list[tuple[str, int, float, float, bool]]] = {}  # page -> [(system_id, system_index, y_top, y_bot, suspicious)]
     for s in systems:
         anchor = s.get("anchor")
         if not isinstance(anchor, dict):
@@ -2533,7 +2545,7 @@ def _reassign_measures_to_nearest_system(systems: list[dict], measures: list[dic
             continue
         if y_bot <= y_top:
             continue
-        page_systems.setdefault(page, []).append((sid, sidx, y_top, y_bot))
+        page_systems.setdefault(page, []).append((sid, sidx, y_top, y_bot, sid in suspicious_system_ids))
     # Sort each page's systems by y_top (top-to-bottom on page).
     for page in page_systems:
         page_systems[page].sort(key=lambda t: t[2])
@@ -2556,23 +2568,45 @@ def _reassign_measures_to_nearest_system(systems: list[dict], measures: list[dic
         if not candidates:
             continue
 
-        best_sid = None
-        best_sidx = 0
-        best_overlap = -999999.0
-        best_center_dist = 999999.0
         m_center = (m_y_top + m_y_bot) / 2.0
+        candidate_rows: list[dict] = []
 
-        for sid, sidx, s_y_top, s_y_bot in candidates:
+        for sid, sidx, s_y_top, s_y_bot, suspicious in candidates:
             overlap = min(m_y_bot, s_y_bot) - max(m_y_top, s_y_top) + tolerance
             s_center = (s_y_top + s_y_bot) / 2.0
             center_dist = abs(m_center - s_center)
-            if overlap > best_overlap or (overlap == best_overlap and center_dist < best_center_dist):
-                best_overlap = overlap
-                best_center_dist = center_dist
-                best_sid = sid
-                best_sidx = sidx
+            candidate_rows.append(
+                {
+                    "system_id": sid,
+                    "system_index": sidx,
+                    "overlap": overlap,
+                    "center_dist": center_dist,
+                    "suspicious": bool(suspicious),
+                }
+            )
 
-        if best_sid is None:
+        def _best_candidate(rows: list[dict]) -> dict | None:
+            if not rows:
+                return None
+            return sorted(rows, key=lambda row: (-float(row["overlap"]), float(row["center_dist"])))[0]
+
+        normal_positive = [row for row in candidate_rows if not row["suspicious"] and float(row["overlap"]) > 0.0]
+        if normal_positive:
+            best = _best_candidate(normal_positive)
+        else:
+            positive_rows = [row for row in candidate_rows if float(row["overlap"]) > 0.0]
+            suspicious_positive = [row for row in positive_rows if row["suspicious"]]
+            if len(positive_rows) == 1 and len(suspicious_positive) == 1:
+                best = suspicious_positive[0]
+            else:
+                non_suspicious_rows = [row for row in candidate_rows if not row["suspicious"]]
+                best = _best_candidate(non_suspicious_rows or candidate_rows)
+
+        if not isinstance(best, dict):
+            continue
+        best_sid = str(best.get("system_id") or "").strip()
+        best_sidx = _safe_int(best.get("system_index"), 0)
+        if not best_sid:
             continue
 
         current_sid = str(m.get("system_id") or "")
@@ -2623,6 +2657,177 @@ def _sorted_system_rows(systems: list[dict] | None) -> list[dict]:
         [s for s in (systems or []) if isinstance(s, dict)],
         key=lambda s: (_safe_int(s.get("page"), 0), _safe_int(s.get("system_index"), 0)),
     )
+
+
+def _profile_system_layouts(systems: list[dict] | None) -> dict:
+    sorted_systems = _sorted_system_rows(systems)
+    by_page: dict[int, list[dict]] = {}
+    suspicious_system_ids: set[str] = set()
+
+    for system in sorted_systems:
+        system["suspicious_partial_staff"] = False
+        anchor = system.get("anchor")
+        if not isinstance(anchor, dict):
+            continue
+        page = _safe_int(system.get("page"), 0)
+        y_top = _safe_float(anchor.get("y_top"), 0.0)
+        y_bottom = _safe_float(anchor.get("y_bottom"), 0.0)
+        height = y_bottom - y_top
+        if page <= 0 or height <= 0.0:
+            continue
+        by_page.setdefault(page, []).append(
+            {
+                "system_id": str(system.get("system_id") or "").strip(),
+                "system_index": _safe_int(system.get("system_index"), 0),
+                "height": float(height),
+                "row": system,
+            }
+        )
+
+    page_profiles: dict[int, dict] = {}
+    for page, rows in by_page.items():
+        heights = [row["height"] for row in rows if row["height"] > 0.0]
+        page_median = float(median(heights)) if heights else 0.0
+        threshold = page_median * SUSPICIOUS_PARTIAL_STAFF_HEIGHT_RATIO if page_median > 0.0 else 0.0
+        suspicious_rows: list[dict] = []
+        for row in rows:
+            suspicious = bool(page_median > 0.0 and row["height"] < threshold)
+            row["row"]["suspicious_partial_staff"] = suspicious
+            if suspicious and row["system_id"]:
+                suspicious_system_ids.add(row["system_id"])
+                suspicious_rows.append(
+                    {
+                        "system_id": row["system_id"],
+                        "system_index": row["system_index"],
+                        "height": row["height"],
+                    }
+                )
+        page_profiles[page] = {
+            "median_height": page_median,
+            "threshold_height": threshold,
+            "suspicious_systems": suspicious_rows,
+        }
+
+    return {
+        "by_page": page_profiles,
+        "suspicious_system_ids": suspicious_system_ids,
+    }
+
+
+def _refresh_editable_state_qa(
+    editable_state: dict | None,
+    systems: list[dict] | None,
+    measures: list[dict] | None,
+) -> dict:
+    if not isinstance(editable_state, dict):
+        return {}
+
+    sorted_systems = _sorted_system_rows(systems)
+    ordered_measures = _sorted_measure_rows(measures)
+    layout_profile = _profile_system_layouts(sorted_systems)
+    by_page = layout_profile.get("by_page") or {}
+
+    warnings: list[dict] = []
+    warning_pages: set[int] = set()
+
+    for page, profile in sorted(by_page.items()):
+        for row in profile.get("suspicious_systems") or []:
+            system_id = str(row.get("system_id") or "").strip()
+            warnings.append(
+                {
+                    "type": "suspicious_partial_staff",
+                    "page": int(page),
+                    "system_id": system_id,
+                    "message": f"System {system_id or '?'} looks unusually short for page {page}.",
+                }
+            )
+            warning_pages.add(int(page))
+
+    measure_counts_by_system: dict[str, int] = {}
+    for measure in ordered_measures:
+        system_id = str(measure.get("system_id") or "").strip()
+        if system_id:
+            measure_counts_by_system[system_id] = measure_counts_by_system.get(system_id, 0) + 1
+
+    for system in sorted_systems:
+        system_id = str(system.get("system_id") or "").strip()
+        if not system_id or measure_counts_by_system.get(system_id, 0) > 0:
+            continue
+        page = _safe_int(system.get("page"), 0)
+        warnings.append(
+            {
+                "type": "system_has_no_measures",
+                "page": page,
+                "system_id": system_id,
+                "message": f"System {system_id} has no measures after reassignment.",
+            }
+        )
+        if page > 0:
+            warning_pages.add(page)
+
+    systems_by_page: dict[int, list[dict]] = {}
+    for system in sorted_systems:
+        page = _safe_int(system.get("page"), 0)
+        if page > 0:
+            systems_by_page.setdefault(page, []).append(system)
+
+    for page, rows in sorted(systems_by_page.items()):
+        duplicate_values: dict[str, list[str]] = {}
+        for row in rows[1:]:
+            start_value = str(row.get("current_value") or row.get("value") or "").strip()
+            if not start_value:
+                continue
+            duplicate_values.setdefault(start_value, []).append(str(row.get("system_id") or "").strip())
+        for start_value, system_ids in sorted(duplicate_values.items()):
+            unique_ids = [sid for sid in system_ids if sid]
+            if len(unique_ids) < 2:
+                continue
+            warnings.append(
+                {
+                    "type": "duplicate_later_system_start",
+                    "page": int(page),
+                    "message": f"Later systems on page {page} share start value {start_value}: {', '.join(unique_ids)}.",
+                }
+            )
+            warning_pages.add(int(page))
+
+    qa = {
+        "status": "warning" if warnings else "ok",
+        "total_systems": len(sorted_systems),
+        "warning_count": len(warnings),
+        "warning_pages": sorted(warning_pages),
+        "warnings": warnings,
+    }
+    editable_state["qa"] = qa
+    return qa
+
+
+def _refresh_editable_state_systems_and_measures(
+    editable_state: dict,
+    *,
+    ending_debug_ctx: dict | None = None,
+) -> tuple[list[dict], list[dict], int, dict]:
+    systems = editable_state.get("systems")
+    if not isinstance(systems, list):
+        systems = []
+    measures = editable_state.get("measures")
+    if not isinstance(measures, list):
+        measures = []
+
+    _editable_rest_measures(editable_state)
+    _editable_pickup_measures(editable_state)
+    reassign_count = _reassign_measures_to_nearest_system(systems, measures)
+    systems, measures, _, _ = _recompute_measure_numbering(
+        systems,
+        measures,
+        editable_state,
+        ending_debug_ctx=ending_debug_ctx,
+    )
+    editable_state["systems"] = systems
+    editable_state["measures"] = measures
+    editable_state["staff_boxes"] = []
+    qa = _refresh_editable_state_qa(editable_state, systems, measures)
+    return systems, measures, reassign_count, qa
 
 
 def _measure_number_overrides(editable_state: dict) -> dict[str, int]:
@@ -3552,6 +3757,7 @@ def _apply_relabel_edits(
     editable_state["measures"] = measures
     editable_state["staff_boxes"] = []
     editable_state["labels_mode"] = labels_mode
+    _refresh_editable_state_qa(editable_state, systems, measures)
     return systems, applied, rejected, len(systems)
 
 
@@ -3917,15 +4123,9 @@ def get_job_state(job_id: str):
     if not isinstance(qa, dict):
         qa = {}
 
-    _editable_rest_measures(editable_state)
-    _editable_pickup_measures(editable_state)
-    reassign_count = _reassign_measures_to_nearest_system(systems, measures)
+    systems, measures, reassign_count, qa = _refresh_editable_state_systems_and_measures(editable_state)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
-    systems, measures, _, _ = _recompute_measure_numbering(systems, measures, editable_state)
-    editable_state["systems"] = systems
-    editable_state["measures"] = measures
-    editable_state["staff_boxes"] = []
 
     response = {
         "job_id": job_id,
@@ -4043,15 +4243,9 @@ def ai_suggest_job(job_id: str):
     if not isinstance(measures, list):
         measures = []
     batch_trace_before_rows = _ai_batch_trace_before_snapshot(measures) if _ai_suggest_debug_enabled() else None
-    _editable_rest_measures(editable_state)
-    _editable_pickup_measures(editable_state)
-    reassign_count = _reassign_measures_to_nearest_system(systems, measures)
+    systems, measures, reassign_count, _ = _refresh_editable_state_systems_and_measures(editable_state)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
-    systems, measures, _, _ = _recompute_measure_numbering(systems, measures, editable_state)
-    editable_state["systems"] = systems
-    editable_state["measures"] = measures
-    editable_state["staff_boxes"] = []
 
     source_state_version = _editable_state_version(editable_state)
     mapping_summary["editable_state"] = editable_state
@@ -4212,15 +4406,9 @@ def ai_suggest_job_step(job_id: str):
     if not isinstance(measures, list):
         measures = []
     batch_trace_before_rows = _ai_batch_trace_before_snapshot(measures) if _ai_suggest_debug_enabled() else None
-    _editable_rest_measures(editable_state)
-    _editable_pickup_measures(editable_state)
-    reassign_count = _reassign_measures_to_nearest_system(systems, measures)
+    systems, measures, reassign_count, _ = _refresh_editable_state_systems_and_measures(editable_state)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
-    systems, measures, _, _ = _recompute_measure_numbering(systems, measures, editable_state)
-    editable_state["systems"] = systems
-    editable_state["measures"] = measures
-    editable_state["staff_boxes"] = []
 
     source_state_version = _editable_state_version(editable_state)
     mapping_summary["editable_state"] = editable_state
@@ -4595,21 +4783,11 @@ def relabel_job(job_id: str):
     editable_state["labels_mode"] = labels_mode_before
     systems_before = _sorted_system_rows(editable_state.get("systems") or [])
     measures_before = _sorted_measure_rows(editable_state.get("measures") or [])
-    _editable_rest_measures(editable_state)
-    _editable_pickup_measures(editable_state)
-    reassign_count = _reassign_measures_to_nearest_system(systems_before, measures_before)
+    editable_state["systems"] = systems_before
+    editable_state["measures"] = measures_before
+    systems_before, measures_before, reassign_count, _ = _refresh_editable_state_systems_and_measures(editable_state)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
-    editable_state["systems"] = systems_before
-    editable_state["measures"] = measures_before
-    editable_state["staff_boxes"] = []
-    systems_before, measures_before, _, _ = _recompute_measure_numbering(
-        systems_before,
-        measures_before,
-        editable_state,
-    )
-    editable_state["systems"] = systems_before
-    editable_state["measures"] = measures_before
 
     if not isinstance(edits, list) or len(edits) == 0:
         trace = {
