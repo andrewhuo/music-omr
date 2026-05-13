@@ -55,6 +55,135 @@ def _barline_el(el_id: int, staff: str, x: float, y_top: float, y_bottom: float,
 
 
 class AnnotateGuidesFromOmrTests(unittest.TestCase):
+    def test_grand_staff_connector_suppression_detects_tiny_shared_left_box(self):
+        rows = [
+            {
+                "x_start": 10.0,
+                "y_top": 20.0,
+                "y_bottom": 40.0,
+                "staff_right": 150.0,
+                "barline_xs": [24.0, 70.0, 116.0],
+                "barline_count": 3,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 10.5,
+                "y_top": 50.0,
+                "y_bottom": 70.0,
+                "staff_right": 150.0,
+                "barline_xs": [24.8, 70.6, 116.4],
+                "barline_count": 3,
+                "y_source": "staff_lines",
+            },
+        ]
+
+        info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
+        starts_without_drop = MOD._build_measure_starts_for_system(rows, 10.0, 220.0)
+        starts_with_drop = MOD._build_measure_starts_for_system(rows, 10.0, 220.0, drop_x_start=True)
+
+        self.assertTrue(info["suppress"])
+        self.assertEqual(info["reason"], "shared_tiny_left_connector")
+        self.assertEqual(starts_without_drop["measure_starts"], [10.0, 24.0, 70.0, 116.0])
+        self.assertEqual(starts_with_drop["measure_starts"], [24.0, 70.0, 116.0])
+
+    def test_grand_staff_connector_suppression_skips_normal_grand_staff(self):
+        rows = [
+            {
+                "x_start": 10.0,
+                "y_top": 20.0,
+                "y_bottom": 40.0,
+                "staff_right": 150.0,
+                "barline_xs": [38.0, 72.0, 106.0],
+                "barline_count": 3,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 10.0,
+                "y_top": 50.0,
+                "y_bottom": 70.0,
+                "staff_right": 150.0,
+                "barline_xs": [38.2, 72.2, 106.2],
+                "barline_count": 3,
+                "y_source": "staff_lines",
+            },
+        ]
+
+        info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
+
+        self.assertFalse(info["suppress"])
+        self.assertEqual(info["reason"], "first_gap_not_tiny")
+
+    def test_grand_staff_connector_suppression_requires_tiny_gap(self):
+        rows = [
+            {
+                "x_start": 10.0,
+                "y_top": 20.0,
+                "y_bottom": 40.0,
+                "staff_right": 150.0,
+                "barline_xs": [29.0, 70.0, 111.0],
+                "barline_count": 3,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 10.0,
+                "y_top": 50.0,
+                "y_bottom": 70.0,
+                "staff_right": 150.0,
+                "barline_xs": [29.2, 70.2, 111.2],
+                "barline_count": 3,
+                "y_source": "staff_lines",
+            },
+        ]
+
+        info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
+
+        self.assertFalse(info["suppress"])
+        self.assertEqual(info["reason"], "first_gap_not_tiny")
+
+    def test_grand_staff_connector_suppression_does_not_run_on_one_staff(self):
+        rows = [
+            {
+                "x_start": 10.0,
+                "y_top": 20.0,
+                "y_bottom": 40.0,
+                "staff_right": 150.0,
+                "barline_xs": [24.0, 70.0, 116.0],
+                "barline_count": 3,
+                "y_source": "staff_lines",
+            }
+        ]
+
+        info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
+
+        self.assertFalse(info["suppress"])
+        self.assertEqual(info["reason"], "not_grand_staff")
+
+    def test_grand_staff_connector_suppression_keeps_staves_aligned(self):
+        rows = [
+            {
+                "x_start": 10.0,
+                "y_top": 20.0,
+                "y_bottom": 40.0,
+                "staff_right": 150.0,
+                "barline_xs": [24.0, 70.0, 116.0],
+                "barline_count": 3,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 10.5,
+                "y_top": 50.0,
+                "y_bottom": 70.0,
+                "staff_right": 150.0,
+                "barline_xs": [24.8, 70.6, 116.4],
+                "barline_count": 3,
+                "y_source": "staff_lines",
+            },
+        ]
+
+        starts = MOD._build_measure_starts_for_system(rows, 10.0, 220.0, drop_x_start=True)
+
+        self.assertEqual(starts["measure_starts"], [24.0, 70.0, 116.0])
+
     def test_second_pass_can_supplement_incomplete_staff_barline_ids(self):
         system_inters = ET.Element("inters")
         bar1 = _barline_el(1, "1", 100.0, 10.0, 50.0)

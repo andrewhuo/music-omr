@@ -1291,12 +1291,89 @@ def _select_measure_rows_for_system(
     return []
 
 
+def _detect_grand_staff_connector_suppression(
+    selected_measure_rows: list[dict],
+    expected_spacing: float,
+) -> dict:
+    info = {
+        "suppress": False,
+        "reason": "not_grand_staff",
+        "first_gap": None,
+        "first_barline_x": None,
+    }
+
+    if len(selected_measure_rows) != 2:
+        return info
+    if any(str(row.get("y_source") or "") != "staff_lines" for row in selected_measure_rows):
+        info["reason"] = "non_staff_line_rows"
+        return info
+
+    rows = sorted(selected_measure_rows, key=lambda row: float(row.get("y_top") or 0.0))
+    if any(int(row.get("barline_count") or 0) < 1 for row in rows):
+        info["reason"] = "missing_first_barline"
+        return info
+
+    first_barlines: list[float] = []
+    first_gaps: list[float] = []
+    next_real_spans: list[float] = []
+    gap_limit = max(18.0, (1.6 * expected_spacing) if expected_spacing > 0 else 18.0)
+
+    for row in rows:
+        x_start = float(row.get("x_start") or 0.0)
+        barline_xs = sorted(float(x) for x in (row.get("barline_xs") or []))
+        if not barline_xs:
+            info["reason"] = "missing_first_barline"
+            return info
+
+        first_bar = float(barline_xs[0])
+        gap = float(first_bar - x_start)
+        first_barlines.append(first_bar)
+        first_gaps.append(gap)
+
+        if gap <= 0.0 or gap > gap_limit:
+            info["reason"] = "first_gap_not_tiny"
+            info["first_gap"] = float(_median(first_gaps)) if first_gaps else None
+            info["first_barline_x"] = float(_median(first_barlines)) if first_barlines else None
+            return info
+
+        if len(barline_xs) >= 2:
+            next_span = float(barline_xs[1] - barline_xs[0])
+            if next_span > 0.0:
+                next_real_spans.append(next_span)
+
+    alignment_tol = max(6.0, (0.5 * expected_spacing) if expected_spacing > 0 else 6.0)
+    info["first_gap"] = float(_median(first_gaps)) if first_gaps else None
+    info["first_barline_x"] = float(_median(first_barlines)) if first_barlines else None
+
+    if len(first_barlines) != 2 or abs(first_barlines[0] - first_barlines[1]) > alignment_tol:
+        info["reason"] = "first_barline_misaligned"
+        return info
+
+    if not next_real_spans:
+        info["reason"] = "no_later_real_span"
+        return info
+
+    median_next_span = _median(next_real_spans)
+    if median_next_span is None or median_next_span <= 0.0:
+        info["reason"] = "no_later_real_span"
+        return info
+
+    if float(info["first_gap"] or 0.0) > (0.45 * float(median_next_span)):
+        info["reason"] = "first_gap_not_small_enough_relative"
+        return info
+
+    info["suppress"] = True
+    info["reason"] = "shared_tiny_left_connector"
+    return info
+
+
 def _build_measure_starts_for_system(
     selected_measure_rows: list[dict],
     expected_spacing: float,
     pic_w: float,
     *,
     relaxed: bool = False,
+    drop_x_start: bool = False,
 ) -> dict:
     system_y_top = min(float(row["y_top"]) for row in selected_measure_rows) if selected_measure_rows else 0.0
     system_y_bottom = max(float(row["y_bottom"]) for row in selected_measure_rows) if selected_measure_rows else 0.0
@@ -1316,7 +1393,8 @@ def _build_measure_starts_for_system(
     staff_right_candidates: list[float] = []
 
     for row in selected_measure_rows:
-        start_candidates.append(float(row["x_start"]))
+        if not drop_x_start:
+            start_candidates.append(float(row["x_start"]))
         for x in row.get("barline_xs") or []:
             boundary_candidates.append(float(x))
         staff_right = row.get("staff_right")
@@ -2104,6 +2182,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 counter_before = measure_counter
 
                 # Always record a staff-start label position; MXL can replace text later.
+                staff_start_mark_index = len(staff_start_marks_px)
                 staff_start_marks_px.append((x_postpad, y_top, y_bot, str(measure_counter)))
                 if staff_barline_xs:
                     measure_counter += increment_bars
@@ -2162,6 +2241,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         "staff_right": staff_right_effective,
                         "x_start": float(x_postpad),
                         "y_source": y_source,
+                        "staff_start_mark_index": int(staff_start_mark_index),
                     }
                 )
 
@@ -2169,10 +2249,15 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 system_measure_rows_px,
                 measure_box_filter_reason_counts,
             )
+            first_pass_connector_info = _detect_grand_staff_connector_suppression(
+                selected_measure_rows,
+                expected_spacing,
+            )
             first_pass_starts_info = _build_measure_starts_for_system(
                 selected_measure_rows,
                 expected_spacing,
                 pic_w,
+                drop_x_start=bool(first_pass_connector_info.get("suppress")),
             )
             first_pass_measure_count = len(first_pass_starts_info.get("measure_starts") or [])
             system_width = 0.0
@@ -2188,6 +2273,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "system_measure_rows_px": system_measure_rows_px,
                     "selected_measure_rows": selected_measure_rows,
                     "first_pass_starts_info": first_pass_starts_info,
+                    "first_pass_connector_info": first_pass_connector_info,
                     "first_pass_measure_count": int(first_pass_measure_count),
                     "system_width": float(system_width),
                     "system_inters": system_inters,
@@ -2215,6 +2301,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             recovery_result = "first_pass"
             second_pass_measure_count: int | None = None
             chosen_starts_info = first_pass_starts_info
+            chosen_connector_info = dict(entry.get("first_pass_connector_info") or {})
 
             if under_split_suspect:
                 recovery_attempted = True
@@ -2255,11 +2342,16 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     )
 
                 second_selected_rows = _select_measure_rows_for_system(recovered_measure_rows_px)
+                second_pass_connector_info = _detect_grand_staff_connector_suppression(
+                    second_selected_rows,
+                    expected_spacing,
+                )
                 second_pass_starts_info = _build_measure_starts_for_system(
                     second_selected_rows,
                     expected_spacing,
                     pic_w,
                     relaxed=True,
+                    drop_x_start=bool(second_pass_connector_info.get("suppress")),
                 )
                 second_pass_measure_count = len(second_pass_starts_info.get("measure_starts") or [])
 
@@ -2269,11 +2361,25 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     neighbor_median_count,
                 ):
                     chosen_starts_info = second_pass_starts_info
+                    chosen_connector_info = second_pass_connector_info
                     recovery_result = "second_pass_recovered"
                 else:
                     recovery_result = "second_pass_rejected"
             else:
                 candidate_sources_second_pass = []
+
+            if bool(chosen_connector_info.get("suppress")):
+                chosen_measure_starts = list(chosen_starts_info.get("measure_starts") or [])
+                if chosen_measure_starts:
+                    first_real_start = float(chosen_measure_starts[0])
+                    for staff_ctx in entry.get("staff_contexts") or []:
+                        if not isinstance(staff_ctx, dict):
+                            continue
+                        mark_idx = int(staff_ctx.get("staff_start_mark_index") or -1)
+                        if mark_idx < 0 or mark_idx >= len(staff_start_marks_px):
+                            continue
+                        _, y0_px, y1_px, text = staff_start_marks_px[mark_idx]
+                        staff_start_marks_px[mark_idx] = (first_real_start, y0_px, y1_px, text)
 
             _append_measure_outputs_for_system(
                 measure_box_rows_px,
@@ -2303,6 +2409,18 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "second_pass_measure_count": int(second_pass_measure_count) if second_pass_measure_count is not None else None,
                     "first_pass_candidate_sources": first_pass_sources,
                     "second_pass_candidate_sources": candidate_sources_second_pass,
+                    "grand_staff_connector_suppressed": bool(chosen_connector_info.get("suppress")),
+                    "grand_staff_connector_reason": chosen_connector_info.get("reason"),
+                    "grand_staff_first_gap": (
+                        float(chosen_connector_info.get("first_gap"))
+                        if chosen_connector_info.get("first_gap") is not None
+                        else None
+                    ),
+                    "grand_staff_first_barline_x": (
+                        float(chosen_connector_info.get("first_barline_x"))
+                        if chosen_connector_info.get("first_barline_x") is not None
+                        else None
+                    ),
                 }
             )
 
