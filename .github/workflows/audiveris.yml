@@ -4482,6 +4482,16 @@ jobs:
                                   if recovery_row.get("grand_staff_first_barline_x") is not None
                                   else None
                               ),
+                              "grand_staff_next_3_median_width": (
+                                  float(recovery_row.get("grand_staff_next_3_median_width"))
+                                  if recovery_row.get("grand_staff_next_3_median_width") is not None
+                                  else None
+                              ),
+                              "grand_staff_first_gap_ratio": (
+                                  float(recovery_row.get("grand_staff_first_gap_ratio"))
+                                  if recovery_row.get("grand_staff_first_gap_ratio") is not None
+                                  else None
+                              ),
                           }
                       )
 

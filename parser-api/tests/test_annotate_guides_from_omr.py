@@ -58,33 +58,35 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
     def test_grand_staff_connector_suppression_detects_tiny_shared_left_box(self):
         rows = [
             {
-                "x_start": 10.0,
+                "x_start": 30.0,
                 "y_top": 20.0,
                 "y_bottom": 40.0,
-                "staff_right": 150.0,
-                "barline_xs": [24.0, 70.0, 116.0],
-                "barline_count": 3,
+                "staff_right": 520.0,
+                "barline_xs": [62.0, 202.0, 342.0, 482.0],
+                "barline_count": 4,
                 "y_source": "staff_lines",
             },
             {
-                "x_start": 10.5,
+                "x_start": 30.4,
                 "y_top": 50.0,
                 "y_bottom": 70.0,
-                "staff_right": 150.0,
-                "barline_xs": [24.8, 70.6, 116.4],
-                "barline_count": 3,
+                "staff_right": 520.0,
+                "barline_xs": [63.0, 203.0, 343.0, 483.0],
+                "barline_count": 4,
                 "y_source": "staff_lines",
             },
         ]
 
         info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
-        starts_without_drop = MOD._build_measure_starts_for_system(rows, 10.0, 220.0)
-        starts_with_drop = MOD._build_measure_starts_for_system(rows, 10.0, 220.0, drop_x_start=True)
+        starts_without_drop = MOD._build_measure_starts_for_system(rows, 30.0, 540.0)
+        starts_with_drop = MOD._build_measure_starts_for_system(rows, 30.0, 540.0, drop_x_start=True)
 
         self.assertTrue(info["suppress"])
-        self.assertEqual(info["reason"], "shared_tiny_left_connector")
-        self.assertEqual(starts_without_drop["measure_starts"], [10.0, 24.0, 70.0, 116.0])
-        self.assertEqual(starts_with_drop["measure_starts"], [24.0, 70.0, 116.0])
+        self.assertEqual(info["reason"], "shared_small_left_connector_relative")
+        self.assertAlmostEqual(info["next_3_median_width"], 140.0)
+        self.assertLess(info["first_gap_ratio"], 0.25)
+        self.assertEqual(starts_without_drop["measure_starts"], [30.0, 62.0, 202.0, 342.0, 482.0])
+        self.assertEqual(starts_with_drop["measure_starts"], [62.0, 202.0, 342.0, 482.0])
 
     def test_grand_staff_connector_suppression_skips_normal_grand_staff(self):
         rows = [
@@ -93,8 +95,8 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
                 "y_top": 20.0,
                 "y_bottom": 40.0,
                 "staff_right": 150.0,
-                "barline_xs": [38.0, 72.0, 106.0],
-                "barline_count": 3,
+                "barline_xs": [38.0, 72.0, 106.0, 140.0],
+                "barline_count": 4,
                 "y_source": "staff_lines",
             },
             {
@@ -102,8 +104,8 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
                 "y_top": 50.0,
                 "y_bottom": 70.0,
                 "staff_right": 150.0,
-                "barline_xs": [38.2, 72.2, 106.2],
-                "barline_count": 3,
+                "barline_xs": [38.2, 72.2, 106.2, 140.2],
+                "barline_count": 4,
                 "y_source": "staff_lines",
             },
         ]
@@ -111,17 +113,17 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
         info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
 
         self.assertFalse(info["suppress"])
-        self.assertEqual(info["reason"], "first_gap_not_tiny")
+        self.assertEqual(info["reason"], "first_gap_not_small_enough_relative")
 
-    def test_grand_staff_connector_suppression_requires_tiny_gap(self):
+    def test_grand_staff_connector_suppression_respects_scaled_cap(self):
         rows = [
             {
                 "x_start": 10.0,
                 "y_top": 20.0,
                 "y_bottom": 40.0,
                 "staff_right": 150.0,
-                "barline_xs": [29.0, 70.0, 111.0],
-                "barline_count": 3,
+                "barline_xs": [60.0, 300.0, 540.0, 780.0],
+                "barline_count": 4,
                 "y_source": "staff_lines",
             },
             {
@@ -129,8 +131,8 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
                 "y_top": 50.0,
                 "y_bottom": 70.0,
                 "staff_right": 150.0,
-                "barline_xs": [29.2, 70.2, 111.2],
-                "barline_count": 3,
+                "barline_xs": [60.2, 300.2, 540.2, 780.2],
+                "barline_count": 4,
                 "y_source": "staff_lines",
             },
         ]
@@ -138,7 +140,7 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
         info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
 
         self.assertFalse(info["suppress"])
-        self.assertEqual(info["reason"], "first_gap_not_tiny")
+        self.assertEqual(info["reason"], "first_gap_too_wide_absolute")
 
     def test_grand_staff_connector_suppression_does_not_run_on_one_staff(self):
         rows = [
@@ -147,8 +149,8 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
                 "y_top": 20.0,
                 "y_bottom": 40.0,
                 "staff_right": 150.0,
-                "barline_xs": [24.0, 70.0, 116.0],
-                "barline_count": 3,
+                "barline_xs": [24.0, 70.0, 116.0, 162.0],
+                "barline_count": 4,
                 "y_source": "staff_lines",
             }
         ]
@@ -165,6 +167,32 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
                 "y_top": 20.0,
                 "y_bottom": 40.0,
                 "staff_right": 150.0,
+                "barline_xs": [24.0, 70.0, 116.0, 162.0],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 10.5,
+                "y_top": 50.0,
+                "y_bottom": 70.0,
+                "staff_right": 150.0,
+                "barline_xs": [24.8, 70.6, 116.4, 162.2],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+        ]
+
+        starts = MOD._build_measure_starts_for_system(rows, 10.0, 220.0, drop_x_start=True)
+
+        self.assertEqual(starts["measure_starts"], [24.0, 70.0, 116.0, 162.0])
+
+    def test_grand_staff_connector_suppression_requires_enough_later_measures(self):
+        rows = [
+            {
+                "x_start": 10.0,
+                "y_top": 20.0,
+                "y_bottom": 40.0,
+                "staff_right": 150.0,
                 "barline_xs": [24.0, 70.0, 116.0],
                 "barline_count": 3,
                 "y_source": "staff_lines",
@@ -180,9 +208,37 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
             },
         ]
 
-        starts = MOD._build_measure_starts_for_system(rows, 10.0, 220.0, drop_x_start=True)
+        info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
 
-        self.assertEqual(starts["measure_starts"], [24.0, 70.0, 116.0])
+        self.assertFalse(info["suppress"])
+        self.assertEqual(info["reason"], "not_enough_later_measures")
+
+    def test_grand_staff_connector_suppression_requires_aligned_first_barlines(self):
+        rows = [
+            {
+                "x_start": 10.0,
+                "y_top": 20.0,
+                "y_bottom": 40.0,
+                "staff_right": 150.0,
+                "barline_xs": [24.0, 70.0, 116.0, 162.0],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 10.5,
+                "y_top": 50.0,
+                "y_bottom": 70.0,
+                "staff_right": 150.0,
+                "barline_xs": [36.8, 70.6, 116.4, 162.2],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+        ]
+
+        info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
+
+        self.assertFalse(info["suppress"])
+        self.assertEqual(info["reason"], "first_barline_misaligned")
 
     def test_second_pass_can_supplement_incomplete_staff_barline_ids(self):
         system_inters = ET.Element("inters")

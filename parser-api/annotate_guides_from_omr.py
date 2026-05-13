@@ -1300,6 +1300,8 @@ def _detect_grand_staff_connector_suppression(
         "reason": "not_grand_staff",
         "first_gap": None,
         "first_barline_x": None,
+        "next_3_median_width": None,
+        "first_gap_ratio": None,
     }
 
     if len(selected_measure_rows) != 2:
@@ -1315,8 +1317,8 @@ def _detect_grand_staff_connector_suppression(
 
     first_barlines: list[float] = []
     first_gaps: list[float] = []
-    next_real_spans: list[float] = []
-    gap_limit = max(18.0, (1.6 * expected_spacing) if expected_spacing > 0 else 18.0)
+    next_3_medians: list[float] = []
+    scaled_gap_limit = max(36.0, (3.0 * expected_spacing) if expected_spacing > 0 else 36.0)
 
     for row in rows:
         x_start = float(row.get("x_start") or 0.0)
@@ -1330,16 +1332,35 @@ def _detect_grand_staff_connector_suppression(
         first_barlines.append(first_bar)
         first_gaps.append(gap)
 
-        if gap <= 0.0 or gap > gap_limit:
-            info["reason"] = "first_gap_not_tiny"
+        if gap <= 0.0:
+            info["reason"] = "first_gap_non_positive"
             info["first_gap"] = float(_median(first_gaps)) if first_gaps else None
             info["first_barline_x"] = float(_median(first_barlines)) if first_barlines else None
             return info
 
-        if len(barline_xs) >= 2:
-            next_span = float(barline_xs[1] - barline_xs[0])
-            if next_span > 0.0:
-                next_real_spans.append(next_span)
+        if len(barline_xs) < 4:
+            info["reason"] = "not_enough_later_measures"
+            info["first_gap"] = float(_median(first_gaps)) if first_gaps else None
+            info["first_barline_x"] = float(_median(first_barlines)) if first_barlines else None
+            return info
+
+        next_spans: list[float] = []
+        for idx in range(3):
+            next_span = float(barline_xs[idx + 1] - barline_xs[idx])
+            if next_span <= 0.0:
+                info["reason"] = "invalid_later_measure_width"
+                info["first_gap"] = float(_median(first_gaps)) if first_gaps else None
+                info["first_barline_x"] = float(_median(first_barlines)) if first_barlines else None
+                return info
+            next_spans.append(next_span)
+
+        next_3_median = _median(next_spans)
+        if next_3_median is None or next_3_median <= 0.0:
+            info["reason"] = "invalid_later_measure_width"
+            info["first_gap"] = float(_median(first_gaps)) if first_gaps else None
+            info["first_barline_x"] = float(_median(first_barlines)) if first_barlines else None
+            return info
+        next_3_medians.append(float(next_3_median))
 
     alignment_tol = max(6.0, (0.5 * expected_spacing) if expected_spacing > 0 else 6.0)
     info["first_gap"] = float(_median(first_gaps)) if first_gaps else None
@@ -1349,21 +1370,29 @@ def _detect_grand_staff_connector_suppression(
         info["reason"] = "first_barline_misaligned"
         return info
 
-    if not next_real_spans:
-        info["reason"] = "no_later_real_span"
+    if not next_3_medians:
+        info["reason"] = "not_enough_later_measures"
         return info
 
-    median_next_span = _median(next_real_spans)
+    median_next_span = _median(next_3_medians)
     if median_next_span is None or median_next_span <= 0.0:
-        info["reason"] = "no_later_real_span"
+        info["reason"] = "invalid_later_measure_width"
+        return info
+    info["next_3_median_width"] = float(median_next_span)
+
+    first_gap = float(info["first_gap"] or 0.0)
+    info["first_gap_ratio"] = first_gap / float(median_next_span) if median_next_span > 0 else None
+
+    if first_gap > scaled_gap_limit:
+        info["reason"] = "first_gap_too_wide_absolute"
         return info
 
-    if float(info["first_gap"] or 0.0) > (0.45 * float(median_next_span)):
+    if first_gap > (0.25 * float(median_next_span)):
         info["reason"] = "first_gap_not_small_enough_relative"
         return info
 
     info["suppress"] = True
-    info["reason"] = "shared_tiny_left_connector"
+    info["reason"] = "shared_small_left_connector_relative"
     return info
 
 
@@ -2419,6 +2448,16 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "grand_staff_first_barline_x": (
                         float(chosen_connector_info.get("first_barline_x"))
                         if chosen_connector_info.get("first_barline_x") is not None
+                        else None
+                    ),
+                    "grand_staff_next_3_median_width": (
+                        float(chosen_connector_info.get("next_3_median_width"))
+                        if chosen_connector_info.get("next_3_median_width") is not None
+                        else None
+                    ),
+                    "grand_staff_first_gap_ratio": (
+                        float(chosen_connector_info.get("first_gap_ratio"))
+                        if chosen_connector_info.get("first_gap_ratio") is not None
                         else None
                     ),
                 }
