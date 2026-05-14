@@ -130,6 +130,23 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         }
 
+    def _sample_state_with_bounds(self):
+        state = self._sample_state()
+        anchor_map = {
+            "p1_s0": {"x": 10, "y_top": 10, "y_bottom": 20},
+            "p1_s1": {"x": 10, "y_top": 50, "y_bottom": 60},
+            "p1_s2": {"x": 10, "y_top": 90, "y_bottom": 100},
+            "p2_s0": {"x": 10, "y_top": 10, "y_bottom": 20},
+        }
+        for system in state.get("systems") or []:
+            system["anchor"] = dict(anchor_map.get(system["system_id"]) or {})
+            system["source"] = "auto"
+        for measure in state.get("measures") or []:
+            measure["x_right"] = int(measure["x_left"]) + 15
+            measure["y_bottom"] = int(measure["y_top"]) + 10
+            measure["source"] = "auto"
+        return state
+
     def test_single_edit_reflows_forward(self):
         systems, applied, rejected, total = WORKER._apply_relabel_edits(
             self._sample_state(),
@@ -1221,6 +1238,151 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(summary["reason_counts"].get("invalid_payload"), 1)
         self.assertEqual(summary["reason_counts"].get("unknown_system_id"), 2)
         self.assertEqual(summary["reason_counts"].get("stale_run_mismatch"), 1)
+
+    def test_replace_manual_rows_for_page_creates_manual_system_and_measures(self):
+        state = self._sample_state_with_bounds()
+
+        systems, applied, rejected, total = WORKER._apply_relabel_edits(
+            state,
+            [
+                {
+                    "type": "replace_manual_rows_for_page",
+                    "page": 1,
+                    "rows": [
+                        {
+                            "manual_row_id": "rowA",
+                            "staff_kind": "single",
+                            "rect": {"left": 12, "right": 90, "top": 70, "bottom": 80},
+                            "cut_xs": [40, 65],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        self.assertEqual(total, 5)
+        self.assertEqual(applied, [{"type": "replace_manual_rows_for_page", "page": 1, "rows_count": 1}])
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            state.get("manual_rows"),
+            [
+                {
+                    "manual_row_id": "rowA",
+                    "page": 1,
+                    "staff_kind": "single",
+                    "rect": {"left": 12.0, "right": 90.0, "top": 70.0, "bottom": 80.0},
+                    "cut_xs": [40.0, 65.0],
+                }
+            ],
+        )
+
+        manual_system = next(row for row in systems if row.get("source") == "manual")
+        self.assertEqual(manual_system.get("manual_row_id"), "rowA")
+        self.assertEqual(manual_system.get("system_index"), 2)
+        self.assertEqual(manual_system.get("staff_kind"), "single")
+        self.assertEqual(int(manual_system.get("current_value")), 7)
+
+        manual_measures = [row for row in (state.get("measures") or []) if row.get("manual_row_id") == "rowA"]
+        self.assertEqual(len(manual_measures), 3)
+        self.assertEqual([row.get("measure_id") for row in manual_measures], ["manual_measure_rowA_m0", "manual_measure_rowA_m1", "manual_measure_rowA_m2"])
+        self.assertEqual([row.get("x_left") for row in manual_measures], [12.0, 40.0, 65.0])
+        self.assertEqual([row.get("x_right") for row in manual_measures], [40.0, 65.0, 90.0])
+        self.assertEqual([int(row.get("current_value")) for row in manual_measures], [7, 8, 9])
+
+        auto_measure_ids = {str(row.get("measure_id") or "") for row in (state.get("measures") or [])}
+        self.assertIn("p1_s2_m0", auto_measure_ids)
+        shifted_measure = next(row for row in (state.get("measures") or []) if row.get("measure_id") == "p1_s2_m0")
+        self.assertEqual(shifted_measure.get("system_index"), 3)
+
+        batches = WORKER._ai_suggest_system_batches(state)
+        manual_batch = next((batch for batch in batches if batch[0].get("manual_row_id") == "rowA"), None)
+        self.assertIsNotNone(manual_batch)
+        self.assertEqual(len(manual_batch[1]), 3)
+
+    def test_replace_manual_rows_for_page_grand_staff_creates_shared_row(self):
+        state = self._sample_state_with_bounds()
+
+        systems, applied, rejected, total = WORKER._apply_relabel_edits(
+            state,
+            [
+                {
+                    "type": "replace_manual_rows_for_page",
+                    "page": 2,
+                    "rows": [
+                        {
+                            "manual_row_id": "grand1",
+                            "staff_kind": "grand",
+                            "rect": {"left": 18, "right": 96, "top": 35, "bottom": 75},
+                            "cut_xs": [58],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        self.assertEqual(total, 5)
+        self.assertEqual(applied, [{"type": "replace_manual_rows_for_page", "page": 2, "rows_count": 1}])
+        self.assertEqual(rejected, [])
+
+        manual_system = next(row for row in systems if row.get("manual_row_id") == "grand1")
+        self.assertEqual(manual_system.get("staff_kind"), "grand")
+        self.assertEqual(manual_system.get("source"), "manual")
+        self.assertEqual(manual_system.get("page"), 2)
+        self.assertEqual(manual_system.get("system_index"), 1)
+        self.assertEqual(len([row for row in systems if row.get("page") == 2]), 2)
+
+        manual_measures = [row for row in (state.get("measures") or []) if row.get("manual_row_id") == "grand1"]
+        self.assertEqual(len(manual_measures), 2)
+        self.assertTrue(all(row.get("staff_kind") == "grand" for row in manual_measures))
+        self.assertTrue(all(row.get("y_top") == 35.0 and row.get("y_bottom") == 75.0 for row in manual_measures))
+
+    def test_replace_manual_rows_for_page_rejected_on_strong_overlap(self):
+        state = self._sample_state_with_bounds()
+
+        systems, applied, rejected, total = WORKER._apply_relabel_edits(
+            state,
+            [
+                {
+                    "type": "replace_manual_rows_for_page",
+                    "page": 1,
+                    "rows": [
+                        {
+                            "manual_row_id": "badrow",
+                            "staff_kind": "single",
+                            "rect": {"left": 12, "right": 90, "top": 52, "bottom": 58},
+                            "cut_xs": [],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        self.assertEqual(total, 4)
+        self.assertEqual(applied, [])
+        self.assertEqual(rejected, [{"edit": {"type": "replace_manual_rows_for_page", "page": 1, "rows": [{"manual_row_id": "badrow", "staff_kind": "single", "rect": {"left": 12, "right": 90, "top": 52, "bottom": 58}, "cut_xs": []}]}, "reason": "manual_row_overlap_auto"}])
+        self.assertEqual(state.get("manual_rows"), [])
+        self.assertEqual(len([row for row in systems if row.get("source") == "manual"]), 0)
+
+    def test_refresh_editable_state_systems_and_measures_rebuilds_manual_rows(self):
+        state = self._sample_state_with_bounds()
+        state["manual_rows"] = [
+            {
+                "manual_row_id": "persist1",
+                "page": 1,
+                "staff_kind": "single",
+                "rect": {"left": 14, "right": 92, "top": 70, "bottom": 82},
+                "cut_xs": [44],
+            }
+        ]
+
+        systems, measures, reassign_count, qa = WORKER._refresh_editable_state_systems_and_measures(state)
+
+        self.assertEqual(reassign_count, 0)
+        self.assertEqual(qa.get("status"), "ok")
+        self.assertEqual(len([row for row in systems if row.get("source") == "manual"]), 1)
+        persisted_measures = [row for row in measures if row.get("manual_row_id") == "persist1"]
+        self.assertEqual([row.get("measure_id") for row in persisted_measures], ["manual_measure_persist1_m0", "manual_measure_persist1_m1"])
+        self.assertTrue(all(row.get("source") == "manual" for row in persisted_measures))
 
 
 if __name__ == "__main__":

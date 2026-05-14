@@ -395,6 +395,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body.get("artifacts_http"), artifacts_http)
         self.assertEqual((body.get("editable_state") or {}).get("labels_mode"), "system_only")
+        self.assertEqual((body.get("editable_state") or {}).get("manual_rows"), [])
         self.assertEqual((body.get("editable_state") or {}).get("rest_measures"), {})
         self.assertEqual((body.get("editable_state") or {}).get("pickup_measures"), {})
         self.assertEqual((body.get("editable_state") or {}).get("staff_boxes"), [])
