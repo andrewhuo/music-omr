@@ -90,6 +90,8 @@ MANUAL_STAFF_KINDS_ALLOWED = {MANUAL_STAFF_KIND_SINGLE, MANUAL_STAFF_KIND_GRAND}
 MANUAL_SYSTEM_ID_PREFIX = "manual_sys_"
 MANUAL_MEASURE_ID_PREFIX = "manual_measure_"
 MANUAL_ROW_OVERLAP_RATIO = 0.5
+STAFF_START_SAME_ROW_OVERLAP_RATIO = 0.65
+STAFF_START_SAME_ROW_EDGE_TOLERANCE_RATIO = 0.35
 AI_SUGGESTIONS_VERSION = "ai_suggestions_v1"
 AI_SUGGEST_RUN_STATUS_IDLE = "idle"
 AI_SUGGEST_RUN_STATUS_RUNNING = "running"
@@ -3588,10 +3590,65 @@ def _apply_post_measure_rest(
 def _system_start_anchor_measures(
     ordered_measures: list[dict] | None,
     result_labels: dict[str, str] | None,
+    systems: list[dict] | None = None,
 ) -> list[tuple[dict, str]]:
-    anchors: list[tuple[dict, str]] = []
-    seen_system_ids: set[str] = set()
     labels = result_labels if isinstance(result_labels, dict) else {}
+    seen_system_ids: set[str] = set()
+    anchor_rows: list[dict] = []
+    system_rows_by_id = {
+        str(system.get("system_id") or "").strip(): system
+        for system in (systems or [])
+        if isinstance(system, dict) and str(system.get("system_id") or "").strip()
+    }
+
+    def _fallback_measure_bounds(measure: dict) -> tuple[float, float, float, float] | None:
+        if not isinstance(measure, dict):
+            return None
+        try:
+            left = float(measure.get("x_left"))
+        except Exception:
+            return None
+        try:
+            right = float(measure.get("x_right")) if measure.get("x_right") is not None else float(left + 1.0)
+        except Exception:
+            right = float(left + 1.0)
+        try:
+            top = float(measure.get("y_top"))
+        except Exception:
+            return None
+        try:
+            bottom = float(measure.get("y_bottom")) if measure.get("y_bottom") is not None else float(top + 1.0)
+        except Exception:
+            bottom = float(top + 1.0)
+        if right <= left:
+            right = float(left + 1.0)
+        if bottom <= top:
+            bottom = float(top + 1.0)
+        return (float(left), float(right), float(top), float(bottom))
+
+    def _same_visual_row(
+        left_bounds: tuple[float, float, float, float] | None,
+        right_bounds: tuple[float, float, float, float] | None,
+    ) -> bool:
+        if left_bounds is None or right_bounds is None:
+            return False
+        _, _, left_top, left_bottom = left_bounds
+        _, _, right_top, right_bottom = right_bounds
+        left_height = float(left_bottom - left_top)
+        right_height = float(right_bottom - right_top)
+        shorter_height = min(left_height, right_height)
+        if shorter_height <= 0.0:
+            return False
+        overlap = max(0.0, min(left_bottom, right_bottom) - max(left_top, right_top))
+        if overlap < (shorter_height * STAFF_START_SAME_ROW_OVERLAP_RATIO):
+            return False
+        tolerance = shorter_height * STAFF_START_SAME_ROW_EDGE_TOLERANCE_RATIO
+        if abs(left_top - right_top) > tolerance:
+            return False
+        if abs(left_bottom - right_bottom) > tolerance:
+            return False
+        return True
+
     for measure in ordered_measures or []:
         if not isinstance(measure, dict):
             continue
@@ -3603,8 +3660,63 @@ def _system_start_anchor_measures(
         if not label:
             continue
         seen_system_ids.add(system_id)
-        anchors.append((measure, label))
-    return anchors
+        system_row = system_rows_by_id.get(system_id)
+        bounds = _system_visual_bounds(system_row, ordered_measures) if system_row is not None else None
+        if bounds is None:
+            bounds = _fallback_measure_bounds(measure)
+        anchor_rows.append(
+            {
+                "measure": measure,
+                "label": label,
+                "system_id": system_id,
+                "page": _safe_int(
+                    measure.get("page"),
+                    _safe_int(system_row.get("page"), 0) if isinstance(system_row, dict) else 0,
+                ),
+                "x_left": _safe_float(measure.get("x_left"), bounds[0] if bounds is not None else 0.0),
+                "bounds": bounds,
+            }
+        )
+
+    if not anchor_rows or not system_rows_by_id:
+        return [(row["measure"], row["label"]) for row in anchor_rows]
+
+    parent = list(range(len(anchor_rows)))
+
+    def _find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def _union(left_idx: int, right_idx: int) -> None:
+        left_root = _find(left_idx)
+        right_root = _find(right_idx)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left_idx in range(len(anchor_rows)):
+        left_row = anchor_rows[left_idx]
+        for right_idx in range(left_idx + 1, len(anchor_rows)):
+            right_row = anchor_rows[right_idx]
+            if left_row["page"] != right_row["page"]:
+                continue
+            if _same_visual_row(left_row.get("bounds"), right_row.get("bounds")):
+                _union(left_idx, right_idx)
+
+    chosen_by_group: dict[int, int] = {}
+    for idx, row in enumerate(anchor_rows):
+        root = _find(idx)
+        chosen_idx = chosen_by_group.get(root)
+        if chosen_idx is None or (row["x_left"], idx) < (anchor_rows[chosen_idx]["x_left"], chosen_idx):
+            chosen_by_group[root] = idx
+
+    selected_indices = {idx for idx in chosen_by_group.values()}
+    return [
+        (row["measure"], row["label"])
+        for idx, row in enumerate(anchor_rows)
+        if idx in selected_indices
+    ]
 
 
 def _apply_pickup_measure_rest(
@@ -4340,7 +4452,7 @@ def _render_corrected_pdf(
     else:
         # Staff-start mode reuses the same computed measure labels, but only
         # draws the first visible numbered measure on each system.
-        for measure, label in _system_start_anchor_measures(ordered_measures, result_labels):
+        for measure, label in _system_start_anchor_measures(ordered_measures, result_labels, sorted_systems):
             page_no = _safe_int(measure.get("page"), 0)
             if page_no <= 0 or page_no > doc.page_count:
                 continue

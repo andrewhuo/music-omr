@@ -612,6 +612,104 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         )
 
+    def test_system_start_anchor_measures_groups_split_same_row_and_keeps_leftmost(self):
+        systems = [
+            {
+                "system_id": "p1_left",
+                "page": 1,
+                "system_index": 0,
+                "anchor": {"x": 10, "y_top": 40, "y_bottom": 60},
+                "x_left": 10,
+                "x_right": 65,
+                "y_top": 40,
+                "y_bottom": 60,
+            },
+            {
+                "system_id": "p1_right",
+                "page": 1,
+                "system_index": 1,
+                "anchor": {"x": 80, "y_top": 42, "y_bottom": 61},
+                "x_left": 80,
+                "x_right": 130,
+                "y_top": 42,
+                "y_bottom": 61,
+            },
+            {
+                "system_id": "p1_next",
+                "page": 1,
+                "system_index": 2,
+                "anchor": {"x": 10, "y_top": 90, "y_bottom": 110},
+                "x_left": 10,
+                "x_right": 130,
+                "y_top": 90,
+                "y_bottom": 110,
+            },
+        ]
+        measures = [
+            {"measure_id": "p1_left_m0", "system_id": "p1_left", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 10, "x_right": 35, "y_top": 40, "y_bottom": 60},
+            {"measure_id": "p1_left_m1", "system_id": "p1_left", "page": 1, "system_index": 0, "measure_local_index": 1, "x_left": 35, "x_right": 65, "y_top": 40, "y_bottom": 60},
+            {"measure_id": "p1_right_m0", "system_id": "p1_right", "page": 1, "system_index": 1, "measure_local_index": 0, "x_left": 80, "x_right": 105, "y_top": 42, "y_bottom": 61},
+            {"measure_id": "p1_right_m1", "system_id": "p1_right", "page": 1, "system_index": 1, "measure_local_index": 1, "x_left": 105, "x_right": 130, "y_top": 42, "y_bottom": 61},
+            {"measure_id": "p1_next_m0", "system_id": "p1_next", "page": 1, "system_index": 2, "measure_local_index": 0, "x_left": 10, "x_right": 40, "y_top": 90, "y_bottom": 110},
+        ]
+        result_labels = {
+            "p1_left_m0": "1",
+            "p1_right_m0": "3",
+            "p1_next_m0": "5",
+        }
+
+        anchors = WORKER._system_start_anchor_measures(measures, result_labels, systems)
+
+        self.assertEqual(
+            [(row["measure_id"], label) for row, label in anchors],
+            [
+                ("p1_left_m0", "1"),
+                ("p1_next_m0", "5"),
+            ],
+        )
+
+    def test_system_start_anchor_measures_keeps_nearby_rows_separate_when_edges_do_not_match(self):
+        systems = [
+            {
+                "system_id": "p1_top",
+                "page": 1,
+                "system_index": 0,
+                "anchor": {"x": 10, "y_top": 40, "y_bottom": 60},
+                "x_left": 10,
+                "x_right": 70,
+                "y_top": 40,
+                "y_bottom": 60,
+            },
+            {
+                "system_id": "p1_bottom",
+                "page": 1,
+                "system_index": 1,
+                "anchor": {"x": 10, "y_top": 54, "y_bottom": 74},
+                "x_left": 10,
+                "x_right": 70,
+                "y_top": 54,
+                "y_bottom": 74,
+            },
+        ]
+        measures = [
+            {"measure_id": "p1_top_m0", "system_id": "p1_top", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 10, "x_right": 40, "y_top": 40, "y_bottom": 60},
+            {"measure_id": "p1_bottom_m0", "system_id": "p1_bottom", "page": 1, "system_index": 1, "measure_local_index": 0, "x_left": 10, "x_right": 40, "y_top": 54, "y_bottom": 74},
+        ]
+        result_labels = {
+            "p1_top_m0": "1",
+            "p1_bottom_m0": "2",
+        }
+
+        anchors = WORKER._system_start_anchor_measures(measures, result_labels, systems)
+
+        self.assertEqual(
+            [(row["measure_id"], label) for row, label in anchors],
+            [
+                ("p1_top_m0", "1"),
+                ("p1_bottom_m0", "2"),
+            ],
+        )
+
     def test_pickup_wins_over_same_measure_number_override(self):
         state = self._sample_state()
         state["measure_number_overrides"] = {"p1_s1_m1": 20}
