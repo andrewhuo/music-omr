@@ -710,6 +710,91 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         )
 
+    def test_system_start_anchor_measures_groups_rows_with_close_centers_even_if_edges_differ(self):
+        systems = [
+            {
+                "system_id": "p1_auto",
+                "page": 1,
+                "system_index": 0,
+                "anchor": {"x": 10, "y_top": 40, "y_bottom": 50},
+                "x_left": 10,
+                "x_right": 70,
+                "y_top": 40,
+                "y_bottom": 50,
+                "source": "auto",
+            },
+            {
+                "system_id": "manual_sys_joined",
+                "page": 1,
+                "system_index": 1,
+                "anchor": {"x": 76, "y_top": 37, "y_bottom": 55},
+                "x_left": 76,
+                "x_right": 130,
+                "y_top": 37,
+                "y_bottom": 55,
+                "source": "manual",
+                "manual_row_id": "joined",
+                "staff_kind": "single",
+            },
+        ]
+        measures = [
+            {"measure_id": "p1_auto_m0", "system_id": "p1_auto", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 10, "x_right": 40, "y_top": 40, "y_bottom": 50, "source": "auto"},
+            {"measure_id": "manual_measure_joined_m0", "system_id": "manual_sys_joined", "page": 1, "system_index": 1, "measure_local_index": 0, "x_left": 76, "x_right": 100, "y_top": 37, "y_bottom": 55, "source": "manual", "manual_row_id": "joined", "staff_kind": "single"},
+        ]
+        result_labels = {
+            "p1_auto_m0": "1",
+            "manual_measure_joined_m0": "2",
+        }
+
+        anchors = WORKER._system_start_anchor_measures(measures, result_labels, systems)
+
+        self.assertEqual(
+            [(row["measure_id"], label) for row, label in anchors],
+            [("p1_auto_m0", "1")],
+        )
+
+    def test_system_start_anchor_measures_keeps_rows_separate_when_height_ratio_is_too_different(self):
+        systems = [
+            {
+                "system_id": "p1_small",
+                "page": 1,
+                "system_index": 0,
+                "anchor": {"x": 10, "y_top": 40, "y_bottom": 50},
+                "x_left": 10,
+                "x_right": 70,
+                "y_top": 40,
+                "y_bottom": 50,
+            },
+            {
+                "system_id": "p1_tall",
+                "page": 1,
+                "system_index": 1,
+                "anchor": {"x": 76, "y_top": 35, "y_bottom": 60},
+                "x_left": 76,
+                "x_right": 130,
+                "y_top": 35,
+                "y_bottom": 60,
+            },
+        ]
+        measures = [
+            {"measure_id": "p1_small_m0", "system_id": "p1_small", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 10, "x_right": 40, "y_top": 40, "y_bottom": 50},
+            {"measure_id": "p1_tall_m0", "system_id": "p1_tall", "page": 1, "system_index": 1, "measure_local_index": 0, "x_left": 76, "x_right": 100, "y_top": 35, "y_bottom": 60},
+        ]
+        result_labels = {
+            "p1_small_m0": "1",
+            "p1_tall_m0": "2",
+        }
+
+        anchors = WORKER._system_start_anchor_measures(measures, result_labels, systems)
+
+        self.assertEqual(
+            [(row["measure_id"], label) for row, label in anchors],
+            [
+                ("p1_small_m0", "1"),
+                ("p1_tall_m0", "2"),
+            ],
+        )
+
     def test_pickup_wins_over_same_measure_number_override(self):
         state = self._sample_state()
         state["measure_number_overrides"] = {"p1_s1_m1": 20}

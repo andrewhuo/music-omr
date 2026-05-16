@@ -90,8 +90,10 @@ MANUAL_STAFF_KINDS_ALLOWED = {MANUAL_STAFF_KIND_SINGLE, MANUAL_STAFF_KIND_GRAND}
 MANUAL_SYSTEM_ID_PREFIX = "manual_sys_"
 MANUAL_MEASURE_ID_PREFIX = "manual_measure_"
 MANUAL_ROW_OVERLAP_RATIO = 0.5
-STAFF_START_SAME_ROW_OVERLAP_RATIO = 0.65
-STAFF_START_SAME_ROW_EDGE_TOLERANCE_RATIO = 0.35
+STAFF_START_SAME_ROW_OVERLAP_RATIO = 0.30
+STAFF_START_SAME_ROW_CENTER_TOLERANCE_RATIO = 0.45
+STAFF_START_SAME_ROW_MIN_HEIGHT_RATIO = 0.55
+STAFF_START_SAME_ROW_MAX_HEIGHT_RATIO = 1.80
 AI_SUGGESTIONS_VERSION = "ai_suggestions_v1"
 AI_SUGGEST_RUN_STATUS_IDLE = "idle"
 AI_SUGGEST_RUN_STATUS_RUNNING = "running"
@@ -3636,16 +3638,22 @@ def _system_start_anchor_measures(
         _, _, right_top, right_bottom = right_bounds
         left_height = float(left_bottom - left_top)
         right_height = float(right_bottom - right_top)
+        if left_height <= 0.0 or right_height <= 0.0:
+            return False
         shorter_height = min(left_height, right_height)
-        if shorter_height <= 0.0:
+        taller_height = max(left_height, right_height)
+        if shorter_height <= 0.0 or taller_height <= 0.0:
+            return False
+        height_ratio = shorter_height / taller_height
+        if height_ratio < STAFF_START_SAME_ROW_MIN_HEIGHT_RATIO or height_ratio > STAFF_START_SAME_ROW_MAX_HEIGHT_RATIO:
+            return False
+        left_center = (left_top + left_bottom) / 2.0
+        right_center = (right_top + right_bottom) / 2.0
+        center_tolerance = shorter_height * STAFF_START_SAME_ROW_CENTER_TOLERANCE_RATIO
+        if abs(left_center - right_center) > center_tolerance:
             return False
         overlap = max(0.0, min(left_bottom, right_bottom) - max(left_top, right_top))
         if overlap < (shorter_height * STAFF_START_SAME_ROW_OVERLAP_RATIO):
-            return False
-        tolerance = shorter_height * STAFF_START_SAME_ROW_EDGE_TOLERANCE_RATIO
-        if abs(left_top - right_top) > tolerance:
-            return False
-        if abs(left_bottom - right_bottom) > tolerance:
             return False
         return True
 
