@@ -1423,6 +1423,40 @@ jobs:
                           f"page={page_num} reason=semantic_multirest_unresolved count={len(unresolved)}"
                       )
 
+          def parse_time_signature_from_measure(measure_el):
+              for attrs in children_named(measure_el, "attributes"):
+                  for time_el in children_named(attrs, "time"):
+                      symbol = (time_el.get("symbol") or "").strip().lower()
+                      beats_tokens = []
+                      beat_type_tokens = []
+                      for beats_el in children_named(time_el, "beats"):
+                          beats_text = " ".join("".join(beats_el.itertext()).split()).strip()
+                          if beats_text:
+                              beats_tokens.append(str(beats_text))
+                      for beat_type_el in children_named(time_el, "beat-type"):
+                          beat_type_text = " ".join("".join(beat_type_el.itertext()).split()).strip()
+                          if beat_type_text:
+                              beat_type_tokens.append(str(beat_type_text))
+                      beats_text = "+".join(beats_tokens).strip()
+                      beat_type_text = "+".join(beat_type_tokens).strip()
+                      display = ""
+                      if beats_text and beat_type_text:
+                          display = f"{beats_text}/{beat_type_text}"
+                      if symbol == "common":
+                          display = display or "4/4"
+                          display = f"{display} (common time)"
+                      elif symbol == "cut":
+                          display = display or "2/2"
+                          display = f"{display} (cut time)"
+                      if display:
+                          return {
+                              "text": str(display),
+                              "beats": str(beats_text) if beats_text else None,
+                              "beat_type": str(beat_type_text) if beat_type_text else None,
+                              "symbol": str(symbol) if symbol else None,
+                          }
+              return None
+
           def parse_xml_member(raw):
               try:
                   root = ET.fromstring(raw)
@@ -1463,12 +1497,20 @@ jobs:
                       ms = []
                   if ms:
                       current_system_index = -1
+                      current_measure_local_index = 0
                       for i, m in enumerate(ms, start=1):
                           label = (m.get("number") or "").strip() or str(i)
                           measure_num_int = parse_xml_int(label)
                           implicit = truthy_attr(m.get("implicit"))
                           if i == 1 and implicit:
                               pickup_detected = True
+                          time_signature_info = parse_time_signature_from_measure(m)
+                          time_signature_text = (
+                              str(time_signature_info.get("text") or "").strip()
+                              if isinstance(time_signature_info, dict)
+                              else ""
+                          )
+                          time_signature_explicit = bool(time_signature_text)
 
                           multiple_rest_present = False
                           multiple_rest_count = None
@@ -1510,6 +1552,10 @@ jobs:
                           if is_new_system or has_system_layout:
                               starts.append(label)
                               current_system_index += 1
+                              current_measure_local_index = 0
+                          elif current_system_index < 0:
+                              current_system_index = 0
+                              current_measure_local_index = 0
 
                           has_forward_repeat = False
                           has_backward_repeat = False
@@ -1574,8 +1620,11 @@ jobs:
                                   "number_int": measure_num_int,
                                   "raw_measure_number": label,
                                   "system_index": max(0, current_system_index),
+                                  "measure_local_index": int(max(0, current_measure_local_index)),
                                   "implicit": implicit,
                                   "system_start": bool(is_new_system or has_system_layout),
+                                  "time_signature_text": str(time_signature_text),
+                                  "time_signature_explicit": bool(time_signature_explicit),
                                   "repeat_forward": has_forward_repeat,
                                   "repeat_backward": has_backward_repeat,
                                   "ending_start_numbers": ending_numbers,
@@ -1597,6 +1646,7 @@ jobs:
                                   "logical_span_source": str(logical_span_source),
                               }
                           )
+                          current_measure_local_index += 1
               return {
                   "parse": "stdlib",
                   "root": local(root.tag),
@@ -2122,6 +2172,10 @@ jobs:
                       raw_measure_number = ev.get("raw_measure_number")
                       if shifted_num_int is not None:
                           raw_measure_number = str(shifted_num_int)
+                      try:
+                          measure_local_index = int(ev.get("measure_local_index"))
+                      except Exception:
+                          measure_local_index = int(row_local_idx)
                       logical_span = ev.get("logical_span")
                       try:
                           logical_span = int(logical_span) if logical_span is not None else 1
@@ -2142,8 +2196,11 @@ jobs:
                               "raw_measure_number": str(raw_measure_number or ""),
                               "measure_index": int(measure_index_base + row_local_idx),
                               "system_index": int(system_index_base + int(ev.get("system_index") or 0)),
+                              "measure_local_index": int(max(0, measure_local_index)),
                               "implicit": bool(ev.get("implicit")),
                               "system_start": bool(ev.get("system_start")),
+                              "time_signature_text": str(ev.get("time_signature_text") or ""),
+                              "time_signature_explicit": bool(ev.get("time_signature_explicit")),
                               "repeat_forward": bool(ev.get("repeat_forward")),
                               "repeat_backward": bool(ev.get("repeat_backward")),
                               "ending_start_numbers": list(ev.get("ending_start_numbers") or []),
@@ -2168,6 +2225,41 @@ jobs:
                   measure_index_base += int(len(row_events))
                   system_index_base += int(len(row.get("system_starts") or []))
               return merged
+
+          def extract_time_signature_explicit_rows(events):
+              rows = []
+              seen = set()
+              for ev in sorted(
+                  list(events or []),
+                  key=lambda row: (
+                      int(row.get("measure_index") or 0),
+                      int(row.get("system_index") or 0),
+                      int(row.get("measure_local_index") or 0),
+                      str(row.get("raw_measure_number") or ""),
+                  ),
+              ):
+                  if not bool(ev.get("time_signature_explicit")):
+                      continue
+                  time_signature_text = str(ev.get("time_signature_text") or "").strip()
+                  if not time_signature_text:
+                      continue
+                  try:
+                      system_index = int(ev.get("system_index") or 0)
+                      measure_local_index = int(ev.get("measure_local_index") or 0)
+                  except Exception:
+                      continue
+                  key = (system_index, measure_local_index)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  rows.append(
+                      {
+                          "system_index": int(system_index),
+                          "measure_local_index": int(measure_local_index),
+                          "time_signature": str(time_signature_text),
+                      }
+                  )
+              return rows
 
           def summarize_semantic_events(events):
               pickup = bool(events and events[0].get("implicit"))
@@ -3818,6 +3910,7 @@ jobs:
                           "multirest_log_source": "",
                       },
                       "ending_anchors": [],
+                      "time_signature_explicit_rows": extract_time_signature_explicit_rows(merged_events),
                       "_semantic_measure_events": merged_events,
                       "selection_source": selection_source,
                       "selection_reason": selection_reason,
@@ -3933,6 +4026,7 @@ jobs:
                           "multirest_log_source": "",
                       },
                       "ending_anchors": [],
+                      "time_signature_explicit_rows": [],
                       "_semantic_measure_events": [],
                       "selection_source": "none",
                       "selection_reason": select_error or reason,
@@ -4339,6 +4433,96 @@ jobs:
               except Exception:
                   return None
 
+          def _safe_int(raw, default=0):
+              try:
+                  return int(raw)
+              except Exception:
+                  return int(default)
+
+          def _normalize_time_signature_text(raw):
+              text = str(raw or "").strip()
+              return text or None
+
+          def _build_time_signature_context(manifest_obj, editable_measures_sorted):
+              explicit_by_key = {}
+              entries = manifest_obj.get("entries") if isinstance(manifest_obj, dict) else None
+              if isinstance(entries, list):
+                  for entry in sorted(entries, key=lambda row: _safe_int((row or {}).get("page_number"), 0)):
+                      if not isinstance(entry, dict):
+                          continue
+                      page_num = _safe_int(entry.get("page_number"), 0)
+                      if page_num <= 0:
+                          continue
+                      explicit_rows = entry.get("time_signature_explicit_rows")
+                      if not isinstance(explicit_rows, list):
+                          continue
+                      for explicit_row in explicit_rows:
+                          if not isinstance(explicit_row, dict):
+                              continue
+                          system_index = _safe_int(explicit_row.get("system_index"), -1)
+                          measure_local_index = _safe_int(explicit_row.get("measure_local_index"), -1)
+                          time_signature = _normalize_time_signature_text(explicit_row.get("time_signature"))
+                          if system_index < 0 or measure_local_index < 0 or not time_signature:
+                              continue
+                          explicit_by_key[(int(page_num), int(system_index), int(measure_local_index))] = str(time_signature)
+
+              carried_time_signature = None
+              measure_rows = []
+              system_rows = []
+              measure_by_id = {}
+              system_by_key = {}
+              for measure_row in editable_measures_sorted:
+                  if not isinstance(measure_row, dict):
+                      continue
+                  page_num = _safe_int(measure_row.get("page"), 0)
+                  system_index = _safe_int(measure_row.get("system_index"), -1)
+                  measure_local_index = _safe_int(measure_row.get("measure_local_index"), -1)
+                  if page_num <= 0 or system_index < 0 or measure_local_index < 0:
+                      continue
+                  explicit_time_signature = explicit_by_key.get(
+                      (int(page_num), int(system_index), int(measure_local_index))
+                  )
+                  source = None
+                  if explicit_time_signature:
+                      carried_time_signature = str(explicit_time_signature)
+                      source = "explicit"
+                  elif carried_time_signature:
+                      source = "inherited"
+                  if not carried_time_signature or not source:
+                      continue
+                  measure_id = str(measure_row.get("measure_id") or "").strip()
+                  system_id = str(measure_row.get("system_id") or "").strip()
+                  measure_context_row = {
+                      "measure_id": measure_id,
+                      "system_id": system_id,
+                      "page": int(page_num),
+                      "system_index": int(system_index),
+                      "measure_local_index": int(measure_local_index),
+                      "time_signature": str(carried_time_signature),
+                      "source": str(source),
+                  }
+                  measure_rows.append(measure_context_row)
+                  if measure_id:
+                      measure_by_id[measure_id] = measure_context_row
+                  system_key = (int(page_num), int(system_index))
+                  if system_key not in system_by_key:
+                      system_context_row = {
+                          "system_id": system_id,
+                          "page": int(page_num),
+                          "system_index": int(system_index),
+                          "time_signature": str(carried_time_signature),
+                          "source": str(source),
+                      }
+                      system_rows.append(system_context_row)
+                      system_by_key[system_key] = system_context_row
+
+              return {
+                  "measure_rows": measure_rows,
+                  "system_rows": system_rows,
+                  "measure_by_id": measure_by_id,
+                  "system_by_key": system_by_key,
+              }
+
           now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
           output_prefix = os.environ.get("RUN_OUTPUT_PREFIX", "") or os.environ.get("OUTPUT_PREFIX", "")
           output_base_prefix = os.environ.get("OUTPUT_PREFIX", "")
@@ -4656,6 +4840,18 @@ jobs:
           for global_index, row in enumerate(editable_measures_sorted):
               row["global_index"] = int(global_index)
 
+          time_signature_context_payload = _build_time_signature_context(manifest, editable_measures_sorted)
+          time_signature_measure_by_id = dict(time_signature_context_payload.get("measure_by_id") or {})
+          time_signature_system_by_key = dict(time_signature_context_payload.get("system_by_key") or {})
+          for row in editable_measures_sorted:
+              if not isinstance(row, dict):
+                  continue
+              measure_context = time_signature_measure_by_id.get(str(row.get("measure_id") or "").strip())
+              if not isinstance(measure_context, dict):
+                  continue
+              row["time_signature"] = str(measure_context.get("time_signature") or "")
+              row["time_signature_source"] = str(measure_context.get("source") or "")
+
           measure_box_reason_counts_payload = {
               "missing": int(measure_box_reason_counts.get("missing", 0)),
               "invalid": int(measure_box_reason_counts.get("invalid", 0)),
@@ -4681,6 +4877,15 @@ jobs:
               _sid = str(_sys.get("system_id") or "")
               _sys["current_value"] = str(_running_start)
               _sys["value"] = str(_running_start)
+              _time_sig_context = time_signature_system_by_key.get(
+                  (
+                      int(_safe_int(_sys.get("page"), 0)),
+                      int(_safe_int(_sys.get("system_index"), -1)),
+                  )
+              )
+              if isinstance(_time_sig_context, dict):
+                  _sys["time_signature"] = str(_time_sig_context.get("time_signature") or "")
+                  _sys["time_signature_source"] = str(_time_sig_context.get("source") or "")
               _running_start += _measures_per_system.get(_sid, 0)
           print(f"SYSTEM_RECOMPUTE total_systems={len(_sorted_sys)} total_measures={sum(_measures_per_system.values())}")
 
@@ -4688,6 +4893,10 @@ jobs:
               "version": "system_state_v1",
               "systems": _sorted_sys,
               "measures": editable_measures_sorted,
+              "time_signature_context": {
+                  "system_rows": list(time_signature_context_payload.get("system_rows") or []),
+                  "measure_rows": list(time_signature_context_payload.get("measure_rows") or []),
+              },
               "staff_boxes": [],
               "qa": {
                   "ok": len(editable_reason_counts) == 0,

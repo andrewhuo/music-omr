@@ -191,9 +191,20 @@ class BrowserReadyApiTests(unittest.TestCase):
         return {
             "editable_state": {
                 "version": "system_state_v1",
+                "time_signature_context": {
+                    "system_rows": [
+                        {"system_id": "p1_s0", "page": 1, "system_index": 0, "time_signature": "3/4", "source": "explicit"},
+                        {"system_id": "p1_s1", "page": 1, "system_index": 1, "time_signature": "3/4", "source": "inherited"},
+                    ],
+                    "measure_rows": [
+                        {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "time_signature": "3/4", "source": "explicit"},
+                        {"measure_id": "p1_s0_m1", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 1, "time_signature": "3/4", "source": "inherited"},
+                        {"measure_id": "p1_s1_m0", "system_id": "p1_s1", "page": 1, "system_index": 1, "measure_local_index": 0, "time_signature": "3/4", "source": "inherited"},
+                    ],
+                },
                 "systems": [
-                    {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1", "anchor": {"x": 10, "y_top": 20, "y_bottom": 60}},
-                    {"system_id": "p1_s1", "page": 1, "system_index": 1, "current_value": "3", "anchor": {"x": 10, "y_top": 80, "y_bottom": 120}},
+                    {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1", "anchor": {"x": 10, "y_top": 20, "y_bottom": 60}, "time_signature": "3/4", "time_signature_source": "explicit"},
+                    {"system_id": "p1_s1", "page": 1, "system_index": 1, "current_value": "3", "anchor": {"x": 10, "y_top": 80, "y_bottom": 120}, "time_signature": "3/4", "time_signature_source": "inherited"},
                 ],
                 "measures": [
                     {
@@ -206,6 +217,8 @@ class BrowserReadyApiTests(unittest.TestCase):
                         "x_left": 30,
                         "y_top": 20,
                         "y_bottom": 40,
+                        "time_signature": "3/4",
+                        "time_signature_source": "explicit",
                     },
                     {
                         "measure_id": "p1_s0_m1",
@@ -217,6 +230,8 @@ class BrowserReadyApiTests(unittest.TestCase):
                         "x_left": 90,
                         "y_top": 20,
                         "y_bottom": 40,
+                        "time_signature": "3/4",
+                        "time_signature_source": "inherited",
                     },
                     {
                         "measure_id": "p1_s1_m0",
@@ -228,6 +243,8 @@ class BrowserReadyApiTests(unittest.TestCase):
                         "x_left": 30,
                         "y_top": 80,
                         "y_bottom": 100,
+                        "time_signature": "3/4",
+                        "time_signature_source": "inherited",
                     },
                 ],
             }
@@ -1019,10 +1036,14 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(body.get("status"), "running")
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
-        self.assertEqual(body.get("reference_examples_attached"), 2)
+        _reference_content, expected_reference_examples_attached = WORKER._build_old_style_multi_rest_reference_content()
+        self.assertEqual(body.get("reference_examples_attached"), expected_reference_examples_attached)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
         self.assertEqual(((body.get("debug_crops") or {}).get("pdf_source")), "corrected")
-        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 2)
+        self.assertEqual(
+            ((body.get("debug_crops") or {}).get("reference_examples_attached")),
+            expected_reference_examples_attached,
+        )
 
     def test_ai_suggest_step_final_system_marks_completed(self):
         artifacts = self._sample_artifacts()
@@ -1394,16 +1415,24 @@ class BrowserReadyApiTests(unittest.TestCase):
                 pdf_source="corrected",
             )
 
-        self.assertEqual(reference_examples_attached, 2)
+        _reference_content, expected_reference_examples_attached = WORKER._build_old_style_multi_rest_reference_content()
+        self.assertEqual(reference_examples_attached, expected_reference_examples_attached)
         self.assertNotIn("reference_examples_attached", payload)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         intro = json.loads((content[0] or {}).get("text") or "{}")
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
+        measure_meta = intro.get("measures") or []
         self.assertIn("Use the visible time signature in the crop to judge completeness.", rules_text)
+        self.assertIn("Each measure may include time_signature and time_signature_source metadata.", rules_text)
+        self.assertIn("If time_signature metadata is provided, use it even when the crop does not visibly show the symbol.", rules_text)
         self.assertIn("If the first measure is clearly too short for the visible time signature, label pickup.", rules_text)
         self.assertIn("Examples: in 2/4, one quarter note in the first measure is pickup;", rules_text)
+        self.assertIn("For measures that are not the first measure of the score, never use later time-signature context to label pickup in this version.", rules_text)
         self.assertIn("If the time signature is unclear but the first measure looks short, label uncertain with maybe_label pickup.", rules_text)
+        self.assertEqual((measure_meta[0] or {}).get("time_signature"), "3/4")
+        self.assertEqual((measure_meta[0] or {}).get("time_signature_source"), "explicit")
+        self.assertEqual((measure_meta[1] or {}).get("time_signature_source"), "inherited")
 
     def test_build_system_measure_request_includes_old_style_multi_rest_guidance(self):
         mapping_summary = self._sample_mapping_summary()
