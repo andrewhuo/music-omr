@@ -857,7 +857,6 @@ def _editable_state_version(editable_state: dict) -> str:
         "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
         "systems": editable_state.get("systems") or [],
         "measures": editable_state.get("measures") or [],
-        "time_signature_context": editable_state.get("time_signature_context") or {},
         "manual_rows": editable_state.get("manual_rows") or [],
         "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
         "rest_measures": editable_state.get("rest_measures") or {},
@@ -2522,17 +2521,6 @@ def _build_system_measure_request(
     content: list[dict] = []
     system_id = str(system_row.get("system_id") or "").strip()
     page_number = _safe_int(system_row.get("page"), _safe_int((measure_rows[0] if measure_rows else {}).get("page"), 1))
-
-    def _measure_time_signature_text(row: dict) -> str | None:
-        text = str(row.get("time_signature") or system_row.get("time_signature") or "").strip()
-        return text or None
-
-    def _measure_time_signature_source(row: dict) -> str | None:
-        raw = str(row.get("time_signature_source") or system_row.get("time_signature_source") or "").strip().lower()
-        if raw in ("explicit", "inherited"):
-            return raw
-        return None
-
     intro = {
         "job_id": str(job_id),
         "run_id": int(run_id),
@@ -2545,17 +2533,13 @@ def _build_system_measure_request(
                 "Each image contains exactly one already-detected measure.",
                 "Do not infer additional measures from internal rhythmic groupings, repeat dots, or barline decorations.",
                 "Only label pickup when is_first_measure_of_score is true.",
-                "Each measure may include time_signature and time_signature_source metadata. time_signature_source is explicit if the symbol appears there, or inherited if it was carried from earlier music.",
                 "Use the visible time signature in the crop to judge completeness. Seeing the time signature is enough to judge whether the first measure is shorter than a full bar.",
-                "If time_signature metadata is provided, use it even when the crop does not visibly show the symbol.",
                 "If the first measure is clearly too short for the visible time signature, label pickup.",
                 "Examples: in 2/4, one quarter note in the first measure is pickup; in 4/4, one quarter note in the first measure is pickup; in 3/4, one quarter note can be pickup; in 6/8, one or two eighth notes can be pickup.",
                 "If the first measure could still plausibly fill the bar, label normal, not pickup.",
-                "For measures that are not the first measure of the score, never use later time-signature context to label pickup in this version. Use it only to judge normal versus uncertain.",
                 "If the time signature is unclear but the first measure looks short, label uncertain with maybe_label pickup.",
                 "A whole note, two half notes, or other sparse-looking content in the first measure is usually a slow full measure, not a pickup. Do not label pickup just because the first measure looks sparse or simple.",
                 "Default to normal when uncertain about completeness. Only label pickup if the first measure is obviously and visually incomplete. When in doubt between pickup and normal, always choose normal.",
-                "If a later measure looks incomplete under the carried time signature but you are not fully sure, use uncertain rather than guessing.",
                 "If not confident, use uncertain rather than guessing.",
                 "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
                 "In the older style, the vertical bars may be short or long, and there may be more than one.",
@@ -2587,8 +2571,6 @@ def _build_system_measure_request(
                 "measure_id": str(row.get("measure_id") or "").strip(),
                 "order_index_in_system": _safe_int(row.get("measure_local_index"), idx),
                 "is_first_measure_of_score": _safe_int(row.get("global_index"), -1) == 0,
-                "time_signature": _measure_time_signature_text(row),
-                "time_signature_source": _measure_time_signature_source(row),
             }
             for idx, row in enumerate(measure_rows)
         ],
@@ -2640,8 +2622,6 @@ def _build_system_measure_request(
                         "measure_id": str(row.get("measure_id") or "").strip(),
                         "order_index_in_system": _safe_int(row.get("measure_local_index"), idx),
                         "is_first_measure_of_score": _safe_int(row.get("global_index"), -1) == 0,
-                        "time_signature": _measure_time_signature_text(row),
-                        "time_signature_source": _measure_time_signature_source(row),
                         "pdf_source": pdf_source,
                     },
                     ensure_ascii=True,
@@ -4789,7 +4769,6 @@ def get_job_state(job_id: str):
             "version": str(editable_state.get("version") or "system_state_v1"),
             "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
             "manual_rows": editable_state.get("manual_rows") or [],
-            "time_signature_context": editable_state.get("time_signature_context") or {},
             "rest_measures": editable_state.get("rest_measures") or {},
             "pickup_measures": editable_state.get("pickup_measures") or {},
             "rest_systems": editable_state.get("rest_systems") or {},
