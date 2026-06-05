@@ -639,6 +639,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(summary.get("measures_seen"), 3)
         self.assertEqual(summary.get("suggestions_kept"), 0)
         self.assertEqual(summary.get("systems_processed"), 0)
+        self.assertEqual(ai_suggestions.get("time_signatures_by_measure_id"), {})
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_total"), 2)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
@@ -1297,6 +1298,10 @@ class BrowserReadyApiTests(unittest.TestCase):
                 "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"},
                 "p1_s1_m0": {"label": "uncertain", "rest_count": None, "confidence": "low"},
             },
+            "time_signatures_by_measure_id": {
+                "p1_s0_m0": {"active_time_signature": "3/4", "time_signature_source": "explicit_here"},
+                "p1_s1_m0": {"active_time_signature": "3/4", "time_signature_source": "inherited"},
+            },
             "warnings": [],
             "summary": {"systems_processed": 2, "measures_seen": 3, "suggestions_kept": 2, "normal_measures_omitted": 1},
         }
@@ -1311,7 +1316,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body.get("dismissed_measure_id"), "p1_s0_m0")
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
+        time_signatures_by_measure_id = ((body.get("ai_suggestions") or {}).get("time_signatures_by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s1_m0"])
+        self.assertEqual(sorted(time_signatures_by_measure_id.keys()), ["p1_s1_m0"])
         self.assertEqual(((body.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept"), 1)
 
     def test_relabel_clears_touched_ai_suggestion(self):
@@ -1327,6 +1334,10 @@ class BrowserReadyApiTests(unittest.TestCase):
             "by_measure_id": {
                 "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"},
                 "p1_s1_m0": {"label": "uncertain", "rest_count": None, "confidence": "low"},
+            },
+            "time_signatures_by_measure_id": {
+                "p1_s0_m0": {"active_time_signature": "3/4", "time_signature_source": "explicit_here"},
+                "p1_s1_m0": {"active_time_signature": "3/4", "time_signature_source": "inherited"},
             },
             "warnings": [],
             "summary": {"systems_processed": 2, "measures_seen": 3, "suggestions_kept": 2, "normal_measures_omitted": 1},
@@ -1352,7 +1363,9 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         remaining = ((mapping_summary.get("ai_suggestions") or {}).get("by_measure_id") or {})
+        remaining_time_signatures = ((mapping_summary.get("ai_suggestions") or {}).get("time_signatures_by_measure_id") or {})
         self.assertEqual(sorted(remaining.keys()), ["p1_s1_m0"])
+        self.assertEqual(sorted(remaining_time_signatures.keys()), ["p1_s1_m0"])
         self.assertEqual((((mapping_summary.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
 
     def test_normalize_ai_suggestions_result_salvages_missing_maybe_rest_count_and_bad_warnings(self):
@@ -1442,6 +1455,136 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertGreaterEqual(
             len([row for row in warnings if (row or {}).get("type") == "normalization_adjusted"]),
             2,
+        )
+
+    def test_normalize_ai_suggestions_result_tracks_remembered_time_signature_for_every_measure(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+                {"measure_id": "m1", "system_id": "p1_s0", "measure_local_index": 1, "global_index": 1},
+                {"measure_id": "m2", "system_id": "p1_s0", "measure_local_index": 2, "global_index": 2},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {"measure_id": "m0", "label": "normal", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m1", "label": "normal", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m2", "label": "normal", "rest_count": None, "confidence": "high"},
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(
+            raw_result,
+            editable_state,
+            111,
+            "test-state",
+            remembered_time_signature_in="3/4",
+        )
+
+        self.assertEqual(normalized.get("by_measure_id"), {})
+        self.assertEqual(
+            normalized.get("time_signatures_by_measure_id"),
+            {
+                "m0": {"active_time_signature": "3/4", "time_signature_source": "remembered"},
+                "m1": {"active_time_signature": "3/4", "time_signature_source": "remembered"},
+                "m2": {"active_time_signature": "3/4", "time_signature_source": "remembered"},
+            },
+        )
+
+    def test_normalize_ai_suggestions_result_tracks_explicit_and_inherited_time_signature_per_measure(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+                {"measure_id": "m1", "system_id": "p1_s0", "measure_local_index": 1, "global_index": 1},
+                {"measure_id": "m2", "system_id": "p1_s0", "measure_local_index": 2, "global_index": 2},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {"measure_id": "m0", "label": "normal", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m1", "label": "uncertain", "rest_count": None, "confidence": "low"},
+                {"measure_id": "m2", "label": "normal", "rest_count": None, "confidence": "high"},
+            ],
+            "warnings": [],
+            "time_signature_updates": [{"measure_id": "m1", "new_time_signature": "3/4"}],
+            "remembered_time_signature_out": "3/4",
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(
+            raw_result,
+            editable_state,
+            111,
+            "test-state",
+            remembered_time_signature_in="4/4",
+        )
+
+        self.assertEqual(
+            normalized.get("time_signatures_by_measure_id"),
+            {
+                "m0": {"active_time_signature": "4/4", "time_signature_source": "remembered"},
+                "m1": {"active_time_signature": "3/4", "time_signature_source": "explicit_here"},
+                "m2": {"active_time_signature": "3/4", "time_signature_source": "inherited"},
+            },
+        )
+        self.assertEqual(
+            normalized.get("by_measure_id", {}).get("m1"),
+            {
+                "label": "uncertain",
+                "rest_count": None,
+                "confidence": "low",
+                "system_id": "p1_s0",
+                "order_index_in_system": 1,
+                "is_first_measure_of_score": False,
+                "active_time_signature": "3/4",
+                "time_signature_source": "explicit_here",
+            },
+        )
+
+    def test_normalize_ai_suggestions_result_tracks_unknown_until_first_explicit_time_signature(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+                {"measure_id": "m1", "system_id": "p1_s0", "measure_local_index": 1, "global_index": 1},
+                {"measure_id": "m2", "system_id": "p1_s0", "measure_local_index": 2, "global_index": 2},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {"measure_id": "m0", "label": "normal", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m1", "label": "normal", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m2", "label": "pickup", "rest_count": None, "confidence": "medium"},
+            ],
+            "warnings": [],
+            "time_signature_updates": [{"measure_id": "m1", "new_time_signature": "6/8"}],
+            "remembered_time_signature_out": "6/8",
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(
+            raw_result,
+            editable_state,
+            111,
+            "test-state",
+            remembered_time_signature_in=None,
+        )
+
+        self.assertEqual(
+            normalized.get("time_signatures_by_measure_id"),
+            {
+                "m0": {"active_time_signature": None, "time_signature_source": "unknown"},
+                "m1": {"active_time_signature": "6/8", "time_signature_source": "explicit_here"},
+                "m2": {"active_time_signature": "6/8", "time_signature_source": "inherited"},
+            },
+        )
+        self.assertEqual(
+            normalized.get("by_measure_id", {}).get("m2", {}).get("time_signature_source"),
+            "inherited",
         )
 
     def test_parse_anthropic_suggestions_message_drops_model_field(self):

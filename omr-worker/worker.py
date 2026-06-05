@@ -1502,6 +1502,7 @@ def _empty_ai_suggestions_state(
         "model": _requested_anthropic_model_name(),
         "source_run_id": int(run_id),
         "by_measure_id": {},
+        "time_signatures_by_measure_id": {},
         "warnings": [],
         "summary": {
             "systems_processed": 0,
@@ -1642,6 +1643,8 @@ def _merge_ai_suggestions_state(
     base = dict(existing) if isinstance(existing, dict) else _empty_ai_suggestions_state(run_id, source_state_version, 0)
     by_measure_id = dict(base.get("by_measure_id") or {})
     by_measure_id.update(dict(system_suggestions.get("by_measure_id") or {}))
+    time_signatures_by_measure_id = dict(base.get("time_signatures_by_measure_id") or {})
+    time_signatures_by_measure_id.update(dict(system_suggestions.get("time_signatures_by_measure_id") or {}))
     warnings = list(base.get("warnings") or [])
     warnings.extend(list(system_suggestions.get("warnings") or []))
     base["version"] = AI_SUGGESTIONS_VERSION
@@ -1653,6 +1656,7 @@ def _merge_ai_suggestions_state(
     if source_state_version_txt:
         base["source_state_version"] = source_state_version_txt
     base["by_measure_id"] = by_measure_id
+    base["time_signatures_by_measure_id"] = time_signatures_by_measure_id
     base["warnings"] = warnings
     summary = base.get("summary")
     if not isinstance(summary, dict):
@@ -1713,6 +1717,9 @@ def _remove_ai_suggestion_entries(mapping_summary: dict | None, measure_ids: set
     by_measure_id = ai_suggestions.get("by_measure_id")
     if not isinstance(by_measure_id, dict):
         return []
+    time_signatures_by_measure_id = ai_suggestions.get("time_signatures_by_measure_id")
+    if not isinstance(time_signatures_by_measure_id, dict):
+        time_signatures_by_measure_id = {}
     removed: list[str] = []
     for measure_id in measure_ids or []:
         mid = str(measure_id or "").strip()
@@ -1721,7 +1728,9 @@ def _remove_ai_suggestion_entries(mapping_summary: dict | None, measure_ids: set
         if mid in by_measure_id:
             by_measure_id.pop(mid, None)
             removed.append(mid)
+        time_signatures_by_measure_id.pop(mid, None)
     if removed:
+        ai_suggestions["time_signatures_by_measure_id"] = time_signatures_by_measure_id
         _refresh_ai_suggestions_summary(ai_suggestions)
     return removed
 
@@ -1768,6 +1777,46 @@ def _ai_suggest_normalization_warning(measure_row: dict | None, message: str) ->
         if measure_row.get("system_index") is not None:
             warning["system_index"] = _safe_int(measure_row.get("system_index"), 0)
     return warning
+
+
+def _derive_ai_measure_time_signatures_by_measure_id(
+    ordered_measures: list[dict],
+    remembered_time_signature_in: str | None,
+    valid_time_signature_updates: list[dict],
+) -> dict[str, dict]:
+    updates_by_measure_id: dict[str, str] = {}
+    for row in valid_time_signature_updates:
+        measure_id = str((row or {}).get("measure_id") or "").strip()
+        new_time_signature = _normalize_ai_time_signature_value((row or {}).get("new_time_signature"))
+        if not measure_id or not new_time_signature:
+            continue
+        updates_by_measure_id[measure_id] = new_time_signature
+
+    active_time_signature = _normalize_ai_time_signature_value(remembered_time_signature_in)
+    have_seen_explicit_update = False
+    result: dict[str, dict] = {}
+    for measure_row in ordered_measures:
+        measure_id = str((measure_row or {}).get("measure_id") or "").strip()
+        if not measure_id:
+            continue
+
+        explicit_time_signature = updates_by_measure_id.get(measure_id)
+        if explicit_time_signature is not None:
+            active_time_signature = explicit_time_signature
+            have_seen_explicit_update = True
+            time_signature_source = "explicit_here"
+        elif active_time_signature is None:
+            time_signature_source = "unknown"
+        elif have_seen_explicit_update:
+            time_signature_source = "inherited"
+        else:
+            time_signature_source = "remembered"
+
+        result[measure_id] = {
+            "active_time_signature": active_time_signature,
+            "time_signature_source": time_signature_source,
+        }
+    return result
 
 
 def _normalize_ai_suggestions_result(
@@ -2009,6 +2058,16 @@ def _normalize_ai_suggestions_result(
             "new_time_signature": remembered_time_signature_out,
         }
 
+    time_signatures_by_measure_id = _derive_ai_measure_time_signatures_by_measure_id(
+        ordered_measures,
+        previous_time_signature,
+        valid_time_signature_updates,
+    )
+    for measure_id, entry in kept_by_measure_id.items():
+        time_signature_row = time_signatures_by_measure_id.get(measure_id)
+        if isinstance(time_signature_row, dict):
+            entry.update(time_signature_row)
+
     ai_suggestions = {
         "version": AI_SUGGESTIONS_VERSION,
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
@@ -2016,6 +2075,7 @@ def _normalize_ai_suggestions_result(
         "model": model,
         "source_run_id": int(run_id),
         "by_measure_id": kept_by_measure_id,
+        "time_signatures_by_measure_id": time_signatures_by_measure_id,
         "warnings": warnings,
         "summary": {
             "systems_processed": systems_processed,
