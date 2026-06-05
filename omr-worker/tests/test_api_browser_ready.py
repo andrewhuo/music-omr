@@ -643,6 +643,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "claude-sonnet-4-6")
+        self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
+        self.assertIsNone((body.get("ai_suggest_run") or {}).get("last_time_signature_update"))
         self.assertIn("ai_suggestions", mapping_summary)
         self.assertEqual(((mapping_summary.get("ai_suggest_run") or {}).get("status")), "running")
 
@@ -760,6 +762,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             "source_run_id": 111,
             "source_state_version": "test-state",
             "last_error": None,
+            "remembered_time_signature": None,
+            "last_time_signature_update": None,
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
         with (
@@ -780,6 +784,8 @@ class BrowserReadyApiTests(unittest.TestCase):
                     },
                     "warnings": [],
                     "summary": {"systems_processed": 1, "measures_seen": 2, "suggestions_kept": 1, "normal_measures_omitted": 1},
+                    "remembered_time_signature_out": "3/4",
+                    "last_time_signature_update": {"measure_id": "p1_s0_m0", "new_time_signature": "3/4"},
                 },
             ),
             patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
@@ -791,10 +797,63 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(body.get("status"), "running")
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("remembered_time_signature"), "3/4")
+        self.assertEqual((((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")), "p1_s0_m0")
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
+
+    def test_ai_suggest_step_passes_and_updates_remembered_time_signature_between_systems(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggest_run"] = {
+            "status": "running",
+            "started_at_utc": "2026-05-05T00:00:00Z",
+            "updated_at_utc": "2026-05-05T00:00:00Z",
+            "completed_at_utc": None,
+            "failed_at_utc": None,
+            "systems_total": 2,
+            "systems_completed": 1,
+            "next_system_index": 1,
+            "source_run_id": 111,
+            "source_state_version": "test-state",
+            "last_error": None,
+            "remembered_time_signature": "3/4",
+            "last_time_signature_update": {"system_id": "p1_s0", "measure_id": "p1_s0_m0", "new_time_signature": "3/4"},
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(
+                WORKER,
+                "_generate_ai_suggestions_for_system_batch",
+                return_value={
+                    "version": "ai_suggestions_v1",
+                    "generated_at_utc": "2026-05-05T00:00:01Z",
+                    "provider": "claude",
+                    "model": "claude-test",
+                    "source_run_id": 111,
+                    "by_measure_id": {"p1_s1_m0": {"label": "uncertain", "rest_count": None, "confidence": "low"}},
+                    "warnings": [],
+                    "summary": {"systems_processed": 1, "measures_seen": 1, "suggestions_kept": 1, "normal_measures_omitted": 0},
+                    "remembered_time_signature_out": "4/4",
+                    "last_time_signature_update": {"measure_id": "p1_s1_m0", "new_time_signature": "4/4"},
+                },
+            ) as mock_generate,
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job_step("111"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(mock_generate.call_args.kwargs.get("remembered_time_signature_in"), "3/4")
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("remembered_time_signature"), "4/4")
+        self.assertEqual((((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")), "p1_s1_m0")
 
     def test_ai_suggest_step_returns_debug_batch_trace_when_enabled(self):
         artifacts = self._sample_artifacts()
@@ -813,6 +872,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             "source_run_id": 111,
             "source_state_version": "test-state",
             "last_error": None,
+            "remembered_time_signature": "3/4",
+            "last_time_signature_update": {"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"},
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
         with (
@@ -917,6 +978,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                 },
             ],
             "warnings": [],
+            "remembered_time_signature_out": "not_a_time_signature",
+            "time_signature_updates": [
+                {"measure_id": "missing", "new_time_signature": "4/4"},
+                {"measure_id": "p1_s0_m1", "new_time_signature": "still_bad"},
+            ],
         }
         message = {"content": [{"type": "text", "text": json.dumps(provider_payload)}]}
 
@@ -960,6 +1026,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             "source_run_id": 111,
             "source_state_version": "test-state",
             "last_error": None,
+            "remembered_time_signature": "3/4",
+            "last_time_signature_update": {"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"},
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
         provider_payload = {
@@ -979,6 +1047,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                 },
             ],
             "warnings": [],
+            "remembered_time_signature_out": "not_a_time_signature",
+            "time_signature_updates": [
+                {"measure_id": "missing", "new_time_signature": "4/4"},
+                {"measure_id": "p1_s0_m1", "new_time_signature": "still_bad"},
+            ],
         }
         message = {"content": [{"type": "text", "text": json.dumps(provider_payload)}]}
         fake_doc = _FakeDoc([_FakePage(_FakeRect(0, 0, 200, 160))])
@@ -1019,10 +1092,15 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(body.get("status"), "running")
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
-        self.assertEqual(body.get("reference_examples_attached"), 2)
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("remembered_time_signature"), "3/4")
+        _, expected_reference_examples = WORKER._build_old_style_multi_rest_reference_content()
+        self.assertEqual(body.get("reference_examples_attached"), expected_reference_examples)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
         self.assertEqual(((body.get("debug_crops") or {}).get("pdf_source")), "corrected")
-        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 2)
+        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), expected_reference_examples)
+        warnings = ((body.get("ai_suggestions") or {}).get("warnings")) or []
+        warnings_text = "\n".join(str((row or {}).get("message") or "") for row in warnings)
+        self.assertIn("remembered_time_signature_out", warnings_text)
 
     def test_ai_suggest_step_final_system_marks_completed(self):
         artifacts = self._sample_artifacts()
@@ -1392,15 +1470,22 @@ class BrowserReadyApiTests(unittest.TestCase):
                 measure_rows,
                 page,
                 pdf_source="corrected",
+                remembered_time_signature_in="3/4",
             )
 
-        self.assertEqual(reference_examples_attached, 2)
+        _, expected_reference_examples = WORKER._build_old_style_multi_rest_reference_content()
+        self.assertEqual(reference_examples_attached, expected_reference_examples)
         self.assertNotIn("reference_examples_attached", payload)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         intro = json.loads((content[0] or {}).get("text") or "{}")
+        self.assertEqual(intro.get("remembered_time_signature_in"), "3/4")
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
+        self.assertIn("Process the provided measures left to right in order.", rules_text)
+        self.assertIn("Start with remembered_time_signature_in as the active time signature", rules_text)
+        self.assertIn("If a clearly visible new time signature appears at a measure, update the active time signature", rules_text)
         self.assertIn("Use the visible time signature in the crop to judge completeness.", rules_text)
+        self.assertIn("If is_first_measure_of_score is false, do not label pickup.", rules_text)
         self.assertIn("If the first measure is clearly too short for the visible time signature, label pickup.", rules_text)
         self.assertIn("Examples: in 2/4, one quarter note in the first measure is pickup;", rules_text)
         self.assertIn("If the time signature is unclear but the first measure looks short, label uncertain with maybe_label pickup.", rules_text)

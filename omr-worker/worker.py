@@ -1467,6 +1467,8 @@ def _current_ai_suggest_run(
         AI_SUGGEST_RUN_STATUS_FAILED,
     }:
         status = AI_SUGGEST_RUN_STATUS_IDLE
+    remembered_time_signature = _normalize_ai_time_signature_value(row.get("remembered_time_signature"))
+    last_time_signature_update = _normalize_ai_time_signature_update_row(row.get("last_time_signature_update"))
     clean = {
         "status": status,
         "started_at_utc": str(row.get("started_at_utc") or "").strip() or None,
@@ -1480,6 +1482,8 @@ def _current_ai_suggest_run(
         "source_state_version": str(row.get("source_state_version") or source_state_version or "").strip() or None,
         "model": str(row.get("model") or _requested_anthropic_model_name()).strip() or "unknown",
         "last_error": row.get("last_error") if isinstance(row.get("last_error"), dict) else None,
+        "remembered_time_signature": remembered_time_signature,
+        "last_time_signature_update": last_time_signature_update,
     }
     return clean
 
@@ -1530,8 +1534,40 @@ def _new_ai_suggest_run_state(
         "source_state_version": str(source_state_version or "").strip() or None,
         "model": _requested_anthropic_model_name(),
         "last_error": None,
+        "remembered_time_signature": None,
+        "last_time_signature_update": None,
     }
     return row
+
+
+def _normalize_ai_time_signature_value(raw_value) -> str | None:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    compact = text.lower().replace("-", "_").replace(" ", "_")
+    if compact in {"common_time", "common", "commonmeter", "c"}:
+        return "common_time"
+    if compact in {"cut_time", "cut", "alla_breve", "cuttime"}:
+        return "cut_time"
+    fraction = compact.replace("_", "")
+    if re.fullmatch(r"\d{1,2}/\d{1,2}", fraction):
+        return fraction
+    return None
+
+
+def _normalize_ai_time_signature_update_row(raw_row, system_id: str | None = None) -> dict | None:
+    if not isinstance(raw_row, dict):
+        return None
+    new_time_signature = _normalize_ai_time_signature_value(raw_row.get("new_time_signature"))
+    if not new_time_signature:
+        return None
+    measure_id = str(raw_row.get("measure_id") or "").strip() or None
+    resolved_system_id = str(raw_row.get("system_id") or system_id or "").strip() or None
+    return {
+        "system_id": resolved_system_id,
+        "measure_id": measure_id,
+        "new_time_signature": new_time_signature,
+    }
 
 
 def _ai_suggest_system_batches(editable_state: dict) -> list[tuple[dict, list[dict]]]:
@@ -1725,6 +1761,7 @@ def _normalize_ai_suggestions_result(
     editable_state: dict,
     run_id: int,
     source_state_version: str | None = None,
+    remembered_time_signature_in: str | None = None,
 ) -> dict:
     if not isinstance(raw_result, dict):
         raise AiSuggestError(detail="malformed_response: root must be an object")
@@ -1744,6 +1781,8 @@ def _normalize_ai_suggestions_result(
     kept_by_measure_id: dict[str, dict] = {}
     normal_measures_omitted = 0
     normalization_warnings: list[dict] = []
+    fallback_measure_row = ordered_measures[0] if ordered_measures else {}
+    system_id = str((ordered_measures[0] if ordered_measures else {}).get("system_id") or "").strip()
 
     for row in raw_suggestions:
         if not isinstance(row, dict):
@@ -1887,6 +1926,75 @@ def _normalize_ai_suggestions_result(
     systems_processed = len(_sorted_system_rows(editable_state.get("systems") or []))
     warnings = _normalize_ai_suggest_warnings(raw_result.get("warnings"))
     warnings.extend(normalization_warnings)
+    previous_time_signature = _normalize_ai_time_signature_value(remembered_time_signature_in)
+    raw_time_signature_updates = raw_result.get("time_signature_updates")
+    valid_time_signature_updates: list[dict] = []
+    if raw_time_signature_updates is not None and not isinstance(raw_time_signature_updates, list):
+        warnings.append(
+            _ai_suggest_normalization_warning(
+                fallback_measure_row,
+                "Ignored malformed time_signature_updates because it was not an array.",
+            )
+        )
+    elif isinstance(raw_time_signature_updates, list):
+        for raw_update in raw_time_signature_updates:
+            if not isinstance(raw_update, dict):
+                warnings.append(
+                    _ai_suggest_normalization_warning(
+                        fallback_measure_row,
+                        "Ignored malformed time_signature update entry because it was not an object.",
+                    )
+                )
+                continue
+            measure_id = str(raw_update.get("measure_id") or "").strip()
+            measure_row = measure_rows_by_id.get(measure_id) or fallback_measure_row
+            if not measure_id or measure_id not in expected_measure_ids:
+                warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        "Ignored time_signature update with missing or unknown measure_id.",
+                    )
+                )
+                continue
+            normalized_update = _normalize_ai_time_signature_update_row(raw_update, system_id=system_id)
+            if not normalized_update:
+                warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Ignored invalid time_signature update for {measure_id}.",
+                    )
+                )
+                continue
+            normalized_update["measure_id"] = measure_id
+            valid_time_signature_updates.append(normalized_update)
+
+    remembered_time_signature_out = previous_time_signature
+    raw_time_signature_out = raw_result.get("remembered_time_signature_out")
+    if raw_time_signature_out is not None:
+        normalized_time_signature_out = _normalize_ai_time_signature_value(raw_time_signature_out)
+        if normalized_time_signature_out is None:
+            warnings.append(
+                _ai_suggest_normalization_warning(
+                    fallback_measure_row,
+                    "Ignored invalid remembered_time_signature_out and kept the previous remembered value.",
+                )
+            )
+        else:
+            remembered_time_signature_out = normalized_time_signature_out
+
+    last_time_signature_update = None
+    if remembered_time_signature_out is not None and valid_time_signature_updates:
+        for row in reversed(valid_time_signature_updates):
+            if str(row.get("new_time_signature") or "") == remembered_time_signature_out:
+                last_time_signature_update = row
+                break
+    elif raw_time_signature_out is not None and remembered_time_signature_out is not None and remembered_time_signature_out != previous_time_signature:
+        last_time_signature_update = {
+            "system_id": system_id or None,
+            "measure_id": None,
+            "new_time_signature": remembered_time_signature_out,
+        }
+
     ai_suggestions = {
         "version": AI_SUGGESTIONS_VERSION,
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
@@ -1905,6 +2013,9 @@ def _normalize_ai_suggestions_result(
     source_state_version_txt = str(source_state_version or "").strip()
     if source_state_version_txt:
         ai_suggestions["source_state_version"] = source_state_version_txt
+    ai_suggestions["remembered_time_signature_out"] = remembered_time_signature_out
+    ai_suggestions["time_signature_updates"] = valid_time_signature_updates
+    ai_suggestions["last_time_signature_update"] = last_time_signature_update
     return ai_suggestions
 
 
@@ -2517,6 +2628,7 @@ def _build_system_measure_request(
     next_system_row: dict | None = None,
     artifacts: dict | None = None,
     debug_crop_rows: list[dict] | None = None,
+    remembered_time_signature_in: str | None = None,
 ) -> tuple[dict, int]:
     content: list[dict] = []
     system_id = str(system_row.get("system_id") or "").strip()
@@ -2526,13 +2638,19 @@ def _build_system_measure_request(
         "run_id": int(run_id),
         "system_id": system_id,
         "page_number": int(page_number),
+        "remembered_time_signature_in": _normalize_ai_time_signature_value(remembered_time_signature_in),
         "instructions": {
             "task": "Classify each already-detected sheet-music measure conservatively.",
             "allowed_labels": ["normal", "pickup", "multi_measure_rest", "uncertain"],
             "rules": [
                 "Each image contains exactly one already-detected measure.",
                 "Do not infer additional measures from internal rhythmic groupings, repeat dots, or barline decorations.",
+                "Process the provided measures left to right in order.",
+                "Start with remembered_time_signature_in as the active time signature, unless it is null.",
+                "If a clearly visible new time signature appears at a measure, update the active time signature from that measure onward within this same system.",
+                "If a new time signature is unclear or only partly visible, keep the previous active time signature.",
                 "Only label pickup when is_first_measure_of_score is true.",
+                "If is_first_measure_of_score is false, do not label pickup.",
                 "Use the visible time signature in the crop to judge completeness. Seeing the time signature is enough to judge whether the first measure is shorter than a full bar.",
                 "If the first measure is clearly too short for the visible time signature, label pickup.",
                 "Examples: in 2/4, one quarter note in the first measure is pickup; in 4/4, one quarter note in the first measure is pickup; in 3/4, one quarter note can be pickup; in 6/8, one or two eighth notes can be pickup.",
@@ -2564,6 +2682,13 @@ def _build_system_measure_request(
                     }
                 ],
                 "warnings": [{"type": "string", "system_id": "string", "system_index": "integer", "message": "string"}],
+                "remembered_time_signature_out": "string|null",
+                "time_signature_updates": [
+                    {
+                        "measure_id": "string",
+                        "new_time_signature": "3/4|4/4|6/8|common_time|cut_time",
+                    }
+                ],
             },
         },
         "measures": [
@@ -2657,6 +2782,7 @@ def _generate_ai_suggestions_for_system_batch(
     system_measures: list[dict],
     source_state_version: str | None,
     artifacts: dict,
+    remembered_time_signature_in: str | None = None,
 ) -> dict:
     model_name = str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
     if not model_name or not _anthropic_api_key():
@@ -2697,6 +2823,7 @@ def _generate_ai_suggestions_for_system_batch(
                 next_system_row=next_system_row,
                 artifacts=artifacts if debug_enabled else None,
                 debug_crop_rows=debug_crop_rows if debug_enabled else None,
+                remembered_time_signature_in=remembered_time_signature_in,
             )
             message = _anthropic_messages_create(payload)
             parsed = _parse_anthropic_suggestions_message(message)
@@ -2723,6 +2850,7 @@ def _generate_ai_suggestions_for_system_batch(
                 {"systems": [system_row], "measures": list(system_measures)},
                 int(run_id),
                 source_state_version,
+                remembered_time_signature_in=remembered_time_signature_in,
             )
             normalized["pdf_source"] = pdf_source
             normalized["reference_examples_attached"] = int(reference_examples_attached)
@@ -5182,6 +5310,7 @@ def ai_suggest_job_step(job_id: str):
     system_row, system_measures = system_batches[next_system_index]
     debug_crops = None
     reference_examples_attached = 0
+    remembered_time_signature_in = _normalize_ai_time_signature_value(ai_suggest_run.get("remembered_time_signature"))
     try:
         system_result = _generate_ai_suggestions_for_system_batch(
             job_id,
@@ -5191,10 +5320,19 @@ def ai_suggest_job_step(job_id: str):
             system_measures,
             source_state_version,
             artifacts,
+            remembered_time_signature_in=remembered_time_signature_in,
         )
         if isinstance(system_result, dict):
             debug_crops = system_result.pop("debug_crops", None)
             reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
+            ai_suggest_run["remembered_time_signature"] = _normalize_ai_time_signature_value(
+                system_result.pop("remembered_time_signature_out", remembered_time_signature_in)
+            )
+            ai_suggest_run["last_time_signature_update"] = _normalize_ai_time_signature_update_row(
+                system_result.pop("last_time_signature_update", None),
+                system_id=str(system_row.get("system_id") or "").strip() or None,
+            )
+            system_result.pop("time_signature_updates", None)
         ai_suggestions = _merge_ai_suggestions_state(ai_suggestions, system_result, int(artifact_run_id), source_state_version)
         if isinstance(debug_batch_trace_payload, dict):
             try:
