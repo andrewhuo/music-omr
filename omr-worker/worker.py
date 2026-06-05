@@ -1469,6 +1469,7 @@ def _current_ai_suggest_run(
         status = AI_SUGGEST_RUN_STATUS_IDLE
     remembered_time_signature = _normalize_ai_time_signature_value(row.get("remembered_time_signature"))
     last_time_signature_update = _normalize_ai_time_signature_update_row(row.get("last_time_signature_update"))
+    time_signature_updates = _normalize_ai_time_signature_update_rows(row.get("time_signature_updates"))
     clean = {
         "status": status,
         "started_at_utc": str(row.get("started_at_utc") or "").strip() or None,
@@ -1484,6 +1485,7 @@ def _current_ai_suggest_run(
         "last_error": row.get("last_error") if isinstance(row.get("last_error"), dict) else None,
         "remembered_time_signature": remembered_time_signature,
         "last_time_signature_update": last_time_signature_update,
+        "time_signature_updates": time_signature_updates,
     }
     return clean
 
@@ -1536,6 +1538,7 @@ def _new_ai_suggest_run_state(
         "last_error": None,
         "remembered_time_signature": None,
         "last_time_signature_update": None,
+        "time_signature_updates": [],
     }
     return row
 
@@ -1568,6 +1571,17 @@ def _normalize_ai_time_signature_update_row(raw_row, system_id: str | None = Non
         "measure_id": measure_id,
         "new_time_signature": new_time_signature,
     }
+
+
+def _normalize_ai_time_signature_update_rows(raw_rows, system_id: str | None = None) -> list[dict]:
+    clean: list[dict] = []
+    if not isinstance(raw_rows, list):
+        return clean
+    for raw_row in raw_rows:
+        normalized = _normalize_ai_time_signature_update_row(raw_row, system_id=system_id)
+        if normalized:
+            clean.append(normalized)
+    return clean
 
 
 def _ai_suggest_system_batches(editable_state: dict) -> list[tuple[dict, list[dict]]]:
@@ -5325,14 +5339,31 @@ def ai_suggest_job_step(job_id: str):
         if isinstance(system_result, dict):
             debug_crops = system_result.pop("debug_crops", None)
             reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
+            current_system_id = str(system_row.get("system_id") or "").strip() or None
             ai_suggest_run["remembered_time_signature"] = _normalize_ai_time_signature_value(
                 system_result.pop("remembered_time_signature_out", remembered_time_signature_in)
             )
-            ai_suggest_run["last_time_signature_update"] = _normalize_ai_time_signature_update_row(
-                system_result.pop("last_time_signature_update", None),
-                system_id=str(system_row.get("system_id") or "").strip() or None,
+            previous_last_time_signature_update = _normalize_ai_time_signature_update_row(
+                ai_suggest_run.get("last_time_signature_update"),
             )
-            system_result.pop("time_signature_updates", None)
+            current_time_signature_updates = _normalize_ai_time_signature_update_rows(
+                ai_suggest_run.get("time_signature_updates"),
+            )
+            step_last_time_signature_update = _normalize_ai_time_signature_update_row(
+                system_result.pop("last_time_signature_update", None),
+                system_id=current_system_id,
+            )
+            step_time_signature_updates = _normalize_ai_time_signature_update_rows(
+                system_result.pop("time_signature_updates", None),
+                system_id=current_system_id,
+            )
+            if step_time_signature_updates:
+                current_time_signature_updates.extend(step_time_signature_updates)
+                previous_last_time_signature_update = step_time_signature_updates[-1]
+            elif step_last_time_signature_update is not None:
+                previous_last_time_signature_update = step_last_time_signature_update
+            ai_suggest_run["last_time_signature_update"] = previous_last_time_signature_update
+            ai_suggest_run["time_signature_updates"] = current_time_signature_updates
         ai_suggestions = _merge_ai_suggestions_state(ai_suggestions, system_result, int(artifact_run_id), source_state_version)
         if isinstance(debug_batch_trace_payload, dict):
             try:

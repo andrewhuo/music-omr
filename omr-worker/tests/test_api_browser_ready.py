@@ -645,6 +645,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "claude-sonnet-4-6")
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("last_time_signature_update"))
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("time_signature_updates"), [])
         self.assertIn("ai_suggestions", mapping_summary)
         self.assertEqual(((mapping_summary.get("ai_suggest_run") or {}).get("status")), "running")
 
@@ -764,6 +765,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             "last_error": None,
             "remembered_time_signature": None,
             "last_time_signature_update": None,
+            "time_signature_updates": [],
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
         with (
@@ -785,6 +787,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     "warnings": [],
                     "summary": {"systems_processed": 1, "measures_seen": 2, "suggestions_kept": 1, "normal_measures_omitted": 1},
                     "remembered_time_signature_out": "3/4",
+                    "time_signature_updates": [{"measure_id": "p1_s0_m0", "new_time_signature": "3/4"}],
                     "last_time_signature_update": {"measure_id": "p1_s0_m0", "new_time_signature": "3/4"},
                 },
             ),
@@ -799,6 +802,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("remembered_time_signature"), "3/4")
         self.assertEqual((((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")), "p1_s0_m0")
+        self.assertEqual(
+            (body.get("ai_suggest_run") or {}).get("time_signature_updates"),
+            [{"system_id": "p1_s0", "measure_id": "p1_s0_m0", "new_time_signature": "3/4"}],
+        )
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
@@ -823,6 +830,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             "last_error": None,
             "remembered_time_signature": "3/4",
             "last_time_signature_update": {"system_id": "p1_s0", "measure_id": "p1_s0_m0", "new_time_signature": "3/4"},
+            "time_signature_updates": [{"system_id": "p1_s0", "measure_id": "p1_s0_m0", "new_time_signature": "3/4"}],
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
         with (
@@ -842,6 +850,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     "warnings": [],
                     "summary": {"systems_processed": 1, "measures_seen": 1, "suggestions_kept": 1, "normal_measures_omitted": 0},
                     "remembered_time_signature_out": "4/4",
+                    "time_signature_updates": [{"measure_id": "p1_s1_m0", "new_time_signature": "4/4"}],
                     "last_time_signature_update": {"measure_id": "p1_s1_m0", "new_time_signature": "4/4"},
                 },
             ) as mock_generate,
@@ -854,6 +863,13 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(mock_generate.call_args.kwargs.get("remembered_time_signature_in"), "3/4")
         self.assertEqual((body.get("ai_suggest_run") or {}).get("remembered_time_signature"), "4/4")
         self.assertEqual((((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")), "p1_s1_m0")
+        self.assertEqual(
+            (body.get("ai_suggest_run") or {}).get("time_signature_updates"),
+            [
+                {"system_id": "p1_s0", "measure_id": "p1_s0_m0", "new_time_signature": "3/4"},
+                {"system_id": "p1_s1", "measure_id": "p1_s1_m0", "new_time_signature": "4/4"},
+            ],
+        )
 
     def test_ai_suggest_step_returns_debug_batch_trace_when_enabled(self):
         artifacts = self._sample_artifacts()
@@ -874,6 +890,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             "last_error": None,
             "remembered_time_signature": "3/4",
             "last_time_signature_update": {"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"},
+            "time_signature_updates": [{"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"}],
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
         with (
@@ -1028,6 +1045,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             "last_error": None,
             "remembered_time_signature": "3/4",
             "last_time_signature_update": {"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"},
+            "time_signature_updates": [{"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"}],
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
         provider_payload = {
@@ -1093,6 +1111,14 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("remembered_time_signature"), "3/4")
+        self.assertEqual(
+            (body.get("ai_suggest_run") or {}).get("time_signature_updates"),
+            [{"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"}],
+        )
+        self.assertEqual(
+            (((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")),
+            "m0",
+        )
         _, expected_reference_examples = WORKER._build_old_style_multi_rest_reference_content()
         self.assertEqual(body.get("reference_examples_attached"), expected_reference_examples)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
