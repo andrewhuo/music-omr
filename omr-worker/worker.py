@@ -102,6 +102,7 @@ AI_SUGGEST_RUN_STATUS_FAILED = "failed"
 AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
+AI_SUGGESTION_COMPLETENESS_ALLOWED = {"full", "incomplete", "unclear"}
 AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
 AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
 AI_OLD_STYLE_REFERENCE_EXAMPLES = (
@@ -1503,6 +1504,7 @@ def _empty_ai_suggestions_state(
         "source_run_id": int(run_id),
         "by_measure_id": {},
         "time_signatures_by_measure_id": {},
+        "measure_completeness_by_measure_id": {},
         "warnings": [],
         "summary": {
             "systems_processed": 0,
@@ -1645,6 +1647,8 @@ def _merge_ai_suggestions_state(
     by_measure_id.update(dict(system_suggestions.get("by_measure_id") or {}))
     time_signatures_by_measure_id = dict(base.get("time_signatures_by_measure_id") or {})
     time_signatures_by_measure_id.update(dict(system_suggestions.get("time_signatures_by_measure_id") or {}))
+    measure_completeness_by_measure_id = dict(base.get("measure_completeness_by_measure_id") or {})
+    measure_completeness_by_measure_id.update(dict(system_suggestions.get("measure_completeness_by_measure_id") or {}))
     warnings = list(base.get("warnings") or [])
     warnings.extend(list(system_suggestions.get("warnings") or []))
     base["version"] = AI_SUGGESTIONS_VERSION
@@ -1657,6 +1661,7 @@ def _merge_ai_suggestions_state(
         base["source_state_version"] = source_state_version_txt
     base["by_measure_id"] = by_measure_id
     base["time_signatures_by_measure_id"] = time_signatures_by_measure_id
+    base["measure_completeness_by_measure_id"] = measure_completeness_by_measure_id
     base["warnings"] = warnings
     summary = base.get("summary")
     if not isinstance(summary, dict):
@@ -1720,7 +1725,11 @@ def _remove_ai_suggestion_entries(mapping_summary: dict | None, measure_ids: set
     time_signatures_by_measure_id = ai_suggestions.get("time_signatures_by_measure_id")
     if not isinstance(time_signatures_by_measure_id, dict):
         time_signatures_by_measure_id = {}
+    measure_completeness_by_measure_id = ai_suggestions.get("measure_completeness_by_measure_id")
+    if not isinstance(measure_completeness_by_measure_id, dict):
+        measure_completeness_by_measure_id = {}
     removed: list[str] = []
+    maps_changed = False
     for measure_id in measure_ids or []:
         mid = str(measure_id or "").strip()
         if not mid:
@@ -1728,9 +1737,15 @@ def _remove_ai_suggestion_entries(mapping_summary: dict | None, measure_ids: set
         if mid in by_measure_id:
             by_measure_id.pop(mid, None)
             removed.append(mid)
-        time_signatures_by_measure_id.pop(mid, None)
-    if removed:
+        if mid in time_signatures_by_measure_id:
+            time_signatures_by_measure_id.pop(mid, None)
+            maps_changed = True
+        if mid in measure_completeness_by_measure_id:
+            measure_completeness_by_measure_id.pop(mid, None)
+            maps_changed = True
+    if removed or maps_changed:
         ai_suggestions["time_signatures_by_measure_id"] = time_signatures_by_measure_id
+        ai_suggestions["measure_completeness_by_measure_id"] = measure_completeness_by_measure_id
         _refresh_ai_suggestions_summary(ai_suggestions)
     return removed
 
@@ -1760,6 +1775,11 @@ def _normalize_ai_suggest_warnings(raw_warnings) -> list[dict]:
             warning["system_index"] = _safe_int(row.get("system_index"), 0)
         clean.append(warning)
     return clean
+
+
+def _normalize_ai_measure_completeness_value(raw_value) -> str | None:
+    text = str(raw_value or "").strip().lower()
+    return text if text in AI_SUGGESTION_COMPLETENESS_ALLOWED else None
 
 
 def _ai_suggest_normalization_warning(measure_row: dict | None, message: str) -> dict:
@@ -1842,6 +1862,7 @@ def _normalize_ai_suggestions_result(
 
     seen_measure_ids: set[str] = set()
     kept_by_measure_id: dict[str, dict] = {}
+    measure_completeness_by_measure_id: dict[str, dict] = {}
     normal_measures_omitted = 0
     normalization_warnings: list[dict] = []
     fallback_measure_row = ordered_measures[0] if ordered_measures else {}
@@ -1865,6 +1886,7 @@ def _normalize_ai_suggestions_result(
             raise AiSuggestError(detail=f"malformed_response: invalid label for {measure_id}")
         confidence = str(row.get("confidence") or "").strip().lower()
         measure_row = measure_rows_by_id[measure_id]
+        is_first_measure_of_score = _safe_int(measure_row.get("global_index"), -1) == 0
         if confidence not in AI_SUGGESTION_CONFIDENCE_ALLOWED:
             normalization_warnings.append(
                 _ai_suggest_normalization_warning(
@@ -1877,6 +1899,33 @@ def _normalize_ai_suggestions_result(
         rest_count = row.get("rest_count")
         maybe_label = row.get("maybe_label")
         maybe_rest_count = row.get("maybe_rest_count")
+        measure_completeness = _normalize_ai_measure_completeness_value(row.get("measure_completeness"))
+        if measure_completeness is None:
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_row,
+                    f"Missing or invalid measure_completeness for {measure_id}; defaulted to unclear.",
+                )
+            )
+            measure_completeness = "unclear"
+
+        if label == "pickup":
+            measure_completeness = "incomplete"
+        elif label == "multi_measure_rest":
+            measure_completeness = "full"
+        elif not is_first_measure_of_score and label == "normal" and measure_completeness == "incomplete":
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_row,
+                    f"Downgraded later normal suggestion to uncertain for {measure_id} because measure_completeness was incomplete.",
+                )
+            )
+            label = "uncertain"
+
+        measure_completeness_by_measure_id[measure_id] = {
+            "measure_completeness": measure_completeness,
+            "measure_completeness_source": "ai",
+        }
 
         if label == "normal":
             if rest_count is not None or maybe_label is not None or maybe_rest_count is not None:
@@ -1895,7 +1944,7 @@ def _normalize_ai_suggestions_result(
             "confidence": confidence,
             "system_id": str(measure_row.get("system_id") or "").strip(),
             "order_index_in_system": _safe_int(measure_row.get("measure_local_index"), 0),
-            "is_first_measure_of_score": _safe_int(measure_row.get("global_index"), -1) == 0,
+            "is_first_measure_of_score": is_first_measure_of_score,
         }
 
         if label == "pickup":
@@ -2067,6 +2116,9 @@ def _normalize_ai_suggestions_result(
         time_signature_row = time_signatures_by_measure_id.get(measure_id)
         if isinstance(time_signature_row, dict):
             entry.update(time_signature_row)
+        measure_completeness_row = measure_completeness_by_measure_id.get(measure_id)
+        if isinstance(measure_completeness_row, dict):
+            entry.update(measure_completeness_row)
 
     ai_suggestions = {
         "version": AI_SUGGESTIONS_VERSION,
@@ -2076,6 +2128,7 @@ def _normalize_ai_suggestions_result(
         "source_run_id": int(run_id),
         "by_measure_id": kept_by_measure_id,
         "time_signatures_by_measure_id": time_signatures_by_measure_id,
+        "measure_completeness_by_measure_id": measure_completeness_by_measure_id,
         "warnings": warnings,
         "summary": {
             "systems_processed": systems_processed,
@@ -2725,12 +2778,16 @@ def _build_system_measure_request(
                 "If a new time signature is unclear or only partly visible, keep the previous active time signature.",
                 "Only label pickup when is_first_measure_of_score is true.",
                 "If is_first_measure_of_score is false, do not label pickup.",
+                "For every measure, also judge measure_completeness as full, incomplete, or unclear.",
                 "Use the visible time signature in the crop to judge completeness. Seeing the time signature is enough to judge whether the first measure is shorter than a full bar.",
                 "If the first measure is clearly too short for the visible time signature, label pickup.",
+                "If a non-first measure clearly looks too short for its active time signature, use label uncertain, not normal.",
+                "Do not label later incomplete measures as pickup yet.",
                 "Examples: in 2/4, one quarter note in the first measure is pickup; in 4/4, one quarter note in the first measure is pickup; in 3/4, one quarter note can be pickup; in 6/8, one or two eighth notes can be pickup.",
                 "If the first measure could still plausibly fill the bar, label normal, not pickup.",
                 "If the time signature is unclear but the first measure looks short, label uncertain with maybe_label pickup.",
                 "A whole note, two half notes, or other sparse-looking content in the first measure is usually a slow full measure, not a pickup. Do not label pickup just because the first measure looks sparse or simple.",
+                "Be very conservative about later completeness. Only use incomplete when the measure clearly looks too short; otherwise use unclear.",
                 "Default to normal when uncertain about completeness. Only label pickup if the first measure is obviously and visually incomplete. When in doubt between pickup and normal, always choose normal.",
                 "If not confident, use uncertain rather than guessing.",
                 "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
@@ -2749,6 +2806,7 @@ def _build_system_measure_request(
                     {
                         "measure_id": "string",
                         "label": "normal|pickup|multi_measure_rest|uncertain",
+                        "measure_completeness": "full|incomplete|unclear",
                         "rest_count": "integer|null",
                         "confidence": "low|medium|high",
                         "maybe_label": "pickup|multi_measure_rest|null",

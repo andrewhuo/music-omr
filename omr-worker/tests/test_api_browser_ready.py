@@ -640,6 +640,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(summary.get("suggestions_kept"), 0)
         self.assertEqual(summary.get("systems_processed"), 0)
         self.assertEqual(ai_suggestions.get("time_signatures_by_measure_id"), {})
+        self.assertEqual(ai_suggestions.get("measure_completeness_by_measure_id"), {})
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_total"), 2)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
@@ -1302,6 +1303,10 @@ class BrowserReadyApiTests(unittest.TestCase):
                 "p1_s0_m0": {"active_time_signature": "3/4", "time_signature_source": "explicit_here"},
                 "p1_s1_m0": {"active_time_signature": "3/4", "time_signature_source": "inherited"},
             },
+            "measure_completeness_by_measure_id": {
+                "p1_s0_m0": {"measure_completeness": "incomplete", "measure_completeness_source": "ai"},
+                "p1_s1_m0": {"measure_completeness": "unclear", "measure_completeness_source": "ai"},
+            },
             "warnings": [],
             "summary": {"systems_processed": 2, "measures_seen": 3, "suggestions_kept": 2, "normal_measures_omitted": 1},
         }
@@ -1317,8 +1322,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(body.get("dismissed_measure_id"), "p1_s0_m0")
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         time_signatures_by_measure_id = ((body.get("ai_suggestions") or {}).get("time_signatures_by_measure_id") or {})
+        measure_completeness_by_measure_id = ((body.get("ai_suggestions") or {}).get("measure_completeness_by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s1_m0"])
         self.assertEqual(sorted(time_signatures_by_measure_id.keys()), ["p1_s1_m0"])
+        self.assertEqual(sorted(measure_completeness_by_measure_id.keys()), ["p1_s1_m0"])
         self.assertEqual(((body.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept"), 1)
 
     def test_relabel_clears_touched_ai_suggestion(self):
@@ -1338,6 +1345,10 @@ class BrowserReadyApiTests(unittest.TestCase):
             "time_signatures_by_measure_id": {
                 "p1_s0_m0": {"active_time_signature": "3/4", "time_signature_source": "explicit_here"},
                 "p1_s1_m0": {"active_time_signature": "3/4", "time_signature_source": "inherited"},
+            },
+            "measure_completeness_by_measure_id": {
+                "p1_s0_m0": {"measure_completeness": "incomplete", "measure_completeness_source": "ai"},
+                "p1_s1_m0": {"measure_completeness": "unclear", "measure_completeness_source": "ai"},
             },
             "warnings": [],
             "summary": {"systems_processed": 2, "measures_seen": 3, "suggestions_kept": 2, "normal_measures_omitted": 1},
@@ -1364,8 +1375,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         remaining = ((mapping_summary.get("ai_suggestions") or {}).get("by_measure_id") or {})
         remaining_time_signatures = ((mapping_summary.get("ai_suggestions") or {}).get("time_signatures_by_measure_id") or {})
+        remaining_completeness = ((mapping_summary.get("ai_suggestions") or {}).get("measure_completeness_by_measure_id") or {})
         self.assertEqual(sorted(remaining.keys()), ["p1_s1_m0"])
         self.assertEqual(sorted(remaining_time_signatures.keys()), ["p1_s1_m0"])
+        self.assertEqual(sorted(remaining_completeness.keys()), ["p1_s1_m0"])
         self.assertEqual((((mapping_summary.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
 
     def test_normalize_ai_suggestions_result_salvages_missing_maybe_rest_count_and_bad_warnings(self):
@@ -1409,6 +1422,14 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "uncertain")
         self.assertNotIn("maybe_label", by_measure_id.get("p1_s0_m0") or {})
         self.assertEqual((by_measure_id.get("p1_s1_m0") or {}).get("label"), "pickup")
+        self.assertEqual(
+            normalized.get("measure_completeness_by_measure_id"),
+            {
+                "p1_s0_m0": {"measure_completeness": "unclear", "measure_completeness_source": "ai"},
+                "p1_s0_m1": {"measure_completeness": "unclear", "measure_completeness_source": "ai"},
+                "p1_s1_m0": {"measure_completeness": "incomplete", "measure_completeness_source": "ai"},
+            },
+        )
         warnings = normalized.get("warnings") or []
         self.assertTrue(any((row or {}).get("type") == "note" for row in warnings))
         self.assertTrue(any((row or {}).get("type") == "normalization_adjusted" for row in warnings))
@@ -1448,14 +1469,101 @@ class BrowserReadyApiTests(unittest.TestCase):
         first = by_measure_id.get("p1_s0_m0") or {}
         self.assertEqual(first.get("label"), "uncertain")
         self.assertEqual(first.get("confidence"), "low")
+        self.assertEqual(first.get("measure_completeness"), "full")
+        self.assertEqual(first.get("measure_completeness_source"), "ai")
         second = by_measure_id.get("p1_s0_m1") or {}
         self.assertEqual(second.get("label"), "uncertain")
         self.assertNotIn("maybe_label", second)
+        self.assertEqual(second.get("measure_completeness"), "unclear")
         warnings = normalized.get("warnings") or []
         self.assertGreaterEqual(
             len([row for row in warnings if (row or {}).get("type") == "normalization_adjusted"]),
             2,
         )
+
+    def test_normalize_ai_suggestions_result_tracks_measure_completeness_for_every_measure(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+                {"measure_id": "m1", "system_id": "p1_s0", "measure_local_index": 1, "global_index": 1},
+                {"measure_id": "m2", "system_id": "p1_s0", "measure_local_index": 2, "global_index": 2},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {"measure_id": "m0", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m1", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m2", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertEqual(normalized.get("by_measure_id"), {})
+        self.assertEqual(
+            normalized.get("measure_completeness_by_measure_id"),
+            {
+                "m0": {"measure_completeness": "full", "measure_completeness_source": "ai"},
+                "m1": {"measure_completeness": "full", "measure_completeness_source": "ai"},
+                "m2": {"measure_completeness": "full", "measure_completeness_source": "ai"},
+            },
+        )
+
+    def test_normalize_ai_suggestions_result_downgrades_later_normal_incomplete_to_uncertain(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+                {"measure_id": "m1", "system_id": "p1_s0", "measure_local_index": 1, "global_index": 1},
+                {"measure_id": "m2", "system_id": "p1_s0", "measure_local_index": 2, "global_index": 2},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {"measure_id": "m0", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m1", "label": "normal", "measure_completeness": "incomplete", "rest_count": None, "confidence": "medium"},
+                {"measure_id": "m2", "label": "normal", "measure_completeness": "unclear", "rest_count": None, "confidence": "high"},
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(
+            raw_result,
+            editable_state,
+            111,
+            "test-state",
+            remembered_time_signature_in="3/4",
+        )
+
+        self.assertEqual(
+            normalized.get("measure_completeness_by_measure_id"),
+            {
+                "m0": {"measure_completeness": "full", "measure_completeness_source": "ai"},
+                "m1": {"measure_completeness": "incomplete", "measure_completeness_source": "ai"},
+                "m2": {"measure_completeness": "unclear", "measure_completeness_source": "ai"},
+            },
+        )
+        self.assertEqual(
+            normalized.get("by_measure_id", {}).get("m1"),
+            {
+                "label": "uncertain",
+                "rest_count": None,
+                "confidence": "medium",
+                "system_id": "p1_s0",
+                "order_index_in_system": 1,
+                "is_first_measure_of_score": False,
+                "active_time_signature": "3/4",
+                "time_signature_source": "remembered",
+                "measure_completeness": "incomplete",
+                "measure_completeness_source": "ai",
+            },
+        )
+        warnings = normalized.get("warnings") or []
+        self.assertTrue(any("Downgraded later normal suggestion to uncertain" in str((row or {}).get("message") or "") for row in warnings))
 
     def test_normalize_ai_suggestions_result_tracks_remembered_time_signature_for_every_measure(self):
         editable_state = {
@@ -1469,9 +1577,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         raw_result = {
             "provider": "claude",
             "suggestions": [
-                {"measure_id": "m0", "label": "normal", "rest_count": None, "confidence": "high"},
-                {"measure_id": "m1", "label": "normal", "rest_count": None, "confidence": "high"},
-                {"measure_id": "m2", "label": "normal", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m0", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m1", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m2", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
             ],
             "warnings": [],
         }
@@ -1485,6 +1593,14 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
 
         self.assertEqual(normalized.get("by_measure_id"), {})
+        self.assertEqual(
+            normalized.get("measure_completeness_by_measure_id"),
+            {
+                "m0": {"measure_completeness": "full", "measure_completeness_source": "ai"},
+                "m1": {"measure_completeness": "full", "measure_completeness_source": "ai"},
+                "m2": {"measure_completeness": "full", "measure_completeness_source": "ai"},
+            },
+        )
         self.assertEqual(
             normalized.get("time_signatures_by_measure_id"),
             {
@@ -1506,9 +1622,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         raw_result = {
             "provider": "claude",
             "suggestions": [
-                {"measure_id": "m0", "label": "normal", "rest_count": None, "confidence": "high"},
-                {"measure_id": "m1", "label": "uncertain", "rest_count": None, "confidence": "low"},
-                {"measure_id": "m2", "label": "normal", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m0", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m1", "label": "uncertain", "measure_completeness": "incomplete", "rest_count": None, "confidence": "low"},
+                {"measure_id": "m2", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
             ],
             "warnings": [],
             "time_signature_updates": [{"measure_id": "m1", "new_time_signature": "3/4"}],
@@ -1542,6 +1658,8 @@ class BrowserReadyApiTests(unittest.TestCase):
                 "is_first_measure_of_score": False,
                 "active_time_signature": "3/4",
                 "time_signature_source": "explicit_here",
+                "measure_completeness": "incomplete",
+                "measure_completeness_source": "ai",
             },
         )
 
@@ -1557,9 +1675,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         raw_result = {
             "provider": "claude",
             "suggestions": [
-                {"measure_id": "m0", "label": "normal", "rest_count": None, "confidence": "high"},
-                {"measure_id": "m1", "label": "normal", "rest_count": None, "confidence": "high"},
-                {"measure_id": "m2", "label": "pickup", "rest_count": None, "confidence": "medium"},
+                {"measure_id": "m0", "label": "normal", "measure_completeness": "unclear", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m1", "label": "normal", "measure_completeness": "full", "rest_count": None, "confidence": "high"},
+                {"measure_id": "m2", "label": "pickup", "measure_completeness": "full", "rest_count": None, "confidence": "medium"},
             ],
             "warnings": [],
             "time_signature_updates": [{"measure_id": "m1", "new_time_signature": "6/8"}],
@@ -1585,6 +1703,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(
             normalized.get("by_measure_id", {}).get("m2", {}).get("time_signature_source"),
             "inherited",
+        )
+        self.assertEqual(
+            normalized.get("by_measure_id", {}).get("m2", {}).get("measure_completeness"),
+            "incomplete",
         )
 
     def test_parse_anthropic_suggestions_message_drops_model_field(self):
@@ -1653,11 +1775,16 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Process the provided measures left to right in order.", rules_text)
         self.assertIn("Start with remembered_time_signature_in as the active time signature", rules_text)
         self.assertIn("If a clearly visible new time signature appears at a measure, update the active time signature", rules_text)
+        self.assertIn("For every measure, also judge measure_completeness as full, incomplete, or unclear.", rules_text)
         self.assertIn("Use the visible time signature in the crop to judge completeness.", rules_text)
+        self.assertIn("If a non-first measure clearly looks too short for its active time signature, use label uncertain, not normal.", rules_text)
         self.assertIn("If is_first_measure_of_score is false, do not label pickup.", rules_text)
         self.assertIn("If the first measure is clearly too short for the visible time signature, label pickup.", rules_text)
         self.assertIn("Examples: in 2/4, one quarter note in the first measure is pickup;", rules_text)
         self.assertIn("If the time signature is unclear but the first measure looks short, label uncertain with maybe_label pickup.", rules_text)
+        output_shape = ((intro.get("instructions") or {}).get("output_shape") or {})
+        suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
+        self.assertEqual(suggestion_shape.get("measure_completeness"), "full|incomplete|unclear")
 
     def test_build_system_measure_request_includes_old_style_multi_rest_guidance(self):
         mapping_summary = self._sample_mapping_summary()
