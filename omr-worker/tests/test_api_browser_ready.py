@@ -1512,6 +1512,118 @@ class BrowserReadyApiTests(unittest.TestCase):
             },
         )
 
+    def test_normalize_ai_suggestions_result_keeps_unclear_reason_on_uncertain_row(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "m0",
+                    "label": "uncertain",
+                    "measure_completeness": "unclear",
+                    "unclear_reason": "split_may_be_wrong",
+                    "rest_count": None,
+                    "confidence": "low",
+                }
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertEqual(
+            normalized.get("by_measure_id", {}).get("m0"),
+            {
+                "label": "uncertain",
+                "rest_count": None,
+                "confidence": "low",
+                "system_id": "p1_s0",
+                "order_index_in_system": 0,
+                "is_first_measure_of_score": True,
+                "active_time_signature": None,
+                "time_signature_source": "unknown",
+                "measure_completeness": "unclear",
+                "measure_completeness_source": "ai",
+                "unclear_reason": "split_may_be_wrong",
+            },
+        )
+        self.assertEqual(
+            normalized.get("measure_completeness_by_measure_id", {}).get("m0"),
+            {
+                "measure_completeness": "unclear",
+                "measure_completeness_source": "ai",
+                "unclear_reason": "split_may_be_wrong",
+            },
+        )
+
+    def test_normalize_ai_suggestions_result_keeps_unclear_reason_for_unclear_normal_omitted_row(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "m0",
+                    "label": "normal",
+                    "measure_completeness": "unclear",
+                    "unclear_reason": "too_dense_to_count",
+                    "rest_count": None,
+                    "confidence": "high",
+                }
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertEqual(normalized.get("by_measure_id"), {})
+        self.assertEqual(
+            normalized.get("measure_completeness_by_measure_id", {}).get("m0"),
+            {
+                "measure_completeness": "unclear",
+                "measure_completeness_source": "ai",
+                "unclear_reason": "too_dense_to_count",
+            },
+        )
+
+    def test_normalize_ai_suggestions_result_drops_invalid_unclear_reason(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "m0",
+                    "label": "uncertain",
+                    "measure_completeness": "unclear",
+                    "unclear_reason": "bad_reason",
+                    "rest_count": None,
+                    "confidence": "low",
+                }
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertNotIn("unclear_reason", normalized.get("by_measure_id", {}).get("m0", {}))
+        self.assertNotIn("unclear_reason", normalized.get("measure_completeness_by_measure_id", {}).get("m0", {}))
+        warnings = normalized.get("warnings") or []
+        self.assertTrue(any("Dropped invalid unclear_reason" in str((row or {}).get("message") or "") for row in warnings))
+
     def test_normalize_ai_suggestions_result_downgrades_later_normal_incomplete_to_uncertain(self):
         editable_state = {
             "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
@@ -1776,6 +1888,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Start with remembered_time_signature_in as the active time signature", rules_text)
         self.assertIn("If a clearly visible new time signature appears at a measure, update the active time signature", rules_text)
         self.assertIn("For every measure, also judge measure_completeness as full, incomplete, or unclear.", rules_text)
+        self.assertIn("If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason", rules_text)
+        self.assertIn("Do not write sentences for unclear_reason. Use only one short code or omit the field.", rules_text)
         self.assertIn("Use the visible time signature in the crop to judge completeness.", rules_text)
         self.assertIn("If a non-first measure clearly looks too short for its active time signature, use label uncertain, not normal.", rules_text)
         self.assertIn("If is_first_measure_of_score is false, do not label pickup.", rules_text)
@@ -1785,6 +1899,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         output_shape = ((intro.get("instructions") or {}).get("output_shape") or {})
         suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
         self.assertEqual(suggestion_shape.get("measure_completeness"), "full|incomplete|unclear")
+        self.assertEqual(
+            suggestion_shape.get("unclear_reason"),
+            "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
+        )
 
     def test_build_system_measure_request_includes_old_style_multi_rest_guidance(self):
         mapping_summary = self._sample_mapping_summary()

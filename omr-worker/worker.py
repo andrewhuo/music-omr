@@ -103,6 +103,14 @@ AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncer
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
 AI_SUGGESTION_COMPLETENESS_ALLOWED = {"full", "incomplete", "unclear"}
+AI_SUGGESTION_UNCLEAR_REASONS_ALLOWED = {
+    "time_signature_not_clear",
+    "too_dense_to_count",
+    "crop_cut_off",
+    "split_may_be_wrong",
+    "ornament_or_tie_confusion",
+    "not_enough_visual_evidence",
+}
 AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
 AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
 AI_OLD_STYLE_REFERENCE_EXAMPLES = (
@@ -1782,6 +1790,11 @@ def _normalize_ai_measure_completeness_value(raw_value) -> str | None:
     return text if text in AI_SUGGESTION_COMPLETENESS_ALLOWED else None
 
 
+def _normalize_ai_unclear_reason_value(raw_value) -> str | None:
+    text = str(raw_value or "").strip().lower()
+    return text if text in AI_SUGGESTION_UNCLEAR_REASONS_ALLOWED else None
+
+
 def _ai_suggest_normalization_warning(measure_row: dict | None, message: str) -> dict:
     warning = {
         "type": "normalization_adjusted",
@@ -1899,6 +1912,7 @@ def _normalize_ai_suggestions_result(
         rest_count = row.get("rest_count")
         maybe_label = row.get("maybe_label")
         maybe_rest_count = row.get("maybe_rest_count")
+        raw_unclear_reason = row.get("unclear_reason")
         measure_completeness = _normalize_ai_measure_completeness_value(row.get("measure_completeness"))
         if measure_completeness is None:
             normalization_warnings.append(
@@ -1922,10 +1936,36 @@ def _normalize_ai_suggestions_result(
             )
             label = "uncertain"
 
-        measure_completeness_by_measure_id[measure_id] = {
+        unclear_reason = None
+        if raw_unclear_reason is not None:
+            normalized_unclear_reason = _normalize_ai_unclear_reason_value(raw_unclear_reason)
+            if normalized_unclear_reason is None:
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Dropped invalid unclear_reason for {measure_id}.",
+                    )
+                )
+            else:
+                unclear_reason = normalized_unclear_reason
+
+        unclear_reason_allowed = label == "uncertain" or measure_completeness == "unclear"
+        if unclear_reason is not None and not unclear_reason_allowed:
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_row,
+                    f"Dropped unclear_reason for {measure_id} because the row was not uncertain or unclear.",
+                )
+            )
+            unclear_reason = None
+
+        measure_completeness_entry = {
             "measure_completeness": measure_completeness,
             "measure_completeness_source": "ai",
         }
+        if unclear_reason is not None:
+            measure_completeness_entry["unclear_reason"] = unclear_reason
+        measure_completeness_by_measure_id[measure_id] = measure_completeness_entry
 
         if label == "normal":
             if rest_count is not None or maybe_label is not None or maybe_rest_count is not None:
@@ -1946,6 +1986,8 @@ def _normalize_ai_suggestions_result(
             "order_index_in_system": _safe_int(measure_row.get("measure_local_index"), 0),
             "is_first_measure_of_score": is_first_measure_of_score,
         }
+        if unclear_reason is not None:
+            entry["unclear_reason"] = unclear_reason
 
         if label == "pickup":
             if rest_count is not None or maybe_label is not None or maybe_rest_count is not None:
@@ -2779,6 +2821,8 @@ def _build_system_measure_request(
                 "Only label pickup when is_first_measure_of_score is true.",
                 "If is_first_measure_of_score is false, do not label pickup.",
                 "For every measure, also judge measure_completeness as full, incomplete, or unclear.",
+                "If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason using one of these exact codes only: time_signature_not_clear, too_dense_to_count, crop_cut_off, split_may_be_wrong, ornament_or_tie_confusion, not_enough_visual_evidence.",
+                "Do not write sentences for unclear_reason. Use only one short code or omit the field.",
                 "Use the visible time signature in the crop to judge completeness. Seeing the time signature is enough to judge whether the first measure is shorter than a full bar.",
                 "If the first measure is clearly too short for the visible time signature, label pickup.",
                 "If a non-first measure clearly looks too short for its active time signature, use label uncertain, not normal.",
@@ -2807,6 +2851,7 @@ def _build_system_measure_request(
                         "measure_id": "string",
                         "label": "normal|pickup|multi_measure_rest|uncertain",
                         "measure_completeness": "full|incomplete|unclear",
+                        "unclear_reason": "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
                         "rest_count": "integer|null",
                         "confidence": "low|medium|high",
                         "maybe_label": "pickup|multi_measure_rest|null",
