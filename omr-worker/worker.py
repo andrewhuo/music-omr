@@ -90,6 +90,8 @@ MANUAL_STAFF_KINDS_ALLOWED = {MANUAL_STAFF_KIND_SINGLE, MANUAL_STAFF_KIND_GRAND}
 MANUAL_SYSTEM_ID_PREFIX = "manual_sys_"
 MANUAL_MEASURE_ID_PREFIX = "manual_measure_"
 MANUAL_ROW_OVERLAP_RATIO = 0.5
+AUTO_ROW_RECT_TOLERANCE = 8.0
+AUTO_BOX_MIN_WIDTH = 2.0
 STAFF_START_SAME_ROW_OVERLAP_RATIO = 0.30
 STAFF_START_SAME_ROW_CENTER_TOLERANCE_RATIO = 0.45
 STAFF_START_SAME_ROW_MIN_HEIGHT_RATIO = 0.55
@@ -866,6 +868,7 @@ def _editable_state_version(editable_state: dict) -> str:
         "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
         "systems": editable_state.get("systems") or [],
         "measures": editable_state.get("measures") or [],
+        "auto_rows": editable_state.get("auto_rows") or [],
         "manual_rows": editable_state.get("manual_rows") or [],
         "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
         "rest_measures": editable_state.get("rest_measures") or {},
@@ -924,6 +927,12 @@ def _parse_manual_row_rect(raw_rect: dict | None) -> tuple[float, float, float, 
     if right <= left or bottom <= top:
         return None
     return (left, right, top, bottom)
+
+
+def _is_excluded_from_counting(row: dict | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return _safe_bool(row.get("excluded_from_counting"), False)
 
 
 def _editable_manual_rows(editable_state: dict) -> list[dict]:
@@ -999,6 +1008,162 @@ def _editable_manual_rows(editable_state: dict) -> list[dict]:
         )
     )
     editable_state["manual_rows"] = cleaned
+    return cleaned
+
+
+def _build_auto_rows_from_state(editable_state: dict) -> list[dict]:
+    systems = _clone_auto_system_rows(editable_state)
+    measures = _clone_auto_measure_rows(editable_state)
+    system_rows_by_id: dict[str, dict] = {}
+    grouped_measures: dict[tuple[int, str], list[dict]] = {}
+    for system in systems:
+        system_id = str(system.get("system_id") or "").strip()
+        if system_id:
+            system_rows_by_id[system_id] = system
+    for measure in measures:
+        system_id = str(measure.get("system_id") or "").strip()
+        page = _safe_int(measure.get("page"), 0)
+        if not system_id or page <= 0:
+            continue
+        grouped_measures.setdefault((page, system_id), []).append(measure)
+
+    rows: list[dict] = []
+    for (page, system_id), group in grouped_measures.items():
+        system_row = system_rows_by_id.get(system_id) or {}
+        bounds = _system_visual_bounds(system_row, group)
+        if bounds is None:
+            continue
+        left, right, top, bottom = bounds
+        if right <= left or bottom <= top:
+            continue
+        ordered_group = sorted(group, key=lambda row: (_safe_float(row.get("x_left"), 0.0), str(row.get("measure_id") or "")))
+        boxes: list[dict] = []
+        for measure in ordered_group:
+            measure_id = str(measure.get("measure_id") or "").strip()
+            box_left = _safe_float(measure.get("x_left"), left)
+            box_right = _safe_float(measure.get("x_right"), box_left)
+            if not measure_id or box_right <= box_left:
+                continue
+            boxes.append(
+                {
+                    "measure_id": measure_id,
+                    "left": float(box_left),
+                    "right": float(box_right),
+                    "excluded_from_counting": _is_excluded_from_counting(measure),
+                }
+            )
+        if not boxes:
+            continue
+        row = {
+            "system_id": system_id,
+            "page": int(page),
+            "rect": {
+                "left": float(left),
+                "right": float(right),
+                "top": float(top),
+                "bottom": float(bottom),
+            },
+            "boxes": boxes,
+        }
+        current_value = str(system_row.get("current_value") or system_row.get("value") or "").strip()
+        if current_value:
+            row["current_value"] = current_value
+        staff_kind = str(system_row.get("staff_kind") or "").strip().lower()
+        if staff_kind:
+            row["staff_kind"] = staff_kind
+        rows.append(row)
+
+    rows.sort(
+        key=lambda row: (
+            _safe_int(row.get("page"), 0),
+            float((((row.get("rect") or {}) if isinstance(row.get("rect"), dict) else {}).get("top")) or 0.0),
+            float((((row.get("rect") or {}) if isinstance(row.get("rect"), dict) else {}).get("left")) or 0.0),
+            str(row.get("system_id") or ""),
+        )
+    )
+    return rows
+
+
+def _editable_auto_rows(editable_state: dict) -> list[dict]:
+    raw_rows = editable_state.get("auto_rows")
+    if not isinstance(raw_rows, list):
+        derived = _build_auto_rows_from_state(editable_state)
+        editable_state["auto_rows"] = derived
+        return derived
+
+    cleaned: list[dict] = []
+    seen_system_ids: set[str] = set()
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict):
+            continue
+        system_id = _normalize_artifact_key(raw_row.get("system_id"))[:128]
+        page = _safe_int(raw_row.get("page"), 0)
+        rect_tuple = _parse_manual_row_rect(raw_row.get("rect"))
+        raw_boxes = raw_row.get("boxes")
+        if not system_id or page <= 0 or rect_tuple is None or not isinstance(raw_boxes, list):
+            continue
+        if system_id in seen_system_ids:
+            continue
+        left, right, top, bottom = rect_tuple
+        boxes: list[dict] = []
+        seen_measure_ids: set[str] = set()
+        last_right = left
+        for raw_box in raw_boxes:
+            if not isinstance(raw_box, dict):
+                continue
+            measure_id = _normalize_artifact_key(raw_box.get("measure_id"))[:128]
+            box_left = _safe_float(raw_box.get("left"), left)
+            box_right = _safe_float(raw_box.get("right"), box_left)
+            if (
+                not measure_id
+                or measure_id in seen_measure_ids
+                or box_right <= box_left
+                or box_left < left
+                or box_right > right
+                or box_left < last_right
+            ):
+                continue
+            boxes.append(
+                {
+                    "measure_id": measure_id,
+                    "left": float(box_left),
+                    "right": float(box_right),
+                    "excluded_from_counting": _safe_bool(raw_box.get("excluded_from_counting"), False),
+                }
+            )
+            seen_measure_ids.add(measure_id)
+            last_right = box_right
+        if not boxes:
+            continue
+        cleaned_row = {
+            "system_id": system_id,
+            "page": int(page),
+            "rect": {
+                "left": float(left),
+                "right": float(right),
+                "top": float(top),
+                "bottom": float(bottom),
+            },
+            "boxes": boxes,
+        }
+        current_value = str(raw_row.get("current_value") or "").strip()
+        if current_value:
+            cleaned_row["current_value"] = current_value
+        staff_kind = str(raw_row.get("staff_kind") or "").strip().lower()
+        if staff_kind:
+            cleaned_row["staff_kind"] = staff_kind
+        cleaned.append(cleaned_row)
+        seen_system_ids.add(system_id)
+
+    cleaned.sort(
+        key=lambda row: (
+            _safe_int(row.get("page"), 0),
+            float((((row.get("rect") or {}) if isinstance(row.get("rect"), dict) else {}).get("top")) or 0.0),
+            float((((row.get("rect") or {}) if isinstance(row.get("rect"), dict) else {}).get("left")) or 0.0),
+            str(row.get("system_id") or ""),
+        )
+    )
+    editable_state["auto_rows"] = cleaned
     return cleaned
 
 
@@ -1213,6 +1378,191 @@ def _normalize_manual_rows_payload(
     return cleaned, None
 
 
+def _build_auto_rows_overlay(auto_rows: list[dict], editable_state: dict) -> tuple[list[dict], list[dict]]:
+    systems: list[dict] = []
+    measures: list[dict] = []
+    existing_systems_by_id: dict[str, dict] = {}
+    for row in _clone_auto_system_rows(editable_state):
+        system_id = str(row.get("system_id") or "").strip()
+        if system_id:
+            existing_systems_by_id[system_id] = row
+
+    for auto_row in auto_rows or []:
+        if not isinstance(auto_row, dict):
+            continue
+        system_id = str(auto_row.get("system_id") or "").strip()
+        page = _safe_int(auto_row.get("page"), 0)
+        rect = (auto_row.get("rect") or {}) if isinstance(auto_row.get("rect"), dict) else {}
+        left = _safe_float(rect.get("left"), 0.0)
+        right = _safe_float(rect.get("right"), left)
+        top = _safe_float(rect.get("top"), 0.0)
+        bottom = _safe_float(rect.get("bottom"), top)
+        boxes = auto_row.get("boxes")
+        if not system_id or page <= 0 or right <= left or bottom <= top or not isinstance(boxes, list):
+            continue
+        existing_system = existing_systems_by_id.get(system_id) or {}
+        system_index = _safe_int(existing_system.get("system_index"), 0)
+        current_value = str(auto_row.get("current_value") or existing_system.get("current_value") or existing_system.get("value") or "").strip()
+        staff_kind = str(auto_row.get("staff_kind") or existing_system.get("staff_kind") or "").strip().lower()
+        systems.append(
+            {
+                "system_id": system_id,
+                "page": int(page),
+                "system_index": int(system_index),
+                "current_value": current_value,
+                "value": current_value,
+                "render_label": current_value,
+                "source": ROW_SOURCE_AUTO,
+                "staff_kind": staff_kind or None,
+                "anchor": {"x": float(left), "y_top": float(top), "y_bottom": float(bottom)},
+                "x_left": float(left),
+                "x_right": float(right),
+                "y_top": float(top),
+                "y_bottom": float(bottom),
+            }
+        )
+        ordered_boxes = sorted(
+            [box for box in boxes if isinstance(box, dict)],
+            key=lambda box: (_safe_float(box.get("left"), 0.0), str(box.get("measure_id") or "")),
+        )
+        for local_idx, box in enumerate(ordered_boxes):
+            measure_id = str(box.get("measure_id") or "").strip()
+            box_left = _safe_float(box.get("left"), left)
+            box_right = _safe_float(box.get("right"), box_left)
+            if not measure_id or box_right <= box_left:
+                continue
+            measures.append(
+                {
+                    "measure_id": measure_id,
+                    "system_id": system_id,
+                    "page": int(page),
+                    "system_index": int(system_index),
+                    "measure_local_index": int(local_idx),
+                    "global_index": 0,
+                    "x_left": float(box_left),
+                    "x_right": float(box_right),
+                    "y_top": float(top),
+                    "y_bottom": float(bottom),
+                    "source": ROW_SOURCE_AUTO,
+                    "staff_kind": staff_kind or None,
+                    "excluded_from_counting": _safe_bool(box.get("excluded_from_counting"), False),
+                }
+            )
+    return systems, measures
+
+
+def _normalize_auto_rows_payload(
+    page: int,
+    rows: list[dict] | None,
+    editable_state: dict,
+) -> tuple[list[dict] | None, str | None]:
+    current_auto_rows = [row for row in _editable_auto_rows(editable_state) if _safe_int(row.get("page"), 0) == page]
+    expected_system_ids = {
+        str(row.get("system_id") or "").strip()
+        for row in current_auto_rows
+        if isinstance(row, dict) and str(row.get("system_id") or "").strip()
+    }
+    if not isinstance(rows, list):
+        return None, "invalid_auto_rows"
+    if not expected_system_ids and rows:
+        return None, "unexpected_auto_rows"
+
+    cleaned: list[dict] = []
+    seen_system_ids: set[str] = set()
+    seen_measure_ids: set[str] = set()
+    current_by_system_id = {
+        str(row.get("system_id") or "").strip(): row
+        for row in current_auto_rows
+        if isinstance(row, dict) and str(row.get("system_id") or "").strip()
+    }
+
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            return None, "invalid_auto_row"
+        system_id = _normalize_artifact_key(raw_row.get("system_id"))[:128]
+        if not system_id or system_id in seen_system_ids:
+            return None, "duplicate_auto_system_id"
+        if system_id not in expected_system_ids:
+            return None, "unknown_auto_system_id"
+        if _safe_int(raw_row.get("page"), 0) != page:
+            return None, "auto_row_page_mismatch"
+        rect_tuple = _parse_manual_row_rect(raw_row.get("rect"))
+        if rect_tuple is None:
+            return None, "invalid_auto_row_rect"
+        left, right, top, bottom = rect_tuple
+        current_row = current_by_system_id.get(system_id) or {}
+        current_rect = _parse_manual_row_rect(current_row.get("rect"))
+        if current_rect is None:
+            return None, "missing_auto_row_baseline"
+        if any(abs(new_val - old_val) > AUTO_ROW_RECT_TOLERANCE for new_val, old_val in zip(rect_tuple, current_rect)):
+            return None, "auto_row_rect_changed"
+        raw_boxes = raw_row.get("boxes")
+        if not isinstance(raw_boxes, list):
+            return None, "invalid_auto_boxes"
+        boxes: list[dict] = []
+        last_right = left
+        for raw_box in raw_boxes:
+            if not isinstance(raw_box, dict):
+                return None, "invalid_auto_box"
+            measure_id = _normalize_artifact_key(raw_box.get("measure_id"))[:128]
+            box_left = _safe_float(raw_box.get("left"), left)
+            box_right = _safe_float(raw_box.get("right"), box_left)
+            if (
+                not measure_id
+                or measure_id in seen_measure_ids
+                or box_right <= box_left
+                or (box_right - box_left) < AUTO_BOX_MIN_WIDTH
+                or box_left < left
+                or box_right > right
+                or box_left < last_right
+            ):
+                return None, "invalid_auto_box"
+            boxes.append(
+                {
+                    "measure_id": measure_id,
+                    "left": float(box_left),
+                    "right": float(box_right),
+                    "excluded_from_counting": _safe_bool(raw_box.get("excluded_from_counting"), False),
+                }
+            )
+            seen_measure_ids.add(measure_id)
+            last_right = box_right
+        if not boxes:
+            return None, "auto_row_missing_boxes"
+        cleaned_row = {
+            "system_id": system_id,
+            "page": int(page),
+            "rect": {
+                "left": float(left),
+                "right": float(right),
+                "top": float(top),
+                "bottom": float(bottom),
+            },
+            "boxes": boxes,
+        }
+        current_value = str(current_row.get("current_value") or raw_row.get("current_value") or "").strip()
+        if current_value:
+            cleaned_row["current_value"] = current_value
+        staff_kind = str(current_row.get("staff_kind") or raw_row.get("staff_kind") or "").strip().lower()
+        if staff_kind:
+            cleaned_row["staff_kind"] = staff_kind
+        cleaned.append(cleaned_row)
+        seen_system_ids.add(system_id)
+
+    if seen_system_ids != expected_system_ids:
+        return None, "auto_systems_mismatch"
+
+    cleaned.sort(
+        key=lambda row: (
+            _safe_int(row.get("page"), 0),
+            float((((row.get("rect") or {}) if isinstance(row.get("rect"), dict) else {}).get("top")) or 0.0),
+            float((((row.get("rect") or {}) if isinstance(row.get("rect"), dict) else {}).get("left")) or 0.0),
+            str(row.get("system_id") or ""),
+        )
+    )
+    return cleaned, None
+
+
 def _build_manual_rows_overlay(manual_rows: list[dict]) -> tuple[list[dict], list[dict]]:
     systems: list[dict] = []
     measures: list[dict] = []
@@ -1337,8 +1687,29 @@ def _reindex_system_and_measure_order(systems: list[dict], measures: list[dict])
 
 def _merge_manual_rows_into_state(editable_state: dict) -> tuple[list[dict], list[dict]]:
     manual_rows = _editable_manual_rows(editable_state)
-    auto_systems = _clone_auto_system_rows(editable_state)
-    auto_measures = _clone_auto_measure_rows(editable_state)
+    base_auto_systems = _clone_auto_system_rows(editable_state)
+    base_auto_measures = _clone_auto_measure_rows(editable_state)
+    auto_rows = _editable_auto_rows(editable_state)
+    overlay_auto_systems, overlay_auto_measures = _build_auto_rows_overlay(auto_rows, editable_state)
+    if overlay_auto_systems:
+        replaced_system_ids = {
+            str(row.get("system_id") or "").strip()
+            for row in overlay_auto_systems
+            if isinstance(row, dict) and str(row.get("system_id") or "").strip()
+        }
+        auto_systems = [
+            row for row in base_auto_systems
+            if str(row.get("system_id") or "").strip() not in replaced_system_ids
+        ]
+        auto_systems.extend(overlay_auto_systems)
+        auto_measures = [
+            row for row in base_auto_measures
+            if str(row.get("system_id") or "").strip() not in replaced_system_ids
+        ]
+        auto_measures.extend(overlay_auto_measures)
+    else:
+        auto_systems = base_auto_systems
+        auto_measures = base_auto_measures
     manual_systems, manual_measures = _build_manual_rows_overlay(manual_rows)
     return _reindex_system_and_measure_order(auto_systems + manual_systems, auto_measures + manual_measures)
 
@@ -1756,6 +2127,46 @@ def _remove_ai_suggestion_entries(mapping_summary: dict | None, measure_ids: set
         ai_suggestions["measure_completeness_by_measure_id"] = measure_completeness_by_measure_id
         _refresh_ai_suggestions_summary(ai_suggestions)
     return removed
+
+
+def _clear_measure_state_for_ids(editable_state: dict, measure_ids: set[str] | list[str] | tuple[str, ...]) -> None:
+    ids = {str(measure_id or "").strip() for measure_id in (measure_ids or []) if str(measure_id or "").strip()}
+    if not ids:
+        return
+    measure_overrides = _measure_number_overrides(editable_state)
+    rest_measures = _editable_rest_measures(editable_state)
+    pickup_measures = _editable_pickup_measures(editable_state)
+    endings_map = _editable_endings_map(editable_state)
+    for measure_id in ids:
+        measure_overrides.pop(measure_id, None)
+        rest_measures.pop(measure_id, None)
+        pickup_measures.pop(measure_id, None)
+        endings_map.pop(measure_id, None)
+
+
+def _measure_ids_on_pages(
+    measures: list[dict] | None,
+    pages: set[int] | list[int] | tuple[int, ...],
+    *,
+    source: str | None = None,
+) -> set[str]:
+    page_set = {int(page) for page in (pages or []) if int(page) > 0}
+    if not page_set:
+        return set()
+    ids: set[str] = set()
+    for row in measures or []:
+        if not isinstance(row, dict):
+            continue
+        if _safe_int(row.get("page"), 0) not in page_set:
+            continue
+        if source == ROW_SOURCE_MANUAL and _row_source(row) != ROW_SOURCE_MANUAL:
+            continue
+        if source == ROW_SOURCE_AUTO and _row_source(row) != ROW_SOURCE_AUTO:
+            continue
+        measure_id = str(row.get("measure_id") or "").strip()
+        if measure_id:
+            ids.add(measure_id)
+    return ids
 
 
 def _normalize_ai_suggest_warnings(raw_warnings) -> list[dict]:
@@ -3778,6 +4189,10 @@ def _build_ending_group_debug_snapshot(
             continue
 
         pickup_active = _pickup_active_for_measure(measure_id, pickup_measures)
+        if _is_excluded_from_counting(measure):
+            _flush_pending()
+            ignored_rows.append({**_base_row(measure, raw_kind, pickup_active), "reason": "excluded_from_counting"})
+            continue
         base_row = _base_row(measure, raw_kind, pickup_active)
         raw_rows.append(base_row)
 
@@ -4088,6 +4503,8 @@ def _recompute_measure_numbering(
 
     exact_rest_system_ids: set[str] = set()
     for measure in ordered_measures:
+        if _is_excluded_from_counting(measure):
+            continue
         measure_id = str(measure.get("measure_id") or "").strip()
         system_id = str(measure.get("system_id") or "").strip()
         if not measure_id or not system_id:
@@ -4147,6 +4564,17 @@ def _recompute_measure_numbering(
             current_sid = system_id
 
         # Stage 2: determine whether this physical measure is marked as pickup.
+        if _is_excluded_from_counting(measure):
+            _apply_measure_label(
+                measure,
+                measure_id,
+                system_id,
+                "",
+                result_labels,
+                seq_starts_by_system,
+            )
+            continue
+
         pickup_active = _pickup_active_for_measure(measure_id, pickup_measures)
 
         # Stage 3: pickup wins over same-measure numbering anchors.
@@ -4386,6 +4814,7 @@ def _apply_legacy_system_start_edit(
 def _apply_measure_number_edit(
     raw_edit: dict,
     measure_ids: set[str],
+    measure_rows_by_id: dict[str, dict],
     measure_overrides: dict[str, int],
     applied: list[dict],
     rejected: list[dict],
@@ -4396,6 +4825,9 @@ def _apply_measure_number_edit(
         return
     if measure_id not in measure_ids:
         rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+    if _is_excluded_from_counting(measure_rows_by_id.get(measure_id)):
+        rejected.append({"edit": raw_edit, "reason": "measure_excluded_from_counting"})
         return
 
     new_value = _relabel_number_value(raw_edit, rejected)
@@ -4409,6 +4841,7 @@ def _apply_measure_number_edit(
 def _apply_clear_measure_number_edit(
     raw_edit: dict,
     measure_ids: set[str],
+    measure_rows_by_id: dict[str, dict],
     measure_overrides: dict[str, int],
     applied: list[dict],
     rejected: list[dict],
@@ -4419,6 +4852,9 @@ def _apply_clear_measure_number_edit(
         return
     if measure_id not in measure_ids:
         rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+    if _is_excluded_from_counting(measure_rows_by_id.get(measure_id)):
+        rejected.append({"edit": raw_edit, "reason": "measure_excluded_from_counting"})
         return
 
     measure_overrides.pop(measure_id, None)
@@ -4476,6 +4912,7 @@ def _apply_legacy_rest_staff_edit(
 def _apply_measure_rest_edit(
     raw_edit: dict,
     measure_ids: set[str],
+    measure_rows_by_id: dict[str, dict],
     editable_state: dict,
     applied: list[dict],
     rejected: list[dict],
@@ -4486,6 +4923,9 @@ def _apply_measure_rest_edit(
         return
     if measure_id not in measure_ids:
         rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+    if _is_excluded_from_counting(measure_rows_by_id.get(measure_id)):
+        rejected.append({"edit": raw_edit, "reason": "measure_excluded_from_counting"})
         return
 
     measure_count = raw_edit.get("value")
@@ -4517,6 +4957,9 @@ def _apply_measure_pickup_edit(
     if measure_id not in measure_ids:
         rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
         return
+    if _is_excluded_from_counting(measure_rows_by_id.get(measure_id)):
+        rejected.append({"edit": raw_edit, "reason": "measure_excluded_from_counting"})
+        return
 
     value = raw_edit.get("value")
     if not isinstance(value, bool):
@@ -4545,6 +4988,7 @@ def _apply_measure_pickup_edit(
 def _apply_ending_edit(
     raw_edit: dict,
     measure_ids: set[str],
+    measure_rows_by_id: dict[str, dict],
     editable_state: dict,
     applied: list[dict],
     rejected: list[dict],
@@ -4556,6 +5000,9 @@ def _apply_ending_edit(
         return
     if measure_id not in measure_ids:
         rejected.append({"edit": raw_edit, "reason": "unknown_measure_id"})
+        return
+    if _is_excluded_from_counting(measure_rows_by_id.get(measure_id)):
+        rejected.append({"edit": raw_edit, "reason": "measure_excluded_from_counting"})
         return
 
     endings = _editable_endings_map(editable_state)
@@ -4598,6 +5045,40 @@ def _apply_replace_manual_rows_for_page_edit(
     applied.append(
         {
             "type": "replace_manual_rows_for_page",
+            "page": int(page),
+            "rows_count": len(cleaned_rows or []),
+        }
+    )
+
+
+def _apply_replace_auto_rows_for_page_edit(
+    raw_edit: dict,
+    editable_state: dict,
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    page = _safe_int(raw_edit.get("page"), 0)
+    rows = raw_edit.get("rows")
+    cleaned_rows, error_reason = _normalize_auto_rows_payload(page, rows, editable_state)
+    if error_reason:
+        rejected.append({"edit": raw_edit, "reason": error_reason})
+        return
+
+    auto_rows = _editable_auto_rows(editable_state)
+    kept_rows = [row for row in auto_rows if _safe_int(row.get("page"), 0) != page]
+    kept_rows.extend(cleaned_rows or [])
+    kept_rows.sort(
+        key=lambda row: (
+            _safe_int(row.get("page"), 0),
+            float((((row.get("rect") or {}) if isinstance(row.get("rect"), dict) else {}).get("top")) or 0.0),
+            float((((row.get("rect") or {}) if isinstance(row.get("rect"), dict) else {}).get("left")) or 0.0),
+            str(row.get("system_id") or ""),
+        )
+    )
+    editable_state["auto_rows"] = kept_rows
+    applied.append(
+        {
+            "type": "replace_auto_rows_for_page",
             "page": int(page),
             "rows_count": len(cleaned_rows or []),
         }
@@ -4658,11 +5139,11 @@ def _apply_relabel_edits(
             continue
 
         if edit_type == "set_measure_number":
-            _apply_measure_number_edit(raw_edit, measure_ids, measure_overrides, applied, rejected)
+            _apply_measure_number_edit(raw_edit, measure_ids, measure_rows_by_id, measure_overrides, applied, rejected)
             continue
 
         if edit_type == "clear_measure_number":
-            _apply_clear_measure_number_edit(raw_edit, measure_ids, measure_overrides, applied, rejected)
+            _apply_clear_measure_number_edit(raw_edit, measure_ids, measure_rows_by_id, measure_overrides, applied, rejected)
             continue
 
         if edit_type == "set_labels_mode":
@@ -4670,7 +5151,7 @@ def _apply_relabel_edits(
             continue
 
         if edit_type == "set_rest_measure":
-            _apply_measure_rest_edit(raw_edit, measure_ids, editable_state, applied, rejected)
+            _apply_measure_rest_edit(raw_edit, measure_ids, measure_rows_by_id, editable_state, applied, rejected)
             continue
 
         if edit_type == "set_pickup_measure":
@@ -4682,11 +5163,15 @@ def _apply_relabel_edits(
             continue
 
         if edit_type == "set_ending":
-            _apply_ending_edit(raw_edit, measure_ids, editable_state, applied, rejected)
+            _apply_ending_edit(raw_edit, measure_ids, measure_rows_by_id, editable_state, applied, rejected)
             continue
 
         if edit_type == "replace_manual_rows_for_page":
             _apply_replace_manual_rows_for_page_edit(raw_edit, editable_state, applied, rejected)
+            continue
+
+        if edit_type == "replace_auto_rows_for_page":
+            _apply_replace_auto_rows_for_page_edit(raw_edit, editable_state, applied, rejected)
             continue
 
         rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
@@ -5073,6 +5558,7 @@ def get_job_state(job_id: str):
         "editable_state": {
             "version": str(editable_state.get("version") or "system_state_v1"),
             "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
+            "auto_rows": editable_state.get("auto_rows") or [],
             "manual_rows": editable_state.get("manual_rows") or [],
             "rest_measures": editable_state.get("rest_measures") or {},
             "pickup_measures": editable_state.get("pickup_measures") or {},
@@ -6004,6 +6490,30 @@ def relabel_job(job_id: str):
         }
         if manual_measure_ids_to_clear:
             _remove_ai_suggestion_entries(mapping_summary, manual_measure_ids_to_clear)
+            _clear_measure_state_for_ids(editable_state, manual_measure_ids_to_clear)
+    auto_pages_updated = {
+        _safe_int(row.get("page"), 0)
+        for row in applied
+        if isinstance(row, dict) and str(row.get("type") or "").strip() == "replace_auto_rows_for_page"
+    }
+    if auto_pages_updated:
+        auto_measure_ids_before = _measure_ids_on_pages(measures_before, auto_pages_updated, source=ROW_SOURCE_AUTO)
+        auto_measure_ids_after = _measure_ids_on_pages(editable_state.get("measures") or [], auto_pages_updated, source=ROW_SOURCE_AUTO)
+        excluded_auto_measure_ids = {
+            str(row.get("measure_id") or "").strip()
+            for row in (editable_state.get("measures") or [])
+            if isinstance(row, dict)
+            and _row_source(row) == ROW_SOURCE_AUTO
+            and _safe_int(row.get("page"), 0) in auto_pages_updated
+            and _is_excluded_from_counting(row)
+            and str(row.get("measure_id") or "").strip()
+        }
+        stale_auto_measure_ids = (auto_measure_ids_before | auto_measure_ids_after) | excluded_auto_measure_ids
+        if stale_auto_measure_ids:
+            _remove_ai_suggestion_entries(mapping_summary, stale_auto_measure_ids)
+        removed_auto_measure_ids = (auto_measure_ids_before - auto_measure_ids_after) | excluded_auto_measure_ids
+        if removed_auto_measure_ids:
+            _clear_measure_state_for_ids(editable_state, removed_auto_measure_ids)
     state_version_after = _editable_state_version(editable_state)
 
     before_values = {}

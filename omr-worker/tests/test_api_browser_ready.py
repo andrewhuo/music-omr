@@ -1381,6 +1381,94 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(remaining_completeness.keys()), ["p1_s1_m0"])
         self.assertEqual((((mapping_summary.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
 
+    def test_relabel_replace_auto_rows_for_page_persists_excluded_boxes_and_clears_page_ai(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = deepcopy(self._sample_mapping_summary())
+        editable_state = mapping_summary.get("editable_state") or {}
+        for measure in editable_state.get("measures") or []:
+            measure["x_right"] = {
+                "p1_s0_m0": 80,
+                "p1_s0_m1": 140,
+                "p1_s1_m0": 90,
+            }.get(measure.get("measure_id"), measure.get("x_left", 0))
+        mapping_summary["ai_suggestions"] = {
+            "version": "ai_suggestions_v1",
+            "generated_at_utc": "2026-04-30T12:00:00Z",
+            "provider": "claude",
+            "model": "test",
+            "source_run_id": 111,
+            "by_measure_id": {
+                "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"},
+                "p1_s1_m0": {"label": "uncertain", "rest_count": None, "confidence": "low"},
+            },
+            "time_signatures_by_measure_id": {
+                "p1_s0_m0": {"active_time_signature": "3/4", "time_signature_source": "explicit_here"},
+                "p1_s1_m0": {"active_time_signature": "3/4", "time_signature_source": "inherited"},
+            },
+            "measure_completeness_by_measure_id": {
+                "p1_s0_m0": {"measure_completeness": "incomplete", "measure_completeness_source": "ai"},
+                "p1_s1_m0": {"measure_completeness": "unclear", "measure_completeness_source": "ai"},
+            },
+            "warnings": [],
+            "summary": {"systems_processed": 2, "measures_seen": 3, "suggestions_kept": 2, "normal_measures_omitted": 1},
+        }
+
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={
+                "edits": [
+                    {
+                        "type": "replace_auto_rows_for_page",
+                        "page": 1,
+                        "rows": [
+                            {
+                                "system_id": "p1_s0",
+                                "page": 1,
+                                "rect": {"left": 30, "right": 140, "top": 20, "bottom": 60},
+                                "boxes": [
+                                    {"measure_id": "p1_s0_m0", "left": 30, "right": 80, "excluded_from_counting": True},
+                                    {"measure_id": "p1_s0_m1", "left": 90, "right": 140, "excluded_from_counting": False},
+                                ],
+                            },
+                            {
+                                "system_id": "p1_s1",
+                                "page": 1,
+                                "rect": {"left": 30, "right": 90, "top": 80, "bottom": 120},
+                                "boxes": [
+                                    {"measure_id": "p1_s1_m0", "left": 30, "right": 90, "excluded_from_counting": False},
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER, "_render_corrected_pdf", return_value=2),
+            patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 200)
+        editable = mapping_summary.get("editable_state") or {}
+        self.assertEqual(len(editable.get("auto_rows") or []), 2)
+        measure_rows = {row.get("measure_id"): row for row in (editable.get("measures") or [])}
+        self.assertTrue((measure_rows.get("p1_s0_m0") or {}).get("excluded_from_counting"))
+        ai = mapping_summary.get("ai_suggestions") or {}
+        self.assertEqual(ai.get("by_measure_id") or {}, {})
+        self.assertEqual(ai.get("time_signatures_by_measure_id") or {}, {})
+        self.assertEqual(ai.get("measure_completeness_by_measure_id") or {}, {})
+        self.assertEqual(((ai.get("summary") or {}).get("suggestions_kept")), 0)
+
     def test_normalize_ai_suggestions_result_salvages_missing_maybe_rest_count_and_bad_warnings(self):
         editable_state = (self._sample_mapping_summary().get("editable_state") or {})
         raw_result = {

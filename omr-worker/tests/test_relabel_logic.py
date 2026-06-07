@@ -259,6 +259,66 @@ class RelabelLogicTests(unittest.TestCase):
         values = [int(row["current_value"]) for row in systems]
         self.assertEqual(values, [1, 4, 7, 10])
 
+    def test_replace_auto_rows_can_exclude_box_and_block_later_count_edit(self):
+        state = self._sample_state_with_bounds()
+        systems, applied, rejected, total = WORKER._apply_relabel_edits(
+            state,
+            [
+                {
+                    "type": "replace_auto_rows_for_page",
+                    "page": 1,
+                    "rows": [
+                        {
+                            "system_id": "p1_s0",
+                            "page": 1,
+                            "rect": {"left": 10, "right": 65, "top": 10, "bottom": 20},
+                            "boxes": [
+                                {"measure_id": "p1_s0_m0", "left": 10, "right": 25, "excluded_from_counting": True},
+                                {"measure_id": "p1_s0_m1", "left": 30, "right": 45, "excluded_from_counting": False},
+                                {"measure_id": "p1_s0_m2", "left": 50, "right": 65, "excluded_from_counting": False},
+                            ],
+                        },
+                        {
+                            "system_id": "p1_s1",
+                            "page": 1,
+                            "rect": {"left": 10, "right": 65, "top": 50, "bottom": 60},
+                            "boxes": [
+                                {"measure_id": "p1_s1_m0", "left": 10, "right": 25, "excluded_from_counting": False},
+                                {"measure_id": "p1_s1_m1", "left": 30, "right": 45, "excluded_from_counting": False},
+                                {"measure_id": "p1_s1_m2", "left": 50, "right": 65, "excluded_from_counting": False},
+                            ],
+                        },
+                        {
+                            "system_id": "p1_s2",
+                            "page": 1,
+                            "rect": {"left": 10, "right": 65, "top": 90, "bottom": 100},
+                            "boxes": [
+                                {"measure_id": "p1_s2_m0", "left": 10, "right": 25, "excluded_from_counting": False},
+                                {"measure_id": "p1_s2_m1", "left": 30, "right": 45, "excluded_from_counting": False},
+                                {"measure_id": "p1_s2_m2", "left": 50, "right": 65, "excluded_from_counting": False},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(total, 4)
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "replace_auto_rows_for_page", "page": 1, "rows_count": 3}])
+        excluded_measure = next(row for row in (state.get("measures") or []) if row.get("measure_id") == "p1_s0_m0")
+        self.assertTrue(excluded_measure.get("excluded_from_counting"))
+        self.assertEqual(str(excluded_measure.get("current_value") or ""), "")
+        self.assertEqual(len(state.get("auto_rows") or []), 4)
+
+        systems_after, applied_after, rejected_after, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "set_measure_number", "measure_id": "p1_s0_m0", "value": 99}],
+        )
+        self.assertEqual(applied_after, [])
+        self.assertEqual(len(rejected_after), 1)
+        self.assertEqual(rejected_after[0]["reason"], "measure_excluded_from_counting")
+        self.assertEqual(len(systems_after), 4)
+
     def test_sorted_by_page_and_system(self):
         systems, _, _, _ = WORKER._apply_relabel_edits(self._sample_state(), [])
         ordering = [(row["page"], row["system_index"]) for row in systems]
