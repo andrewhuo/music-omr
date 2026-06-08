@@ -1028,6 +1028,19 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((result.get("model") or ""), "claude-sonnet-4-6")
         self.assertEqual((result.get("pdf_source") or ""), "corrected")
 
+    def test_ai_suggest_system_batches_skip_excluded_measures_and_empty_systems(self):
+        editable_state = deepcopy(self._sample_mapping_summary().get("editable_state") or {})
+        for row in editable_state.get("measures") or []:
+            if str(row.get("system_id") or "") == "p1_s0":
+                row["excluded_from_counting"] = True
+
+        system_batches = WORKER._ai_suggest_system_batches(editable_state)
+
+        self.assertEqual(len(system_batches), 1)
+        system_row, system_measures = system_batches[0]
+        self.assertEqual(system_row.get("system_id"), "p1_s1")
+        self.assertEqual([row.get("measure_id") for row in system_measures], ["p1_s1_m0"])
+
     def test_ai_suggest_step_real_system_batch_path_no_longer_crashes(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
@@ -1130,6 +1143,62 @@ class BrowserReadyApiTests(unittest.TestCase):
         warnings_text = "\n".join(str((row or {}).get("message") or "") for row in warnings)
         self.assertIn("remembered_time_signature_out", warnings_text)
 
+    def test_ai_suggest_step_filters_excluded_measures_before_calling_ai(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = deepcopy(self._sample_mapping_summary())
+        for row in (mapping_summary.get("editable_state") or {}).get("measures") or []:
+            if str(row.get("measure_id") or "") == "p1_s0_m0":
+                row["excluded_from_counting"] = True
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 2)
+        mapping_summary["ai_suggest_run"] = {
+            "status": "running",
+            "started_at_utc": "2026-05-05T00:00:00Z",
+            "updated_at_utc": "2026-05-05T00:00:00Z",
+            "completed_at_utc": None,
+            "failed_at_utc": None,
+            "systems_total": 2,
+            "systems_completed": 0,
+            "next_system_index": 0,
+            "source_run_id": 111,
+            "source_state_version": "test-state",
+            "last_error": None,
+            "remembered_time_signature": None,
+            "last_time_signature_update": None,
+            "time_signature_updates": [],
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(
+                WORKER,
+                "_generate_ai_suggestions_for_system_batch",
+                return_value={
+                    "version": "ai_suggestions_v1",
+                    "generated_at_utc": "2026-05-05T00:00:01Z",
+                    "provider": "claude",
+                    "model": "claude-test",
+                    "source_run_id": 111,
+                    "by_measure_id": {},
+                    "warnings": [],
+                    "summary": {"systems_processed": 1, "measures_seen": 1, "suggestions_kept": 0, "normal_measures_omitted": 1},
+                    "remembered_time_signature_out": None,
+                    "time_signature_updates": [],
+                    "last_time_signature_update": None,
+                },
+            ) as mock_generate,
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job_step("111"))
+
+        self.assertEqual(status, 200)
+        called_measures = mock_generate.call_args.args[4]
+        self.assertEqual([row.get("measure_id") for row in called_measures], ["p1_s0_m1"])
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_total"), 2)
+
     def test_ai_suggest_step_final_system_marks_completed(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
@@ -1193,6 +1262,46 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0", "p1_s1_m0"])
         self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 2)
+
+    def test_ai_suggest_step_completes_cleanly_when_all_measures_are_excluded(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = deepcopy(self._sample_mapping_summary())
+        for row in (mapping_summary.get("editable_state") or {}).get("measures") or []:
+            row["excluded_from_counting"] = True
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 0)
+        mapping_summary["ai_suggest_run"] = {
+            "status": "running",
+            "started_at_utc": "2026-05-05T00:00:00Z",
+            "updated_at_utc": "2026-05-05T00:00:00Z",
+            "completed_at_utc": None,
+            "failed_at_utc": None,
+            "systems_total": 2,
+            "systems_completed": 0,
+            "next_system_index": 0,
+            "source_run_id": 111,
+            "source_state_version": "test-state",
+            "last_error": None,
+            "remembered_time_signature": None,
+            "last_time_signature_update": None,
+            "time_signature_updates": [],
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(WORKER, "_generate_ai_suggestions_for_system_batch") as mock_generate,
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job_step("111"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("status"), "completed")
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_total"), 0)
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
+        mock_generate.assert_not_called()
 
     def test_ai_suggest_step_failure_marks_failed_and_keeps_partial_suggestions(self):
         artifacts = self._sample_artifacts()

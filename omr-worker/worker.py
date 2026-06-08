@@ -1964,9 +1964,14 @@ def _normalize_ai_time_signature_update_rows(raw_rows, system_id: str | None = N
     return clean
 
 
+def _ai_suggest_candidate_measures(editable_state: dict) -> list[dict]:
+    measures = _sorted_measure_rows(editable_state.get("measures") or [])
+    return [row for row in measures if not _is_excluded_from_counting(row)]
+
+
 def _ai_suggest_system_batches(editable_state: dict) -> list[tuple[dict, list[dict]]]:
     systems = _sorted_system_rows(editable_state.get("systems") or [])
-    measures = _sorted_measure_rows(editable_state.get("measures") or [])
+    measures = _ai_suggest_candidate_measures(editable_state)
     grouped_measures: dict[str, list[dict]] = {}
     for row in measures:
         system_id = str(row.get("system_id") or "").strip()
@@ -3468,7 +3473,7 @@ def _generate_ai_suggestions_for_job(
         raise AiSuggestError(provider_status=503, detail="provider_not_configured")
 
     systems = _sorted_system_rows(editable_state.get("systems") or [])
-    measures = _sorted_measure_rows(editable_state.get("measures") or [])
+    measures = _ai_suggest_candidate_measures(editable_state)
     grouped_measures: dict[str, list[dict]] = {}
     for row in measures:
         system_id = str(row.get("system_id") or "").strip()
@@ -5676,7 +5681,7 @@ def ai_suggest_job(job_id: str):
     mapping_summary["ai_suggestions"] = _empty_ai_suggestions_state(
         int(artifact_run_id),
         source_state_version,
-        len(_sorted_measure_rows(editable_state.get("measures") or [])),
+        len(_ai_suggest_candidate_measures(editable_state)),
     )
     system_batches = _ai_suggest_system_batches(editable_state)
     debug_batch_trace = None
@@ -5841,7 +5846,7 @@ def ai_suggest_job_step(job_id: str):
         ai_suggestions = _empty_ai_suggestions_state(
             int(artifact_run_id),
             source_state_version,
-            len(_sorted_measure_rows(editable_state.get("measures") or [])),
+            len(_ai_suggest_candidate_measures(editable_state)),
         )
         mapping_summary["ai_suggestions"] = ai_suggestions
     ai_suggest_run = _current_ai_suggest_run(mapping_summary, int(artifact_run_id), source_state_version)
