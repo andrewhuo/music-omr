@@ -254,8 +254,16 @@ private enum EditColorPalette {
         stroke: UIColor(red: 0.53, green: 0.38, blue: 0.84, alpha: 0.92)
     )
 
+    static let excluded = EditColorStyle(
+        id: "excluded",
+        title: "Excluded",
+        fill: UIColor(red: 1.00, green: 0.82, blue: 0.70, alpha: 0.62),
+        stroke: UIColor(red: 0.90, green: 0.42, blue: 0.12, alpha: 0.96)
+    )
+
     static let legendItems: [EditColorStyle] = [
         normal,
+        excluded,
         measureNumber,
         rest,
         pickup,
@@ -2086,14 +2094,14 @@ struct ContentView: View {
                 preserveViewport: true
             )
 
-            manualDraftRows = []
-            autoDraftRows = []
-            manualDraftPage = nil
+            let refreshedPage = page
+            manualDraftPage = refreshedPage
+            manualDraftRows = savedManualRowsForPage(refreshedPage)
+            autoDraftRows = savedAutoRowsForPage(refreshedPage)
             manualSelection = nil
             autoSelection = nil
             pendingManualFixDelete = nil
-            manualFixTool = .addRow
-            activeEditTool = .none
+            activeEditTool = .manualFix
             phase = .ready
             detailNote = "Manual fixes saved"
         } catch is CancellationError {
@@ -5378,8 +5386,16 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                     let boxLayer = CAShapeLayer()
                     boxLayer.frame = boxRect
                     boxLayer.path = UIBezierPath(roundedRect: boxLayer.bounds, cornerRadius: 4).cgPath
-                    boxLayer.fillColor = UIColor.clear.cgColor
-                    boxLayer.strokeColor = (isSelectedBox ? UIColor.systemBlue : UIColor.systemGreen.withAlphaComponent(0.9)).cgColor
+                    if box.excludedFromCounting {
+                        boxLayer.fillColor = EditColorPalette.excluded.fill.withAlphaComponent(isSelectedBox ? 0.32 : 0.22).cgColor
+                    } else {
+                        boxLayer.fillColor = UIColor.clear.cgColor
+                    }
+                    boxLayer.strokeColor = (
+                        isSelectedBox
+                        ? UIColor.systemBlue
+                        : (box.excludedFromCounting ? EditColorPalette.excluded.stroke : UIColor.systemGreen.withAlphaComponent(0.9))
+                    ).cgColor
                     boxLayer.lineWidth = isSelectedBox ? 2.6 : 1.6
                     if box.excludedFromCounting {
                         boxLayer.lineDashPattern = [6, 4]
@@ -5571,7 +5587,11 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func activeEditStyles(for measureID: String) -> [EditColorStyle] {
-        var styles = SavedMeasureEditKind.displayOrder.compactMap { kind -> EditColorStyle? in
+        var styles: [EditColorStyle] = []
+        if currentMeasures.first(where: { $0.id == measureID })?.excluded_from_counting == true {
+            styles.append(EditColorPalette.excluded)
+        }
+        styles.append(contentsOf: SavedMeasureEditKind.displayOrder.compactMap { kind -> EditColorStyle? in
             switch kind {
             case .measureNumber:
                 return currentMeasureNumberOverrideIDs.contains(measureID) ? EditColorPalette.measureNumber : nil
@@ -5580,7 +5600,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             case .rest:
                 return currentRestAnchorIDs.contains(measureID) ? EditColorPalette.rest : nil
             }
-        }
+        })
         if currentEnding1AnchorIDs.contains(measureID) {
             styles.append(EditColorPalette.ending1)
         }
