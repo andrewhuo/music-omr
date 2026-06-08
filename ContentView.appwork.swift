@@ -392,7 +392,7 @@ private enum ManualFixTool: String, CaseIterable, Identifiable {
     case addMeasures
     case resizeRow
     case delete
-    case editAuto
+    case exclude
 
     var id: String { rawValue }
 
@@ -402,25 +402,7 @@ private enum ManualFixTool: String, CaseIterable, Identifiable {
         case .addMeasures: return "Add Measures"
         case .resizeRow: return "Resize Row"
         case .delete: return "Delete"
-        case .editAuto: return "Edit Auto"
-        }
-    }
-}
-
-private enum AutoEditMode: String, CaseIterable, Identifiable {
-    case addLine
-    case moveLine
-    case deleteLine
-    case boxes
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .addLine: return "Add Line"
-        case .moveLine: return "Move Line"
-        case .deleteLine: return "Delete Line"
-        case .boxes: return "Boxes"
+        case .exclude: return "Exclude"
         }
     }
 }
@@ -503,9 +485,29 @@ private struct ManualEditorState: Equatable {
 
 private struct AutoEditorState: Equatable {
     let activePage: Int
-    let mode: AutoEditMode
+    let tool: ManualFixTool
     let rows: [AutoRowState]
     let selection: AutoSelectionState?
+}
+
+private enum PendingManualFixDelete: Identifiable, Equatable {
+    case manualRow(rowID: String)
+    case manualLine(rowID: String, cutIndex: Int)
+    case autoLine(rowID: String, splitIndex: Int)
+    case autoBox(rowID: String, measureID: String)
+
+    var id: String {
+        switch self {
+        case .manualRow(let rowID):
+            return "manual-row-\(rowID)"
+        case .manualLine(let rowID, let cutIndex):
+            return "manual-line-\(rowID)-\(cutIndex)"
+        case .autoLine(let rowID, let splitIndex):
+            return "auto-line-\(rowID)-\(splitIndex)"
+        case .autoBox(let rowID, let measureID):
+            return "auto-box-\(rowID)-\(measureID)"
+        }
+    }
 }
 
 private struct RelabelEdit: Encodable {
@@ -697,8 +699,8 @@ struct ContentView: View {
     @State private var manualStaffKind: ManualStaffKind = .single
     @State private var manualSelection: ManualSelectionState?
     @State private var autoDraftRows: [AutoRowState] = []
-    @State private var autoEditMode: AutoEditMode = .addLine
     @State private var autoSelection: AutoSelectionState?
+    @State private var pendingManualFixDelete: PendingManualFixDelete?
     @State private var currentVisiblePDFPage: Int = 1
     @State private var pendingAutoScrollToTools = false
     @State private var pendingAutoScrollToPDF = false
@@ -930,6 +932,25 @@ struct ContentView: View {
         } message: {
             Text(actionError ?? "")
         }
+        .confirmationDialog(
+            pendingManualFixDeleteTitle,
+            isPresented: Binding(
+                get: { pendingManualFixDelete != nil },
+                set: { newValue in
+                    if !newValue { pendingManualFixDelete = nil }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(pendingManualFixDeleteButtonTitle, role: .destructive) {
+                performPendingManualFixDelete()
+            }
+            Button("Cancel", role: .cancel) {
+                pendingManualFixDelete = nil
+            }
+        } message: {
+            Text(pendingManualFixDeleteMessage)
+        }
         .onChange(of: labelsMode) { _, mode in
             guard !isBusy else { return }
             guard currentJobID != nil else { return }
@@ -937,23 +958,6 @@ struct ContentView: View {
         }
         .onChange(of: manualFixTool) { _, tool in
             normalizeManualSelection(for: tool)
-        }
-        .onChange(of: autoEditMode) { _, mode in
-            guard manualFixTool == .editAuto else { return }
-            switch mode {
-            case .addLine:
-                if let selection = autoSelection {
-                    autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
-                }
-            case .moveLine, .deleteLine:
-                if let selection = autoSelection, selection.measureID != nil {
-                    autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
-                }
-            case .boxes:
-                if let selection = autoSelection, selection.splitIndex != nil {
-                    autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
-                }
-            }
         }
         .sheet(isPresented: $showSettings) {
             SettingsSheet(accentThemeRaw: $accentThemeRaw, forceDark: $forceDark)
@@ -1132,19 +1136,8 @@ struct ContentView: View {
                     pendingEnding1IDs: activeEditTool == .ending ? pendingEnding1MeasureIDs : [],
                     pendingEnding2IDs: activeEditTool == .ending ? pendingEnding2MeasureIDs : [],
                     labelsMode: snapshot.labelsMode,
-                    manualEditor: activeEditTool == .manualFix && manualFixTool != .editAuto ? ManualEditorState(
-                        activePage: manualDraftPage ?? currentVisiblePDFPage,
-                        tool: manualFixTool,
-                        defaultStaffKind: manualStaffKind,
-                        rows: manualDraftRows,
-                        selection: manualSelection
-                    ) : nil,
-                    autoEditor: activeEditTool == .manualFix && manualFixTool == .editAuto ? AutoEditorState(
-                        activePage: manualDraftPage ?? currentVisiblePDFPage,
-                        mode: autoEditMode,
-                        rows: autoDraftRows,
-                        selection: autoSelection
-                    ) : nil,
+                    manualEditor: activeManualFixManualEditor,
+                    autoEditor: activeManualFixAutoEditor,
                     onOverlayCount: { count in
                         DispatchQueue.main.async {
                             drawnOverlayCount = count
@@ -1431,7 +1424,7 @@ struct ContentView: View {
             Text("Editing page \(manualDraftPage ?? currentVisiblePDFPage)")
                 .font(.subheadline.weight(.semibold))
 
-            if manualFixTool != .editAuto {
+            if manualFixTool == .addRow {
                 Picker("Row Kind", selection: $manualStaffKind) {
                     ForEach(ManualStaffKind.allCases) { kind in
                         Text(kind.title).tag(kind)
@@ -1448,16 +1441,6 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
             .disabled(isBusy)
-
-            if manualFixTool == .editAuto {
-                Picker("Edit Auto Mode", selection: $autoEditMode) {
-                    ForEach(AutoEditMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .disabled(isBusy)
-            }
 
             Text(manualFixInstructionText)
                 .font(.subheadline)
@@ -1490,36 +1473,20 @@ struct ContentView: View {
 
         if manualFixTool == .delete {
             Button("Delete") {
-                deleteSelectedManualItem()
+                requestManualFixDelete()
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(isBusy || !canDeleteManualSelection)
+            .disabled(isBusy || !canDeleteCurrentSelection)
         }
 
-        if manualFixTool == .editAuto && autoEditMode == .deleteLine {
-            Button("Delete") {
-                deleteSelectedAutoLine()
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(isBusy || !canDeleteSelectedAutoSplit)
-        }
-
-        if manualFixTool == .editAuto && autoEditMode == .boxes {
+        if manualFixTool == .exclude {
             Button(selectedAutoBoxExcluded ? "Include" : "Exclude") {
                 toggleSelectedAutoBoxExcluded()
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(isBusy || selectedAutoBox == nil)
-
-            Button("Delete Box") {
-                deleteSelectedAutoBox()
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(isBusy || !canDeleteSelectedAutoBox)
+            .disabled(isBusy || !canToggleSelectedAutoBoxExcluded)
         }
 
         Button("Save") {
@@ -1564,35 +1531,27 @@ struct ContentView: View {
         selectedAutoBox?.excludedFromCounting == true
     }
 
-    private var canDeleteSelectedAutoSplit: Bool {
-        guard manualFixTool == .editAuto,
-              autoEditMode == .deleteLine,
-              let selection = autoSelection,
-              selection.splitIndex != nil else { return false }
-        return true
+    private var canDeleteCurrentSelection: Bool {
+        guard manualFixTool == .delete else { return false }
+        if manualSelection != nil {
+            return true
+        }
+        guard let selection = autoSelection else { return false }
+        if selection.splitIndex != nil {
+            return true
+        }
+        if selection.measureID != nil, let row = selectedAutoRow {
+            return row.boxes.count > 1
+        }
+        return false
     }
 
-    private var canDeleteSelectedAutoBox: Bool {
-        guard manualFixTool == .editAuto,
-              autoEditMode == .boxes,
-              let row = selectedAutoRow,
-              selectedAutoBox != nil else { return false }
-        return row.boxes.count > 1
+    private var canToggleSelectedAutoBoxExcluded: Bool {
+        guard manualFixTool == .exclude else { return false }
+        return selectedAutoBox != nil
     }
 
     private var manualFixInstructionText: String {
-        if manualFixTool == .editAuto {
-            switch autoEditMode {
-            case .addLine:
-                return "Tap an auto row, then drag inside one box to add a split line."
-            case .moveLine:
-                return "Tap a split line, then drag it left or right."
-            case .deleteLine:
-                return "Tap a split line, then press Delete."
-            case .boxes:
-                return "Tap a box, then exclude it or delete it."
-            }
-        }
         if let selection = manualSelection {
             if selection.cutIndex != nil {
                 if manualFixTool == .delete {
@@ -1607,34 +1566,76 @@ struct ContentView: View {
                     return "Tap a row, then drag a corner handle to resize it."
                 case .delete:
                     return "Delete removes this line."
-                case .editAuto:
-                    return "Tap a split line or box."
+                case .exclude:
+                    return "Exclude only works on auto boxes."
                 }
             }
             switch manualFixTool {
             case .addRow:
                 return "Drag a corner handle to resize this row, then tap Done Row."
             case .addMeasures:
-                return "Drag anywhere inside this row to place a new measure line."
+                return "Drag inside this row to place a new measure line."
             case .resizeRow:
                 return "Tap a row, then drag a corner handle to resize it."
             case .delete:
                 return "Delete removes this row. Tap a line instead if you only want to delete that line."
-            case .editAuto:
-                return "Tap an auto row to edit its splits or boxes."
+            case .exclude:
+                return "Exclude only works on auto boxes."
+            }
+        }
+        if let selection = autoSelection {
+            if selection.splitIndex != nil {
+                switch manualFixTool {
+                case .addMeasures:
+                    return "Drag inside this auto box to add a split line."
+                case .resizeRow:
+                    return "Tap the auto row, then drag a corner handle to resize it."
+                case .delete:
+                    return "Delete removes this auto split line after confirmation."
+                case .exclude:
+                    return "Tap an auto box to exclude or include it."
+                case .addRow:
+                    return "Add Row only creates new manual rows on empty space."
+                }
+            }
+            if selection.measureID != nil {
+                switch manualFixTool {
+                case .delete:
+                    return "Delete removes this auto box after confirmation."
+                case .exclude:
+                    return "Tap Exclude or Include for this auto box."
+                case .addMeasures:
+                    return "Drag inside this auto box to add a split line."
+                case .resizeRow:
+                    return "Tap the auto row, then drag a corner handle to resize it."
+                case .addRow:
+                    return "Add Row only creates new manual rows on empty space."
+                }
+            }
+            switch manualFixTool {
+            case .addMeasures:
+                return "Drag inside this auto row to place a new measure line."
+            case .resizeRow:
+                return "Tap the auto row, then drag a corner handle to resize it."
+            case .delete:
+                return "Tap an auto split or box, then press Delete."
+            case .exclude:
+                return "Tap an auto box, then Exclude or Include it."
+            case .addRow:
+                return "Add Row only creates new manual rows on empty space."
             }
         }
         switch manualFixTool {
         case .addRow:
             return "Touch and hold one corner, then drag to the opposite corner to make the box. Resize it if needed, then tap Done Row."
         case .addMeasures:
-            return "Drag anywhere inside the row to place a vertical measure line."
+            return "Tap a row, then drag inside it to place a vertical measure line."
         case .resizeRow:
             return "Tap a row, then drag a corner handle to resize it."
         case .delete:
             return "Tap a row to delete the row, or tap a line to delete just that line."
-        case .editAuto:
-            return "Tap an auto row, then use the Edit Auto mode to fix the detected splits."
+        case .exclude:
+            return "Tap an auto box to exclude it from counting or include it again."
         }
     }
 
@@ -1644,6 +1645,78 @@ struct ContentView: View {
             return "Select all first-ending measures."
         case .selectingEnding2:
             return "Select all second-ending measures."
+        }
+    }
+
+    private var activeManualFixManualEditor: ManualEditorState? {
+        guard activeEditTool == .manualFix else { return nil }
+        switch manualFixTool {
+        case .addRow, .addMeasures, .resizeRow, .delete:
+            return ManualEditorState(
+                activePage: manualDraftPage ?? currentVisiblePDFPage,
+                tool: manualFixTool,
+                defaultStaffKind: manualStaffKind,
+                rows: manualDraftRows,
+                selection: manualSelection
+            )
+        case .exclude:
+            return nil
+        }
+    }
+
+    private var activeManualFixAutoEditor: AutoEditorState? {
+        guard activeEditTool == .manualFix else { return nil }
+        switch manualFixTool {
+        case .addMeasures, .resizeRow, .delete, .exclude:
+            return AutoEditorState(
+                activePage: manualDraftPage ?? currentVisiblePDFPage,
+                tool: manualFixTool,
+                rows: autoDraftRows,
+                selection: autoSelection
+            )
+        case .addRow:
+            return nil
+        }
+    }
+
+    private var pendingManualFixDeleteTitle: String {
+        switch pendingManualFixDelete {
+        case .manualRow:
+            return "Delete row?"
+        case .manualLine, .autoLine:
+            return "Delete line?"
+        case .autoBox:
+            return "Delete box?"
+        case nil:
+            return "Delete?"
+        }
+    }
+
+    private var pendingManualFixDeleteButtonTitle: String {
+        switch pendingManualFixDelete {
+        case .manualRow:
+            return "Delete Row"
+        case .manualLine, .autoLine:
+            return "Delete Line"
+        case .autoBox:
+            return "Delete Box"
+        case nil:
+            return "Delete"
+        }
+    }
+
+    private var pendingManualFixDeleteMessage: String {
+        switch pendingManualFixDelete {
+        case .manualRow:
+            return "This will remove the whole manual row."
+        case .manualLine:
+            return "This will remove the selected manual split line."
+        case .autoLine:
+            return "This will remove the selected auto split line and merge the two boxes."
+        case .autoBox:
+            return "This will remove the selected auto box and merge its space into a neighbor."
+        case nil:
+            return ""
         }
     }
 
@@ -1702,7 +1775,6 @@ struct ContentView: View {
         autoDraftRows = savedAutoRowsForPage(page)
         manualSelection = nil
         autoSelection = nil
-        autoEditMode = .addLine
         manualFixTool = .addRow
         activeEditTool = .manualFix
         pendingAutoScrollToPDF = true
@@ -1714,7 +1786,7 @@ struct ContentView: View {
         manualDraftPage = nil
         manualSelection = nil
         autoSelection = nil
-        autoEditMode = .addLine
+        pendingManualFixDelete = nil
         manualFixTool = .addRow
         activeEditTool = .none
     }
@@ -1831,6 +1903,7 @@ struct ContentView: View {
         var leftBox = row.boxes[splitIndex]
         let rightBox = row.boxes[splitIndex + 1]
         leftBox.right = rightBox.right
+        leftBox.excludedFromCounting = leftBox.excludedFromCounting || rightBox.excludedFromCounting
         row.boxes.removeSubrange(splitIndex...(splitIndex + 1))
         row.boxes.insert(leftBox, at: splitIndex)
         autoDraftRows[rowIndex] = row
@@ -1856,13 +1929,55 @@ struct ContentView: View {
               row.boxes.count > 1 else { return }
         if boxIndex > 0 {
             row.boxes[boxIndex - 1].right = row.boxes[boxIndex].right
+            row.boxes[boxIndex - 1].excludedFromCounting = row.boxes[boxIndex - 1].excludedFromCounting || row.boxes[boxIndex].excludedFromCounting
         } else if row.boxes.count > 1 {
             row.boxes[1].left = row.boxes[0].left
+            row.boxes[1].excludedFromCounting = row.boxes[1].excludedFromCounting || row.boxes[0].excludedFromCounting
         }
         row.boxes.remove(at: boxIndex)
         autoDraftRows[rowIndex] = row
         replaceAutoDraftRows(autoDraftRows)
         autoSelection = AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil)
+    }
+
+    private func requestManualFixDelete() {
+        guard manualFixTool == .delete else { return }
+        if let selection = manualSelection {
+            if let cutIndex = selection.cutIndex {
+                pendingManualFixDelete = .manualLine(rowID: selection.rowID, cutIndex: cutIndex)
+            } else {
+                pendingManualFixDelete = .manualRow(rowID: selection.rowID)
+            }
+            return
+        }
+        guard let selection = autoSelection else { return }
+        if let splitIndex = selection.splitIndex {
+            pendingManualFixDelete = .autoLine(rowID: selection.rowID, splitIndex: splitIndex)
+            return
+        }
+        if let measureID = selection.measureID,
+           canDeleteCurrentSelection {
+            pendingManualFixDelete = .autoBox(rowID: selection.rowID, measureID: measureID)
+        }
+    }
+
+    private func performPendingManualFixDelete() {
+        guard let pending = pendingManualFixDelete else { return }
+        pendingManualFixDelete = nil
+        switch pending {
+        case .manualRow(let rowID):
+            manualSelection = ManualSelectionState(rowID: rowID, cutIndex: nil)
+            deleteSelectedManualItem()
+        case .manualLine(let rowID, let cutIndex):
+            manualSelection = ManualSelectionState(rowID: rowID, cutIndex: cutIndex)
+            deleteSelectedManualItem()
+        case .autoLine(let rowID, let splitIndex):
+            autoSelection = AutoSelectionState(rowID: rowID, splitIndex: splitIndex, measureID: nil)
+            deleteSelectedAutoLine()
+        case .autoBox(let rowID, let measureID):
+            autoSelection = AutoSelectionState(rowID: rowID, splitIndex: nil, measureID: measureID)
+            deleteSelectedAutoBox()
+        }
     }
 
     private func finishCurrentManualRow() {
@@ -1871,24 +1986,14 @@ struct ContentView: View {
     }
 
     private func normalizeManualSelection(for tool: ManualFixTool) {
-        if tool == .editAuto {
+        pendingManualFixDelete = nil
+        if tool == .exclude {
             manualSelection = nil
-            if let selection = autoSelection {
-                if autoEditMode == .boxes {
-                    if selection.measureID == nil {
-                        autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
-                    }
-                } else if autoEditMode == .deleteLine || autoEditMode == .moveLine {
-                    if selection.measureID != nil {
-                        autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
-                    }
-                } else {
-                    autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
-                }
+            if let selection = autoSelection, selection.splitIndex != nil {
+                autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
             }
             return
         }
-        autoSelection = nil
         guard let selection = manualSelection else { return }
         switch tool {
         case .delete:
@@ -1897,8 +2002,12 @@ struct ContentView: View {
             if selection.cutIndex != nil {
                 manualSelection = ManualSelectionState(rowID: selection.rowID, cutIndex: nil)
             }
-        case .editAuto:
+        case .exclude:
             return
+        }
+        if let selection = autoSelection,
+           selection.splitIndex != nil || selection.measureID != nil {
+            autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
         }
     }
 
@@ -1982,7 +2091,7 @@ struct ContentView: View {
             manualDraftPage = nil
             manualSelection = nil
             autoSelection = nil
-            autoEditMode = .addLine
+            pendingManualFixDelete = nil
             manualFixTool = .addRow
             activeEditTool = .none
             phase = .ready
@@ -3784,8 +3893,8 @@ struct ContentView: View {
         manualFixTool = .addRow
         manualStaffKind = .single
         manualSelection = nil
-        autoEditMode = .addLine
         autoSelection = nil
+        pendingManualFixDelete = nil
         currentVisiblePDFPage = 1
         aiSuggestions = nil
         aiSuggestRun = nil
@@ -3830,8 +3939,8 @@ struct ContentView: View {
         manualFixTool = .addRow
         manualStaffKind = .single
         manualSelection = nil
-        autoEditMode = .addLine
         autoSelection = nil
+        pendingManualFixDelete = nil
         currentVisiblePDFPage = 1
         aiSuggestions = nil
         aiSuggestRun = nil
@@ -4231,7 +4340,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         case addCut(rowID: String, currentX: Double)
         case resize(rowID: String, corner: ManualCorner, startRect: ManualRowRect, currentPoint: CGPoint)
         case addAutoCut(rowID: String, boxIndex: Int, currentX: Double)
-        case moveAutoCut(rowID: String, splitIndex: Int, minX: Double, maxX: Double, currentX: Double)
+        case resizeAuto(rowID: String, corner: ManualCorner, startRect: ManualRowRect, currentPoint: CGPoint)
     }
 
     private struct SavedViewport {
@@ -4958,6 +5067,34 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         return nil
     }
 
+    private func autoHandleHit(
+        at point: CGPoint,
+        documentView: UIView
+    ) -> (row: AutoRowState, corner: ManualCorner)? {
+        guard let autoEditor = currentAutoEditor,
+              autoEditor.tool == .resizeRow,
+              let selection = autoEditor.selection,
+              selection.splitIndex == nil,
+              selection.measureID == nil,
+              let row = autoRow(for: selection.rowID),
+              let document = pdfView.document else { return nil }
+        let pageIndex = max(0, row.page - 1)
+        guard let page = document.page(at: pageIndex),
+              let rect = autoRowDocumentRect(row, page: page, documentView: documentView) else { return nil }
+        let handles: [(ManualCorner, CGPoint)] = [
+            (.topLeft, rect.origin),
+            (.topRight, CGPoint(x: rect.maxX, y: rect.minY)),
+            (.bottomLeft, CGPoint(x: rect.minX, y: rect.maxY)),
+            (.bottomRight, CGPoint(x: rect.maxX, y: rect.maxY)),
+        ]
+        for (corner, handlePoint) in handles {
+            if hypot(point.x - handlePoint.x, point.y - handlePoint.y) <= 18 {
+                return (row, corner)
+            }
+        }
+        return nil
+    }
+
     private func manualRowRectFromPoints(page: Int, start: CGPoint, end: CGPoint, staffKind: ManualStaffKind) -> ManualRowState? {
         let left = min(start.x, end.x)
         let right = max(start.x, end.x)
@@ -5001,6 +5138,67 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             return $0.manualRowId < $1.manualRowId
         })
         onManualRowsChange?(rows)
+    }
+
+    private func previewAutoRow(
+        for rowID: String,
+        startRect: ManualRowRect,
+        currentPoint: CGPoint,
+        page: PDFPage,
+        documentView: UIView
+    ) -> AutoRowState? {
+        guard case let .resizeAuto(_, corner, _, _) = manualDragState,
+              let row = autoRow(for: rowID),
+              let point = documentPointToTopOriginPagePoint(currentPoint, page: page, documentView: documentView) else { return nil }
+        let bounds = page.bounds(for: .mediaBox)
+        let minSize = 10.0
+        var left = startRect.left
+        var right = startRect.right
+        var top = startRect.top
+        var bottom = startRect.bottom
+        switch corner {
+        case .topLeft:
+            left = min(max(0, point.x), right - minSize)
+            top = min(max(0, point.y), bottom - minSize)
+        case .topRight:
+            right = max(min(bounds.width, point.x), left + minSize)
+            top = min(max(0, point.y), bottom - minSize)
+        case .bottomLeft:
+            left = min(max(0, point.x), right - minSize)
+            bottom = max(min(bounds.height, point.y), top + minSize)
+        case .bottomRight:
+            right = max(min(bounds.width, point.x), left + minSize)
+            bottom = max(min(bounds.height, point.y), top + minSize)
+        }
+
+        let keptSplits = row.boxes.dropLast().map(\.right).filter { $0 > left + 2 && $0 < right - 2 }.sorted()
+        let boundaries = [left] + keptSplits + [right]
+        guard boundaries.count >= 2 else { return nil }
+
+        var rebuiltBoxes: [AutoBoxState] = []
+        for index in 0..<(boundaries.count - 1) {
+            let boxLeft = boundaries[index]
+            let boxRight = boundaries[index + 1]
+            guard boxRight - boxLeft >= 2 else { continue }
+            let merged = row.boxes.filter { $0.right > boxLeft && $0.left < boxRight }
+            guard let first = merged.first else { continue }
+            rebuiltBoxes.append(
+                AutoBoxState(
+                    measureID: first.measureID,
+                    left: boxLeft,
+                    right: boxRight,
+                    excludedFromCounting: merged.contains(where: { $0.excludedFromCounting })
+                )
+            )
+        }
+        guard !rebuiltBoxes.isEmpty else { return nil }
+
+        return AutoRowState(
+            systemID: row.systemID,
+            page: row.page,
+            rect: ManualRowRect(left: left, right: right, top: top, bottom: bottom),
+            boxes: rebuiltBoxes
+        )
     }
 
     private func addSplitDot(
@@ -5144,7 +5342,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             previewLayer.strokeColor = UIColor.systemBlue.cgColor
             previewLayer.lineWidth = 2.2
             manualLayer.addSublayer(previewLayer)
-        case .addAutoCut, .moveAutoCut:
+        case .addAutoCut, .resizeAuto:
             break
         }
     }
@@ -5205,6 +5403,28 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                     )
                 }
             }
+
+            if rowSelected,
+               autoEditor.selection?.splitIndex == nil,
+               autoEditor.selection?.measureID == nil,
+               autoEditor.tool == .resizeRow {
+                let handlePoints = [
+                    CGPoint(x: rect.minX, y: rect.minY),
+                    CGPoint(x: rect.maxX, y: rect.minY),
+                    CGPoint(x: rect.minX, y: rect.maxY),
+                    CGPoint(x: rect.maxX, y: rect.maxY),
+                ]
+                for point in handlePoints {
+                    let handleLayer = CAShapeLayer()
+                    let handleRect = CGRect(x: point.x - 8, y: point.y - 8, width: 16, height: 16)
+                    handleLayer.frame = handleRect
+                    handleLayer.path = UIBezierPath(ovalIn: handleLayer.bounds).cgPath
+                    handleLayer.fillColor = UIColor.systemBlue.cgColor
+                    handleLayer.strokeColor = UIColor.white.cgColor
+                    handleLayer.lineWidth = 1.2
+                    manualLayer.addSublayer(handleLayer)
+                }
+            }
         }
     }
 
@@ -5228,21 +5448,18 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 dotDiameter: 4,
                 dashed: true
             )
-        case .moveAutoCut(let rowID, _, _, _, let currentX):
-            guard let row = autoRow(for: rowID) else { return }
-            let pageIndex = max(0, row.page - 1)
-            guard let pdfPage = document.page(at: pageIndex),
-                  let rect = autoRowDocumentRect(row, page: pdfPage, documentView: documentView) else { return }
-            let ratio = (currentX - row.rect.left) / max(1.0, row.rect.right - row.rect.left)
-            let x = rect.minX + (rect.width * ratio)
-            addManualCutLine(
-                from: CGPoint(x: x, y: rect.minY),
-                to: CGPoint(x: x, y: rect.maxY),
-                color: .systemBlue,
-                foregroundWidth: 2.5,
-                dotDiameter: 4,
-                dashed: true
-            )
+        case .resizeAuto(let rowID, _, let startRect, let currentPoint):
+            guard let selectedRow = autoRow(for: rowID),
+                  let page = document.page(at: max(0, selectedRow.page - 1)),
+                  let previewRow = previewAutoRow(for: rowID, startRect: startRect, currentPoint: currentPoint, page: page, documentView: documentView),
+                  let rect = autoRowDocumentRect(previewRow, page: page, documentView: documentView) else { return }
+            let previewLayer = CAShapeLayer()
+            previewLayer.frame = rect
+            previewLayer.path = UIBezierPath(roundedRect: previewLayer.bounds, cornerRadius: 4).cgPath
+            previewLayer.fillColor = UIColor.clear.cgColor
+            previewLayer.strokeColor = UIColor.systemBlue.cgColor
+            previewLayer.lineWidth = 2.2
+            manualLayer.addSublayer(previewLayer)
         default:
             _ = autoEditor
         }
@@ -5520,59 +5737,66 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         guard let documentView = pdfView.documentView else { return }
 
         let tap = sender.location(in: documentView)
-        if let autoEditor = currentAutoEditor {
-            switch autoEditor.mode {
-            case .addLine, .moveLine:
-                if let splitSelection = autoSplitSelectionAtDocumentPoint(tap, documentView: documentView) {
-                    onAutoSelectionChange?(splitSelection)
-                    return
-                }
-                if let row = autoRowAtDocumentPoint(tap, documentView: documentView) {
-                    onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
-                    return
-                }
-            case .deleteLine:
-                if let splitSelection = autoSplitSelectionAtDocumentPoint(tap, documentView: documentView) {
-                    onAutoSelectionChange?(splitSelection)
-                    return
-                }
-                if let row = autoRowAtDocumentPoint(tap, documentView: documentView) {
-                    onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
-                    return
-                }
-            case .boxes:
-                if let boxSelection = autoBoxSelectionAtDocumentPoint(tap, documentView: documentView) {
-                    onAutoSelectionChange?(boxSelection)
-                    return
-                }
-                if let row = autoRowAtDocumentPoint(tap, documentView: documentView) {
-                    onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
-                    return
-                }
-            }
-            onAutoSelectionChange?(nil)
-            return
-        }
-        if let manualEditor = currentManualEditor {
-            switch manualEditor.tool {
-            case .addRow, .addMeasures, .resizeRow:
+        if let tool = currentManualEditor?.tool ?? currentAutoEditor?.tool {
+            switch tool {
+            case .addRow:
                 if let row = manualRowAtDocumentPoint(tap, documentView: documentView) {
                     onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
+                    onAutoSelectionChange?(nil)
+                    return
+                }
+            case .addMeasures:
+                if let row = manualRowAtDocumentPoint(tap, documentView: documentView) {
+                    onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
+                    onAutoSelectionChange?(nil)
+                    return
+                }
+                if let row = autoRowAtDocumentPoint(tap, documentView: documentView) {
+                    onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
+                    onManualSelectionChange?(nil)
+                    return
+                }
+            case .resizeRow:
+                if let row = manualRowAtDocumentPoint(tap, documentView: documentView) {
+                    onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
+                    onAutoSelectionChange?(nil)
+                    return
+                }
+                if let row = autoRowAtDocumentPoint(tap, documentView: documentView) {
+                    onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
+                    onManualSelectionChange?(nil)
                     return
                 }
             case .delete:
                 if let cutSelection = manualCutSelectionAtDocumentPoint(tap, documentView: documentView) {
                     onManualSelectionChange?(cutSelection)
+                    onAutoSelectionChange?(nil)
                     return
                 }
                 if let row = manualRowAtDocumentPoint(tap, documentView: documentView) {
                     onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
+                    onAutoSelectionChange?(nil)
                     return
                 }
-            case .editAuto:
-                break
+                if let splitSelection = autoSplitSelectionAtDocumentPoint(tap, documentView: documentView) {
+                    onAutoSelectionChange?(splitSelection)
+                    onManualSelectionChange?(nil)
+                    return
+                }
+                if let boxSelection = autoBoxSelectionAtDocumentPoint(tap, documentView: documentView) {
+                    onAutoSelectionChange?(boxSelection)
+                    onManualSelectionChange?(nil)
+                    return
+                }
+            case .exclude:
+                if let boxSelection = autoBoxSelectionAtDocumentPoint(tap, documentView: documentView) {
+                    onAutoSelectionChange?(boxSelection)
+                    onManualSelectionChange?(nil)
+                    return
+                }
             }
             onManualSelectionChange?(nil)
+            onAutoSelectionChange?(nil)
             return
         }
         for sub in overlayLayer.sublayers ?? [] {
@@ -5591,113 +5815,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         guard let documentView = pdfView.documentView,
               let document = pdfView.document else { return }
         let location = sender.location(in: documentView)
-
-        if let autoEditor = currentAutoEditor {
-            switch sender.state {
-            case .began:
-                switch autoEditor.mode {
-                case .addLine:
-                    guard let row = autoRowAtDocumentPoint(location, documentView: documentView),
-                          let page = document.page(at: max(0, row.page - 1)),
-                          row.page == autoEditor.activePage,
-                          let point = documentPointToTopOriginPagePoint(location, page: page, documentView: documentView),
-                          let boxIndex = row.boxes.firstIndex(where: { point.x > $0.left && point.x < $0.right }) else { return }
-                    let box = row.boxes[boxIndex]
-                    let clampedX = min(max(point.x, box.left + 1), box.right - 1)
-                    onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
-                    setManualInteractionLocked(true)
-                    manualDragState = .addAutoCut(rowID: row.systemID, boxIndex: boxIndex, currentX: clampedX)
-                case .moveLine:
-                    guard let splitSelection = autoSplitSelectionAtDocumentPoint(location, documentView: documentView),
-                          let row = autoRow(for: splitSelection.rowID),
-                          let splitIndex = splitSelection.splitIndex,
-                          splitIndex >= 0,
-                          splitIndex < row.boxes.count - 1 else { return }
-                    let minX = row.boxes[splitIndex].left + 1
-                    let maxX = row.boxes[splitIndex + 1].right - 1
-                    let currentX = min(max(row.boxes[splitIndex].right, minX), maxX)
-                    onAutoSelectionChange?(splitSelection)
-                    setManualInteractionLocked(true)
-                    manualDragState = .moveAutoCut(rowID: row.systemID, splitIndex: splitIndex, minX: minX, maxX: maxX, currentX: currentX)
-                case .deleteLine, .boxes:
-                    return
-                }
-                redrawOverlays()
-
-            case .changed:
-                guard let drag = manualDragState else { return }
-                switch drag {
-                case .addAutoCut(let rowID, _, _):
-                    guard let row = autoRow(for: rowID),
-                          let pdfPage = document.page(at: max(0, row.page - 1)),
-                          let current = documentPointToTopOriginPagePoint(location, page: pdfPage, documentView: documentView),
-                          let boxIndex = row.boxes.firstIndex(where: { current.x > $0.left && current.x < $0.right }) ?? row.boxes.indices.first else { return }
-                    let box = row.boxes[boxIndex]
-                    let clampedX = min(max(current.x, box.left + 1), box.right - 1)
-                    manualDragState = .addAutoCut(rowID: rowID, boxIndex: boxIndex, currentX: clampedX)
-                case .moveAutoCut(let rowID, let splitIndex, let minX, let maxX, _):
-                    guard let row = autoRow(for: rowID),
-                          let pdfPage = document.page(at: max(0, row.page - 1)),
-                          let current = documentPointToTopOriginPagePoint(location, page: pdfPage, documentView: documentView) else { return }
-                    let clampedX = min(max(current.x, minX), maxX)
-                    manualDragState = .moveAutoCut(rowID: rowID, splitIndex: splitIndex, minX: minX, maxX: maxX, currentX: clampedX)
-                default:
-                    break
-                }
-                redrawOverlays()
-
-            case .ended, .cancelled, .failed:
-                defer {
-                    setManualInteractionLocked(false)
-                    manualDragState = nil
-                    redrawOverlays()
-                }
-                guard let drag = manualDragState else { return }
-                switch drag {
-                case .addAutoCut(let rowID, let boxIndex, let currentX):
-                    guard var row = autoRow(for: rowID),
-                          boxIndex >= 0,
-                          boxIndex < row.boxes.count else { return }
-                    let box = row.boxes[boxIndex]
-                    if abs(box.left - currentX) < 4 || abs(box.right - currentX) < 4 {
-                        return
-                    }
-                    let newMeasureID = "auto_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10))"
-                    let leftBox = AutoBoxState(
-                        measureID: box.measureID,
-                        left: box.left,
-                        right: currentX,
-                        excludedFromCounting: box.excludedFromCounting
-                    )
-                    let rightBox = AutoBoxState(
-                        measureID: String(newMeasureID),
-                        left: currentX,
-                        right: box.right,
-                        excludedFromCounting: box.excludedFromCounting
-                    )
-                    row.boxes.remove(at: boxIndex)
-                    row.boxes.insert(contentsOf: [leftBox, rightBox], at: boxIndex)
-                    replaceAutoRow(row)
-                    onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: boxIndex, measureID: nil))
-                case .moveAutoCut(let rowID, let splitIndex, _, _, let currentX):
-                    guard var row = autoRow(for: rowID),
-                          splitIndex >= 0,
-                          splitIndex < row.boxes.count - 1 else { return }
-                    row.boxes[splitIndex].right = currentX
-                    row.boxes[splitIndex + 1].left = currentX
-                    replaceAutoRow(row)
-                    onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: splitIndex, measureID: nil))
-                default:
-                    break
-                }
-            default:
-                break
-            }
-            return
-        }
-
-        guard let manualEditor = currentManualEditor else { return }
-
         switch sender.state {
         case .began:
             if let handle = manualHandleHit(at: location, documentView: documentView) {
@@ -5708,14 +5825,32 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                     startRect: handle.row.rect,
                     currentPoint: location
                 )
+                redrawOverlays()
+                return
+            }
+            if let handle = autoHandleHit(at: location, documentView: documentView) {
+                setManualInteractionLocked(true)
+                manualDragState = .resizeAuto(
+                    rowID: handle.row.systemID,
+                    corner: handle.corner,
+                    startRect: handle.row.rect,
+                    currentPoint: location
+                )
+                redrawOverlays()
                 return
             }
 
-            switch manualEditor.tool {
+            guard let tool = currentManualEditor?.tool ?? currentAutoEditor?.tool else { return }
+            switch tool {
             case .addRow:
+                guard let manualEditor = currentManualEditor else { return }
                 if let row = manualRowAtDocumentPoint(location, documentView: documentView) {
                     onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
+                    onAutoSelectionChange?(nil)
                     redrawOverlays()
+                    return
+                }
+                if autoRowAtDocumentPoint(location, documentView: documentView) != nil {
                     return
                 }
                 guard let page = pageContainingDocumentPoint(location, in: document, documentView: documentView) else { return }
@@ -5725,24 +5860,38 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 setManualInteractionLocked(true)
                 manualDragState = .addRow(page: pageNumber, start: start, current: start)
             case .addMeasures:
-                let touchedRow = manualRowAtDocumentPoint(location, documentView: documentView)
-                guard let row = touchedRow,
-                      let page = document.page(at: max(0, row.page - 1)),
-                      row.page == manualEditor.activePage,
-                      let point = documentPointToTopOriginPagePoint(location, page: page, documentView: documentView),
-                      point.x >= row.rect.left,
-                      point.x <= row.rect.right,
-                      point.y >= row.rect.top,
-                      point.y <= row.rect.bottom else { return }
-                if manualEditor.selection?.rowID != row.manualRowId || manualEditor.selection?.cutIndex != nil {
-                    onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
+                if let manualEditor = currentManualEditor,
+                   let row = manualRowAtDocumentPoint(location, documentView: documentView),
+                   let page = document.page(at: max(0, row.page - 1)),
+                   row.page == manualEditor.activePage,
+                   let point = documentPointToTopOriginPagePoint(location, page: page, documentView: documentView),
+                   point.x >= row.rect.left,
+                   point.x <= row.rect.right,
+                   point.y >= row.rect.top,
+                   point.y <= row.rect.bottom {
+                    if manualEditor.selection?.rowID != row.manualRowId || manualEditor.selection?.cutIndex != nil {
+                        onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
+                        onAutoSelectionChange?(nil)
+                    }
+                    let clampedX = min(max(point.x, row.rect.left + 1), row.rect.right - 1)
+                    setManualInteractionLocked(true)
+                    manualDragState = .addCut(rowID: row.manualRowId, currentX: clampedX)
+                    redrawOverlays()
+                    return
                 }
-                let clampedX = min(max(point.x, row.rect.left + 1), row.rect.right - 1)
+                guard let autoEditor = currentAutoEditor,
+                      let row = autoRowAtDocumentPoint(location, documentView: documentView),
+                      let page = document.page(at: max(0, row.page - 1)),
+                      row.page == autoEditor.activePage,
+                      let point = documentPointToTopOriginPagePoint(location, page: page, documentView: documentView),
+                      let boxIndex = row.boxes.firstIndex(where: { point.x > $0.left && point.x < $0.right }) else { return }
+                let box = row.boxes[boxIndex]
+                let clampedX = min(max(point.x, box.left + 1), box.right - 1)
+                onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
+                onManualSelectionChange?(nil)
                 setManualInteractionLocked(true)
-                manualDragState = .addCut(rowID: row.manualRowId, currentX: clampedX)
-            case .resizeRow, .delete:
-                return
-            case .editAuto:
+                manualDragState = .addAutoCut(rowID: row.systemID, boxIndex: boxIndex, currentX: clampedX)
+            case .resizeRow, .delete, .exclude:
                 return
             }
             redrawOverlays()
@@ -5762,8 +5911,16 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 manualDragState = .addCut(rowID: rowID, currentX: clampedX)
             case .resize(let rowID, let corner, let startRect, _):
                 manualDragState = .resize(rowID: rowID, corner: corner, startRect: startRect, currentPoint: location)
-            case .addAutoCut, .moveAutoCut:
-                break
+            case .addAutoCut(let rowID, _, _):
+                guard let row = autoRow(for: rowID),
+                      let pdfPage = document.page(at: max(0, row.page - 1)),
+                      let current = documentPointToTopOriginPagePoint(location, page: pdfPage, documentView: documentView),
+                      let boxIndex = row.boxes.firstIndex(where: { current.x > $0.left && current.x < $0.right }) ?? row.boxes.indices.first else { return }
+                let box = row.boxes[boxIndex]
+                let clampedX = min(max(current.x, box.left + 1), box.right - 1)
+                manualDragState = .addAutoCut(rowID: rowID, boxIndex: boxIndex, currentX: clampedX)
+            case .resizeAuto(let rowID, let corner, let startRect, _):
+                manualDragState = .resizeAuto(rowID: rowID, corner: corner, startRect: startRect, currentPoint: location)
             }
             redrawOverlays()
 
@@ -5776,7 +5933,9 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             guard let drag = manualDragState else { return }
             switch drag {
             case .addRow(let page, let start, let current):
-                guard let row = manualRowRectFromPoints(page: page, start: start, end: current, staffKind: manualEditor.defaultStaffKind) else { return }
+                guard let manualEditor = currentManualEditor,
+                      manualEditor.tool == .addRow,
+                      let row = manualRowRectFromPoints(page: page, start: start, end: current, staffKind: manualEditor.defaultStaffKind) else { return }
                 appendManualRow(row)
                 onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
             case .addCut(let rowID, let currentX):
@@ -5795,8 +5954,37 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                       let updated = previewRowRect(for: rowID, startRect: startRect, currentPoint: currentPoint, page: page, documentView: documentView) else { return }
                 replaceManualRow(updated)
                 onManualSelectionChange?(ManualSelectionState(rowID: rowID, cutIndex: nil))
-            case .addAutoCut, .moveAutoCut:
-                break
+            case .addAutoCut(let rowID, let boxIndex, let currentX):
+                guard var row = autoRow(for: rowID),
+                      boxIndex >= 0,
+                      boxIndex < row.boxes.count else { return }
+                let box = row.boxes[boxIndex]
+                if abs(box.left - currentX) < 4 || abs(box.right - currentX) < 4 {
+                    return
+                }
+                let newMeasureID = "auto_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10))"
+                let leftBox = AutoBoxState(
+                    measureID: box.measureID,
+                    left: box.left,
+                    right: currentX,
+                    excludedFromCounting: box.excludedFromCounting
+                )
+                let rightBox = AutoBoxState(
+                    measureID: String(newMeasureID),
+                    left: currentX,
+                    right: box.right,
+                    excludedFromCounting: box.excludedFromCounting
+                )
+                row.boxes.remove(at: boxIndex)
+                row.boxes.insert(contentsOf: [leftBox, rightBox], at: boxIndex)
+                replaceAutoRow(row)
+                onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
+            case .resizeAuto(let rowID, _, let startRect, let currentPoint):
+                guard let row = autoRow(for: rowID),
+                      let page = document.page(at: max(0, row.page - 1)),
+                      let updated = previewAutoRow(for: rowID, startRect: startRect, currentPoint: currentPoint, page: page, documentView: documentView) else { return }
+                replaceAutoRow(updated)
+                onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
             }
 
         default:
@@ -5809,40 +5997,28 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             if manualDragState != nil {
                 return false
             }
-            if let autoEditor = currentAutoEditor,
-               let pan = panGesture,
+            if let pan = panGesture,
                let documentView = pdfView.documentView {
                 let point = pan.location(in: documentView)
-                switch autoEditor.mode {
-                case .addLine:
-                    if let row = autoRowAtDocumentPoint(point, documentView: documentView),
-                       row.page == autoEditor.activePage {
-                        return false
-                    }
-                case .moveLine:
-                    if autoSplitSelectionAtDocumentPoint(point, documentView: documentView) != nil {
-                        return false
-                    }
-                case .deleteLine, .boxes:
-                    break
-                }
-            }
-            if let manualEditor = currentManualEditor,
-               let pan = panGesture,
-               let documentView = pdfView.documentView {
-                let point = pan.location(in: documentView)
-                if manualHandleHit(at: point, documentView: documentView) != nil {
+                if manualHandleHit(at: point, documentView: documentView) != nil
+                    || autoHandleHit(at: point, documentView: documentView) != nil {
                     return false
                 }
-                switch manualEditor.tool {
+                switch currentManualEditor?.tool ?? currentAutoEditor?.tool {
                 case .addRow:
                     return false
                 case .addMeasures:
-                    if let row = manualRowAtDocumentPoint(point, documentView: documentView),
+                    if let manualEditor = currentManualEditor,
+                       let row = manualRowAtDocumentPoint(point, documentView: documentView),
                        row.page == manualEditor.activePage {
                         return false
                     }
-                case .resizeRow, .delete, .editAuto:
+                    if let autoEditor = currentAutoEditor,
+                       let row = autoRowAtDocumentPoint(point, documentView: documentView),
+                       row.page == autoEditor.activePage {
+                        return false
+                    }
+                case .resizeRow, .delete, .exclude, .none:
                     break
                 }
             }
@@ -5857,36 +6033,28 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             return true
         }
         let point = pan.location(in: documentView)
-        if let autoEditor = currentAutoEditor {
-            switch autoEditor.mode {
-            case .addLine:
-                guard let row = autoRowAtDocumentPoint(point, documentView: documentView) else {
-                    return false
-                }
-                return row.page == autoEditor.activePage
-            case .moveLine:
-                return autoSplitSelectionAtDocumentPoint(point, documentView: documentView) != nil
-            case .deleteLine, .boxes:
-                return false
-            }
-        }
-        guard let manualEditor = currentManualEditor else {
+        if manualHandleHit(at: point, documentView: documentView) != nil
+            || autoHandleHit(at: point, documentView: documentView) != nil {
             return true
         }
-        if manualHandleHit(at: point, documentView: documentView) != nil {
+        let tool = currentManualEditor?.tool ?? currentAutoEditor?.tool
+        guard let tool else {
             return true
         }
-        switch manualEditor.tool {
+        switch tool {
         case .addRow:
             return true
         case .addMeasures:
-            guard let row = manualRowAtDocumentPoint(point, documentView: documentView) else {
-                return false
+            if let manualEditor = currentManualEditor,
+               let row = manualRowAtDocumentPoint(point, documentView: documentView) {
+                return row.page == manualEditor.activePage
             }
-            return row.page == manualEditor.activePage
-        case .resizeRow, .delete:
+            if let autoEditor = currentAutoEditor,
+               let row = autoRowAtDocumentPoint(point, documentView: documentView) {
+                return row.page == autoEditor.activePage
+            }
             return false
-        case .editAuto:
+        case .resizeRow, .delete, .exclude:
             return false
         }
     }

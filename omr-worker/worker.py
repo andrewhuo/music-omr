@@ -1494,8 +1494,6 @@ def _normalize_auto_rows_payload(
         current_rect = _parse_manual_row_rect(current_row.get("rect"))
         if current_rect is None:
             return None, "missing_auto_row_baseline"
-        if any(abs(new_val - old_val) > AUTO_ROW_RECT_TOLERANCE for new_val, old_val in zip(rect_tuple, current_rect)):
-            return None, "auto_row_rect_changed"
         raw_boxes = raw_row.get("boxes")
         if not isinstance(raw_boxes, list):
             return None, "invalid_auto_boxes"
