@@ -215,8 +215,8 @@ private enum EditColorPalette {
     static let measureNumber = EditColorStyle(
         id: "measure_number",
         title: "Set Measure #",
-        fill: UIColor(red: 0.82, green: 0.91, blue: 0.99, alpha: 0.58),
-        stroke: UIColor(red: 0.21, green: 0.49, blue: 0.89, alpha: 0.92)
+        fill: UIColor(red: 0.79, green: 0.89, blue: 1.00, alpha: 0.60),
+        stroke: UIColor(red: 0.14, green: 0.42, blue: 0.88, alpha: 0.95)
     )
 
     static let rest = EditColorStyle(
@@ -229,36 +229,36 @@ private enum EditColorPalette {
     static let pickup = EditColorStyle(
         id: "pickup",
         title: "Pickup",
-        fill: UIColor(red: 1.00, green: 0.96, blue: 0.76, alpha: 0.60),
-        stroke: UIColor(red: 0.77, green: 0.60, blue: 0.14, alpha: 0.92)
+        fill: UIColor(red: 1.00, green: 0.95, blue: 0.70, alpha: 0.62),
+        stroke: UIColor(red: 0.72, green: 0.54, blue: 0.05, alpha: 0.94)
     )
 
     static let aiSuggestion = EditColorStyle(
         id: "ai_suggestion",
         title: "AI Suggestion",
-        fill: UIColor(red: 0.70, green: 0.95, blue: 0.92, alpha: 0.62),
-        stroke: UIColor(red: 0.06, green: 0.63, blue: 0.60, alpha: 0.96)
+        fill: UIColor(red: 0.74, green: 0.91, blue: 1.00, alpha: 0.64),
+        stroke: UIColor(red: 0.00, green: 0.50, blue: 0.80, alpha: 0.96)
     )
 
     static let ending1 = EditColorStyle(
         id: "ending_1",
         title: "Ending 1",
-        fill: UIColor(red: 0.99, green: 0.85, blue: 0.90, alpha: 0.60),
-        stroke: UIColor(red: 0.84, green: 0.39, blue: 0.55, alpha: 0.92)
+        fill: UIColor(red: 1.00, green: 0.84, blue: 0.89, alpha: 0.62),
+        stroke: UIColor(red: 0.84, green: 0.30, blue: 0.50, alpha: 0.94)
     )
 
     static let ending2 = EditColorStyle(
         id: "ending_2",
         title: "Ending 2",
-        fill: UIColor(red: 0.92, green: 0.87, blue: 1.00, alpha: 0.60),
-        stroke: UIColor(red: 0.53, green: 0.38, blue: 0.84, alpha: 0.92)
+        fill: UIColor(red: 0.88, green: 0.84, blue: 1.00, alpha: 0.62),
+        stroke: UIColor(red: 0.45, green: 0.29, blue: 0.83, alpha: 0.95)
     )
 
     static let excluded = EditColorStyle(
         id: "excluded",
         title: "Excluded",
-        fill: UIColor(red: 1.00, green: 0.82, blue: 0.70, alpha: 0.62),
-        stroke: UIColor(red: 0.90, green: 0.42, blue: 0.12, alpha: 0.96)
+        fill: UIColor(red: 0.84, green: 0.86, blue: 0.89, alpha: 0.68),
+        stroke: UIColor(red: 0.32, green: 0.36, blue: 0.42, alpha: 0.96)
     )
 
     static let legendItems: [EditColorStyle] = [
