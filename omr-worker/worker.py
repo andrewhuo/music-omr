@@ -1885,7 +1885,7 @@ def _empty_ai_suggestions_state(
         "warnings": [],
         "summary": {
             "systems_processed": 0,
-            "measures_seen": max(0, int(measures_seen)),
+            "measures_seen": 0,
             "suggestions_kept": 0,
             "normal_measures_omitted": 0,
         },

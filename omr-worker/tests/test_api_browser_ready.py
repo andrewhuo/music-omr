@@ -636,7 +636,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(body.get("status"), "running")
         ai_suggestions = body.get("ai_suggestions") or {}
         summary = ai_suggestions.get("summary") or {}
-        self.assertEqual(summary.get("measures_seen"), 3)
+        self.assertEqual(summary.get("measures_seen"), 0)
         self.assertEqual(summary.get("suggestions_kept"), 0)
         self.assertEqual(summary.get("systems_processed"), 0)
         self.assertEqual(ai_suggestions.get("time_signatures_by_measure_id"), {})
