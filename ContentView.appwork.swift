@@ -5363,7 +5363,10 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             guard let page = document.page(at: pageIndex),
                   let rect = autoRowDocumentRect(row, page: page, documentView: documentView) else { continue }
 
-            let rowSelected = autoEditor.selection?.rowID == row.systemID
+            let rowSelected =
+                autoEditor.selection?.rowID == row.systemID
+                && autoEditor.selection?.splitIndex == nil
+                && autoEditor.selection?.measureID == nil
             let rowLayer = CAShapeLayer()
             rowLayer.frame = rect
             rowLayer.path = UIBezierPath(roundedRect: rowLayer.bounds, cornerRadius: 4).cgPath
@@ -5809,8 +5812,16 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                     return
                 }
             case .exclude:
-                if let boxSelection = autoBoxSelectionAtDocumentPoint(tap, documentView: documentView) {
-                    onAutoSelectionChange?(boxSelection)
+                if let row = autoRowAtDocumentPoint(tap, documentView: documentView) {
+                    if let currentSelection = currentAutoEditor?.selection,
+                       currentSelection.rowID == row.systemID,
+                       currentSelection.splitIndex == nil,
+                       let boxSelection = autoBoxSelectionAtDocumentPoint(tap, documentView: documentView),
+                       boxSelection.rowID == row.systemID {
+                        onAutoSelectionChange?(boxSelection)
+                    } else {
+                        onAutoSelectionChange?(AutoSelectionState(rowID: row.systemID, splitIndex: nil, measureID: nil))
+                    }
                     onManualSelectionChange?(nil)
                     return
                 }
