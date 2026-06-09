@@ -3242,6 +3242,7 @@ def _build_system_measure_request(
                 "Do not write sentences for unclear_reason. Use only one short code or omit the field.",
                 "Use the visible time signature in the crop to judge completeness. Seeing the time signature is enough to judge whether the first measure is shorter than a full bar.",
                 "If the first measure is clearly too short for the visible time signature, label pickup.",
+                "For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves. Do not require both staves to play notes: notes in one staff plus rests or silence in the other can still be a pickup. If the opening measure is shorter than the active time signature, mark it pickup/incomplete. Example: in 3/4, one beat before the first barline is a pickup even if only the treble staff plays. Do not mark pickup merely because one staff is sparse when the full vertical measure lasts the complete meter.",
                 "If a non-first measure clearly looks too short for its active time signature, use label uncertain, not normal.",
                 "Do not label later incomplete measures as pickup yet.",
                 "Examples: in 2/4, one quarter note in the first measure is pickup; in 4/4, one quarter note in the first measure is pickup; in 3/4, one quarter note can be pickup; in 6/8, one or two eighth notes can be pickup.",

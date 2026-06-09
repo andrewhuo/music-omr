@@ -2094,6 +2094,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("If a non-first measure clearly looks too short for its active time signature, use label uncertain, not normal.", rules_text)
         self.assertIn("If is_first_measure_of_score is false, do not label pickup.", rules_text)
         self.assertIn("If the first measure is clearly too short for the visible time signature, label pickup.", rules_text)
+        self.assertIn("For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves.", rules_text)
+        self.assertIn("one beat before the first barline is a pickup even if only the treble staff plays", rules_text)
         self.assertIn("Examples: in 2/4, one quarter note in the first measure is pickup;", rules_text)
         self.assertIn("If the time signature is unclear but the first measure looks short, label uncertain with maybe_label pickup.", rules_text)
         output_shape = ((intro.get("instructions") or {}).get("output_shape") or {})
