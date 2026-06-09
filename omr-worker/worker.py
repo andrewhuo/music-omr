@@ -3230,6 +3230,9 @@ def _build_system_measure_request(
                 "Do not infer additional measures from internal rhythmic groupings, repeat dots, or barline decorations.",
                 "Process the provided measures left to right in order.",
                 "Start with remembered_time_signature_in as the active time signature, unless it is null.",
+                "A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.",
+                "In grand-staff or piano crops, the same time signature may appear on both staves; use the shared meter for the whole measure.",
+                "Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.",
                 "If a clearly visible new time signature appears at a measure, update the active time signature from that measure onward within this same system.",
                 "If a new time signature is unclear or only partly visible, keep the previous active time signature.",
                 "Only label pickup when is_first_measure_of_score is true.",
@@ -3254,6 +3257,7 @@ def _build_system_measure_request(
                 "A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.",
                 "If label is multi_measure_rest, include integer rest_count of 2 or more. A visible count of 1 means the measure is normal, not multi_measure_rest.",
                 "A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.",
+                "For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count. If one staff has music, no count, or a different count, do not return multi_measure_rest.",
                 "If label is uncertain and you have a tentative guess, maybe_label may be pickup or multi_measure_rest, and maybe_rest_count is only allowed for maybe_label multi_measure_rest.",
                 "If maybe_label is multi_measure_rest, always include maybe_rest_count if the count number is at all readable. Only omit maybe_rest_count if the number is completely unreadable.",
                 "Return JSON only.",
@@ -3277,7 +3281,7 @@ def _build_system_measure_request(
                 "time_signature_updates": [
                     {
                         "measure_id": "string",
-                        "new_time_signature": "3/4|4/4|6/8|common_time|cut_time",
+                        "new_time_signature": "visible meter such as 2/4, 3/4, 4/4, 6/8, common_time, cut_time, or null",
                     }
                 ],
             },

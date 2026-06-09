@@ -2083,6 +2083,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         rules_text = "\n".join(str(row) for row in rules)
         self.assertIn("Process the provided measures left to right in order.", rules_text)
         self.assertIn("Start with remembered_time_signature_in as the active time signature", rules_text)
+        self.assertIn("A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature", rules_text)
+        self.assertIn("In grand-staff or piano crops, the same time signature may appear on both staves", rules_text)
+        self.assertIn("Ignore fingering/count numbers near notes, above the staff, or below the staff.", rules_text)
         self.assertIn("If a clearly visible new time signature appears at a measure, update the active time signature", rules_text)
         self.assertIn("For every measure, also judge measure_completeness as full, incomplete, or unclear.", rules_text)
         self.assertIn("If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason", rules_text)
@@ -2100,6 +2103,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             suggestion_shape.get("unclear_reason"),
             "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
         )
+        time_update_shape = ((output_shape.get("time_signature_updates") or [])[0] or {})
+        self.assertIn("2/4", time_update_shape.get("new_time_signature") or "")
 
     def test_build_system_measure_request_includes_old_style_multi_rest_guidance(self):
         mapping_summary = self._sample_mapping_summary()
@@ -2129,6 +2134,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("In the older style, the vertical bars may be short or long, and there may be more than one.", rules_text)
         self.assertIn("A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.", rules_text)
         self.assertIn("A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.", rules_text)
+        self.assertIn("For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count.", rules_text)
 
     def test_build_system_measure_request_includes_reference_examples_before_real_measures(self):
         mapping_summary = self._sample_mapping_summary()
