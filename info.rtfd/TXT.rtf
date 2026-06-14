@@ -1,0 +1,572 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2870
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica-Light;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\vieww11520\viewh8400\viewkind0
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 Welcome to Cloud Shell! Type "help" to get started, or type "gemini" to try prompting with Gemini CLI.\
+Your Cloud Platform project in this session is set to music-omr-backend.\
+Use `gcloud config set project [PROJECT_ID]` to change to a different project.\
+andrewmhuo@cloudshell:~ (music-omr-backend)$ curl -sS "https://omr-trigger-777135743132.us-central1.run.app/api/omr/jobs" | jq -r '.jobs[0].job_id'\
+12-1780966950-D872A483\
+andrewmhuo@cloudshell:~ (music-omr-backend)$ JOB_ID="12-1780966950-D872A483"\
+\
+curl -sS "https://omr-trigger-777135743132.us-central1.run.app/api/omr/jobs/$JOB_ID/state" \\\
+  | jq '.ai_suggest_run'\
+\{\
+  "completed_at_utc": "2026-06-09T01:05:21.155577Z",\
+  "failed_at_utc": null,\
+  "last_error": null,\
+  "last_time_signature_update": \{\
+    "measure_id": "p1_s0_m0",\
+    "new_time_signature": "4/4",\
+    "system_id": "p1_s0"\
+  \},\
+  "model": "claude-sonnet-4-6",\
+  "next_system_index": 4,\
+  "remembered_time_signature": "4/4",\
+  "source_run_id": 27177070446,\
+  "source_state_version": "ebb1c858a71f0af9",\
+  "started_at_utc": "2026-06-09T01:04:48.136506Z",\
+  "status": "completed",\
+  "systems_completed": 4,\
+  "systems_total": 4,\
+  "time_signature_updates": [\
+    \{\
+      "measure_id": "p1_s0_m0",\
+      "new_time_signature": "4/4",\
+      "system_id": "p1_s0"\
+    \}\
+  ],\
+  "updated_at_utc": "2026-06-09T01:05:21.155577Z"\
+\}\
+andrewmhuo@cloudshell:~ (music-omr-backend)$ curl -sS "https://omr-trigger-777135743132.us-central1.run.app/api/omr/jobs/$JOB_ID/state" \\\
+  | jq '.ai_suggestions | \{summary, by_measure_id, time_signatures_by_measure_id, measure_completeness_by_measure_id, warnings\}'\
+\{\
+  "summary": \{\
+    "measures_seen": 16,\
+    "normal_measures_omitted": 16,\
+    "suggestions_kept": 0,\
+    "systems_processed": 4\
+  \},\
+  "by_measure_id": \{\},\
+  "time_signatures_by_measure_id": \{\
+    "p1_s0_m0": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "explicit_here"\
+    \},\
+    "p1_s0_m1": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "inherited"\
+    \},\
+    "p1_s0_m2": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "inherited"\
+    \},\
+    "p1_s0_m3": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "inherited"\
+    \},\
+    "p1_s1_m0": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s1_m1": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s1_m2": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s1_m3": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s2_m0": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s2_m1": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s2_m2": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s2_m3": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s3_m0": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s3_m1": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s3_m2": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \},\
+    "p1_s3_m3": \{\
+      "active_time_signature": "4/4",\
+      "time_signature_source": "remembered"\
+    \}\
+  \},\
+  "measure_completeness_by_measure_id": \{\
+    "p1_s0_m0": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s0_m1": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s0_m2": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s0_m3": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s1_m0": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s1_m1": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s1_m2": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s1_m3": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s2_m0": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s2_m1": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s2_m2": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s2_m3": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s3_m0": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s3_m1": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s3_m2": \{\
+      "measure_completeness": "full",\
+      "measure_completeness_source": "ai"\
+    \},\
+    "p1_s3_m3": \{\
+      "measure_completeness": "unclear",\
+      "measure_completeness_source": "ai",\
+      "unclear_reason": "crop_cut_off"\
+    \}\
+  \},\
+  "warnings": []\
+\}\
+andrewmhuo@cloudshell:~ (music-omr-backend)$ curl -sS "https://omr-trigger-777135743132.us-central1.run.app/api/omr/jobs/$JOB_ID/state" \\\
+  | jq '.editable_state | \{qa, systems, measures\}'\
+\{\
+  "qa": \{\
+    "status": "ok",\
+    "total_systems": 4,\
+    "warning_count": 0,\
+    "warning_pages": [],\
+    "warnings": []\
+  \},\
+  "systems": [\
+    \{\
+      "anchor": \{\
+        "x": 107.76,\
+        "y_bottom": 213.665,\
+        "y_top": 149.565\
+      \},\
+      "current_value": "1",\
+      "page": 1,\
+      "render_label": "1",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "suspicious_partial_staff": false,\
+      "system_id": "p1_s0",\
+      "system_index": 0,\
+      "value": "1",\
+      "x_left": 107.76,\
+      "x_right": 539.52,\
+      "y_bottom": 213.665,\
+      "y_top": 149.565\
+    \},\
+    \{\
+      "anchor": \{\
+        "x": 70.56,\
+        "y_bottom": 375.234,\
+        "y_top": 313.295\
+      \},\
+      "current_value": "5",\
+      "page": 1,\
+      "render_label": "5",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "suspicious_partial_staff": false,\
+      "system_id": "p1_s1",\
+      "system_index": 1,\
+      "value": "5",\
+      "x_left": 70.56,\
+      "x_right": 539.52,\
+      "y_bottom": 375.234,\
+      "y_top": 313.295\
+    \},\
+    \{\
+      "anchor": \{\
+        "x": 70.56,\
+        "y_bottom": 545.925,\
+        "y_top": 475.104\
+      \},\
+      "current_value": "9",\
+      "page": 1,\
+      "render_label": "9",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "suspicious_partial_staff": false,\
+      "system_id": "p1_s2",\
+      "system_index": 2,\
+      "value": "9",\
+      "x_left": 70.56,\
+      "x_right": 539.52,\
+      "y_bottom": 545.925,\
+      "y_top": 475.104\
+    \},\
+    \{\
+      "anchor": \{\
+        "x": 70.56,\
+        "y_bottom": 715.417,\
+        "y_top": 645.796\
+      \},\
+      "current_value": "13",\
+      "page": 1,\
+      "render_label": "13",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "suspicious_partial_staff": false,\
+      "system_id": "p1_s3",\
+      "system_index": 3,\
+      "value": "13",\
+      "x_left": 70.56,\
+      "x_right": 539.52,\
+      "y_bottom": 715.417,\
+      "y_top": 645.796\
+    \}\
+  ],\
+  "measures": [\
+    \{\
+      "current_value": "1",\
+      "excluded_from_counting": false,\
+      "global_index": 0,\
+      "measure_id": "p1_s0_m0",\
+      "measure_local_index": 0,\
+      "page": 1,\
+      "render_label": "1",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s0",\
+      "system_index": 0,\
+      "value": "1",\
+      "x_left": 107.76,\
+      "x_right": 251.76,\
+      "y_bottom": 213.665,\
+      "y_top": 149.565\
+    \},\
+    \{\
+      "current_value": "2",\
+      "excluded_from_counting": false,\
+      "global_index": 1,\
+      "measure_id": "p1_s0_m1",\
+      "measure_local_index": 1,\
+      "page": 1,\
+      "render_label": "2",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s0",\
+      "system_index": 0,\
+      "value": "2",\
+      "x_left": 251.76,\
+      "x_right": 345.12,\
+      "y_bottom": 213.665,\
+      "y_top": 149.565\
+    \},\
+    \{\
+      "current_value": "3",\
+      "excluded_from_counting": false,\
+      "global_index": 2,\
+      "measure_id": "p1_s0_m2",\
+      "measure_local_index": 2,\
+      "page": 1,\
+      "render_label": "3",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s0",\
+      "system_index": 0,\
+      "value": "3",\
+      "x_left": 345.12,\
+      "x_right": 440.88,\
+      "y_bottom": 213.665,\
+      "y_top": 149.565\
+    \},\
+    \{\
+      "current_value": "4",\
+      "excluded_from_counting": false,\
+      "global_index": 3,\
+      "measure_id": "p1_s0_m3",\
+      "measure_local_index": 3,\
+      "page": 1,\
+      "render_label": "4",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s0",\
+      "system_index": 0,\
+      "value": "4",\
+      "x_left": 440.88,\
+      "x_right": 539.52,\
+      "y_bottom": 213.665,\
+      "y_top": 149.565\
+    \},\
+    \{\
+      "current_value": "5",\
+      "excluded_from_counting": false,\
+      "global_index": 4,\
+      "measure_id": "p1_s1_m0",\
+      "measure_local_index": 0,\
+      "page": 1,\
+      "render_label": "5",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s1",\
+      "system_index": 1,\
+      "value": "5",\
+      "x_left": 70.56,\
+      "x_right": 219.84,\
+      "y_bottom": 375.234,\
+      "y_top": 313.295\
+    \},\
+    \{\
+      "current_value": "6",\
+      "excluded_from_counting": false,\
+      "global_index": 5,\
+      "measure_id": "p1_s1_m1",\
+      "measure_local_index": 1,\
+      "page": 1,\
+      "render_label": "6",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s1",\
+      "system_index": 1,\
+      "value": "6",\
+      "x_left": 219.84,\
+      "x_right": 318.96,\
+      "y_bottom": 375.234,\
+      "y_top": 313.295\
+    \},\
+    \{\
+      "current_value": "7",\
+      "excluded_from_counting": false,\
+      "global_index": 6,\
+      "measure_id": "p1_s1_m2",\
+      "measure_local_index": 2,\
+      "page": 1,\
+      "render_label": "7",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s1",\
+      "system_index": 1,\
+      "value": "7",\
+      "x_left": 318.96,\
+      "x_right": 418.32,\
+      "y_bottom": 375.234,\
+      "y_top": 313.295\
+    \},\
+    \{\
+      "current_value": "8",\
+      "excluded_from_counting": false,\
+      "global_index": 7,\
+      "measure_id": "p1_s1_m3",\
+      "measure_local_index": 3,\
+      "page": 1,\
+      "render_label": "8",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s1",\
+      "system_index": 1,\
+      "value": "8",\
+      "x_left": 418.32,\
+      "x_right": 539.52,\
+      "y_bottom": 375.234,\
+      "y_top": 313.295\
+    \},\
+    \{\
+      "current_value": "9",\
+      "excluded_from_counting": false,\
+      "global_index": 8,\
+      "measure_id": "p1_s2_m0",\
+      "measure_local_index": 0,\
+      "page": 1,\
+      "render_label": "9",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s2",\
+      "system_index": 2,\
+      "value": "9",\
+      "x_left": 70.56,\
+      "x_right": 217.2,\
+      "y_bottom": 545.925,\
+      "y_top": 475.104\
+    \},\
+    \{\
+      "current_value": "10",\
+      "excluded_from_counting": false,\
+      "global_index": 9,\
+      "measure_id": "p1_s2_m1",\
+      "measure_local_index": 1,\
+      "page": 1,\
+      "render_label": "10",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s2",\
+      "system_index": 2,\
+      "value": "10",\
+      "x_left": 217.2,\
+      "x_right": 324.0,\
+      "y_bottom": 545.925,\
+      "y_top": 475.104\
+    \},\
+    \{\
+      "current_value": "11",\
+      "excluded_from_counting": false,\
+      "global_index": 10,\
+      "measure_id": "p1_s2_m2",\
+      "measure_local_index": 2,\
+      "page": 1,\
+      "render_label": "11",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s2",\
+      "system_index": 2,\
+      "value": "11",\
+      "x_left": 324.0,\
+      "x_right": 430.56,\
+      "y_bottom": 545.925,\
+      "y_top": 475.104\
+    \},\
+    \{\
+      "current_value": "12",\
+      "excluded_from_counting": false,\
+      "global_index": 11,\
+      "measure_id": "p1_s2_m3",\
+      "measure_local_index": 3,\
+      "page": 1,\
+      "render_label": "12",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s2",\
+      "system_index": 2,\
+      "value": "12",\
+      "x_left": 430.56,\
+      "x_right": 539.52,\
+      "y_bottom": 545.925,\
+      "y_top": 475.104\
+    \},\
+    \{\
+      "current_value": "13",\
+      "excluded_from_counting": false,\
+      "global_index": 12,\
+      "measure_id": "p1_s3_m0",\
+      "measure_local_index": 0,\
+      "page": 1,\
+      "render_label": "13",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s3",\
+      "system_index": 3,\
+      "value": "13",\
+      "x_left": 70.56,\
+      "x_right": 222.48,\
+      "y_bottom": 715.417,\
+      "y_top": 645.796\
+    \},\
+    \{\
+      "current_value": "14",\
+      "excluded_from_counting": false,\
+      "global_index": 13,\
+      "measure_id": "p1_s3_m1",\
+      "measure_local_index": 1,\
+      "page": 1,\
+      "render_label": "14",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s3",\
+      "system_index": 3,\
+      "value": "14",\
+      "x_left": 222.48,\
+      "x_right": 334.56,\
+      "y_bottom": 715.417,\
+      "y_top": 645.796\
+    \},\
+    \{\
+      "current_value": "15",\
+      "excluded_from_counting": false,\
+      "global_index": 14,\
+      "measure_id": "p1_s3_m2",\
+      "measure_local_index": 2,\
+      "page": 1,\
+      "render_label": "15",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s3",\
+      "system_index": 3,\
+      "value": "15",\
+      "x_left": 334.56,\
+      "x_right": 441.12,\
+      "y_bottom": 715.417,\
+      "y_top": 645.796\
+    \},\
+    \{\
+      "current_value": "16",\
+      "excluded_from_counting": false,\
+      "global_index": 15,\
+      "measure_id": "p1_s3_m3",\
+      "measure_local_index": 3,\
+      "page": 1,\
+      "render_label": "16",\
+      "source": "auto",\
+      "staff_kind": null,\
+      "system_id": "p1_s3",\
+      "system_index": 3,\
+      "value": "16",\
+      "x_left": 441.12,\
+      "x_right": 539.52,\
+      "y_bottom": 715.417,\
+      "y_top": 645.796\
+    \}\
+  ]\
+\}\
+andrewmhuo@cloudshell:~ (music-omr-backend)$ }

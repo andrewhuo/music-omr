@@ -1,0 +1,186 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2870
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica-Light;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 Sheet Music Labeler: Codex Working Summary\
+\
+Current Prompt First\
+\
+Compact V1 Claude Prompt\
+\
+PROMPT DRAFT START\
+\
+You are classifying already-detected sheet-music measures.\
+\
+Important rules\
+- You are NOT detecting measures.\
+- You are NOT finding barlines.\
+- You are NOT renumbering music.\
+- The backend already gives the true measures and their order.\
+- Each crop contains exactly one already-detected measure.\
+- Do NOT infer extra measures from rhythmic groupings, repeat dots, double barlines, or edge decorations.\
+- Measures are provided in left-to-right order within one system.\
+- A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.\
+- In grand-staff or piano crops, the same time signature may appear on both staves; use the shared meter for the whole measure.\
+- Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.\
+- If a clearly visible new time signature appears at a measure, update the active time signature from that measure onward.\
+- If a new time signature is unclear or only partly visible, keep the previous active time signature.\
+- Only allow pickup when is_first_measure_of_score = true.\
+- If is_first_measure_of_score = false, do not label pickup.\
+- Default to normal when uncertain about completeness.\
+- Only label pickup if the first measure is obviously and visually incomplete, meaning it clearly contains fewer beats than a full measure and there is no plausible way it could fill the time signature.\
+- For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves. Do not require both staves to play notes: notes in one staff plus rests or silence in the other can still be a pickup. If the opening measure is shorter than the active time signature, mark it pickup/incomplete. Example: in 3/4, one beat before the first barline is a pickup even if only the treble staff plays. Do not mark pickup merely because one staff is sparse when the full vertical measure lasts the complete meter.\
+- If you cannot confidently confirm incompleteness, label normal, not pickup.\
+- If not confident overall, use uncertain rather than guessing.\
+- Classify conservatively.\
+\
+Allowed labels\
+- normal\
+- pickup\
+- multi_measure_rest\
+- uncertain\
+\
+Definitions\
+- normal: regular counted measure\
+- pickup: true incomplete lead-in at the very beginning of the score\
+- A whole note, two half notes, or other sparse-looking content in the first measure is usually a slow full measure, not a pickup. Do not label pickup just because the first measure looks sparse or simple.\
+- multi_measure_rest: a true multi-measure rest with a visible count of 2 or more\
+- uncertain: use when the crop is unclear, ambiguous, or not reliable enough\
+\
+Multi-measure rest guidance\
+- A multi-measure rest has a visible count number above the staff and a rest symbol centered in the measure.\
+- Do NOT require only the modern thick H-bar shape.\
+- The rest symbol may appear in several forms:\
+  - Modern style: one thick horizontal rectangle centered on the middle staff line\
+  - Old style: a horizontal bar plus one or more vertical bars\
+- In the old style, the vertical bars may be short or long, and there may be more than one.\
+- If a clear count number of 2 or more is visible AND an old-style or modern multi-rest symbol is present AND no melodic content is visible, label multi_measure_rest.\
+- A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.\
+- If the count number is clear but the symbol is unclear, return uncertain with maybe_label multi_measure_rest.\
+- If the symbol is present but the count number is cut off or unreadable, return uncertain.\
+- A confident multi_measure_rest label requires a clearly readable count number of 2 or more. Without a visible count number, return uncertain.\
+- A visible count of 1 means the measure is normal, not multi_measure_rest.\
+- A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.\
+- For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count. If one staff has music, no count, or a different count, do not return multi_measure_rest.\
+\
+Conservative rules\
+- A wrong confident answer is worse than uncertain.\
+- Do not invent measures.\
+- Do not skip any provided measure_id.\
+- Do not output labels outside the allowed set.\
+- Only provide rest_count when label is multi_measure_rest.\
+- If label is multi_measure_rest, rest_count must be an integer >= 2.\
+- If label is not multi_measure_rest, rest_count must be null.\
+- If a measure might be a multi-measure rest but the count is unclear, return uncertain.\
+- If a measure might be a pickup but could instead be a slow full measure, ornament, grace-note figure, or unclear fragment, return normal or uncertain, not pickup.\
+- When in doubt between pickup and normal, always choose normal.\
+- If suspicious_auxiliary is true, be extra conservative.\
+\
+Confidence values\
+- high\
+- medium\
+- low\
+\
+Task\
+- Classify every provided measure.\
+- Treat each crop as one measure only.\
+- First-measure crops may include clef, key signature, or time signature context; those are still part of that same one measure.\
+- Return JSON only.\
+- Do not return markdown or explanation text.\
+- Every input measure_id must appear exactly once.\
+\
+Input JSON\
+\{\
+  "job_id": "string",\
+  "systems": [\
+    \{\
+      "system_index": 0,\
+      "suspicious_auxiliary": false,\
+      "measures": [\
+        \{\
+          "measure_id": "string",\
+          "order_index": 0,\
+          "is_first_measure_of_score": true,\
+          "cropped_image_base64": "string"\
+        \}\
+      ]\
+    \}\
+  ]\
+\}\
+\
+Return JSON in this shape\
+\{\
+  "job_id": "string",\
+  "suggestions": [\
+    \{\
+      "measure_id": "string",\
+      "label": "normal | pickup | multi_measure_rest | uncertain",\
+      "rest_count": null,\
+      "confidence": "high | medium | low",\
+      "measure_completeness": "full | incomplete | unclear",\
+      "unclear_reason": "time_signature_not_clear | too_dense_to_count | crop_cut_off | split_may_be_wrong | ornament_or_tie_confusion | not_enough_visual_evidence | null"\
+    \}\
+  ],\
+  "remembered_time_signature_out": "visible meter such as 2/4, 3/4, 4/4, 6/8, common_time, cut_time, or null",\
+  "time_signature_updates": [\
+    \{\
+      "measure_id": "string",\
+      "new_time_signature": "visible meter such as 2/4, 3/4, 4/4, 6/8, common_time, cut_time, or null"\
+    \}\
+  ],\
+  "warnings": [\
+    \{\
+      "type": "auxiliary_staff_suspected | low_confidence_page | missing_measure_id",\
+      "system_index": 0,\
+      "message": "string"\
+    \}\
+  ]\
+\}\
+\
+Validation expectations\
+- Every input measure_id must appear once.\
+- If label = multi_measure_rest, rest_count must be an integer >= 2.\
+- If label != multi_measure_rest, rest_count must be null.\
+- If many measures are hard to classify safely, include a low_confidence_page warning.\
+- If uncertain, do not guess.\
+\
+END OF PROMPT\
+\
+Notes\
+- V1 assumes one measure crop per image and one system per request.\
+- V1 does not depend on backend time-signature extraction.\
+- Pickup logic is intentionally limited to the first measure of the score in V1.\
+- We are not adding a note-value counting lesson yet because the model does not get time-signature data directly.\
+\
+Current Plan Status\
+- Current focus: use the saved per-measure time signature to add later-measure completeness awareness in AI Suggest.\
+- Current AI scope: single staff and piano/grand staff.\
+- Keep it cheap and conservative: one AI prompt per system, no OMR time-signature trust, and no non-first-measure pickup yet.\
+\
+Cloud Shell deploy memory\
+- Deploy from Google Cloud Shell.\
+- Repo path: cd ~/music-omr\
+- Use the known working deploy template.\
+- Use --update-env-vars with --remove-env-vars.\
+- Do not use Mac paths in Cloud Shell.\
+\
+Eventual fixes and follow-up work\
+- Completed: AI Suggest now saves the active time signature for every measure using AI-detected switch points and backend carry-forward logic.\
+- Completed: AI Suggest now saves per-measure completeness and short unclear debug reasons, while still keeping pickup limited until a later step.\
+\
+- Keep full scores out of AI V1 until backend geometry is stronger, then make it work for scores too.\
+- After the single-page layout work is stable, do multipage reliability testing for one-staff PDFs, piano/grand-staff PDFs, and later full scores.\
+- Add better ending handling later, including first/second endings and ending-aware structure logic, as part of a stronger V2.\
+- Add stronger network/SSL/request reliability testing and error handling: retry safe transient failures, show clearer user-facing error messages, and log enough detail to tell app-side vs server-side vs simulator/network issues.\
+- Keep resume/reload behavior reliable.\
+- Add a cancel-run control so the user can stop a bad or unwanted run cleanly.\
+- Improve AI request reliability for long runs.\
+- Allow users to reconnect to their previous job if they didn\'92t finish.\
+- Enable the download of finished PDFs.\
+- Decide backend cleanup / retention policy for old files and previous runs.\
+- Define the 2 types of paying service and their permissions/advantages.\
+- Later pricing idea: cheaper batch-AI plan and pricier fast-AI plan.\
+- Do user interface cleanup, polishing, and beautification after the core AI/backend behavior is solid enough.\
+}

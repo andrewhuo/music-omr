@@ -5234,8 +5234,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         to end: CGPoint,
         color: UIColor,
         foregroundWidth: CGFloat,
-        dotDiameter: CGFloat,
-        dashed: Bool = false
+        dotDiameter: CGFloat
     ) {
         let foregroundLayer = CAShapeLayer()
         let foregroundPath = UIBezierPath()
@@ -5244,9 +5243,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         foregroundLayer.path = foregroundPath.cgPath
         foregroundLayer.strokeColor = color.cgColor
         foregroundLayer.lineWidth = foregroundWidth
-        if dashed {
-            foregroundLayer.lineDashPattern = [5, 4]
-        }
         manualLayer.addSublayer(foregroundLayer)
         addSplitDot(at: CGPoint(x: end.x, y: end.y + 8), color: .systemBlue, diameter: dotDiameter)
     }
@@ -5334,8 +5330,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 to: CGPoint(x: x, y: rect.maxY),
                 color: .systemBlue,
                 foregroundWidth: 2.5,
-                dotDiameter: 4,
-                dashed: true
+                dotDiameter: 4
             )
 
         case .resize(let rowID, _, let startRect, let currentPoint):
@@ -5400,9 +5395,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                         : (box.excludedFromCounting ? EditColorPalette.excluded.stroke : UIColor.systemGreen.withAlphaComponent(0.9))
                     ).cgColor
                     boxLayer.lineWidth = isSelectedBox ? 2.6 : 1.6
-                    if box.excludedFromCounting {
-                        boxLayer.lineDashPattern = [6, 4]
-                    }
                     manualLayer.addSublayer(boxLayer)
                 }
             }
@@ -5464,8 +5456,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 to: CGPoint(x: x, y: rect.maxY),
                 color: .systemBlue,
                 foregroundWidth: 2.5,
-                dotDiameter: 4,
-                dashed: true
+                dotDiameter: 4
             )
         case .resizeAuto(let rowID, _, let startRect, let currentPoint):
             guard let selectedRow = autoRow(for: rowID),
