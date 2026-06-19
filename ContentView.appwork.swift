@@ -192,7 +192,6 @@ private struct EditableState: Decodable {
     let pickup_measures: [String: Bool]?
     let endings: [String: String]?
     let manual_rows: [ManualRowState]?
-    let label_boxes: [LabelBoxState]?
 }
 
 private struct EditColorStyle: Identifiable {
@@ -447,32 +446,6 @@ private struct LabelEraseAreaState: Codable, Hashable, Identifiable, Equatable {
     var rect: ManualRowRect
 }
 
-private struct LabelBoxState: Codable, Hashable, Identifiable, Equatable {
-    let labelID: String
-    let kind: String?
-    let page: Int
-    let text: String
-    let measureID: String?
-    let systemID: String?
-    let defaultRect: ManualRowRect
-    let rect: ManualRowRect
-    let hidden: Bool
-
-    enum CodingKeys: String, CodingKey {
-        case labelID = "label_id"
-        case kind
-        case page
-        case text
-        case measureID = "measure_id"
-        case systemID = "system_id"
-        case defaultRect = "default_rect"
-        case rect
-        case hidden
-    }
-
-    var id: String { labelID }
-}
-
 private struct AutoBoxState: Codable, Hashable, Identifiable {
     var measureID: String
     var left: Double
@@ -523,7 +496,6 @@ private struct ManualEditorState: Equatable {
     let rows: [ManualRowState]
     let selection: ManualSelectionState?
     let pendingLabelEraseArea: LabelEraseAreaState?
-    let selectedLabelBox: LabelBoxState?
 }
 
 private struct AutoEditorState: Equatable {
@@ -564,7 +536,6 @@ private struct RelabelEdit: Encodable {
     let rows: [ManualRowState]?
     let autoRows: [AutoRowState]?
     let rect: ManualRowRect?
-    let labelID: String?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -574,7 +545,6 @@ private struct RelabelEdit: Encodable {
         case page
         case rows
         case rect
-        case label_id
     }
 
     init(
@@ -587,8 +557,7 @@ private struct RelabelEdit: Encodable {
         page: Int? = nil,
         rows: [ManualRowState]? = nil,
         autoRows: [AutoRowState]? = nil,
-        rect: ManualRowRect? = nil,
-        labelID: String? = nil
+        rect: ManualRowRect? = nil
     ) {
         self.type = type
         self.system_id = system_id
@@ -600,7 +569,6 @@ private struct RelabelEdit: Encodable {
         self.rows = rows
         self.autoRows = autoRows
         self.rect = rect
-        self.labelID = labelID
     }
 
     func encode(to encoder: Encoder) throws {
@@ -629,9 +597,6 @@ private struct RelabelEdit: Encodable {
         }
         if let rect {
             try container.encode(rect, forKey: .rect)
-        }
-        if let labelID {
-            try container.encode(labelID, forKey: .label_id)
         }
     }
 }
@@ -665,7 +630,6 @@ private struct RenderSnapshot {
     let labelsMode: LabelsMode
     let systems: [SystemState]
     let measures: [MeasureState]
-    let labelBoxes: [LabelBoxState]
     let measureNumberOverrideIDs: Set<String>
     let restAnchorIDs: Set<String>
     let pickupAnchorIDs: Set<String>
@@ -731,7 +695,6 @@ struct ContentView: View {
 
     @State private var systems: [SystemState] = []
     @State private var measures: [MeasureState] = []
-    @State private var labelBoxes: [LabelBoxState] = []
     @State private var labelsMode: LabelsMode = .allMeasures
     @State private var overlayGeometryWarning: String = ""
 
@@ -761,7 +724,6 @@ struct ContentView: View {
     @State private var autoSelection: AutoSelectionState?
     @State private var pendingManualFixDelete: PendingManualFixDelete?
     @State private var pendingLabelEraseArea: LabelEraseAreaState?
-    @State private var selectedLabelBox: LabelBoxState?
     @State private var currentVisiblePDFPage: Int = 1
     @State private var pendingAutoScrollToTools = false
     @State private var pendingAutoScrollToPDF = false
@@ -1188,7 +1150,6 @@ struct ContentView: View {
                     preserveViewport: snapshot.preserveViewport,
                     systems: snapshot.systems,
                     measures: snapshot.measures,
-                    labelBoxes: snapshot.labelBoxes,
                     measureNumberOverrideIDs: snapshot.measureNumberOverrideIDs,
                     restAnchorIDs: snapshot.restAnchorIDs,
                     pickupAnchorIDs: snapshot.pickupAnchorIDs,
@@ -1234,15 +1195,6 @@ struct ContentView: View {
                     onLabelEraseAreaChange: { area in
                         DispatchQueue.main.async {
                             pendingLabelEraseArea = area
-                            selectedLabelBox = nil
-                            manualSelection = nil
-                            autoSelection = nil
-                        }
-                    },
-                    onLabelBoxSelectionChange: { box in
-                        DispatchQueue.main.async {
-                            selectedLabelBox = box
-                            pendingLabelEraseArea = nil
                             manualSelection = nil
                             autoSelection = nil
                         }
@@ -1551,10 +1503,8 @@ struct ContentView: View {
         }
 
         if manualFixTool == .delete {
-            Button((selectedLabelBox == nil && pendingLabelEraseArea == nil) ? "Delete" : "Remove Label") {
-                if selectedLabelBox != nil {
-                    Task { await hideSelectedLabelBox() }
-                } else if pendingLabelEraseArea != nil {
+            Button(pendingLabelEraseArea == nil ? "Delete" : "Remove Label") {
+                if pendingLabelEraseArea != nil {
                     Task { await removeSelectedLabelArea() }
                 } else {
                     requestManualFixDelete()
@@ -1562,7 +1512,7 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(isBusy || (!canDeleteCurrentSelection && pendingLabelEraseArea == nil && selectedLabelBox == nil))
+            .disabled(isBusy || (!canDeleteCurrentSelection && pendingLabelEraseArea == nil))
         }
 
         if manualFixTool == .exclude {
@@ -1746,8 +1696,7 @@ struct ContentView: View {
                 defaultStaffKind: manualStaffKind,
                 rows: manualDraftRows,
                 selection: manualSelection,
-                pendingLabelEraseArea: pendingLabelEraseArea,
-                selectedLabelBox: selectedLabelBox
+                pendingLabelEraseArea: pendingLabelEraseArea
             )
         case .exclude:
             return nil
@@ -1866,7 +1815,6 @@ struct ContentView: View {
         manualSelection = nil
         autoSelection = nil
         pendingLabelEraseArea = nil
-        selectedLabelBox = nil
         manualFixTool = .addRow
         activeEditTool = .manualFix
         pendingAutoScrollToPDF = true
@@ -1880,7 +1828,6 @@ struct ContentView: View {
         autoSelection = nil
         pendingManualFixDelete = nil
         pendingLabelEraseArea = nil
-        selectedLabelBox = nil
         manualFixTool = .addRow
         activeEditTool = .none
     }
@@ -2083,7 +2030,6 @@ struct ContentView: View {
         pendingManualFixDelete = nil
         if tool != .delete {
             pendingLabelEraseArea = nil
-            selectedLabelBox = nil
         }
         if tool == .exclude {
             manualSelection = nil
@@ -2268,81 +2214,6 @@ struct ContentView: View {
                 preserveViewport: true
             )
 
-            pendingLabelEraseArea = nil
-            manualDraftPage = max(1, currentVisiblePDFPage)
-            manualDraftRows = savedManualRowsForPage(manualDraftPage ?? currentVisiblePDFPage)
-            autoDraftRows = savedAutoRowsForPage(manualDraftPage ?? currentVisiblePDFPage)
-            manualSelection = nil
-            autoSelection = nil
-            activeEditTool = .manualFix
-            phase = .ready
-            detailNote = "Label removed"
-        } catch is CancellationError {
-            return
-        } catch {
-            phase = .failed
-            detailNote = error.localizedDescription
-            actionError = error.localizedDescription
-        }
-    }
-
-    private func hideSelectedLabelBox() async {
-        guard let jobID = currentJobID else {
-            actionError = "No active job"
-            return
-        }
-        guard let labelBox = selectedLabelBox else {
-            actionError = "Tap a label first"
-            return
-        }
-        guard !isBusy else { return }
-        let token = activeJobToken
-
-        isBusy = true
-        defer { isBusy = false }
-
-        do {
-            detailNote = "Removing label..."
-            let relabel = try await apiRelabel(
-                jobID: jobID,
-                edits: [
-                    RelabelEdit(
-                        type: "hide_label",
-                        labelID: labelBox.labelID
-                    )
-                ]
-            )
-            guard isTokenCurrent(token, expectedJobID: jobID) else { return }
-            try validateRelabelOutcome(relabel)
-
-            let newURL = relabel.artifacts_http?.audiveris_out_corrected_pdf?.nonEmpty
-                ?? relabel.artifacts_http?.audiveris_out_pdf?.nonEmpty
-                ?? correctedPDFURL
-                ?? baselinePDFURL
-
-            guard let finalURL = newURL else {
-                throw LocalError("Rendered PDF not ready")
-            }
-
-            let pdfData = try await downloadPDF(urlString: finalURL)
-            guard isTokenCurrent(token, expectedJobID: jobID) else { return }
-            correctedPDFURL = relabel.artifacts_http?.audiveris_out_corrected_pdf ?? correctedPDFURL
-
-            let state = try await apiFetchState(jobID: jobID)
-            guard isTokenCurrent(token, expectedJobID: jobID) else { return }
-            commitRenderSnapshot(
-                jobID: jobID,
-                runID: currentRunID,
-                pdfData: pdfData,
-                editable: state.editable_state,
-                aiSuggestions: state.ai_suggestions,
-                aiSuggestRun: state.ai_suggest_run,
-                labelsMode: labelsModeFromState(state),
-                token: token,
-                preserveViewport: true
-            )
-
-            selectedLabelBox = nil
             pendingLabelEraseArea = nil
             manualDraftPage = max(1, currentVisiblePDFPage)
             manualDraftRows = savedManualRowsForPage(manualDraftPage ?? currentVisiblePDFPage)
@@ -3510,7 +3381,6 @@ struct ContentView: View {
             labelsMode: labelsMode,
             systems: editable.systems,
             measures: normalizedMeasures,
-            labelBoxes: editable.label_boxes ?? [],
             measureNumberOverrideIDs: overrideIDs,
             restAnchorIDs: Set(normalizedRestCounts.keys),
             pickupAnchorIDs: normalizedPickupIDs,
@@ -3523,7 +3393,6 @@ struct ContentView: View {
         currentRunID = snapshot.runID
         systems = snapshot.systems
         measures = snapshot.measures
-        labelBoxes = snapshot.labelBoxes
         measureNumberOverrideValues = normalizedMeasureOverrides
         restMeasureCounts = normalizedRestCounts
         pickupMeasureIDs = normalizedPickupIDs
@@ -4140,7 +4009,6 @@ struct ContentView: View {
         drawnOverlayCount = 0
         systems = []
         measures = []
-        labelBoxes = []
         labelsMode = .allMeasures
         measureNumberOverrideValues = [:]
         restMeasureCounts = [:]
@@ -4155,7 +4023,6 @@ struct ContentView: View {
         autoSelection = nil
         pendingManualFixDelete = nil
         pendingLabelEraseArea = nil
-        selectedLabelBox = nil
         currentVisiblePDFPage = 1
         aiSuggestions = nil
         aiSuggestRun = nil
@@ -4189,7 +4056,6 @@ struct ContentView: View {
         drawnOverlayCount = 0
         systems = []
         measures = []
-        labelBoxes = []
         labelsMode = .allMeasures
         measureNumberOverrideValues = [:]
         restMeasureCounts = [:]
@@ -4204,7 +4070,6 @@ struct ContentView: View {
         autoSelection = nil
         pendingManualFixDelete = nil
         pendingLabelEraseArea = nil
-        selectedLabelBox = nil
         currentVisiblePDFPage = 1
         aiSuggestions = nil
         aiSuggestRun = nil
@@ -4522,7 +4387,6 @@ private struct PDFOverlayContainer: UIViewRepresentable {
     let preserveViewport: Bool
     let systems: [SystemState]
     let measures: [MeasureState]
-    let labelBoxes: [LabelBoxState]
     let measureNumberOverrideIDs: Set<String>
     let restAnchorIDs: Set<String>
     let pickupAnchorIDs: Set<String>
@@ -4542,7 +4406,6 @@ private struct PDFOverlayContainer: UIViewRepresentable {
     let onAutoRowsChange: ([AutoRowState]) -> Void
     let onAutoSelectionChange: (AutoSelectionState?) -> Void
     let onLabelEraseAreaChange: (LabelEraseAreaState?) -> Void
-    let onLabelBoxSelectionChange: (LabelBoxState?) -> Void
     let onSelectMeasure: (MeasureState) -> Void
 
     func makeUIView(context: Context) -> OverlayPDFView {
@@ -4555,7 +4418,6 @@ private struct PDFOverlayContainer: UIViewRepresentable {
         view.onAutoRowsChange = onAutoRowsChange
         view.onAutoSelectionChange = onAutoSelectionChange
         view.onLabelEraseAreaChange = onLabelEraseAreaChange
-        view.onLabelBoxSelectionChange = onLabelBoxSelectionChange
         return view
     }
 
@@ -4568,7 +4430,6 @@ private struct PDFOverlayContainer: UIViewRepresentable {
         uiView.onAutoRowsChange = onAutoRowsChange
         uiView.onAutoSelectionChange = onAutoSelectionChange
         uiView.onLabelEraseAreaChange = onLabelEraseAreaChange
-        uiView.onLabelBoxSelectionChange = onLabelBoxSelectionChange
         uiView.update(
             pdfData: pdfData,
             snapshotToken: snapshotToken,
@@ -4576,7 +4437,6 @@ private struct PDFOverlayContainer: UIViewRepresentable {
             preserveViewport: preserveViewport,
             systems: systems,
             measures: measures,
-            labelBoxes: labelBoxes,
             measureNumberOverrideIDs: measureNumberOverrideIDs,
             restAnchorIDs: restAnchorIDs,
             pickupAnchorIDs: pickupAnchorIDs,
@@ -4635,7 +4495,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
     private var currentSnapshotToken: UUID = UUID()
     private var currentDocumentLoadID: UUID = UUID()
     private var currentMeasures: [MeasureState] = []
-    private var currentLabelBoxes: [LabelBoxState] = []
     private var currentMeasureNumberOverrideIDs: Set<String> = []
     private var currentRestAnchorIDs: Set<String> = []
     private var currentPickupAnchorIDs: Set<String> = []
@@ -4662,7 +4521,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
     var onAutoRowsChange: (([AutoRowState]) -> Void)?
     var onAutoSelectionChange: ((AutoSelectionState?) -> Void)?
     var onLabelEraseAreaChange: ((LabelEraseAreaState?) -> Void)?
-    var onLabelBoxSelectionChange: ((LabelBoxState?) -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -4738,7 +4596,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         preserveViewport: Bool,
         systems: [SystemState],
         measures: [MeasureState],
-        labelBoxes: [LabelBoxState],
         measureNumberOverrideIDs: Set<String>,
         restAnchorIDs: Set<String>,
         pickupAnchorIDs: Set<String>,
@@ -4769,7 +4626,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             }
         }
         currentMeasures = measures
-        currentLabelBoxes = labelBoxes
         currentMeasureNumberOverrideIDs = measureNumberOverrideIDs
         currentRestAnchorIDs = restAnchorIDs
         currentPickupAnchorIDs = pickupAnchorIDs
@@ -5604,55 +5460,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         )
     }
 
-    private func labelBoxPageRect(_ box: LabelBoxState, in page: PDFPage) -> CGRect? {
-        normalizedPageRect(
-            pageBounds: page.bounds(for: .mediaBox),
-            xLeft: CGFloat(box.rect.left),
-            xRight: CGFloat(box.rect.right),
-            yTop: CGFloat(box.rect.top),
-            yBottom: CGFloat(box.rect.bottom),
-            minimumSpan: 4
-        )
-    }
-
-    private func labelBoxDocumentRect(_ box: LabelBoxState, page: PDFPage, documentView: UIView) -> CGRect? {
-        guard let pageRect = labelBoxPageRect(box, in: page) else { return nil }
-        let viewRect = pdfView.convert(pageRect, from: page)
-        let docRect = documentView.convert(viewRect, from: pdfView)
-        guard docRect.width > 0, docRect.height > 0 else { return nil }
-        return docRect
-    }
-
-    private func labelBoxAtDocumentPoint(_ point: CGPoint, documentView: UIView) -> LabelBoxState? {
-        guard let manualEditor = currentManualEditor,
-              manualEditor.tool == .delete,
-              let document = pdfView.document else { return nil }
-        for box in currentLabelBoxes.reversed() {
-            guard box.page == manualEditor.activePage, box.hidden == false else { continue }
-            let pageIndex = max(0, box.page - 1)
-            guard let page = document.page(at: pageIndex),
-                  let rect = labelBoxDocumentRect(box, page: page, documentView: documentView) else { continue }
-            if rect.insetBy(dx: -8, dy: -8).contains(point) {
-                return box
-            }
-        }
-        return nil
-    }
-
-    private func drawSelectedLabelBox(in documentView: UIView) {
-        guard let box = currentManualEditor?.selectedLabelBox,
-              let document = pdfView.document,
-              let page = document.page(at: max(0, box.page - 1)),
-              let rect = labelBoxDocumentRect(box, page: page, documentView: documentView) else { return }
-        let layer = CAShapeLayer()
-        layer.frame = rect
-        layer.path = UIBezierPath(roundedRect: layer.bounds, cornerRadius: 2).cgPath
-        layer.fillColor = UIColor.systemBlue.withAlphaComponent(0.16).cgColor
-        layer.strokeColor = UIColor.systemBlue.withAlphaComponent(0.95).cgColor
-        layer.lineWidth = 2.0
-        manualLayer.addSublayer(layer)
-    }
-
     private func labelEraseDocumentRect(_ area: LabelEraseAreaState, page: PDFPage, documentView: UIView) -> CGRect? {
         guard let pageRect = labelErasePageRect(area, in: page) else { return nil }
         let viewRect = pdfView.convert(pageRect, from: page)
@@ -6116,7 +5923,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         drawAutoRows(in: documentView)
         drawAutoPreview(in: documentView)
         drawManualRows(in: documentView)
-        drawSelectedLabelBox(in: documentView)
         drawPendingLabelEraseArea(in: documentView)
         drawManualPreview(in: documentView)
         notifyVisiblePageIfNeeded()
@@ -6159,36 +5965,25 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                     return
                 }
             case .delete:
-                if let labelBox = labelBoxAtDocumentPoint(tap, documentView: documentView) {
-                    onLabelBoxSelectionChange?(labelBox)
-                    onLabelEraseAreaChange?(nil)
-                    onManualSelectionChange?(nil)
-                    onAutoSelectionChange?(nil)
-                    return
-                }
                 if let cutSelection = manualCutSelectionAtDocumentPoint(tap, documentView: documentView) {
-                    onLabelBoxSelectionChange?(nil)
                     onLabelEraseAreaChange?(nil)
                     onManualSelectionChange?(cutSelection)
                     onAutoSelectionChange?(nil)
                     return
                 }
                 if let row = manualRowAtDocumentPoint(tap, documentView: documentView) {
-                    onLabelBoxSelectionChange?(nil)
                     onLabelEraseAreaChange?(nil)
                     onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
                     onAutoSelectionChange?(nil)
                     return
                 }
                 if let splitSelection = autoSplitSelectionAtDocumentPoint(tap, documentView: documentView) {
-                    onLabelBoxSelectionChange?(nil)
                     onLabelEraseAreaChange?(nil)
                     onAutoSelectionChange?(splitSelection)
                     onManualSelectionChange?(nil)
                     return
                 }
                 if let boxSelection = autoBoxSelectionAtDocumentPoint(tap, documentView: documentView) {
-                    onLabelBoxSelectionChange?(nil)
                     onLabelEraseAreaChange?(nil)
                     onAutoSelectionChange?(boxSelection)
                     onManualSelectionChange?(nil)
@@ -6196,11 +5991,9 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 }
                 guard let area = labelEraseAreaFromTap(tap, documentView: documentView),
                       area.page == currentManualEditor?.activePage else {
-                    onLabelBoxSelectionChange?(nil)
                     onLabelEraseAreaChange?(nil)
                     return
                 }
-                onLabelBoxSelectionChange?(nil)
                 onLabelEraseAreaChange?(area)
                 onManualSelectionChange?(nil)
                 onAutoSelectionChange?(nil)
