@@ -876,6 +876,7 @@ def _editable_state_version(editable_state: dict) -> str:
         "rest_systems": editable_state.get("rest_systems") or {},
         "endings": editable_state.get("endings") or {},
         "label_erase_areas": editable_state.get("label_erase_areas") or [],
+        "label_edits": editable_state.get("label_edits") or {},
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
@@ -977,6 +978,42 @@ def _editable_label_erase_areas(editable_state: dict) -> list[dict]:
         cleaned.append(area)
 
     editable_state["label_erase_areas"] = cleaned
+    return cleaned
+
+
+def _rect_dict_from_fitz(rect) -> dict:
+    return {
+        "left": float(rect.x0),
+        "right": float(rect.x1),
+        "top": float(rect.y0),
+        "bottom": float(rect.y1),
+    }
+
+
+def _editable_label_edits(editable_state: dict) -> dict[str, dict]:
+    raw = editable_state.get("label_edits")
+    if not isinstance(raw, dict):
+        editable_state["label_edits"] = {}
+        return {}
+    cleaned: dict[str, dict] = {}
+    for raw_id, raw_edit in raw.items():
+        label_id = str(raw_id or "").strip()
+        if not label_id or not isinstance(raw_edit, dict):
+            continue
+        entry: dict = {}
+        if _safe_bool(raw_edit.get("hidden"), False):
+            entry["hidden"] = True
+        normalized_rect_area = (
+            _normalize_label_erase_area({"page": 1, "rect": raw_edit.get("rect")})
+            if isinstance(raw_edit.get("rect"), dict)
+            else None
+        )
+        rect = normalized_rect_area.get("rect") if isinstance(normalized_rect_area, dict) else None
+        if isinstance(rect, dict):
+            entry["rect"] = rect
+        if entry:
+            cleaned[label_id] = entry
+    editable_state["label_edits"] = cleaned
     return cleaned
 
 
@@ -3673,6 +3710,35 @@ def _draw_measure_label_left_barline(page: fitz.Page, page_rect: fitz.Rect, x_le
     page.insert_text((x_text, y_text), text, fontsize=MEASURE_TEXT_SIZE, color=MEASURE_TEXT_COLOR)
 
 
+def _measure_label_left_barline_geometry(page_rect: fitz.Rect, x_left: float, y_top: float, text: str) -> tuple[fitz.Rect, tuple[float, float]]:
+    tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
+    x_text = min(max(0.0, float(x_left) + 1.0), max(0.0, float(page_rect.width) - tw - 2.0))
+    y_text = max(MEASURE_TEXT_SIZE + 2.0, float(y_top) - MEASURE_TEXT_Y_OFFSET)
+    y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, float(page_rect.height) - 2.0))
+    th = float(MEASURE_TEXT_SIZE + 2.0)
+    bg = fitz.Rect(x_text - 1.0, y_text - th + 1.0, x_text + tw + 1.0, y_text + 1.0)
+    x0 = max(0.0, min(bg.x0, page_rect.width))
+    y0 = max(0.0, min(bg.y0, page_rect.height))
+    x1 = max(0.0, min(bg.x1, page_rect.width))
+    y1 = max(0.0, min(bg.y1, page_rect.height))
+    return fitz.Rect(x0, y0, x1, y1), (x_text, y_text)
+
+
+def _draw_measure_label_at_rect(page: fitz.Page, page_rect: fitz.Rect, rect: dict, text: str) -> bool:
+    try:
+        x0 = max(0.0, min(float(rect.get("left")), float(page_rect.width)))
+        y0 = max(0.0, min(float(rect.get("top")), float(page_rect.height)))
+        x1 = max(0.0, min(float(rect.get("right")), float(page_rect.width)))
+        y1 = max(0.0, min(float(rect.get("bottom")), float(page_rect.height)))
+    except Exception:
+        return False
+    if x1 <= x0 or y1 <= y0:
+        return False
+    page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
+    page.insert_text((x0 + 1.0, y1 - 1.0), text, fontsize=MEASURE_TEXT_SIZE, color=MEASURE_TEXT_COLOR)
+    return True
+
+
 def _erase_label_area(page: fitz.Page, page_rect: fitz.Rect, area: dict) -> bool:
     if not isinstance(area, dict):
         return False
@@ -3694,6 +3760,102 @@ def _erase_label_area(page: fitz.Page, page_rect: fitz.Rect, area: dict) -> bool
         return False
     page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
     return True
+
+
+def _label_box_id(kind: str, measure_id: str, system_id: str = "") -> str:
+    safe_mid = _normalize_artifact_key(measure_id) or "measure"
+    safe_sid = _normalize_artifact_key(system_id) or "system"
+    return f"{kind}:{safe_sid}:{safe_mid}"
+
+
+def _build_label_box(kind: str, measure: dict, label: str, rect, current_rect: dict | None = None, hidden: bool = False) -> dict:
+    measure_id = str(measure.get("measure_id") or "").strip()
+    system_id = str(measure.get("system_id") or "").strip()
+    page = _safe_int(measure.get("page"), 0)
+    default_rect = _rect_dict_from_fitz(rect)
+    return {
+        "label_id": _label_box_id(kind, measure_id, system_id),
+        "kind": kind,
+        "page": int(page),
+        "text": str(label),
+        "measure_id": measure_id,
+        "system_id": system_id,
+        "default_rect": default_rect,
+        "rect": current_rect if isinstance(current_rect, dict) else default_rect,
+        "hidden": bool(hidden),
+    }
+
+
+def _compute_label_boxes_for_state(
+    systems: list[dict],
+    measures: list[dict],
+    labels_mode: str,
+    editable_state: dict | None,
+    page_rect_by_page: dict[int, fitz.Rect] | None = None,
+) -> list[dict]:
+    editable_state = editable_state or {}
+    page_rect_by_page = page_rect_by_page or {}
+    label_edits = _editable_label_edits(editable_state)
+    sorted_systems, ordered_measures, result_labels, _ = _recompute_measure_numbering(
+        systems,
+        measures,
+        editable_state,
+    )
+    boxes: list[dict] = []
+    label_rows: list[tuple[str, dict, str]] = []
+    if labels_mode == LABELS_MODE_ALL_MEASURES:
+        for measure in ordered_measures:
+            mid = str(measure.get("measure_id") or "").strip()
+            label = str(result_labels.get(mid) or "").strip()
+            if label:
+                label_rows.append(("current", measure, label))
+    else:
+        for measure, label in _system_start_anchor_measures(ordered_measures, result_labels, sorted_systems):
+            if str(label or "").strip():
+                label_rows.append(("current", measure, str(label)))
+
+    for kind, measure, label in label_rows:
+        page_no = _safe_int(measure.get("page"), 0)
+        page_rect = page_rect_by_page.get(page_no) or fitz.Rect(0, 0, 612, 792)
+        try:
+            x_left = float(measure.get("x_left"))
+            y_top = float(measure.get("y_top"))
+        except Exception:
+            continue
+        default_rect, _ = _measure_label_left_barline_geometry(page_rect, x_left, y_top, label)
+        label_id = _label_box_id(kind, str(measure.get("measure_id") or ""), str(measure.get("system_id") or ""))
+        edit = label_edits.get(label_id) or {}
+        boxes.append(_build_label_box(kind, measure, label, default_rect, edit.get("rect"), _safe_bool(edit.get("hidden"), False)))
+
+    first_measure_by_system: dict[str, dict] = {}
+    for measure in ordered_measures:
+        sid = str(measure.get("system_id") or "").strip()
+        if sid and sid not in first_measure_by_system:
+            first_measure_by_system[sid] = measure
+    for system in sorted_systems:
+        sid = str(system.get("system_id") or "").strip()
+        measure = first_measure_by_system.get(sid)
+        anchor = system.get("anchor") if isinstance(system, dict) else {}
+        label = str(system.get("current_value") or system.get("value") or "").strip()
+        if not isinstance(measure, dict) or not isinstance(anchor, dict) or not label:
+            continue
+        page_no = _safe_int(system.get("page"), _safe_int(measure.get("page"), 0))
+        page_rect = page_rect_by_page.get(page_no) or fitz.Rect(0, 0, 612, 792)
+        try:
+            x_anchor = float(anchor.get("x"))
+            y_top = float(anchor.get("y_top"))
+            x_text, y_text, tw = _label_position(x_anchor, y_top, float(page_rect.width), float(page_rect.height), label)
+            th = float(MEASURE_TEXT_SIZE + 2.0)
+            rect = fitz.Rect(x_text - 2.0, y_text - th, x_text + tw + 2.0, y_text + 2.0)
+        except Exception:
+            continue
+        legacy_measure = dict(measure)
+        legacy_measure["page"] = page_no
+        label_id = _label_box_id("legacy", str(legacy_measure.get("measure_id") or ""), sid)
+        edit = label_edits.get(label_id) or {}
+        boxes.append(_build_label_box("legacy", legacy_measure, label, rect, edit.get("rect"), _safe_bool(edit.get("hidden"), False)))
+
+    return boxes
 
 
 def _run_public_status(run: dict) -> str:
@@ -5201,6 +5363,39 @@ def _apply_remove_label_area_edit(
     applied.append({"type": "remove_label_area", "page": area["page"], "rect": rect})
 
 
+def _apply_hide_label_edit(raw_edit: dict, editable_state: dict, applied: list[dict], rejected: list[dict]) -> None:
+    label_id = str(raw_edit.get("label_id") or "").strip()
+    if not label_id:
+        rejected.append({"edit": raw_edit, "reason": "missing_label_id"})
+        return
+    label_edits = _editable_label_edits(editable_state)
+    entry = dict(label_edits.get(label_id) or {})
+    entry["hidden"] = True
+    label_edits[label_id] = entry
+    editable_state["label_edits"] = label_edits
+    applied.append({"type": "hide_label", "label_id": label_id})
+
+
+def _apply_move_label_edit(raw_edit: dict, editable_state: dict, applied: list[dict], rejected: list[dict]) -> None:
+    label_id = str(raw_edit.get("label_id") or "").strip()
+    rect = raw_edit.get("rect")
+    parsed = _parse_manual_row_rect(rect if isinstance(rect, dict) else None)
+    if not label_id:
+        rejected.append({"edit": raw_edit, "reason": "missing_label_id"})
+        return
+    if parsed is None:
+        rejected.append({"edit": raw_edit, "reason": "invalid_label_rect"})
+        return
+    left, right, top, bottom = parsed
+    label_edits = _editable_label_edits(editable_state)
+    entry = dict(label_edits.get(label_id) or {})
+    entry["hidden"] = False
+    entry["rect"] = {"left": float(left), "right": float(right), "top": float(top), "bottom": float(bottom)}
+    label_edits[label_id] = entry
+    editable_state["label_edits"] = label_edits
+    applied.append({"type": "move_label", "label_id": label_id, "rect": entry["rect"]})
+
+
 def _apply_relabel_edits(
     editable_state: dict,
     edits: list[dict],
@@ -5294,11 +5489,20 @@ def _apply_relabel_edits(
             _apply_remove_label_area_edit(raw_edit, editable_state, applied, rejected)
             continue
 
+        if edit_type == "hide_label":
+            _apply_hide_label_edit(raw_edit, editable_state, applied, rejected)
+            continue
+
+        if edit_type == "move_label":
+            _apply_move_label_edit(raw_edit, editable_state, applied, rejected)
+            continue
+
         rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
 
     editable_state["measure_number_overrides"] = measure_overrides
     editable_state["labels_mode"] = labels_mode
     _editable_label_erase_areas(editable_state)
+    _editable_label_edits(editable_state)
     systems, measures, _, _ = _refresh_editable_state_systems_and_measures(
         editable_state,
         ending_debug_ctx=ending_debug_ctx,
@@ -5353,44 +5557,31 @@ def _render_corrected_pdf(
         page = doc[page_no - 1]
         _erase_label_area(page, page.rect, area)
 
-    sorted_systems, ordered_measures, result_labels, _ = _recompute_measure_numbering(
+    page_rect_by_page = {idx + 1: doc[idx].rect for idx in range(doc.page_count)}
+    label_boxes = _compute_label_boxes_for_state(
         systems,
         measures,
+        labels_mode,
         editable_state,
+        page_rect_by_page=page_rect_by_page,
     )
+    editable_state["label_boxes"] = label_boxes
 
-    if labels_mode == LABELS_MODE_ALL_MEASURES:
-        # Draw every measure with its computed label
-        for measure in ordered_measures:
-            mid = str(measure.get("measure_id") or "").strip()
-            page_no = _safe_int(measure.get("page"), 0)
-            if page_no <= 0 or page_no > doc.page_count:
-                continue
-            label = result_labels.get(mid)
-            if not label:
-                continue
-            try:
-                x_left = float(measure.get("x_left"))
-                y_top = float(measure.get("y_top"))
-            except Exception:
-                continue
-            page = doc[page_no - 1]
-            _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
-            drawn += 1
-    else:
-        # Staff-start mode reuses the same computed measure labels, but only
-        # draws the first visible numbered measure on each system.
-        for measure, label in _system_start_anchor_measures(ordered_measures, result_labels, sorted_systems):
-            page_no = _safe_int(measure.get("page"), 0)
-            if page_no <= 0 or page_no > doc.page_count:
-                continue
-            try:
-                x_left = float(measure.get("x_left"))
-                y_top = float(measure.get("y_top"))
-            except Exception:
-                continue
-            page = doc[page_no - 1]
-            _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
+    for box in label_boxes:
+        page_no = _safe_int(box.get("page"), 0)
+        if page_no <= 0 or page_no > doc.page_count:
+            continue
+        page = doc[page_no - 1]
+        default_rect = box.get("default_rect")
+        if isinstance(default_rect, dict):
+            _erase_label_area(page, page.rect, {"page": page_no, "rect": default_rect})
+        if _safe_bool(box.get("hidden"), False):
+            continue
+        if str(box.get("kind") or "") != "current":
+            continue
+        rect = box.get("rect")
+        text = str(box.get("text") or "").strip()
+        if isinstance(rect, dict) and text and _draw_measure_label_at_rect(page, page.rect, rect, text):
             drawn += 1
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -5680,6 +5871,15 @@ def get_job_state(job_id: str):
     systems, measures, reassign_count, qa = _refresh_editable_state_systems_and_measures(editable_state)
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
+    label_boxes = editable_state.get("label_boxes")
+    if not isinstance(label_boxes, list):
+        label_boxes = _compute_label_boxes_for_state(
+            systems,
+            measures,
+            str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
+            editable_state,
+        )
+        editable_state["label_boxes"] = label_boxes
 
     response = {
         "job_id": job_id,
@@ -5693,6 +5893,8 @@ def get_job_state(job_id: str):
             "rest_measures": editable_state.get("rest_measures") or {},
             "pickup_measures": editable_state.get("pickup_measures") or {},
             "label_erase_areas": _editable_label_erase_areas(editable_state),
+            "label_edits": _editable_label_edits(editable_state),
+            "label_boxes": label_boxes,
             "rest_systems": editable_state.get("rest_systems") or {},
             "qa": qa,
             "systems": systems,

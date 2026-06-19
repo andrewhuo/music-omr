@@ -203,6 +203,29 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual([row.get("reason") for row in rejected], ["invalid_label_erase_area", "invalid_label_erase_area", "invalid_label_erase_area"])
         self.assertEqual(state.get("label_erase_areas"), [])
 
+    def test_hide_label_persists(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "hide_label", "label_id": "current:p1_s0:p1_s0_m0"}],
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "hide_label", "label_id": "current:p1_s0:p1_s0_m0"}])
+        self.assertEqual(state.get("label_edits"), {"current:p1_s0:p1_s0_m0": {"hidden": True}})
+
+    def test_move_label_persists(self):
+        state = self._sample_state()
+        rect = {"left": 12, "right": 30, "top": 4, "bottom": 18}
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "move_label", "label_id": "current:p1_s0:p1_s0_m0", "rect": rect}],
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied[0].get("type"), "move_label")
+        self.assertEqual(state.get("label_edits"), {"current:p1_s0:p1_s0_m0": {"rect": {k: float(v) for k, v in rect.items()}}})
+
     def test_measure_anchor_reflows_forward(self):
         state = self._sample_state()
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(
