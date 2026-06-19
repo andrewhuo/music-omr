@@ -5361,7 +5361,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
     private func addSplitDot(
         at center: CGPoint,
         color: UIColor = .systemBlue,
-        diameter: CGFloat = 4
+        diameter: CGFloat = 6
     ) {
         let dotLayer = CAShapeLayer()
         let dotRect = CGRect(
@@ -5422,7 +5422,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                     to: CGPoint(x: x, y: rect.maxY),
                     color: isSelectedCut ? .systemBlue : .systemGreen,
                     foregroundWidth: isSelectedCut ? 3.0 : 2.0,
-                    dotDiameter: isSelectedCut ? 5 : 4
+                    dotDiameter: 6
                 )
             }
 
@@ -5512,7 +5512,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 to: CGPoint(x: x, y: rect.maxY),
                 color: .systemBlue,
                 foregroundWidth: 2.5,
-                dotDiameter: 4
+                dotDiameter: 6
             )
 
         case .resize(let rowID, _, let startRect, let currentPoint):
@@ -5592,7 +5592,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                         to: CGPoint(x: x, y: rect.maxY),
                         color: isSelectedCut ? .systemBlue : .systemGreen,
                         foregroundWidth: isSelectedCut ? 3.0 : 2.0,
-                        dotDiameter: isSelectedCut ? 5 : 4
+                        dotDiameter: 6
                     )
                 }
             }
@@ -5638,7 +5638,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 to: CGPoint(x: x, y: rect.maxY),
                 color: .systemBlue,
                 foregroundWidth: 2.5,
-                dotDiameter: 4
+                dotDiameter: 6
             )
         case .resizeAuto(let rowID, _, let startRect, let currentPoint):
             guard let selectedRow = autoRow(for: rowID),
@@ -5877,7 +5877,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             guard sortedRects.count > 1 else { continue }
             for rect in sortedRects.dropFirst() {
                 let dotLayer = CAShapeLayer()
-                let diameter: CGFloat = 4
+                let diameter: CGFloat = 6
                 let center = CGPoint(x: rect.minX, y: rect.maxY + 8)
                 let dotRect = CGRect(
                     x: center.x - (diameter / 2),
