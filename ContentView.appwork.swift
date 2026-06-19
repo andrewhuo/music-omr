@@ -401,7 +401,6 @@ private enum ManualFixTool: String, CaseIterable, Identifiable {
     case resizeRow
     case delete
     case exclude
-    case removeLabel
 
     var id: String { rawValue }
 
@@ -412,7 +411,6 @@ private enum ManualFixTool: String, CaseIterable, Identifiable {
         case .resizeRow: return "Resize Row"
         case .delete: return "Delete"
         case .exclude: return "Exclude"
-        case .removeLabel: return "Remove Label"
         }
     }
 }
@@ -1505,12 +1503,16 @@ struct ContentView: View {
         }
 
         if manualFixTool == .delete {
-            Button("Delete") {
-                requestManualFixDelete()
+            Button(pendingLabelEraseArea == nil ? "Delete" : "Remove Label") {
+                if pendingLabelEraseArea != nil {
+                    Task { await removeSelectedLabelArea() }
+                } else {
+                    requestManualFixDelete()
+                }
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(isBusy || !canDeleteCurrentSelection)
+            .disabled(isBusy || (!canDeleteCurrentSelection && pendingLabelEraseArea == nil))
         }
 
         if manualFixTool == .exclude {
@@ -1520,15 +1522,6 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .disabled(isBusy || !canToggleSelectedAutoBoxExcluded)
-        }
-
-        if manualFixTool == .removeLabel {
-            Button("Remove Label") {
-                Task { await removeSelectedLabelArea() }
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .disabled(isBusy || pendingLabelEraseArea == nil || currentJobID == nil)
         }
 
         Button("Save") {
@@ -1610,8 +1603,6 @@ struct ContentView: View {
                     return "Delete removes this line."
                 case .exclude:
                     return "Exclude only works on auto boxes."
-                case .removeLabel:
-                    return "Tap the unwanted label, confirm the blue box, then save."
                 }
             }
             switch manualFixTool {
@@ -1625,8 +1616,6 @@ struct ContentView: View {
                 return "Delete removes this row. Tap a line instead if you only want to delete that line."
             case .exclude:
                 return "Exclude only works on auto boxes."
-            case .removeLabel:
-                return "Tap the unwanted label, confirm the blue box, then save."
             }
         }
         if let selection = autoSelection {
@@ -1642,8 +1631,6 @@ struct ContentView: View {
                     return "Tap an auto box to exclude or include it."
                 case .addRow:
                     return "Add Row only creates new manual rows on empty space."
-                case .removeLabel:
-                    return "Tap the unwanted label, confirm the blue box, then save."
                 }
             }
             if selection.measureID != nil {
@@ -1658,8 +1645,6 @@ struct ContentView: View {
                     return "Tap the auto row, then drag a corner handle to resize it."
                 case .addRow:
                     return "Add Row only creates new manual rows on empty space."
-                case .removeLabel:
-                    return "Tap the unwanted label, confirm the blue box, then save."
                 }
             }
             switch manualFixTool {
@@ -1673,8 +1658,6 @@ struct ContentView: View {
                 return "Tap an auto box, then Exclude or Include it."
             case .addRow:
                 return "Add Row only creates new manual rows on empty space."
-            case .removeLabel:
-                return "Tap the unwanted label, confirm the blue box, then save."
             }
         }
         if pendingLabelEraseArea != nil {
@@ -1688,11 +1671,9 @@ struct ContentView: View {
         case .resizeRow:
             return "Tap a row, then drag a corner handle to resize it."
         case .delete:
-            return "Tap a row to delete the row, or tap a line to delete just that line."
+            return "Tap a row, line, box, or unwanted label, then confirm."
         case .exclude:
             return "Tap an auto box to exclude it from counting or include it again."
-        case .removeLabel:
-            return "Tap the unwanted label, confirm the blue box, then save."
         }
     }
 
@@ -1708,7 +1689,7 @@ struct ContentView: View {
     private var activeManualFixManualEditor: ManualEditorState? {
         guard activeEditTool == .manualFix else { return nil }
         switch manualFixTool {
-        case .addRow, .addMeasures, .resizeRow, .delete, .removeLabel:
+        case .addRow, .addMeasures, .resizeRow, .delete:
             return ManualEditorState(
                 activePage: manualDraftPage ?? currentVisiblePDFPage,
                 tool: manualFixTool,
@@ -1732,7 +1713,7 @@ struct ContentView: View {
                 rows: autoDraftRows,
                 selection: autoSelection
             )
-        case .addRow, .removeLabel:
+        case .addRow:
             return nil
         }
     }
@@ -2047,7 +2028,7 @@ struct ContentView: View {
 
     private func normalizeManualSelection(for tool: ManualFixTool) {
         pendingManualFixDelete = nil
-        if tool != .removeLabel {
+        if tool != .delete {
             pendingLabelEraseArea = nil
         }
         if tool == .exclude {
@@ -2055,11 +2036,6 @@ struct ContentView: View {
             if let selection = autoSelection, selection.splitIndex != nil {
                 autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
             }
-            return
-        }
-        if tool == .removeLabel {
-            manualSelection = nil
-            autoSelection = nil
             return
         }
         guard let selection = manualSelection else { return }
@@ -2070,7 +2046,7 @@ struct ContentView: View {
             if selection.cutIndex != nil {
                 manualSelection = ManualSelectionState(rowID: selection.rowID, cutIndex: nil)
             }
-        case .exclude, .removeLabel:
+        case .exclude:
             return
         }
         if let selection = autoSelection,
@@ -5990,25 +5966,38 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 }
             case .delete:
                 if let cutSelection = manualCutSelectionAtDocumentPoint(tap, documentView: documentView) {
+                    onLabelEraseAreaChange?(nil)
                     onManualSelectionChange?(cutSelection)
                     onAutoSelectionChange?(nil)
                     return
                 }
                 if let row = manualRowAtDocumentPoint(tap, documentView: documentView) {
+                    onLabelEraseAreaChange?(nil)
                     onManualSelectionChange?(ManualSelectionState(rowID: row.manualRowId, cutIndex: nil))
                     onAutoSelectionChange?(nil)
                     return
                 }
                 if let splitSelection = autoSplitSelectionAtDocumentPoint(tap, documentView: documentView) {
+                    onLabelEraseAreaChange?(nil)
                     onAutoSelectionChange?(splitSelection)
                     onManualSelectionChange?(nil)
                     return
                 }
                 if let boxSelection = autoBoxSelectionAtDocumentPoint(tap, documentView: documentView) {
+                    onLabelEraseAreaChange?(nil)
                     onAutoSelectionChange?(boxSelection)
                     onManualSelectionChange?(nil)
                     return
                 }
+                guard let area = labelEraseAreaFromTap(tap, documentView: documentView),
+                      area.page == currentManualEditor?.activePage else {
+                    onLabelEraseAreaChange?(nil)
+                    return
+                }
+                onLabelEraseAreaChange?(area)
+                onManualSelectionChange?(nil)
+                onAutoSelectionChange?(nil)
+                return
             case .exclude:
                 if let row = autoRowAtDocumentPoint(tap, documentView: documentView) {
                     if let currentSelection = currentAutoEditor?.selection,
@@ -6023,16 +6012,6 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                     onManualSelectionChange?(nil)
                     return
                 }
-            case .removeLabel:
-                guard let area = labelEraseAreaFromTap(tap, documentView: documentView),
-                      area.page == currentManualEditor?.activePage else {
-                    onLabelEraseAreaChange?(nil)
-                    return
-                }
-                onLabelEraseAreaChange?(area)
-                onManualSelectionChange?(nil)
-                onAutoSelectionChange?(nil)
-                return
             }
             onManualSelectionChange?(nil)
             onAutoSelectionChange?(nil)
@@ -6130,7 +6109,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 onManualSelectionChange?(nil)
                 setManualInteractionLocked(true)
                 manualDragState = .addAutoCut(rowID: row.systemID, boxIndex: boxIndex, currentX: clampedX)
-            case .resizeRow, .delete, .exclude, .removeLabel:
+            case .resizeRow, .delete, .exclude:
                 return
             }
             redrawOverlays()
@@ -6257,7 +6236,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                        row.page == autoEditor.activePage {
                         return false
                     }
-                case .resizeRow, .delete, .exclude, .removeLabel, .none:
+                case .resizeRow, .delete, .exclude, .none:
                     break
                 }
             }
@@ -6293,7 +6272,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 return row.page == autoEditor.activePage
             }
             return false
-        case .resizeRow, .delete, .exclude, .removeLabel:
+        case .resizeRow, .delete, .exclude:
             return false
         }
     }
