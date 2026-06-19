@@ -2847,10 +2847,10 @@ jobs:
 
           echo "MXL_PAGE_MANIFEST_PATH=/tmp/work/mxl_page_manifest.json" >> "$GITHUB_ENV"
 
-      - name: Annotate PDF (guides + measure labels) with verbose debug
+      - name: Annotate PDF (guides only) with verbose debug
         env:
           DEBUG_GUIDES: "0"
-          ENABLE_MEASURE_LABELS: "1"
+          ENABLE_MEASURE_LABELS: "0"
           MEASURE_LABEL_MODE: "staff_start"
           MEASURE_SOURCE_POLICY: "mxl_strict"
           ENDING_LABEL_MODE: "system_only"
@@ -3574,7 +3574,7 @@ jobs:
         if: always()
         env:
           DEBUG_GUIDES: "0"
-          ENABLE_MEASURE_LABELS: "1"
+          ENABLE_MEASURE_LABELS: "0"
           MEASURE_LABEL_MODE: "staff_start"
           MEASURE_SOURCE_POLICY: "mxl_strict"
           ENDING_LABEL_MODE: "system_only"
