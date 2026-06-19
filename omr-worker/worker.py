@@ -5319,31 +5319,6 @@ def _render_corrected_pdf(
     doc = fitz.open(str(input_pdf))
     drawn = 0
 
-    def _erase_baseline_system_label(page, rect, base_row: dict) -> None:
-        base_anchor = base_row.get("anchor") if isinstance(base_row, dict) else {}
-        base_value = str(base_row.get("current_value") or base_row.get("value") or "").strip()
-        if not isinstance(base_anchor, dict) or not base_value:
-            return
-        try:
-            bx = float(base_anchor.get("x"))
-            by0 = float(base_anchor.get("y_top"))
-            old_x, old_y, old_tw = _label_position(bx, by0, float(rect.width), float(rect.height), base_value)
-            old_h = float(MEASURE_TEXT_SIZE + 2.0)
-            erase = fitz.Rect(old_x - 2.0, old_y - old_h, old_x + old_tw + 2.0, old_y + 2.0)
-            page.draw_rect(erase, color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
-        except Exception:
-            return
-
-    # --- Shared: erase all baseline system labels ---
-    for base in baseline_systems.values():
-        if not isinstance(base, dict):
-            continue
-        page_no = _safe_int(base.get("page"), 0)
-        if page_no <= 0 or page_no > doc.page_count:
-            continue
-        page = doc[page_no - 1]
-        _erase_baseline_system_label(page, page.rect, base)
-
     # Manual label erases are intentionally narrow and are applied before
     # current labels are redrawn.
     for area in _editable_label_erase_areas(editable_state):
