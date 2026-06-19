@@ -2397,17 +2397,18 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
             else:
                 candidate_sources_second_pass = []
 
-            chosen_measure_starts = list(chosen_starts_info.get("measure_starts") or [])
-            if chosen_measure_starts:
-                first_real_start = float(chosen_measure_starts[0])
-                for staff_ctx in entry.get("staff_contexts") or []:
-                    if not isinstance(staff_ctx, dict):
-                        continue
-                    mark_idx = int(staff_ctx.get("staff_start_mark_index") or -1)
-                    if mark_idx < 0 or mark_idx >= len(staff_start_marks_px):
-                        continue
-                    _, y0_px, y1_px, text = staff_start_marks_px[mark_idx]
-                    staff_start_marks_px[mark_idx] = (first_real_start, y0_px, y1_px, text)
+            if bool(chosen_connector_info.get("suppress")):
+                chosen_measure_starts = list(chosen_starts_info.get("measure_starts") or [])
+                if chosen_measure_starts:
+                    first_real_start = float(chosen_measure_starts[0])
+                    for staff_ctx in entry.get("staff_contexts") or []:
+                        if not isinstance(staff_ctx, dict):
+                            continue
+                        mark_idx = int(staff_ctx.get("staff_start_mark_index") or -1)
+                        if mark_idx < 0 or mark_idx >= len(staff_start_marks_px):
+                            continue
+                        _, y0_px, y1_px, text = staff_start_marks_px[mark_idx]
+                        staff_start_marks_px[mark_idx] = (first_real_start, y0_px, y1_px, text)
 
             _append_measure_outputs_for_system(
                 measure_box_rows_px,

@@ -3622,24 +3622,6 @@ def _draw_measure_label_left_barline(page: fitz.Page, page_rect: fitz.Rect, x_le
     page.insert_text((x_text, y_text), text, fontsize=MEASURE_TEXT_SIZE, color=MEASURE_TEXT_COLOR)
 
 
-def _erase_measure_label_left_barline_area(page: fitz.Page, page_rect: fitz.Rect, x_left: float, y_top: float) -> None:
-    y_text = max(MEASURE_TEXT_SIZE + 2.0, float(y_top) - MEASURE_TEXT_Y_OFFSET)
-    y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, float(page_rect.height) - 2.0))
-    th = float(MEASURE_TEXT_SIZE + 2.0)
-    erase = fitz.Rect(
-        float(x_left) - 4.0,
-        y_text - th - 2.0,
-        float(x_left) + 48.0,
-        y_text + 3.0,
-    )
-    x0 = max(0.0, min(erase.x0, page_rect.width))
-    y0 = max(0.0, min(erase.y0, page_rect.height))
-    x1 = max(0.0, min(erase.x1, page_rect.width))
-    y1 = max(0.0, min(erase.y1, page_rect.height))
-    if x1 > x0 and y1 > y0:
-        page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
-
-
 def _run_public_status(run: dict) -> str:
     status = str(run.get("status") or "").strip().lower()
     conclusion = str(run.get("conclusion") or "").strip().lower()
@@ -5241,13 +5223,7 @@ def _render_corrected_pdf(
         except Exception:
             return
 
-    sorted_systems, ordered_measures, result_labels, _ = _recompute_measure_numbering(
-        systems,
-        measures,
-        editable_state,
-    )
-
-    # --- Shared: erase legacy system-anchor labels from Stage 1 ---
+    # --- Shared: erase all baseline system labels ---
     for base in baseline_systems.values():
         if not isinstance(base, dict):
             continue
@@ -5257,18 +5233,11 @@ def _render_corrected_pdf(
         page = doc[page_no - 1]
         _erase_baseline_system_label(page, page.rect, base)
 
-    # --- Shared: erase barline-based label zones before drawing final labels ---
-    for measure in ordered_measures:
-        page_no = _safe_int(measure.get("page"), 0)
-        if page_no <= 0 or page_no > doc.page_count:
-            continue
-        try:
-            x_left = float(measure.get("x_left"))
-            y_top = float(measure.get("y_top"))
-        except Exception:
-            continue
-        page = doc[page_no - 1]
-        _erase_measure_label_left_barline_area(page, page.rect, x_left, y_top)
+    sorted_systems, ordered_measures, result_labels, _ = _recompute_measure_numbering(
+        systems,
+        measures,
+        editable_state,
+    )
 
     if labels_mode == LABELS_MODE_ALL_MEASURES:
         # Draw every measure with its computed label
