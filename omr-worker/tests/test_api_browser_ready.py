@@ -149,6 +149,7 @@ class _FakePage:
 class _FakeDoc:
     def __init__(self, pages):
         self._pages = list(pages)
+        self.saved_to = None
 
     def __len__(self):
         return len(self._pages)
@@ -156,8 +157,28 @@ class _FakeDoc:
     def __getitem__(self, index):
         return self._pages[index]
 
+    @property
+    def page_count(self) -> int:
+        return len(self._pages)
+
+    def save(self, path):
+        self.saved_to = path
+
     def close(self):
         return None
+
+
+class _DrawRecordingPage:
+    def __init__(self, rect: _FakeRect):
+        self.rect = rect
+        self.drawn_rects = []
+        self.inserted_text = []
+
+    def draw_rect(self, rect, color=None, fill=None):
+        self.drawn_rects.append(rect)
+
+    def insert_text(self, point, text, fontsize=10.0, color=None):
+        self.inserted_text.append((point, text, fontsize, color))
 
 
 class _FakeUploadFile:
@@ -488,6 +509,71 @@ class BrowserReadyApiTests(unittest.TestCase):
         relabel = body.get("relabel") or {}
         self.assertEqual(relabel.get("labels_mode"), "all_measures")
         self.assertEqual(relabel.get("labels_redrawn_count"), 2)
+
+    def test_render_corrected_pdf_erases_legacy_and_barline_label_areas(self):
+        page = _DrawRecordingPage(_FakeRect(0, 0, 200, 120))
+        doc = _FakeDoc([page])
+        systems = [
+            {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1", "anchor": {"x": 10, "y_top": 20, "y_bottom": 60}},
+        ]
+        baseline_systems = {
+            "p1_s0": {"system_id": "p1_s0", "page": 1, "current_value": "0", "anchor": {"x": 10, "y_top": 20, "y_bottom": 60}},
+        }
+        measures = [
+            {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "global_index": 0, "x_left": 30, "y_top": 20, "y_bottom": 60},
+            {"measure_id": "p1_s0_m1", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 1, "global_index": 1, "x_left": 90, "y_top": 20, "y_bottom": 60},
+        ]
+
+        with (
+            TemporaryDirectory() as tmp,
+            patch.object(WORKER.fitz, "open", return_value=doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+        ):
+            drawn = WORKER._render_corrected_pdf(
+                Path(tmp) / "in.pdf",
+                Path(tmp) / "out.pdf",
+                systems,
+                baseline_systems,
+                measures,
+                "system_only",
+                editable_state={"labels_mode": "system_only"},
+            )
+
+        self.assertEqual(drawn, 1)
+        self.assertEqual([row[1] for row in page.inserted_text], ["1"])
+        self.assertAlmostEqual(page.inserted_text[0][0][0], 31.0)
+        self.assertTrue(any(rect.x0 <= 5.0 and rect.x1 >= 15.0 for rect in page.drawn_rects))
+        self.assertTrue(any(rect.x0 <= 26.0 and rect.x1 >= 78.0 for rect in page.drawn_rects))
+
+    def test_render_corrected_pdf_all_measures_places_every_label_at_barline(self):
+        page = _DrawRecordingPage(_FakeRect(0, 0, 200, 120))
+        doc = _FakeDoc([page])
+        systems = [
+            {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1", "anchor": {"x": 10, "y_top": 20, "y_bottom": 60}},
+        ]
+        measures = [
+            {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "global_index": 0, "x_left": 30, "y_top": 20, "y_bottom": 60},
+            {"measure_id": "p1_s0_m1", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 1, "global_index": 1, "x_left": 90, "y_top": 20, "y_bottom": 60},
+        ]
+
+        with (
+            TemporaryDirectory() as tmp,
+            patch.object(WORKER.fitz, "open", return_value=doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+        ):
+            drawn = WORKER._render_corrected_pdf(
+                Path(tmp) / "in.pdf",
+                Path(tmp) / "out.pdf",
+                systems,
+                {},
+                measures,
+                "all_measures",
+                editable_state={"labels_mode": "all_measures"},
+            )
+
+        self.assertEqual(drawn, 2)
+        self.assertEqual([row[1] for row in page.inserted_text], ["1", "2"])
+        self.assertEqual([row[0][0] for row in page.inserted_text], [31.0, 91.0])
 
     def test_measure_crop_spec_uses_full_vertical_padding_when_room_exists(self):
         page_rect = _FakeRect(0, 0, 200, 160)
