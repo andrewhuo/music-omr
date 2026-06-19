@@ -171,6 +171,38 @@ class RelabelLogicTests(unittest.TestCase):
         values = [int(row["current_value"]) for row in systems]
         self.assertEqual(values, [1, 20, 23, 50])
 
+    def test_remove_label_area_persists(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {
+                    "type": "remove_label_area",
+                    "page": 1,
+                    "rect": {"left": 8, "right": 42, "top": 4, "bottom": 22},
+                }
+            ],
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied[0]["type"], "remove_label_area")
+        self.assertEqual(state.get("label_erase_areas"), [{"page": 1, "rect": {"left": 8.0, "right": 42.0, "top": 4.0, "bottom": 22.0}}])
+
+    def test_remove_label_area_rejects_invalid_rect(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "remove_label_area", "page": 0, "rect": {"left": 8, "right": 42, "top": 4, "bottom": 22}},
+                {"type": "remove_label_area", "page": 1, "rect": {"left": 8, "right": 200, "top": 4, "bottom": 22}},
+                {"type": "remove_label_area", "page": 1},
+            ],
+        )
+
+        self.assertEqual(applied, [])
+        self.assertEqual([row.get("reason") for row in rejected], ["invalid_label_erase_area", "invalid_label_erase_area", "invalid_label_erase_area"])
+        self.assertEqual(state.get("label_erase_areas"), [])
+
     def test_measure_anchor_reflows_forward(self):
         state = self._sample_state()
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(

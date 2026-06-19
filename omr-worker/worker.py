@@ -875,6 +875,7 @@ def _editable_state_version(editable_state: dict) -> str:
         "pickup_measures": editable_state.get("pickup_measures") or {},
         "rest_systems": editable_state.get("rest_systems") or {},
         "endings": editable_state.get("endings") or {},
+        "label_erase_areas": editable_state.get("label_erase_areas") or [],
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
@@ -927,6 +928,56 @@ def _parse_manual_row_rect(raw_rect: dict | None) -> tuple[float, float, float, 
     if right <= left or bottom <= top:
         return None
     return (left, right, top, bottom)
+
+
+def _normalize_label_erase_area(raw_area: dict | None) -> dict | None:
+    if not isinstance(raw_area, dict):
+        return None
+    page = _safe_int(raw_area.get("page"), 0)
+    if page <= 0:
+        return None
+    rect = raw_area.get("rect")
+    parsed = _parse_manual_row_rect(rect if isinstance(rect, dict) else None)
+    if parsed is None:
+        return None
+    left, right, top, bottom = parsed
+    if (right - left) > 96.0 or (bottom - top) > 48.0:
+        return None
+    return {
+        "page": int(page),
+        "rect": {
+            "left": float(left),
+            "right": float(right),
+            "top": float(top),
+            "bottom": float(bottom),
+        },
+    }
+
+
+def _editable_label_erase_areas(editable_state: dict) -> list[dict]:
+    raw_areas = editable_state.get("label_erase_areas")
+    if not isinstance(raw_areas, list):
+        editable_state["label_erase_areas"] = []
+        return []
+
+    cleaned: list[dict] = []
+    seen: set[str] = set()
+    for raw_area in raw_areas:
+        area = _normalize_label_erase_area(raw_area if isinstance(raw_area, dict) else None)
+        if area is None:
+            continue
+        rect = area["rect"]
+        key = (
+            f"{area['page']}|{rect['left']:.2f}|{rect['right']:.2f}|"
+            f"{rect['top']:.2f}|{rect['bottom']:.2f}"
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(area)
+
+    editable_state["label_erase_areas"] = cleaned
+    return cleaned
 
 
 def _is_excluded_from_counting(row: dict | None) -> bool:
@@ -3622,6 +3673,29 @@ def _draw_measure_label_left_barline(page: fitz.Page, page_rect: fitz.Rect, x_le
     page.insert_text((x_text, y_text), text, fontsize=MEASURE_TEXT_SIZE, color=MEASURE_TEXT_COLOR)
 
 
+def _erase_label_area(page: fitz.Page, page_rect: fitz.Rect, area: dict) -> bool:
+    if not isinstance(area, dict):
+        return False
+    rect = area.get("rect")
+    if not isinstance(rect, dict):
+        return False
+    try:
+        left = float(rect.get("left"))
+        right = float(rect.get("right"))
+        top = float(rect.get("top"))
+        bottom = float(rect.get("bottom"))
+    except Exception:
+        return False
+    x0 = max(0.0, min(left, float(page_rect.width)))
+    x1 = max(0.0, min(right, float(page_rect.width)))
+    y0 = max(0.0, min(top, float(page_rect.height)))
+    y1 = max(0.0, min(bottom, float(page_rect.height)))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
+    return True
+
+
 def _run_public_status(run: dict) -> str:
     status = str(run.get("status") or "").strip().lower()
     conclusion = str(run.get("conclusion") or "").strip().lower()
@@ -5095,6 +5169,38 @@ def _apply_replace_auto_rows_for_page_edit(
     )
 
 
+def _apply_remove_label_area_edit(
+    raw_edit: dict,
+    editable_state: dict,
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    area = _normalize_label_erase_area(raw_edit)
+    if area is None:
+        rejected.append({"edit": raw_edit, "reason": "invalid_label_erase_area"})
+        return
+
+    erase_areas = _editable_label_erase_areas(editable_state)
+    rect = area["rect"]
+    key = (
+        f"{area['page']}|{rect['left']:.2f}|{rect['right']:.2f}|"
+        f"{rect['top']:.2f}|{rect['bottom']:.2f}"
+    )
+    existing = {
+        (
+            f"{saved['page']}|{saved['rect']['left']:.2f}|{saved['rect']['right']:.2f}|"
+            f"{saved['rect']['top']:.2f}|{saved['rect']['bottom']:.2f}"
+        )
+        for saved in erase_areas
+        if isinstance(saved, dict) and isinstance(saved.get("rect"), dict)
+    }
+    if key not in existing:
+        erase_areas.append(area)
+        editable_state["label_erase_areas"] = erase_areas
+
+    applied.append({"type": "remove_label_area", "page": area["page"], "rect": rect})
+
+
 def _apply_relabel_edits(
     editable_state: dict,
     edits: list[dict],
@@ -5184,10 +5290,15 @@ def _apply_relabel_edits(
             _apply_replace_auto_rows_for_page_edit(raw_edit, editable_state, applied, rejected)
             continue
 
+        if edit_type == "remove_label_area":
+            _apply_remove_label_area_edit(raw_edit, editable_state, applied, rejected)
+            continue
+
         rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
 
     editable_state["measure_number_overrides"] = measure_overrides
     editable_state["labels_mode"] = labels_mode
+    _editable_label_erase_areas(editable_state)
     systems, measures, _, _ = _refresh_editable_state_systems_and_measures(
         editable_state,
         ending_debug_ctx=ending_debug_ctx,
@@ -5232,6 +5343,15 @@ def _render_corrected_pdf(
             continue
         page = doc[page_no - 1]
         _erase_baseline_system_label(page, page.rect, base)
+
+    # Manual label erases are intentionally narrow and are applied before
+    # current labels are redrawn.
+    for area in _editable_label_erase_areas(editable_state):
+        page_no = _safe_int(area.get("page"), 0)
+        if page_no <= 0 or page_no > doc.page_count:
+            continue
+        page = doc[page_no - 1]
+        _erase_label_area(page, page.rect, area)
 
     sorted_systems, ordered_measures, result_labels, _ = _recompute_measure_numbering(
         systems,
@@ -5572,6 +5692,7 @@ def get_job_state(job_id: str):
             "manual_rows": editable_state.get("manual_rows") or [],
             "rest_measures": editable_state.get("rest_measures") or {},
             "pickup_measures": editable_state.get("pickup_measures") or {},
+            "label_erase_areas": _editable_label_erase_areas(editable_state),
             "rest_systems": editable_state.get("rest_systems") or {},
             "qa": qa,
             "systems": systems,

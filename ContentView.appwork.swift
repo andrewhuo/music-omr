@@ -401,6 +401,7 @@ private enum ManualFixTool: String, CaseIterable, Identifiable {
     case resizeRow
     case delete
     case exclude
+    case removeLabel
 
     var id: String { rawValue }
 
@@ -411,6 +412,7 @@ private enum ManualFixTool: String, CaseIterable, Identifiable {
         case .resizeRow: return "Resize Row"
         case .delete: return "Delete"
         case .exclude: return "Exclude"
+        case .removeLabel: return "Remove Label"
         }
     }
 }
@@ -438,6 +440,12 @@ private struct ManualRowState: Codable, Hashable, Identifiable {
     }
 
     var id: String { manualRowId }
+}
+
+private struct LabelEraseAreaState: Codable, Hashable, Identifiable, Equatable {
+    let id: String
+    let page: Int
+    var rect: ManualRowRect
 }
 
 private struct AutoBoxState: Codable, Hashable, Identifiable {
@@ -489,6 +497,7 @@ private struct ManualEditorState: Equatable {
     let defaultStaffKind: ManualStaffKind
     let rows: [ManualRowState]
     let selection: ManualSelectionState?
+    let pendingLabelEraseArea: LabelEraseAreaState?
 }
 
 private struct AutoEditorState: Equatable {
@@ -528,6 +537,7 @@ private struct RelabelEdit: Encodable {
     let page: Int?
     let rows: [ManualRowState]?
     let autoRows: [AutoRowState]?
+    let rect: ManualRowRect?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -536,6 +546,7 @@ private struct RelabelEdit: Encodable {
         case value
         case page
         case rows
+        case rect
     }
 
     init(
@@ -547,7 +558,8 @@ private struct RelabelEdit: Encodable {
         stringValue: String? = nil,
         page: Int? = nil,
         rows: [ManualRowState]? = nil,
-        autoRows: [AutoRowState]? = nil
+        autoRows: [AutoRowState]? = nil,
+        rect: ManualRowRect? = nil
     ) {
         self.type = type
         self.system_id = system_id
@@ -558,6 +570,7 @@ private struct RelabelEdit: Encodable {
         self.page = page
         self.rows = rows
         self.autoRows = autoRows
+        self.rect = rect
     }
 
     func encode(to encoder: Encoder) throws {
@@ -583,6 +596,9 @@ private struct RelabelEdit: Encodable {
             try container.encode(rows, forKey: .rows)
         } else if let autoRows {
             try container.encode(autoRows, forKey: .rows)
+        }
+        if let rect {
+            try container.encode(rect, forKey: .rect)
         }
     }
 }
@@ -709,6 +725,7 @@ struct ContentView: View {
     @State private var autoDraftRows: [AutoRowState] = []
     @State private var autoSelection: AutoSelectionState?
     @State private var pendingManualFixDelete: PendingManualFixDelete?
+    @State private var pendingLabelEraseArea: LabelEraseAreaState?
     @State private var currentVisiblePDFPage: Int = 1
     @State private var pendingAutoScrollToTools = false
     @State private var pendingAutoScrollToPDF = false
@@ -1146,6 +1163,7 @@ struct ContentView: View {
                     labelsMode: snapshot.labelsMode,
                     manualEditor: activeManualFixManualEditor,
                     autoEditor: activeManualFixAutoEditor,
+                    pendingLabelEraseArea: pendingLabelEraseArea,
                     onOverlayCount: { count in
                         DispatchQueue.main.async {
                             drawnOverlayCount = count
@@ -1174,6 +1192,13 @@ struct ContentView: View {
                     onAutoSelectionChange: { selection in
                         DispatchQueue.main.async {
                             autoSelection = selection
+                        }
+                    },
+                    onLabelEraseAreaChange: { area in
+                        DispatchQueue.main.async {
+                            pendingLabelEraseArea = area
+                            manualSelection = nil
+                            autoSelection = nil
                         }
                     },
                     onSelectMeasure: { measure in
@@ -1497,6 +1522,15 @@ struct ContentView: View {
             .disabled(isBusy || !canToggleSelectedAutoBoxExcluded)
         }
 
+        if manualFixTool == .removeLabel {
+            Button("Remove Label") {
+                Task { await removeSelectedLabelArea() }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(isBusy || pendingLabelEraseArea == nil || currentJobID == nil)
+        }
+
         Button("Save") {
             Task { await saveManualFix() }
         }
@@ -1576,6 +1610,8 @@ struct ContentView: View {
                     return "Delete removes this line."
                 case .exclude:
                     return "Exclude only works on auto boxes."
+                case .removeLabel:
+                    return "Tap the unwanted label, confirm the blue box, then save."
                 }
             }
             switch manualFixTool {
@@ -1589,6 +1625,8 @@ struct ContentView: View {
                 return "Delete removes this row. Tap a line instead if you only want to delete that line."
             case .exclude:
                 return "Exclude only works on auto boxes."
+            case .removeLabel:
+                return "Tap the unwanted label, confirm the blue box, then save."
             }
         }
         if let selection = autoSelection {
@@ -1604,6 +1642,8 @@ struct ContentView: View {
                     return "Tap an auto box to exclude or include it."
                 case .addRow:
                     return "Add Row only creates new manual rows on empty space."
+                case .removeLabel:
+                    return "Tap the unwanted label, confirm the blue box, then save."
                 }
             }
             if selection.measureID != nil {
@@ -1618,6 +1658,8 @@ struct ContentView: View {
                     return "Tap the auto row, then drag a corner handle to resize it."
                 case .addRow:
                     return "Add Row only creates new manual rows on empty space."
+                case .removeLabel:
+                    return "Tap the unwanted label, confirm the blue box, then save."
                 }
             }
             switch manualFixTool {
@@ -1631,7 +1673,12 @@ struct ContentView: View {
                 return "Tap an auto box, then Exclude or Include it."
             case .addRow:
                 return "Add Row only creates new manual rows on empty space."
+            case .removeLabel:
+                return "Tap the unwanted label, confirm the blue box, then save."
             }
+        }
+        if pendingLabelEraseArea != nil {
+            return "Confirm the blue box, or tap another label to move it."
         }
         switch manualFixTool {
         case .addRow:
@@ -1644,6 +1691,8 @@ struct ContentView: View {
             return "Tap a row to delete the row, or tap a line to delete just that line."
         case .exclude:
             return "Tap an auto box to exclude it from counting or include it again."
+        case .removeLabel:
+            return "Tap the unwanted label, confirm the blue box, then save."
         }
     }
 
@@ -1659,13 +1708,14 @@ struct ContentView: View {
     private var activeManualFixManualEditor: ManualEditorState? {
         guard activeEditTool == .manualFix else { return nil }
         switch manualFixTool {
-        case .addRow, .addMeasures, .resizeRow, .delete:
+        case .addRow, .addMeasures, .resizeRow, .delete, .removeLabel:
             return ManualEditorState(
                 activePage: manualDraftPage ?? currentVisiblePDFPage,
                 tool: manualFixTool,
                 defaultStaffKind: manualStaffKind,
                 rows: manualDraftRows,
-                selection: manualSelection
+                selection: manualSelection,
+                pendingLabelEraseArea: pendingLabelEraseArea
             )
         case .exclude:
             return nil
@@ -1682,7 +1732,7 @@ struct ContentView: View {
                 rows: autoDraftRows,
                 selection: autoSelection
             )
-        case .addRow:
+        case .addRow, .removeLabel:
             return nil
         }
     }
@@ -1783,6 +1833,7 @@ struct ContentView: View {
         autoDraftRows = savedAutoRowsForPage(page)
         manualSelection = nil
         autoSelection = nil
+        pendingLabelEraseArea = nil
         manualFixTool = .addRow
         activeEditTool = .manualFix
         pendingAutoScrollToPDF = true
@@ -1795,6 +1846,7 @@ struct ContentView: View {
         manualSelection = nil
         autoSelection = nil
         pendingManualFixDelete = nil
+        pendingLabelEraseArea = nil
         manualFixTool = .addRow
         activeEditTool = .none
     }
@@ -1995,11 +2047,19 @@ struct ContentView: View {
 
     private func normalizeManualSelection(for tool: ManualFixTool) {
         pendingManualFixDelete = nil
+        if tool != .removeLabel {
+            pendingLabelEraseArea = nil
+        }
         if tool == .exclude {
             manualSelection = nil
             if let selection = autoSelection, selection.splitIndex != nil {
                 autoSelection = AutoSelectionState(rowID: selection.rowID, splitIndex: nil, measureID: nil)
             }
+            return
+        }
+        if tool == .removeLabel {
+            manualSelection = nil
+            autoSelection = nil
             return
         }
         guard let selection = manualSelection else { return }
@@ -2010,7 +2070,7 @@ struct ContentView: View {
             if selection.cutIndex != nil {
                 manualSelection = ManualSelectionState(rowID: selection.rowID, cutIndex: nil)
             }
-        case .exclude:
+        case .exclude, .removeLabel:
             return
         }
         if let selection = autoSelection,
@@ -2049,21 +2109,28 @@ struct ContentView: View {
                 }
                 return cleaned
             }
-            let relabel = try await apiRelabel(
-                jobID: jobID,
-                edits: [
+            var edits = [
+                RelabelEdit(
+                    type: "replace_manual_rows_for_page",
+                    page: page,
+                    rows: cleanedManualRows
+                ),
+                RelabelEdit(
+                    type: "replace_auto_rows_for_page",
+                    page: page,
+                    autoRows: cleanedAutoRows
+                )
+            ]
+            if let area = pendingLabelEraseArea {
+                edits.append(
                     RelabelEdit(
-                        type: "replace_manual_rows_for_page",
-                        page: page,
-                        rows: cleanedManualRows
-                    ),
-                    RelabelEdit(
-                        type: "replace_auto_rows_for_page",
-                        page: page,
-                        autoRows: cleanedAutoRows
+                        type: "remove_label_area",
+                        page: area.page,
+                        rect: area.rect
                     )
-                ]
-            )
+                )
+            }
+            let relabel = try await apiRelabel(jobID: jobID, edits: edits)
             guard isTokenCurrent(token, expectedJobID: jobID) else { return }
             try validateRelabelOutcome(relabel)
 
@@ -2101,9 +2168,85 @@ struct ContentView: View {
             manualSelection = nil
             autoSelection = nil
             pendingManualFixDelete = nil
+            pendingLabelEraseArea = nil
             activeEditTool = .manualFix
             phase = .ready
             detailNote = "Manual fixes saved"
+        } catch is CancellationError {
+            return
+        } catch {
+            phase = .failed
+            detailNote = error.localizedDescription
+            actionError = error.localizedDescription
+        }
+    }
+
+    private func removeSelectedLabelArea() async {
+        guard let jobID = currentJobID else {
+            actionError = "No active job"
+            return
+        }
+        guard let area = pendingLabelEraseArea else {
+            actionError = "Tap a label first"
+            return
+        }
+        guard !isBusy else { return }
+        let token = activeJobToken
+
+        isBusy = true
+        defer { isBusy = false }
+
+        do {
+            detailNote = "Removing label..."
+            let relabel = try await apiRelabel(
+                jobID: jobID,
+                edits: [
+                    RelabelEdit(
+                        type: "remove_label_area",
+                        page: area.page,
+                        rect: area.rect
+                    )
+                ]
+            )
+            guard isTokenCurrent(token, expectedJobID: jobID) else { return }
+            try validateRelabelOutcome(relabel)
+
+            let newURL = relabel.artifacts_http?.audiveris_out_corrected_pdf?.nonEmpty
+                ?? relabel.artifacts_http?.audiveris_out_pdf?.nonEmpty
+                ?? correctedPDFURL
+                ?? baselinePDFURL
+
+            guard let finalURL = newURL else {
+                throw LocalError("Rendered PDF not ready")
+            }
+
+            let pdfData = try await downloadPDF(urlString: finalURL)
+            guard isTokenCurrent(token, expectedJobID: jobID) else { return }
+            correctedPDFURL = relabel.artifacts_http?.audiveris_out_corrected_pdf ?? correctedPDFURL
+
+            let state = try await apiFetchState(jobID: jobID)
+            guard isTokenCurrent(token, expectedJobID: jobID) else { return }
+            commitRenderSnapshot(
+                jobID: jobID,
+                runID: currentRunID,
+                pdfData: pdfData,
+                editable: state.editable_state,
+                aiSuggestions: state.ai_suggestions,
+                aiSuggestRun: state.ai_suggest_run,
+                labelsMode: labelsModeFromState(state),
+                token: token,
+                preserveViewport: true
+            )
+
+            pendingLabelEraseArea = nil
+            manualDraftPage = max(1, currentVisiblePDFPage)
+            manualDraftRows = savedManualRowsForPage(manualDraftPage ?? currentVisiblePDFPage)
+            autoDraftRows = savedAutoRowsForPage(manualDraftPage ?? currentVisiblePDFPage)
+            manualSelection = nil
+            autoSelection = nil
+            activeEditTool = .manualFix
+            phase = .ready
+            detailNote = "Label removed"
         } catch is CancellationError {
             return
         } catch {
@@ -3903,6 +4046,7 @@ struct ContentView: View {
         manualSelection = nil
         autoSelection = nil
         pendingManualFixDelete = nil
+        pendingLabelEraseArea = nil
         currentVisiblePDFPage = 1
         aiSuggestions = nil
         aiSuggestRun = nil
@@ -3949,6 +4093,7 @@ struct ContentView: View {
         manualSelection = nil
         autoSelection = nil
         pendingManualFixDelete = nil
+        pendingLabelEraseArea = nil
         currentVisiblePDFPage = 1
         aiSuggestions = nil
         aiSuggestRun = nil
@@ -4277,12 +4422,14 @@ private struct PDFOverlayContainer: UIViewRepresentable {
     let labelsMode: LabelsMode
     let manualEditor: ManualEditorState?
     let autoEditor: AutoEditorState?
+    let pendingLabelEraseArea: LabelEraseAreaState?
     let onOverlayCount: (Int) -> Void
     let onVisiblePageChange: (Int) -> Void
     let onManualRowsChange: ([ManualRowState]) -> Void
     let onManualSelectionChange: (ManualSelectionState?) -> Void
     let onAutoRowsChange: ([AutoRowState]) -> Void
     let onAutoSelectionChange: (AutoSelectionState?) -> Void
+    let onLabelEraseAreaChange: (LabelEraseAreaState?) -> Void
     let onSelectMeasure: (MeasureState) -> Void
 
     func makeUIView(context: Context) -> OverlayPDFView {
@@ -4294,6 +4441,7 @@ private struct PDFOverlayContainer: UIViewRepresentable {
         view.onManualSelectionChange = onManualSelectionChange
         view.onAutoRowsChange = onAutoRowsChange
         view.onAutoSelectionChange = onAutoSelectionChange
+        view.onLabelEraseAreaChange = onLabelEraseAreaChange
         return view
     }
 
@@ -4305,6 +4453,7 @@ private struct PDFOverlayContainer: UIViewRepresentable {
         uiView.onManualSelectionChange = onManualSelectionChange
         uiView.onAutoRowsChange = onAutoRowsChange
         uiView.onAutoSelectionChange = onAutoSelectionChange
+        uiView.onLabelEraseAreaChange = onLabelEraseAreaChange
         uiView.update(
             pdfData: pdfData,
             snapshotToken: snapshotToken,
@@ -4322,7 +4471,8 @@ private struct PDFOverlayContainer: UIViewRepresentable {
             pendingEnding2IDs: pendingEnding2IDs,
             labelsMode: labelsMode,
             manualEditor: manualEditor,
-            autoEditor: autoEditor
+            autoEditor: autoEditor,
+            pendingLabelEraseArea: pendingLabelEraseArea
         )
     }
 }
@@ -4380,6 +4530,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
     private var currentLabelsMode: LabelsMode = .allMeasures
     private var currentManualEditor: ManualEditorState?
     private var currentAutoEditor: AutoEditorState?
+    private var currentPendingLabelEraseArea: LabelEraseAreaState?
     private var manualDragState: ManualDragState?
     private var lastOverlayLogSignature: String = ""
     private var pendingViewportRestore: PendingViewportRestore?
@@ -4393,6 +4544,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
     var onManualSelectionChange: ((ManualSelectionState?) -> Void)?
     var onAutoRowsChange: (([AutoRowState]) -> Void)?
     var onAutoSelectionChange: ((AutoSelectionState?) -> Void)?
+    var onLabelEraseAreaChange: ((LabelEraseAreaState?) -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -4478,7 +4630,8 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
             pendingEnding2IDs: Set<String>,
             labelsMode: LabelsMode,
             manualEditor: ManualEditorState?,
-            autoEditor: AutoEditorState?
+            autoEditor: AutoEditorState?,
+            pendingLabelEraseArea: LabelEraseAreaState?
     ) {
         currentSnapshotToken = snapshotToken
         if documentLoadID != currentDocumentLoadID {
@@ -4508,6 +4661,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         currentLabelsMode = labelsMode
         currentManualEditor = manualEditor
         currentAutoEditor = autoEditor
+        currentPendingLabelEraseArea = pendingLabelEraseArea
         suppressPDFTextInteractions()
         setManualInteractionLocked(manualEditor != nil || autoEditor != nil)
         if let manualEditor,
@@ -4844,6 +4998,25 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         let pageBounds = page.bounds(for: .mediaBox)
         guard pointOnPage.x.isFinite, pointOnPage.y.isFinite else { return nil }
         return CGPoint(x: pointOnPage.x, y: pageBounds.maxY - pointOnPage.y)
+    }
+
+    private func labelEraseAreaFromTap(_ point: CGPoint, documentView: UIView) -> LabelEraseAreaState? {
+        guard let document = pdfView.document,
+              let page = pageContainingDocumentPoint(point, in: document, documentView: documentView),
+              let topOriginPoint = documentPointToTopOriginPagePoint(point, page: page, documentView: documentView) else {
+            return nil
+        }
+        let pageNumber = pageNumber(for: page, in: document)
+        let bounds = page.bounds(for: .mediaBox)
+        let width = 34.0
+        let height = 18.0
+        let left = max(0.0, min(Double(bounds.width) - width, Double(topOriginPoint.x) - (width / 2.0)))
+        let top = max(0.0, min(Double(bounds.height) - height, Double(topOriginPoint.y) - (height / 2.0)))
+        return LabelEraseAreaState(
+            id: "label_erase_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10))",
+            page: pageNumber,
+            rect: ManualRowRect(left: left, right: left + width, top: top, bottom: top + height)
+        )
     }
 
     private func normalizedPageRect(
@@ -5300,6 +5473,39 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         }
     }
 
+    private func labelErasePageRect(_ area: LabelEraseAreaState, in page: PDFPage) -> CGRect? {
+        normalizedPageRect(
+            pageBounds: page.bounds(for: .mediaBox),
+            xLeft: CGFloat(area.rect.left),
+            xRight: CGFloat(area.rect.right),
+            yTop: CGFloat(area.rect.top),
+            yBottom: CGFloat(area.rect.bottom),
+            minimumSpan: 4
+        )
+    }
+
+    private func labelEraseDocumentRect(_ area: LabelEraseAreaState, page: PDFPage, documentView: UIView) -> CGRect? {
+        guard let pageRect = labelErasePageRect(area, in: page) else { return nil }
+        let viewRect = pdfView.convert(pageRect, from: page)
+        let docRect = documentView.convert(viewRect, from: pdfView)
+        guard docRect.width > 0, docRect.height > 0 else { return nil }
+        return docRect
+    }
+
+    private func drawPendingLabelEraseArea(in documentView: UIView) {
+        guard let area = currentPendingLabelEraseArea,
+              let document = pdfView.document,
+              let page = document.page(at: max(0, area.page - 1)),
+              let rect = labelEraseDocumentRect(area, page: page, documentView: documentView) else { return }
+        let layer = CAShapeLayer()
+        layer.frame = rect
+        layer.path = UIBezierPath(roundedRect: layer.bounds, cornerRadius: 2).cgPath
+        layer.fillColor = UIColor.systemBlue.withAlphaComponent(0.16).cgColor
+        layer.strokeColor = UIColor.systemBlue.withAlphaComponent(0.95).cgColor
+        layer.lineWidth = 2.0
+        manualLayer.addSublayer(layer)
+    }
+
     private func drawManualPreview(in documentView: UIView) {
         guard let drag = manualDragState,
               let manualEditor = currentManualEditor,
@@ -5741,6 +5947,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
         drawAutoRows(in: documentView)
         drawAutoPreview(in: documentView)
         drawManualRows(in: documentView)
+        drawPendingLabelEraseArea(in: documentView)
         drawManualPreview(in: documentView)
         notifyVisiblePageIfNeeded()
         onOverlayCount?(drawn)
@@ -5816,6 +6023,16 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                     onManualSelectionChange?(nil)
                     return
                 }
+            case .removeLabel:
+                guard let area = labelEraseAreaFromTap(tap, documentView: documentView),
+                      area.page == currentManualEditor?.activePage else {
+                    onLabelEraseAreaChange?(nil)
+                    return
+                }
+                onLabelEraseAreaChange?(area)
+                onManualSelectionChange?(nil)
+                onAutoSelectionChange?(nil)
+                return
             }
             onManualSelectionChange?(nil)
             onAutoSelectionChange?(nil)
@@ -5913,7 +6130,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 onManualSelectionChange?(nil)
                 setManualInteractionLocked(true)
                 manualDragState = .addAutoCut(rowID: row.systemID, boxIndex: boxIndex, currentX: clampedX)
-            case .resizeRow, .delete, .exclude:
+            case .resizeRow, .delete, .exclude, .removeLabel:
                 return
             }
             redrawOverlays()
@@ -6040,7 +6257,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                        row.page == autoEditor.activePage {
                         return false
                     }
-                case .resizeRow, .delete, .exclude, .none:
+                case .resizeRow, .delete, .exclude, .removeLabel, .none:
                     break
                 }
             }
@@ -6076,7 +6293,7 @@ private final class OverlayPDFView: UIView, UIGestureRecognizerDelegate {
                 return row.page == autoEditor.activePage
             }
             return false
-        case .resizeRow, .delete, .exclude:
+        case .resizeRow, .delete, .exclude, .removeLabel:
             return false
         }
     }

@@ -144,6 +144,14 @@ class _FakeRect:
 class _FakePage:
     def __init__(self, rect: _FakeRect):
         self.rect = rect
+        self.draw_rect_calls = []
+        self.insert_text_calls = []
+
+    def draw_rect(self, rect, color=None, fill=None):
+        self.draw_rect_calls.append({"rect": rect, "color": color, "fill": fill})
+
+    def insert_text(self, point, text, fontsize=None, color=None):
+        self.insert_text_calls.append({"point": point, "text": text, "fontsize": fontsize, "color": color})
 
 
 class _FakeDoc:
@@ -155,6 +163,13 @@ class _FakeDoc:
 
     def __getitem__(self, index):
         return self._pages[index]
+
+    @property
+    def page_count(self):
+        return len(self._pages)
+
+    def save(self, _path):
+        return None
 
     def close(self):
         return None
@@ -2076,6 +2091,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         _, expected_reference_examples = WORKER._build_old_style_multi_rest_reference_content()
         self.assertEqual(reference_examples_attached, expected_reference_examples)
         self.assertNotIn("reference_examples_attached", payload)
+
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         intro = json.loads((content[0] or {}).get("text") or "{}")
         self.assertEqual(intro.get("remembered_time_signature_in"), "3/4")
@@ -2112,6 +2128,52 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         time_update_shape = ((output_shape.get("time_signature_updates") or [])[0] or {})
         self.assertIn("2/4", time_update_shape.get("new_time_signature") or "")
+
+    def test_render_corrected_pdf_applies_label_erase_before_labels(self):
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+        fake_doc = _FakeDoc([page])
+        systems = [{"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1"}]
+        measures = [
+            {
+                "measure_id": "p1_s0_m0",
+                "system_id": "p1_s0",
+                "page": 1,
+                "system_index": 0,
+                "measure_local_index": 0,
+                "x_left": 20,
+                "x_right": 70,
+                "y_top": 30,
+                "y_bottom": 60,
+            }
+        ]
+        editable_state = {
+            "labels_mode": "system_only",
+            "systems": systems,
+            "measures": measures,
+            "label_erase_areas": [
+                {"page": 1, "rect": {"left": 4, "right": 38, "top": 8, "bottom": 26}}
+            ],
+        }
+
+        with (
+            patch.object(WORKER.fitz, "open", return_value=fake_doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+        ):
+            drawn = WORKER._render_corrected_pdf(
+                Path("/tmp/in.pdf"),
+                Path("/tmp/out.pdf"),
+                systems,
+                {},
+                measures,
+                "system_only",
+                editable_state=editable_state,
+            )
+
+        self.assertEqual(drawn, 1)
+        self.assertGreaterEqual(len(page.draw_rect_calls), 2)
+        first_rect = page.draw_rect_calls[0]["rect"]
+        self.assertEqual((first_rect.x0, first_rect.y0, first_rect.x1, first_rect.y1), (4.0, 8.0, 38.0, 26.0))
+        self.assertEqual(page.insert_text_calls[0]["text"], "1")
 
     def test_build_system_measure_request_includes_old_style_multi_rest_guidance(self):
         mapping_summary = self._sample_mapping_summary()
