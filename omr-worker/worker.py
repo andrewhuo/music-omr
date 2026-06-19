@@ -3658,7 +3658,7 @@ def _draw_measure_label(page: fitz.Page, page_rect: fitz.Rect, anchor_x: float, 
 
 def _draw_measure_label_left_barline(page: fitz.Page, page_rect: fitz.Rect, x_left: float, y_top: float, text: str) -> None:
     tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
-    x_text = min(max(0.0, float(x_left) + 1.0), max(0.0, float(page_rect.width) - tw - 2.0))
+    x_text = min(max(0.0, float(x_left) - (tw / 2.0)), max(0.0, float(page_rect.width) - tw - 2.0))
     y_text = max(MEASURE_TEXT_SIZE + 2.0, float(y_top) - MEASURE_TEXT_Y_OFFSET)
     y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, float(page_rect.height) - 2.0))
 
