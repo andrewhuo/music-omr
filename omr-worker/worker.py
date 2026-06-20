@@ -113,6 +113,22 @@ AI_SUGGESTION_UNCLEAR_REASONS_ALLOWED = {
     "ornament_or_tie_confusion",
     "not_enough_visual_evidence",
 }
+AI_SUGGESTION_DEBUG_DURATION_ALLOWED = {"full", "short", "unclear"}
+AI_SUGGESTION_DEBUG_RHYTHM_ALLOWED = {
+    "single_event",
+    "chord_single_event",
+    "multiple_events",
+    "rest_or_silence",
+    "unclear",
+}
+AI_SUGGESTION_DEBUG_REASON_ALLOWED = {
+    "fills_meter",
+    "short_for_meter",
+    "meter_unclear",
+    "rhythm_unclear",
+    "not_first_measure",
+    "other",
+}
 AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
 AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
 AI_OLD_STYLE_REFERENCE_EXAMPLES = (
@@ -2275,6 +2291,27 @@ def _normalize_ai_unclear_reason_value(raw_value) -> str | None:
     return text if text in AI_SUGGESTION_UNCLEAR_REASONS_ALLOWED else None
 
 
+def _normalize_ai_decision_debug(raw_debug) -> dict | None:
+    if not isinstance(raw_debug, dict):
+        return None
+    active_meter = _normalize_ai_time_signature_value(raw_debug.get("active_meter_read")) or "unknown"
+    duration = str(raw_debug.get("duration_judgment") or "").strip().lower()
+    if duration not in AI_SUGGESTION_DEBUG_DURATION_ALLOWED:
+        duration = "unclear"
+    rhythm = str(raw_debug.get("rhythm_basis") or "").strip().lower()
+    if rhythm not in AI_SUGGESTION_DEBUG_RHYTHM_ALLOWED:
+        rhythm = "unclear"
+    reason = str(raw_debug.get("decision_reason") or "").strip().lower()
+    if reason not in AI_SUGGESTION_DEBUG_REASON_ALLOWED:
+        reason = "other"
+    return {
+        "active_meter_read": active_meter,
+        "duration_judgment": duration,
+        "rhythm_basis": rhythm,
+        "decision_reason": reason,
+    }
+
+
 def _ai_suggest_normalization_warning(measure_row: dict | None, message: str) -> dict:
     warning = {
         "type": "normalization_adjusted",
@@ -2355,6 +2392,7 @@ def _normalize_ai_suggestions_result(
 
     seen_measure_ids: set[str] = set()
     kept_by_measure_id: dict[str, dict] = {}
+    decision_debug_by_measure_id: dict[str, dict] = {}
     measure_completeness_by_measure_id: dict[str, dict] = {}
     normal_measures_omitted = 0
     normalization_warnings: list[dict] = []
@@ -2393,6 +2431,18 @@ def _normalize_ai_suggestions_result(
         maybe_label = row.get("maybe_label")
         maybe_rest_count = row.get("maybe_rest_count")
         raw_unclear_reason = row.get("unclear_reason")
+        decision_debug = None
+        if is_first_measure_of_score and row.get("decision_debug") is not None:
+            decision_debug = _normalize_ai_decision_debug(row.get("decision_debug"))
+            if decision_debug is None:
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Dropped invalid decision_debug for {measure_id}.",
+                    )
+                )
+            else:
+                decision_debug_by_measure_id[measure_id] = decision_debug
         measure_completeness = _normalize_ai_measure_completeness_value(row.get("measure_completeness"))
         if measure_completeness is None:
             normalization_warnings.append(
@@ -2468,6 +2518,8 @@ def _normalize_ai_suggestions_result(
         }
         if unclear_reason is not None:
             entry["unclear_reason"] = unclear_reason
+        if decision_debug is not None:
+            entry["decision_debug"] = decision_debug
 
         if label == "pickup":
             if rest_count is not None or maybe_label is not None or maybe_rest_count is not None:
@@ -2649,6 +2701,7 @@ def _normalize_ai_suggestions_result(
         "model": model,
         "source_run_id": int(run_id),
         "by_measure_id": kept_by_measure_id,
+        "decision_debug_by_measure_id": decision_debug_by_measure_id,
         "time_signatures_by_measure_id": time_signatures_by_measure_id,
         "measure_completeness_by_measure_id": measure_completeness_by_measure_id,
         "warnings": warnings,
@@ -3330,6 +3383,7 @@ def _build_system_measure_request(
                 "For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count. If one staff has music, no count, or a different count, do not return multi_measure_rest.",
                 "If label is uncertain and you have a tentative guess, maybe_label may be pickup or multi_measure_rest, and maybe_rest_count is only allowed for maybe_label multi_measure_rest.",
                 "If maybe_label is multi_measure_rest, always include maybe_rest_count if the count number is at all readable. Only omit maybe_rest_count if the number is completely unreadable.",
+                "For the first measure of the score only, include decision_debug with short codes showing what meter you used, whether the rhythm looked full/short/unclear, and why you chose the label.",
                 "Return JSON only.",
             ],
             "output_shape": {
@@ -3344,6 +3398,12 @@ def _build_system_measure_request(
                         "confidence": "low|medium|high",
                         "maybe_label": "pickup|multi_measure_rest|null",
                         "maybe_rest_count": "integer|null",
+                        "decision_debug": {
+                            "active_meter_read": "2/4|3/4|4/4|6/8|common_time|cut_time|unknown|null",
+                            "duration_judgment": "full|short|unclear|null",
+                            "rhythm_basis": "single_event|chord_single_event|multiple_events|rest_or_silence|unclear|null",
+                            "decision_reason": "fills_meter|short_for_meter|meter_unclear|rhythm_unclear|not_first_measure|other|null",
+                        },
                     }
                 ],
                 "warnings": [{"type": "string", "system_id": "string", "system_index": "integer", "message": "string"}],

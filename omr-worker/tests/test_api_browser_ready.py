@@ -1725,6 +1725,141 @@ class BrowserReadyApiTests(unittest.TestCase):
             },
         )
 
+    def test_normalize_ai_suggestions_result_keeps_first_measure_decision_debug_on_pickup(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "m0",
+                    "label": "pickup",
+                    "measure_completeness": "incomplete",
+                    "rest_count": None,
+                    "confidence": "medium",
+                    "decision_debug": {
+                        "active_meter_read": "2/4",
+                        "duration_judgment": "short",
+                        "rhythm_basis": "chord_single_event",
+                        "decision_reason": "short_for_meter",
+                    },
+                }
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        expected_debug = {
+            "active_meter_read": "2/4",
+            "duration_judgment": "short",
+            "rhythm_basis": "chord_single_event",
+            "decision_reason": "short_for_meter",
+        }
+        self.assertEqual(normalized.get("decision_debug_by_measure_id"), {"m0": expected_debug})
+        self.assertEqual((normalized.get("by_measure_id", {}).get("m0") or {}).get("decision_debug"), expected_debug)
+
+    def test_normalize_ai_suggestions_result_keeps_first_measure_decision_debug_on_omitted_normal(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "m0",
+                    "label": "normal",
+                    "measure_completeness": "full",
+                    "rest_count": None,
+                    "confidence": "high",
+                    "decision_debug": {
+                        "active_meter_read": "2/4",
+                        "duration_judgment": "full",
+                        "rhythm_basis": "multiple_events",
+                        "decision_reason": "fills_meter",
+                    },
+                }
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertEqual(normalized.get("by_measure_id"), {})
+        self.assertEqual(
+            normalized.get("decision_debug_by_measure_id"),
+            {
+                "m0": {
+                    "active_meter_read": "2/4",
+                    "duration_judgment": "full",
+                    "rhythm_basis": "multiple_events",
+                    "decision_reason": "fills_meter",
+                }
+            },
+        )
+
+    def test_normalize_ai_suggestions_result_sanitizes_invalid_first_measure_decision_debug(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+                {"measure_id": "m1", "system_id": "p1_s0", "measure_local_index": 1, "global_index": 1},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "m0",
+                    "label": "normal",
+                    "measure_completeness": "full",
+                    "rest_count": None,
+                    "confidence": "high",
+                    "decision_debug": {
+                        "active_meter_read": "not a meter",
+                        "duration_judgment": "very long explanation",
+                        "rhythm_basis": "unknown rhythm words",
+                        "decision_reason": "because I think so",
+                    },
+                },
+                {
+                    "measure_id": "m1",
+                    "label": "normal",
+                    "measure_completeness": "full",
+                    "rest_count": None,
+                    "confidence": "high",
+                    "decision_debug": {
+                        "active_meter_read": "2/4",
+                        "duration_judgment": "short",
+                        "rhythm_basis": "single_event",
+                        "decision_reason": "short_for_meter",
+                    },
+                },
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertEqual(
+            normalized.get("decision_debug_by_measure_id"),
+            {
+                "m0": {
+                    "active_meter_read": "unknown",
+                    "duration_judgment": "unclear",
+                    "rhythm_basis": "unclear",
+                    "decision_reason": "other",
+                }
+            },
+        )
+
     def test_normalize_ai_suggestions_result_keeps_unclear_reason_on_uncertain_row(self):
         editable_state = {
             "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
@@ -2114,6 +2249,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves.", rules_text)
         self.assertIn("one beat before the first barline is a pickup even if only the treble staff plays", rules_text)
         self.assertIn("Chords or stacked notes count as one rhythmic event, not multiple beats.", rules_text)
+        self.assertIn("For the first measure of the score only, include decision_debug", rules_text)
         self.assertIn("a visibly short opening measure before the first barline is strong pickup evidence", rules_text)
         self.assertIn("Do not use width alone; a measure may look narrow", rules_text)
         self.assertIn("Examples: in 2/4, one quarter note in the first measure is pickup;", rules_text)
@@ -2128,6 +2264,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             suggestion_shape.get("unclear_reason"),
             "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
         )
+        self.assertIsInstance(suggestion_shape.get("decision_debug"), dict)
+        self.assertIn("active_meter_read", suggestion_shape.get("decision_debug") or {})
         time_update_shape = ((output_shape.get("time_signature_updates") or [])[0] or {})
         self.assertIn("2/4", time_update_shape.get("new_time_signature") or "")
 
