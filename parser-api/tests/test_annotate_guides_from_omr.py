@@ -427,6 +427,64 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
         self.assertEqual(row["filename"], "coordinate_debug_page_12.png")
         self.assertTrue(row["written"])
 
+    def test_omr_to_pdf_point_without_crop_offset_matches_old_math(self):
+        class FakeRect:
+            def __init__(self, x0, y0, x1, y1):
+                self.x0 = x0
+                self.y0 = y0
+                self.x1 = x1
+                self.y1 = y1
+                self.width = x1 - x0
+                self.height = y1 - y0
+
+        class FakePage:
+            rect = FakeRect(0.0, 0.0, 200.0, 100.0)
+            cropbox = FakeRect(0.0, 0.0, 200.0, 100.0)
+
+        x_pdf, y_pdf = MOD._omr_to_pdf_point(20.0, 30.0, 0.5, 0.5, FakePage())
+
+        self.assertEqual(x_pdf, 10.0)
+        self.assertEqual(y_pdf, 15.0)
+
+    def test_omr_to_pdf_point_adds_crop_offset(self):
+        class FakeRect:
+            def __init__(self, x0, y0, x1, y1):
+                self.x0 = x0
+                self.y0 = y0
+                self.x1 = x1
+                self.y1 = y1
+                self.width = x1 - x0
+                self.height = y1 - y0
+
+        class FakePage:
+            rect = FakeRect(0.0, 0.0, 200.0, 100.0)
+            cropbox = FakeRect(10.0, 20.0, 210.0, 120.0)
+
+        x_pdf, y_pdf = MOD._omr_to_pdf_point(20.0, 30.0, 0.5, 0.5, FakePage())
+
+        self.assertEqual(x_pdf, 20.0)
+        self.assertEqual(y_pdf, 35.0)
+
+    def test_crop_offset_keeps_converted_box_size_same(self):
+        class FakeRect:
+            def __init__(self, x0, y0, x1, y1):
+                self.x0 = x0
+                self.y0 = y0
+                self.x1 = x1
+                self.y1 = y1
+                self.width = x1 - x0
+                self.height = y1 - y0
+
+        class FakePage:
+            rect = FakeRect(0.0, 0.0, 200.0, 100.0)
+            cropbox = FakeRect(10.0, 20.0, 210.0, 120.0)
+
+        x_left, y_top = MOD._omr_to_pdf_point(20.0, 30.0, 0.5, 0.5, FakePage())
+        x_right, y_bottom = MOD._omr_to_pdf_point(80.0, 90.0, 0.5, 0.5, FakePage())
+
+        self.assertEqual(x_right - x_left, 30.0)
+        self.assertEqual(y_bottom - y_top, 30.0)
+
     def test_page_box_debug_payload_includes_boxes_and_conversion_samples(self):
         class FakeRect:
             def __init__(self, x0, y0, x1, y1):
@@ -464,7 +522,10 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
         self.assertEqual(payload["cropbox"]["x0"], 10.0)
         self.assertEqual(payload["mediabox"]["height"], 130.0)
         self.assertEqual(payload["picture_width"], 400.0)
-        self.assertEqual(payload["sample_current_pdf_boxes"][0]["x_left"], 10.0)
+        self.assertEqual(payload["conversion_mode"], "cropbox_offset")
+        self.assertEqual(payload["sample_current_pdf_boxes"][0]["x_left"], 20.0)
+        self.assertEqual(payload["sample_current_pdf_boxes"][0]["y_top"], 35.0)
+        self.assertEqual(payload["sample_rect_only_pdf_boxes"][0]["x_left"], 10.0)
         self.assertEqual(payload["sample_cropbox_offset_pdf_boxes"][0]["x_left"], 20.0)
 
     def test_second_pass_can_supplement_incomplete_staff_barline_ids(self):

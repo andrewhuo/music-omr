@@ -128,11 +128,12 @@ def _draw_measure_label(page: fitz.Page, rect: fitz.Rect, x: float, y: float, te
     tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
     th = float(MEASURE_TEXT_SIZE + 2.0)
     bg = fitz.Rect(x - 1.0, y - th + 1.0, x + tw + 1.0, y + 1.0)
+    max_w, max_h = _page_coord_limits(page)
 
-    x0 = max(0.0, min(bg.x0, rect.width))
-    y0 = max(0.0, min(bg.y0, rect.height))
-    x1 = max(0.0, min(bg.x1, rect.width))
-    y1 = max(0.0, min(bg.y1, rect.height))
+    x0 = max(0.0, min(bg.x0, max_w))
+    y0 = max(0.0, min(bg.y0, max_h))
+    x1 = max(0.0, min(bg.x1, max_w))
+    y1 = max(0.0, min(bg.y1, max_h))
     if x1 > x0 and y1 > y0:
         page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
 
@@ -1521,6 +1522,45 @@ def _safe_round_float(value, digits: int = 3):
         return None
 
 
+def _page_crop_offsets(page: fitz.Page) -> tuple[float, float]:
+    cropbox = getattr(page, "cropbox", None)
+    if cropbox is None:
+        return (0.0, 0.0)
+    return (float(getattr(cropbox, "x0", 0.0) or 0.0), float(getattr(cropbox, "y0", 0.0) or 0.0))
+
+
+def _page_coord_limits(page: fitz.Page) -> tuple[float, float]:
+    cropbox = getattr(page, "cropbox", None)
+    if cropbox is not None:
+        return (
+            max(float(page.rect.width), float(getattr(cropbox, "x1", page.rect.width) or page.rect.width)),
+            max(float(page.rect.height), float(getattr(cropbox, "y1", page.rect.height) or page.rect.height)),
+        )
+    return (float(page.rect.width), float(page.rect.height))
+
+
+def _omr_to_pdf_point(
+    x_px: float,
+    y_px: float,
+    scale_x: float,
+    scale_y: float,
+    page: fitz.Page,
+) -> tuple[float, float]:
+    crop_x, crop_y = _page_crop_offsets(page)
+    return ((float(x_px) * float(scale_x)) + crop_x, (float(y_px) * float(scale_y)) + crop_y)
+
+
+def _omr_to_pdf_y_span(
+    y0_px: float,
+    y1_px: float,
+    scale_y: float,
+    page: fitz.Page,
+) -> tuple[float, float]:
+    _, y0 = _omr_to_pdf_point(0.0, y0_px, 1.0, scale_y, page)
+    _, y1 = _omr_to_pdf_point(0.0, y1_px, 1.0, scale_y, page)
+    return (y0, y1)
+
+
 def _box_preview(rows: list[dict], limit: int = 2) -> list[dict]:
     if not rows:
         return []
@@ -1624,6 +1664,7 @@ def _page_box_debug_payload(
     mediabox = getattr(page, "mediabox", None)
     sample_px = _box_preview(measure_box_rows_px, limit=1)
     sample_current = []
+    sample_rect_only = []
     sample_crop_offset = []
     sample_media_offset = []
     for row in sample_px:
@@ -1631,13 +1672,23 @@ def _page_box_debug_payload(
         x_right = float(row.get("x_right") or 0.0)
         y_top = float(row.get("y_top") or 0.0)
         y_bottom = float(row.get("y_bottom") or 0.0)
+        x_left_pdf, y_top_pdf = _omr_to_pdf_point(x_left, y_top, scale_x, scale_y, page)
+        x_right_pdf, y_bottom_pdf = _omr_to_pdf_point(x_right, y_bottom, scale_x, scale_y, page)
         current = {
-            "x_left": _safe_round_float(x_left * scale_x),
-            "x_right": _safe_round_float(x_right * scale_x),
-            "y_top": _safe_round_float(y_top * scale_y),
-            "y_bottom": _safe_round_float(y_bottom * scale_y),
+            "x_left": _safe_round_float(x_left_pdf),
+            "x_right": _safe_round_float(x_right_pdf),
+            "y_top": _safe_round_float(y_top_pdf),
+            "y_bottom": _safe_round_float(y_bottom_pdf),
         }
         sample_current.append(current)
+        sample_rect_only.append(
+            {
+                "x_left": _safe_round_float(x_left * scale_x),
+                "x_right": _safe_round_float(x_right * scale_x),
+                "y_top": _safe_round_float(y_top * scale_y),
+                "y_bottom": _safe_round_float(y_bottom * scale_y),
+            }
+        )
         if cropbox is not None:
             sample_crop_offset.append(
                 {
@@ -1672,9 +1723,13 @@ def _page_box_debug_payload(
         "picture_height": _safe_round_float(pic_h),
         "scale_x": _safe_round_float(scale_x, 6),
         "scale_y": _safe_round_float(scale_y, 6),
+        "conversion_mode": "cropbox_offset",
+        "crop_offset_x": _safe_round_float(_page_crop_offsets(page)[0]),
+        "crop_offset_y": _safe_round_float(_page_crop_offsets(page)[1]),
         "debug_image_size": debug_image_size,
         "sample_pixel_boxes": sample_px,
         "sample_current_pdf_boxes": sample_current,
+        "sample_rect_only_pdf_boxes": sample_rect_only,
         "sample_cropbox_offset_pdf_boxes": sample_crop_offset,
         "sample_mediabox_offset_pdf_boxes": sample_media_offset,
     }
@@ -2856,13 +2911,17 @@ def _fallback_missing_staff_guides(
         staves.append((x_left, y_top, y_bot))
 
     rect = page.rect
-    pad_pdf = (PAD_LEFT_PX / float(w)) * rect.width
+    scale_x = rect.width / float(w)
+    scale_y = rect.height / float(h)
+    coord_limit_w, coord_limit_h = _page_coord_limits(page)
 
     extras = []
     for x_left_i, y_top_i, y_bot_i in staves:
-        x_pdf = (x_left_i / float(w)) * rect.width - pad_pdf
-        y0_pdf = (y_top_i / float(h)) * rect.height
-        y1_pdf = (y_bot_i / float(h)) * rect.height
+        x_pdf, y0_pdf = _omr_to_pdf_point(float(x_left_i) - float(PAD_LEFT_PX), y_top_i, scale_x, scale_y, page)
+        _, y1_pdf = _omr_to_pdf_point(float(x_left_i) - float(PAD_LEFT_PX), y_bot_i, scale_x, scale_y, page)
+        x_pdf = max(0.0, min(float(coord_limit_w), x_pdf))
+        y0_pdf = max(0.0, min(float(coord_limit_h), y0_pdf))
+        y1_pdf = max(0.0, min(float(coord_limit_h), y1_pdf))
         if y1_pdf <= y0_pdf:
             continue
 
@@ -3063,17 +3122,24 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             rect = page.rect
             scale_x = rect.width / pic_w
             scale_y = rect.height / pic_h
+            coord_limit_w, coord_limit_h = _page_coord_limits(page)
 
             staff_guides_pdf_raw: list[tuple[float, float, float]] = []
             for (x_px, y0_px, y1_px) in guides_px:
-                staff_guides_pdf_raw.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y))
+                x_pdf, y0_pdf = _omr_to_pdf_point(x_px, y0_px, scale_x, scale_y, page)
+                _, y1_pdf = _omr_to_pdf_point(x_px, y1_px, scale_x, scale_y, page)
+                staff_guides_pdf_raw.append((x_pdf, y0_pdf, y1_pdf))
 
             sequential_labels_pdf = []
             for (x_px, y0_px, y1_px, text) in measure_marks_px:
-                sequential_labels_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y, text))
+                x_pdf, y0_pdf = _omr_to_pdf_point(x_px, y0_px, scale_x, scale_y, page)
+                _, y1_pdf = _omr_to_pdf_point(x_px, y1_px, scale_x, scale_y, page)
+                sequential_labels_pdf.append((x_pdf, y0_pdf, y1_pdf, text))
             staff_start_labels_pdf = []
             for (x_px, y0_px, y1_px, text) in staff_start_marks_px:
-                staff_start_labels_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y, text))
+                x_pdf, y0_pdf = _omr_to_pdf_point(x_px, y0_px, scale_x, scale_y, page)
+                _, y1_pdf = _omr_to_pdf_point(x_px, y1_px, scale_x, scale_y, page)
+                staff_start_labels_pdf.append((x_pdf, y0_pdf, y1_pdf, text))
             system_label_candidate_rows = [
                 row for row in _aggregate_system_label_rows(staff_start_labels_pdf, system_staff_counts) if row is not None
             ]
@@ -3090,11 +3156,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     primary_system_guides_aligned_pdf.append(None)
                 else:
                     x_px, y0_px, y1_px = row
-                    primary_system_guides_aligned_pdf.append((x_px * scale_x, y0_px * scale_y, y1_px * scale_y))
+                    x_pdf, y0_pdf = _omr_to_pdf_point(x_px, y0_px, scale_x, scale_y, page)
+                    _, y1_pdf = _omr_to_pdf_point(x_px, y1_px, scale_x, scale_y, page)
+                    primary_system_guides_aligned_pdf.append((x_pdf, y0_pdf, y1_pdf))
 
             needs_rebuild = (
                 len([r for r in primary_system_guides_aligned_pdf if r is not None]) != omr_system_count
-                or _system_guides_invalid(primary_system_guides_aligned_pdf, float(rect.width), float(rect.height))
+                or _system_guides_invalid(primary_system_guides_aligned_pdf, float(coord_limit_w), float(coord_limit_h))
             )
             if needs_rebuild:
                 (
@@ -3107,8 +3175,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     primary_guides_aligned=primary_system_guides_aligned_pdf,
                     staff_start_labels_pdf=staff_start_labels_pdf,
                     system_staff_counts=system_staff_counts,
-                    page_w=float(rect.width),
-                    page_h=float(rect.height),
+                    page_w=float(coord_limit_w),
+                    page_h=float(coord_limit_h),
                 )
             else:
                 system_guides_pdf = [row for row in primary_system_guides_aligned_pdf if row is not None]
@@ -3332,8 +3400,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "scale_y": _safe_round_float(scale_y, 6),
                     "page_width": _safe_round_float(rect.width),
                     "page_height": _safe_round_float(rect.height),
+                    "coord_limit_width": _safe_round_float(coord_limit_w),
+                    "coord_limit_height": _safe_round_float(coord_limit_h),
                     "picture_width": _safe_round_float(pic_w),
                     "picture_height": _safe_round_float(pic_h),
+                    "conversion_mode": "cropbox_offset",
+                    "crop_offset_x": _safe_round_float(_page_crop_offsets(page)[0]),
+                    "crop_offset_y": _safe_round_float(_page_crop_offsets(page)[1]),
                 }
                 trace["pdf_measure_boxes_preview"] = []
                 trace["pdf_measure_box_count"] = 0
@@ -3352,10 +3425,12 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 if (x_right_px - x_left_px) < 6.0 or y_bottom_px <= y_top_px:
                     continue
 
-                x_left_pdf = max(0.0, min(float(rect.width), x_left_px * scale_x))
-                x_right_pdf = max(0.0, min(float(rect.width), x_right_px * scale_x))
-                y_top_pdf = max(0.0, min(float(rect.height), y_top_px * scale_y))
-                y_bottom_pdf = max(0.0, min(float(rect.height), y_bottom_px * scale_y))
+                x_left_pdf, y_top_pdf = _omr_to_pdf_point(x_left_px, y_top_px, scale_x, scale_y, page)
+                x_right_pdf, y_bottom_pdf = _omr_to_pdf_point(x_right_px, y_bottom_px, scale_x, scale_y, page)
+                x_left_pdf = max(0.0, min(float(coord_limit_w), x_left_pdf))
+                x_right_pdf = max(0.0, min(float(coord_limit_w), x_right_pdf))
+                y_top_pdf = max(0.0, min(float(coord_limit_h), y_top_pdf))
+                y_bottom_pdf = max(0.0, min(float(coord_limit_h), y_bottom_pdf))
                 if (x_right_pdf - x_left_pdf) < 6.0 or y_bottom_pdf <= y_top_pdf:
                     continue
 
@@ -3478,13 +3553,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     max_right = float(x_pdf) + MEASURE_TEXT_GUIDE_RIGHT_LIMIT
                     if (x_centered + tw) > max_right:
                         x_centered = max_right - tw
-                    x_text = min(max(0.0, x_centered), max(0.0, rect.width - tw - 2.0))
+                    x_text = min(max(0.0, x_centered), max(0.0, coord_limit_w - tw - 2.0))
                     y_text = max(MEASURE_TEXT_SIZE + 2.0, y0_pdf - y_offset)
-                    y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, rect.height - 2.0))
+                    y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, coord_limit_h - 2.0))
 
                     in_bounds = (
-                        0.0 <= x_text <= max(0.0, rect.width - tw)
-                        and (MEASURE_TEXT_SIZE + 2.0) <= y_text <= rect.height
+                        0.0 <= x_text <= max(0.0, coord_limit_w - tw)
+                        and (MEASURE_TEXT_SIZE + 2.0) <= y_text <= coord_limit_h
                     )
                     if in_bounds:
                         labels_in_bounds += 1
@@ -3595,8 +3670,8 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "system_label_rows": system_label_rows,
                     "measure_box_rows": measure_box_rows,
                     "measure_box_filter_reason_counts": dict(measure_box_filter_reason_counts),
-                    "page_width": round(float(rect.width), 3),
-                    "page_height": round(float(rect.height), 3),
+                    "page_width": round(float(coord_limit_w), 3),
+                    "page_height": round(float(coord_limit_h), 3),
                     "ending_anchor_count": ending_anchor_count,
                     "ending_labels_drawn": ending_labels_drawn,
                     "label_x_mode": "center_with_anti_clef_shift",
