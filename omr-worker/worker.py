@@ -2291,6 +2291,16 @@ def _normalize_ai_unclear_reason_value(raw_value) -> str | None:
     return text if text in AI_SUGGESTION_UNCLEAR_REASONS_ALLOWED else None
 
 
+def _normalize_ai_debug_note(raw_value, max_words: int = 50) -> str:
+    text = re.sub(r"\s+", " ", str(raw_value or "").strip())
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) > max_words:
+        text = " ".join(words[:max_words])
+    return text
+
+
 def _normalize_ai_decision_debug(raw_debug) -> dict | None:
     if not isinstance(raw_debug, dict):
         return None
@@ -2309,6 +2319,7 @@ def _normalize_ai_decision_debug(raw_debug) -> dict | None:
         "duration_judgment": duration,
         "rhythm_basis": rhythm,
         "decision_reason": reason,
+        "debug_note": _normalize_ai_debug_note(raw_debug.get("debug_note")),
     }
 
 
@@ -3391,7 +3402,7 @@ def _build_system_measure_request(
                 "For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count. If one staff has music, no count, or a different count, do not return multi_measure_rest.",
                 "If label is uncertain and you have a tentative guess, maybe_label may be pickup or multi_measure_rest, and maybe_rest_count is only allowed for maybe_label multi_measure_rest.",
                 "If maybe_label is multi_measure_rest, always include maybe_rest_count if the count number is at all readable. Only omit maybe_rest_count if the number is completely unreadable.",
-                "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes showing what meter you used, whether the rhythm looked full/short/unclear, and why you chose the label.",
+                "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes plus debug_note: 1-3 short sentences, max 50 words, explaining what you saw rhythmically, what meter you used, and why you chose the label.",
                 "Return JSON only.",
             ],
             "output_shape": {
@@ -3411,6 +3422,7 @@ def _build_system_measure_request(
                             "duration_judgment": "full|short|unclear|null",
                             "rhythm_basis": "single_event|chord_single_event|multiple_events|rest_or_silence|unclear|null",
                             "decision_reason": "fills_meter|short_for_meter|meter_unclear|rhythm_unclear|not_first_measure|other|null",
+                            "debug_note": "1-3 short sentences, max 50 words|null",
                         },
                     }
                 ],

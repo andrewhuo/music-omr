@@ -1746,6 +1746,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                         "duration_judgment": "short",
                         "rhythm_basis": "chord_single_event",
                         "decision_reason": "short_for_meter",
+                        "debug_note": "I saw one stacked chord event in 2/4, so I judged it short.",
                     },
                 }
             ],
@@ -1759,6 +1760,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             "duration_judgment": "short",
             "rhythm_basis": "chord_single_event",
             "decision_reason": "short_for_meter",
+            "debug_note": "I saw one stacked chord event in 2/4, so I judged it short.",
         }
         self.assertEqual(normalized.get("decision_debug_by_measure_id"), {"m0": expected_debug})
         self.assertEqual((normalized.get("by_measure_id", {}).get("m0") or {}).get("decision_debug"), expected_debug)
@@ -1784,6 +1786,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                         "duration_judgment": "full",
                         "rhythm_basis": "multiple_events",
                         "decision_reason": "fills_meter",
+                        "debug_note": "I saw enough rhythm to fill the visible 2/4 measure.",
                     },
                 }
             ],
@@ -1801,6 +1804,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     "duration_judgment": "full",
                     "rhythm_basis": "multiple_events",
                     "decision_reason": "fills_meter",
+                    "debug_note": "I saw enough rhythm to fill the visible 2/4 measure.",
                 }
             },
         )
@@ -1827,6 +1831,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                         "duration_judgment": "very long explanation",
                         "rhythm_basis": "unknown rhythm words",
                         "decision_reason": "because I think so",
+                        "debug_note": " ".join(f"word{i}" for i in range(60)),
                     },
                 },
                 {
@@ -1840,6 +1845,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                         "duration_judgment": "short",
                         "rhythm_basis": "single_event",
                         "decision_reason": "short_for_meter",
+                        "debug_note": "This later debug should be ignored.",
                     },
                 },
             ],
@@ -1856,6 +1862,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     "duration_judgment": "unclear",
                     "rhythm_basis": "unclear",
                     "decision_reason": "other",
+                    "debug_note": " ".join(f"word{i}" for i in range(50)),
                 }
             },
         )
@@ -2277,6 +2284,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("one beat before the first barline is a pickup even if only the treble staff plays", rules_text)
         self.assertIn("Chords or stacked notes count as one rhythmic event, not multiple beats.", rules_text)
         self.assertIn("For the first measure of the score only, decision_debug is required. Do not omit it.", rules_text)
+        self.assertIn("debug_note: 1-3 short sentences, max 50 words", rules_text)
         self.assertIn("a visibly short opening measure before the first barline is strong pickup evidence", rules_text)
         self.assertIn("Do not use width alone; a measure may look narrow", rules_text)
         self.assertIn("Examples: in 2/4, one quarter note in the first measure is pickup;", rules_text)
@@ -2293,6 +2301,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         self.assertIsInstance(suggestion_shape.get("decision_debug"), dict)
         self.assertIn("active_meter_read", suggestion_shape.get("decision_debug") or {})
+        self.assertIn("debug_note", suggestion_shape.get("decision_debug") or {})
         time_update_shape = ((output_shape.get("time_signature_updates") or [])[0] or {})
         self.assertIn("2/4", time_update_shape.get("new_time_signature") or "")
 
