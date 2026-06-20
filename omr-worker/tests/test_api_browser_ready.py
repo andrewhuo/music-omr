@@ -1860,6 +1860,33 @@ class BrowserReadyApiTests(unittest.TestCase):
             },
         )
 
+    def test_normalize_ai_suggestions_result_warns_when_first_measure_decision_debug_missing(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "m0",
+                    "label": "normal",
+                    "measure_completeness": "full",
+                    "rest_count": None,
+                    "confidence": "high",
+                }
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertEqual(normalized.get("decision_debug_by_measure_id"), {})
+        warnings = normalized.get("warnings") or []
+        self.assertTrue(any("first_measure_decision_debug_missing" in str((row or {}).get("message") or "") for row in warnings))
+
     def test_normalize_ai_suggestions_result_keeps_unclear_reason_on_uncertain_row(self):
         editable_state = {
             "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
@@ -2249,7 +2276,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves.", rules_text)
         self.assertIn("one beat before the first barline is a pickup even if only the treble staff plays", rules_text)
         self.assertIn("Chords or stacked notes count as one rhythmic event, not multiple beats.", rules_text)
-        self.assertIn("For the first measure of the score only, include decision_debug", rules_text)
+        self.assertIn("For the first measure of the score only, decision_debug is required. Do not omit it.", rules_text)
         self.assertIn("a visibly short opening measure before the first barline is strong pickup evidence", rules_text)
         self.assertIn("Do not use width alone; a measure may look narrow", rules_text)
         self.assertIn("Examples: in 2/4, one quarter note in the first measure is pickup;", rules_text)

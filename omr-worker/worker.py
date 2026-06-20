@@ -2432,17 +2432,25 @@ def _normalize_ai_suggestions_result(
         maybe_rest_count = row.get("maybe_rest_count")
         raw_unclear_reason = row.get("unclear_reason")
         decision_debug = None
-        if is_first_measure_of_score and row.get("decision_debug") is not None:
-            decision_debug = _normalize_ai_decision_debug(row.get("decision_debug"))
-            if decision_debug is None:
+        if is_first_measure_of_score:
+            if row.get("decision_debug") is None:
                 normalization_warnings.append(
                     _ai_suggest_normalization_warning(
                         measure_row,
-                        f"Dropped invalid decision_debug for {measure_id}.",
+                        f"first_measure_decision_debug_missing for {measure_id}.",
                     )
                 )
             else:
-                decision_debug_by_measure_id[measure_id] = decision_debug
+                decision_debug = _normalize_ai_decision_debug(row.get("decision_debug"))
+                if decision_debug is None:
+                    normalization_warnings.append(
+                        _ai_suggest_normalization_warning(
+                            measure_row,
+                            f"Dropped invalid decision_debug for {measure_id}.",
+                        )
+                    )
+                else:
+                    decision_debug_by_measure_id[measure_id] = decision_debug
         measure_completeness = _normalize_ai_measure_completeness_value(row.get("measure_completeness"))
         if measure_completeness is None:
             normalization_warnings.append(
@@ -3383,7 +3391,7 @@ def _build_system_measure_request(
                 "For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count. If one staff has music, no count, or a different count, do not return multi_measure_rest.",
                 "If label is uncertain and you have a tentative guess, maybe_label may be pickup or multi_measure_rest, and maybe_rest_count is only allowed for maybe_label multi_measure_rest.",
                 "If maybe_label is multi_measure_rest, always include maybe_rest_count if the count number is at all readable. Only omit maybe_rest_count if the number is completely unreadable.",
-                "For the first measure of the score only, include decision_debug with short codes showing what meter you used, whether the rhythm looked full/short/unclear, and why you chose the label.",
+                "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes showing what meter you used, whether the rhythm looked full/short/unclear, and why you chose the label.",
                 "Return JSON only.",
             ],
             "output_shape": {
