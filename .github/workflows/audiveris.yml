@@ -4369,6 +4369,7 @@ jobs:
           parser_system_debug: list[dict] = []
           coordinate_trace: list[dict] = []
           coordinate_debug_images: list[dict] = []
+          page_box_debug: list[dict] = []
 
           strict_total = len(pages)
           strict_ok = 0
@@ -4529,6 +4530,15 @@ jobs:
                               "written": bool(image_row.get("written")),
                           }
                       )
+
+              page_box_row = pg.get("page_box_debug")
+              if isinstance(page_box_row, dict):
+                  page_box_debug.append(
+                      {
+                          "page": int(page_no),
+                          **page_box_row,
+                      }
+                  )
 
               system_rows = pg.get("system_label_rows") or []
               if not isinstance(system_rows, list):
@@ -4757,6 +4767,7 @@ jobs:
               "coordinate_trace_count": len(coordinate_trace),
               "coordinate_trace": coordinate_trace,
               "coordinate_debug_images": coordinate_debug_images,
+              "page_box_debug": page_box_debug,
               "editable_state": editable_state,
           }
 

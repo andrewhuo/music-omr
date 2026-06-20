@@ -427,6 +427,46 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
         self.assertEqual(row["filename"], "coordinate_debug_page_12.png")
         self.assertTrue(row["written"])
 
+    def test_page_box_debug_payload_includes_boxes_and_conversion_samples(self):
+        class FakeRect:
+            def __init__(self, x0, y0, x1, y1):
+                self.x0 = x0
+                self.y0 = y0
+                self.x1 = x1
+                self.y1 = y1
+                self.width = x1 - x0
+                self.height = y1 - y0
+
+        class FakePage:
+            rect = FakeRect(0.0, 0.0, 200.0, 100.0)
+            cropbox = FakeRect(10.0, 20.0, 210.0, 120.0)
+            mediabox = FakeRect(0.0, 0.0, 220.0, 130.0)
+            rotation = 0
+
+        payload = MOD._page_box_debug_payload(
+            FakePage(),
+            400.0,
+            200.0,
+            0.5,
+            0.5,
+            [
+                {
+                    "measure_local_index": 0,
+                    "x_left": 20.0,
+                    "x_right": 80.0,
+                    "y_top": 30.0,
+                    "y_bottom": 90.0,
+                }
+            ],
+        )
+
+        self.assertEqual(payload["rect"]["width"], 200.0)
+        self.assertEqual(payload["cropbox"]["x0"], 10.0)
+        self.assertEqual(payload["mediabox"]["height"], 130.0)
+        self.assertEqual(payload["picture_width"], 400.0)
+        self.assertEqual(payload["sample_current_pdf_boxes"][0]["x_left"], 10.0)
+        self.assertEqual(payload["sample_cropbox_offset_pdf_boxes"][0]["x_left"], 20.0)
+
     def test_second_pass_can_supplement_incomplete_staff_barline_ids(self):
         system_inters = ET.Element("inters")
         bar1 = _barline_el(1, "1", 100.0, 10.0, 50.0)

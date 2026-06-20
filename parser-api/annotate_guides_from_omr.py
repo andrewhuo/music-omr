@@ -1599,6 +1599,87 @@ def _coordinate_trace_payload(entry: dict, chosen_starts_info: dict) -> dict:
     }
 
 
+def _rect_payload(rect) -> dict:
+    return {
+        "x0": _safe_round_float(getattr(rect, "x0", None)),
+        "y0": _safe_round_float(getattr(rect, "y0", None)),
+        "x1": _safe_round_float(getattr(rect, "x1", None)),
+        "y1": _safe_round_float(getattr(rect, "y1", None)),
+        "width": _safe_round_float(getattr(rect, "width", None)),
+        "height": _safe_round_float(getattr(rect, "height", None)),
+    }
+
+
+def _page_box_debug_payload(
+    page: fitz.Page,
+    pic_w: float,
+    pic_h: float,
+    scale_x: float,
+    scale_y: float,
+    measure_box_rows_px: list[dict],
+    debug_image_path: str | None = None,
+) -> dict:
+    page_rect = page.rect
+    cropbox = getattr(page, "cropbox", None)
+    mediabox = getattr(page, "mediabox", None)
+    sample_px = _box_preview(measure_box_rows_px, limit=1)
+    sample_current = []
+    sample_crop_offset = []
+    sample_media_offset = []
+    for row in sample_px:
+        x_left = float(row.get("x_left") or 0.0)
+        x_right = float(row.get("x_right") or 0.0)
+        y_top = float(row.get("y_top") or 0.0)
+        y_bottom = float(row.get("y_bottom") or 0.0)
+        current = {
+            "x_left": _safe_round_float(x_left * scale_x),
+            "x_right": _safe_round_float(x_right * scale_x),
+            "y_top": _safe_round_float(y_top * scale_y),
+            "y_bottom": _safe_round_float(y_bottom * scale_y),
+        }
+        sample_current.append(current)
+        if cropbox is not None:
+            sample_crop_offset.append(
+                {
+                    "x_left": _safe_round_float((x_left * scale_x) + float(cropbox.x0)),
+                    "x_right": _safe_round_float((x_right * scale_x) + float(cropbox.x0)),
+                    "y_top": _safe_round_float((y_top * scale_y) + float(cropbox.y0)),
+                    "y_bottom": _safe_round_float((y_bottom * scale_y) + float(cropbox.y0)),
+                }
+            )
+        if mediabox is not None:
+            sample_media_offset.append(
+                {
+                    "x_left": _safe_round_float((x_left * scale_x) + float(mediabox.x0)),
+                    "x_right": _safe_round_float((x_right * scale_x) + float(mediabox.x0)),
+                    "y_top": _safe_round_float((y_top * scale_y) + float(mediabox.y0)),
+                    "y_bottom": _safe_round_float((y_bottom * scale_y) + float(mediabox.y0)),
+                }
+            )
+
+    debug_image_size = None
+    if debug_image_path and os.path.exists(debug_image_path):
+        img = cv2.imread(debug_image_path)
+        if img is not None:
+            debug_image_size = {"width": int(img.shape[1]), "height": int(img.shape[0])}
+
+    return {
+        "rect": _rect_payload(page_rect),
+        "cropbox": _rect_payload(cropbox) if cropbox is not None else None,
+        "mediabox": _rect_payload(mediabox) if mediabox is not None else None,
+        "rotation": int(getattr(page, "rotation", 0) or 0),
+        "picture_width": _safe_round_float(pic_w),
+        "picture_height": _safe_round_float(pic_h),
+        "scale_x": _safe_round_float(scale_x, 6),
+        "scale_y": _safe_round_float(scale_y, 6),
+        "debug_image_size": debug_image_size,
+        "sample_pixel_boxes": sample_px,
+        "sample_current_pdf_boxes": sample_current,
+        "sample_cropbox_offset_pdf_boxes": sample_crop_offset,
+        "sample_mediabox_offset_pdf_boxes": sample_media_offset,
+    }
+
+
 def _system_x_debug_payload(entry: dict, chosen_starts_info: dict) -> dict:
     staffs: list[dict] = []
     for staff_ctx in entry.get("staff_contexts") or []:
@@ -3324,6 +3405,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             ]
             coordinate_debug_images: list[dict] = []
             debug_dir = os.getenv("COORDINATE_DEBUG_DIR", "").strip()
+            debug_image_path = None
             if debug_dir:
                 os.makedirs(debug_dir, exist_ok=True)
                 debug_image_path = os.path.join(debug_dir, f"coordinate_debug_page_{page_index + 1}.png")
@@ -3343,6 +3425,15 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         "written": bool(debug_image_written),
                     }
                 )
+            page_box_debug = _page_box_debug_payload(
+                page,
+                pic_w,
+                pic_h,
+                scale_x,
+                scale_y,
+                measure_box_rows_px,
+                debug_image_path,
+            )
 
             if _debug_measure_labels_enabled():
                 print(
@@ -3490,6 +3581,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "omr_system_recovery_rows": omr_system_recovery_rows,
                     "coordinate_trace": coordinate_trace,
                     "coordinate_debug_images": coordinate_debug_images,
+                    "page_box_debug": page_box_debug,
                     "assigned_labels": [t[3] for t in staff_start_labels_pdf],
                     "staff_start_candidate_count": len(staff_start_labels_pdf),
                     "system_label_candidate_count": system_label_candidate_count,
