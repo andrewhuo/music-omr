@@ -2624,6 +2624,89 @@ def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
     return gray
 
 
+def _render_page_bgr_at_size(page: fitz.Page, width: float, height: float) -> np.ndarray:
+    page_rect = page.rect
+    zoom_x = float(width) / float(page_rect.width) if page_rect.width else 1.0
+    zoom_y = float(height) / float(page_rect.height) if page_rect.height else 1.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom_x, zoom_y), alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n == 4:
+        return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    if pix.n == 3:
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+
+def _draw_coordinate_debug_image(
+    page: fitz.Page,
+    out_path: str,
+    pic_w: float,
+    pic_h: float,
+    measure_box_rows_px: list[dict],
+    coordinate_trace: list[dict],
+) -> bool:
+    if pic_w <= 0 or pic_h <= 0:
+        return False
+    try:
+        img = _render_page_bgr_at_size(page, pic_w, pic_h)
+    except Exception:
+        return False
+
+    max_w = max(1, img.shape[1] - 1)
+    max_h = max(1, img.shape[0] - 1)
+
+    for row in measure_box_rows_px:
+        if not isinstance(row, dict):
+            continue
+        try:
+            x0 = int(round(float(row.get("x_left"))))
+            x1 = int(round(float(row.get("x_right"))))
+            y0 = int(round(float(row.get("y_top"))))
+            y1 = int(round(float(row.get("y_bottom"))))
+        except Exception:
+            continue
+        x0 = max(0, min(max_w, x0))
+        x1 = max(0, min(max_w, x1))
+        y0 = max(0, min(max_h, y0))
+        y1 = max(0, min(max_h, y1))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        cv2.rectangle(img, (x0, y0), (x1, y1), (0, 180, 0), 3)
+
+    for trace in coordinate_trace:
+        if not isinstance(trace, dict):
+            continue
+        system_index = int(trace.get("system_index") or 0)
+        for row in trace.get("raw_staff_rows_px") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                y0 = int(round(float(row.get("y_top"))))
+                y1 = int(round(float(row.get("y_bottom"))))
+            except Exception:
+                continue
+            y0 = max(0, min(max_h, y0))
+            y1 = max(0, min(max_h, y1))
+            cv2.line(img, (0, y0), (max_w, y0), (255, 80, 0), 2)
+            cv2.line(img, (0, y1), (max_w, y1), (255, 80, 0), 2)
+        boxes = trace.get("pixel_measure_boxes_preview") or []
+        if boxes and isinstance(boxes[0], dict):
+            x_text = int(max(0, min(max_w, float(boxes[0].get("x_left") or 0))))
+            y_text = int(max(14, min(max_h, float(boxes[0].get("y_top") or 0) - 8)))
+            cv2.putText(
+                img,
+                f"S{system_index}",
+                (x_text, y_text),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (255, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+    return bool(cv2.imwrite(out_path, img))
+
+
 def _fallback_missing_staff_guides(
     page: fitz.Page,
     existing_guides_pdf: list[tuple[float, float, float]],
@@ -3239,6 +3322,27 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 }
                 for system_index, trace in sorted(coordinate_trace_by_system.items())
             ]
+            coordinate_debug_images: list[dict] = []
+            debug_dir = os.getenv("COORDINATE_DEBUG_DIR", "").strip()
+            if debug_dir:
+                os.makedirs(debug_dir, exist_ok=True)
+                debug_image_path = os.path.join(debug_dir, f"coordinate_debug_page_{page_index + 1}.png")
+                debug_image_written = _draw_coordinate_debug_image(
+                    page,
+                    debug_image_path,
+                    pic_w,
+                    pic_h,
+                    measure_box_rows_px,
+                    coordinate_trace,
+                )
+                coordinate_debug_images.append(
+                    {
+                        "page": page_index + 1,
+                        "path": debug_image_path,
+                        "filename": os.path.basename(debug_image_path),
+                        "written": bool(debug_image_written),
+                    }
+                )
 
             if _debug_measure_labels_enabled():
                 print(
@@ -3385,6 +3489,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "omr_fallback_rows": omr_fallback_rows,
                     "omr_system_recovery_rows": omr_system_recovery_rows,
                     "coordinate_trace": coordinate_trace,
+                    "coordinate_debug_images": coordinate_debug_images,
                     "assigned_labels": [t[3] for t in staff_start_labels_pdf],
                     "staff_start_candidate_count": len(staff_start_labels_pdf),
                     "system_label_candidate_count": system_label_candidate_count,

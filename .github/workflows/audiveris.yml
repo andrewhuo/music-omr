@@ -4056,6 +4056,7 @@ jobs:
           SYSTEM_QA_POLICY: "${{ env.SYSTEM_QA_POLICY }}"
           PIPELINE_LOG_MODE: "${{ env.PIPELINE_LOG_MODE }}"
           MEASURE_MAPPING_DEBUG_PATH: "/tmp/work/measure_mapping_debug.json"
+          COORDINATE_DEBUG_DIR: "/tmp/work/coordinate_debug"
         run: |
           set -euo pipefail
           mode="$(echo "${PIPELINE_LOG_MODE:-quiet}" | tr '[:upper:]' '[:lower:]')"
@@ -4367,6 +4368,7 @@ jobs:
           parser_system_debug_available = bool(isinstance(mm_raw, dict) and isinstance(mm_raw.get("pages"), list))
           parser_system_debug: list[dict] = []
           coordinate_trace: list[dict] = []
+          coordinate_debug_images: list[dict] = []
 
           strict_total = len(pages)
           strict_ok = 0
@@ -4510,6 +4512,21 @@ jobs:
                           {
                               "page": int(page_no),
                               **trace_row,
+                          }
+                      )
+
+              page_coordinate_debug_images = pg.get("coordinate_debug_images") or []
+              if isinstance(page_coordinate_debug_images, list):
+                  for image_row in page_coordinate_debug_images:
+                      if not isinstance(image_row, dict):
+                          continue
+                      filename = str(image_row.get("filename") or "")
+                      coordinate_debug_images.append(
+                          {
+                              "page": int(page_no),
+                              "filename": filename,
+                              "artifact": f"artifacts/{filename}" if filename else None,
+                              "written": bool(image_row.get("written")),
                           }
                       )
 
@@ -4739,6 +4756,7 @@ jobs:
               "parser_system_debug": parser_system_debug,
               "coordinate_trace_count": len(coordinate_trace),
               "coordinate_trace": coordinate_trace,
+              "coordinate_debug_images": coordinate_debug_images,
               "editable_state": editable_state,
           }
 
@@ -4800,5 +4818,14 @@ jobs:
             echo "WARN: /tmp/work/mapping_summary.json not found"
             missing_count=$((missing_count + 1))
           fi
+
+          shopt -s nullglob
+          for debug_png in /tmp/work/coordinate_debug/coordinate_debug_page_*.png; do
+            name="$(basename "${debug_png}")"
+            gsutil cp "${debug_png}" "${ARTIFACTS_PREFIX}/${name}"
+            echo "uploaded_artifact_coordinate_debug=${ARTIFACTS_PREFIX}/${name}"
+            uploaded_count=$((uploaded_count + 1))
+          done
+          shopt -u nullglob
 
           echo "OUTPUT_LAYOUT_OK top_level=audiveris_out.pdf,artifacts/ uploaded=${uploaded_count} missing=${missing_count}"

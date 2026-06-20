@@ -415,6 +415,18 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
         self.assertEqual(payload["pixel_measure_boxes_preview"][0]["x_left"], 25.0)
         self.assertEqual(payload["pixel_measure_boxes_preview"][-1]["x_right"], 160.0)
 
+    def test_coordinate_debug_image_filename_shape(self):
+        path = "/tmp/work/coordinate_debug/coordinate_debug_page_12.png"
+        row = {
+            "page": 12,
+            "path": path,
+            "filename": os.path.basename(path),
+            "written": True,
+        }
+
+        self.assertEqual(row["filename"], "coordinate_debug_page_12.png")
+        self.assertTrue(row["written"])
+
     def test_second_pass_can_supplement_incomplete_staff_barline_ids(self):
         system_inters = ET.Element("inters")
         bar1 = _barline_el(1, "1", 100.0, 10.0, 50.0)
