@@ -1521,6 +1521,84 @@ def _safe_round_float(value, digits: int = 3):
         return None
 
 
+def _box_preview(rows: list[dict], limit: int = 2) -> list[dict]:
+    if not rows:
+        return []
+    if len(rows) <= (limit * 2):
+        picked = list(rows)
+    else:
+        picked = list(rows[:limit]) + list(rows[-limit:])
+    out: list[dict] = []
+    for row in picked:
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            {
+                "measure_local_index": int(row.get("measure_local_index") or 0),
+                "x_left": _safe_round_float(row.get("x_left")),
+                "x_right": _safe_round_float(row.get("x_right")),
+                "y_top": _safe_round_float(row.get("y_top")),
+                "y_bottom": _safe_round_float(row.get("y_bottom")),
+            }
+        )
+    return out
+
+
+def _measure_box_rows_from_starts_info(
+    page_id: str,
+    system_id: str,
+    system_index: int,
+    measure_starts_info: dict,
+) -> list[dict]:
+    rows: list[dict] = []
+    measure_starts = list(measure_starts_info.get("measure_starts") or [])
+    system_y_top = float(measure_starts_info.get("system_y_top") or 0.0)
+    system_y_bottom = float(measure_starts_info.get("system_y_bottom") or 0.0)
+    row_tail = float(measure_starts_info.get("row_tail") or 0.0)
+    if not measure_starts or system_y_bottom <= system_y_top:
+        return rows
+    for local_idx, x_left in enumerate(measure_starts):
+        x_right = float(measure_starts[local_idx + 1]) if local_idx + 1 < len(measure_starts) else row_tail
+        if (x_right - float(x_left)) < 6.0:
+            continue
+        rows.append(
+            {
+                "page_id": page_id,
+                "system_id": system_id,
+                "system_index": int(system_index),
+                "measure_local_index": int(local_idx),
+                "x_left": float(x_left),
+                "x_right": float(x_right),
+                "y_top": float(system_y_top),
+                "y_bottom": float(system_y_bottom),
+            }
+        )
+    return rows
+
+
+def _coordinate_trace_payload(entry: dict, chosen_starts_info: dict) -> dict:
+    first_pass = dict(entry.get("first_pass_starts_info") or {})
+    raw_rows = list(entry.get("system_measure_rows_px") or [])
+    adjusted_rows = _measure_box_rows_from_starts_info(
+        str(entry.get("page_id") or "?"),
+        str(entry.get("system_id") or "?"),
+        int(entry.get("system_index") or 0),
+        chosen_starts_info,
+    )
+    return {
+        "raw_staff_rows_px": _box_preview(raw_rows, limit=2),
+        "raw_measure_starts_px": [
+            _safe_round_float(x) for x in list(first_pass.get("measure_starts") or [])[:12]
+        ],
+        "adjusted_measure_starts_px": [
+            _safe_round_float(x) for x in list(chosen_starts_info.get("measure_starts") or [])[:12]
+        ],
+        "pixel_measure_boxes_preview": _box_preview(adjusted_rows, limit=2),
+        "pixel_measure_box_count": len(adjusted_rows),
+        "pixel_final_right_edge": _safe_round_float(chosen_starts_info.get("row_tail")),
+    }
+
+
 def _system_x_debug_payload(entry: dict, chosen_starts_info: dict) -> dict:
     staffs: list[dict] = []
     for staff_ctx in entry.get("staff_contexts") or []:
@@ -2517,6 +2595,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         else None
                     ),
                     "score_x_debug": _system_x_debug_payload(entry, chosen_starts_info),
+                    "coordinate_trace": _coordinate_trace_payload(entry, chosen_starts_info),
                 }
             )
 
@@ -3072,6 +3151,28 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     }
                 )
             measure_box_rows: list[dict] = []
+            coordinate_trace_by_system: dict[int, dict] = {}
+            for recovery_row in omr_system_recovery_rows:
+                if not isinstance(recovery_row, dict):
+                    continue
+                try:
+                    trace_system_index = int(recovery_row.get("system_index"))
+                except Exception:
+                    continue
+                trace = recovery_row.get("coordinate_trace")
+                if isinstance(trace, dict):
+                    coordinate_trace_by_system[trace_system_index] = dict(trace)
+            for trace in coordinate_trace_by_system.values():
+                trace["scale"] = {
+                    "scale_x": _safe_round_float(scale_x, 6),
+                    "scale_y": _safe_round_float(scale_y, 6),
+                    "page_width": _safe_round_float(rect.width),
+                    "page_height": _safe_round_float(rect.height),
+                    "picture_width": _safe_round_float(pic_w),
+                    "picture_height": _safe_round_float(pic_h),
+                }
+                trace["pdf_measure_boxes_preview"] = []
+                trace["pdf_measure_box_count"] = 0
             for row in measure_box_rows_px:
                 if not isinstance(row, dict):
                     continue
@@ -3101,21 +3202,43 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     else None
                 )
                 page_no = int(page_index + 1)
-                measure_box_rows.append(
-                    {
-                        "measure_id": f"p{page_no}_s{system_index}_m{measure_local_index}",
-                        "page": page_no,
-                        "system_id": f"p{page_no}_s{system_index}",
-                        "system_index": int(system_index),
-                        "measure_local_index": int(measure_local_index),
-                        "x_left": round(float(x_left_pdf), 3),
-                        "x_right": round(float(x_right_pdf), 3),
-                        "y_top": round(float(y_top_pdf), 3),
-                        "y_bottom": round(float(y_bottom_pdf), 3),
-                        "raw_measure_number": raw_measure_number,
-                        "source": str(row.get("source") or "omr"),
-                    }
-                )
+                measure_row_pdf = {
+                    "measure_id": f"p{page_no}_s{system_index}_m{measure_local_index}",
+                    "page": page_no,
+                    "system_id": f"p{page_no}_s{system_index}",
+                    "system_index": int(system_index),
+                    "measure_local_index": int(measure_local_index),
+                    "x_left": round(float(x_left_pdf), 3),
+                    "x_right": round(float(x_right_pdf), 3),
+                    "y_top": round(float(y_top_pdf), 3),
+                    "y_bottom": round(float(y_bottom_pdf), 3),
+                    "raw_measure_number": raw_measure_number,
+                    "source": str(row.get("source") or "omr"),
+                }
+                measure_box_rows.append(measure_row_pdf)
+                trace = coordinate_trace_by_system.get(int(system_index))
+                if isinstance(trace, dict):
+                    trace["pdf_measure_box_count"] = int(trace.get("pdf_measure_box_count") or 0) + 1
+                    preview = trace.get("pdf_measure_boxes_preview")
+                    if isinstance(preview, list) and len(preview) < 4:
+                        preview.append(
+                            {
+                                "measure_local_index": int(measure_local_index),
+                                "x_left": round(float(x_left_pdf), 3),
+                                "x_right": round(float(x_right_pdf), 3),
+                                "y_top": round(float(y_top_pdf), 3),
+                                "y_bottom": round(float(y_bottom_pdf), 3),
+                            }
+                        )
+                    trace["pdf_final_right_edge"] = round(float(x_right_pdf), 3)
+
+            coordinate_trace = [
+                {
+                    "system_index": int(system_index),
+                    **trace,
+                }
+                for system_index, trace in sorted(coordinate_trace_by_system.items())
+            ]
 
             if _debug_measure_labels_enabled():
                 print(
@@ -3261,6 +3384,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                     "xml_low_confidence_used": xml_low_confidence_used,
                     "omr_fallback_rows": omr_fallback_rows,
                     "omr_system_recovery_rows": omr_system_recovery_rows,
+                    "coordinate_trace": coordinate_trace,
                     "assigned_labels": [t[3] for t in staff_start_labels_pdf],
                     "staff_start_candidate_count": len(staff_start_labels_pdf),
                     "system_label_candidate_count": system_label_candidate_count,

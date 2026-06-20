@@ -376,6 +376,45 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
         self.assertEqual(payload["staffs"][1]["candidate_source"], "staff_ids_plus_overlap")
         self.assertEqual(payload["staffs"][1]["barline_xs_preview"], [62.5, 202.5, 342.5, 482.5])
 
+    def test_coordinate_trace_payload_includes_pixel_stages(self):
+        entry = {
+            "page_id": "1",
+            "system_id": "1",
+            "system_index": 0,
+            "system_measure_rows_px": [
+                {
+                    "measure_local_index": 0,
+                    "x_left": 10.0,
+                    "x_right": 20.0,
+                    "x_start": 10.0,
+                    "y_top": 30.0,
+                    "y_bottom": 80.0,
+                    "barline_xs": [25.0, 60.0, 95.0, 130.0],
+                }
+            ],
+            "first_pass_starts_info": {
+                "measure_starts": [10.0, 25.0, 60.0, 95.0, 130.0],
+                "system_y_top": 30.0,
+                "system_y_bottom": 80.0,
+                "row_tail": 160.0,
+            },
+        }
+        chosen_starts_info = {
+            "measure_starts": [25.0, 60.0, 95.0, 130.0],
+            "system_y_top": 30.0,
+            "system_y_bottom": 80.0,
+            "row_tail": 160.0,
+        }
+
+        payload = MOD._coordinate_trace_payload(entry, chosen_starts_info)
+
+        self.assertEqual(payload["raw_measure_starts_px"], [10.0, 25.0, 60.0, 95.0, 130.0])
+        self.assertEqual(payload["adjusted_measure_starts_px"], [25.0, 60.0, 95.0, 130.0])
+        self.assertEqual(payload["pixel_measure_box_count"], 4)
+        self.assertEqual(payload["pixel_final_right_edge"], 160.0)
+        self.assertEqual(payload["pixel_measure_boxes_preview"][0]["x_left"], 25.0)
+        self.assertEqual(payload["pixel_measure_boxes_preview"][-1]["x_right"], 160.0)
+
     def test_second_pass_can_supplement_incomplete_staff_barline_ids(self):
         system_inters = ET.Element("inters")
         bar1 = _barline_el(1, "1", 100.0, 10.0, 50.0)

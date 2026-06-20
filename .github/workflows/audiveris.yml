@@ -4366,6 +4366,7 @@ jobs:
               pages = []
           parser_system_debug_available = bool(isinstance(mm_raw, dict) and isinstance(mm_raw.get("pages"), list))
           parser_system_debug: list[dict] = []
+          coordinate_trace: list[dict] = []
 
           strict_total = len(pages)
           strict_ok = 0
@@ -4497,6 +4498,18 @@ jobs:
                                   if isinstance(recovery_row.get("score_x_debug"), dict)
                                   else None
                               ),
+                          }
+                      )
+
+              page_coordinate_trace = pg.get("coordinate_trace") or []
+              if isinstance(page_coordinate_trace, list):
+                  for trace_row in page_coordinate_trace:
+                      if not isinstance(trace_row, dict):
+                          continue
+                      coordinate_trace.append(
+                          {
+                              "page": int(page_no),
+                              **trace_row,
                           }
                       )
 
@@ -4724,6 +4737,8 @@ jobs:
               "parser_system_debug_available": parser_system_debug_available,
               "parser_system_debug_count": len(parser_system_debug),
               "parser_system_debug": parser_system_debug,
+              "coordinate_trace_count": len(coordinate_trace),
+              "coordinate_trace": coordinate_trace,
               "editable_state": editable_state,
           }
 
