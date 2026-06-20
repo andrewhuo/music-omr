@@ -142,8 +142,9 @@ class _FakeRect:
 
 
 class _FakePage:
-    def __init__(self, rect: _FakeRect):
+    def __init__(self, rect: _FakeRect, cropbox: _FakeRect | None = None):
         self.rect = rect
+        self.cropbox = cropbox
         self.draw_rect_calls = []
         self.insert_text_calls = []
 
@@ -2173,6 +2174,68 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertGreaterEqual(len(page.draw_rect_calls), 2)
         first_rect = page.draw_rect_calls[0]["rect"]
         self.assertEqual((first_rect.x0, first_rect.y0, first_rect.x1, first_rect.y1), (4.0, 8.0, 38.0, 26.0))
+        self.assertEqual(page.insert_text_calls[0]["text"], "1")
+
+    def test_label_ink_point_without_cropbox_uses_green_box_coords(self):
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+
+        x, y = WORKER._green_box_point_to_pdf_ink(page, 40.0, 50.0)
+
+        self.assertEqual((x, y), (40.0, 50.0))
+
+    def test_label_ink_point_subtracts_cropbox_offset(self):
+        page = _FakePage(
+            _FakeRect(0, 0, 200, 160),
+            cropbox=_FakeRect(10, 20, 210, 180),
+        )
+
+        x, y = WORKER._green_box_point_to_pdf_ink(page, 40.0, 50.0)
+
+        self.assertEqual((x, y), (30.0, 30.0))
+
+    def test_render_corrected_pdf_draws_cropped_label_ink_from_green_box_coords(self):
+        page = _FakePage(
+            _FakeRect(0, 0, 200, 160),
+            cropbox=_FakeRect(10, 20, 210, 180),
+        )
+        fake_doc = _FakeDoc([page])
+        systems = [{"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1"}]
+        measures = [
+            {
+                "measure_id": "p1_s0_m0",
+                "system_id": "p1_s0",
+                "page": 1,
+                "system_index": 0,
+                "measure_local_index": 0,
+                "x_left": 40,
+                "x_right": 90,
+                "y_top": 50,
+                "y_bottom": 80,
+            }
+        ]
+        editable_state = {
+            "labels_mode": "system_only",
+            "systems": systems,
+            "measures": measures,
+        }
+
+        with (
+            patch.object(WORKER.fitz, "open", return_value=fake_doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+            patch.object(WORKER.fitz, "get_text_length", return_value=10.0),
+        ):
+            drawn = WORKER._render_corrected_pdf(
+                Path("/tmp/in.pdf"),
+                Path("/tmp/out.pdf"),
+                systems,
+                {},
+                measures,
+                "system_only",
+                editable_state=editable_state,
+            )
+
+        self.assertEqual(drawn, 1)
+        self.assertEqual(page.insert_text_calls[0]["point"], (25.0, 22.0))
         self.assertEqual(page.insert_text_calls[0]["text"], "1")
 
     def test_build_system_measure_request_includes_old_style_multi_rest_guidance(self):

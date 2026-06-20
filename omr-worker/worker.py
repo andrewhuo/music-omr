@@ -850,6 +850,21 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(default)
 
 
+def _cropbox_offsets(page: fitz.Page) -> tuple[float, float]:
+    cropbox = getattr(page, "cropbox", None)
+    if cropbox is None:
+        return (0.0, 0.0)
+    return (
+        _safe_float(getattr(cropbox, "x0", 0.0), 0.0),
+        _safe_float(getattr(cropbox, "y0", 0.0), 0.0),
+    )
+
+
+def _green_box_point_to_pdf_ink(page: fitz.Page, x: float, y: float) -> tuple[float, float]:
+    crop_x, crop_y = _cropbox_offsets(page)
+    return (float(x) - crop_x, float(y) - crop_y)
+
+
 def _label_position(anchor_x: float, anchor_y_top: float, page_width: float, page_height: float, text: str) -> tuple[float, float, float]:
     tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
     x_centered = float(anchor_x) - (tw / 2.0)
@@ -3657,6 +3672,7 @@ def _draw_measure_label(page: fitz.Page, page_rect: fitz.Rect, anchor_x: float, 
 
 
 def _draw_measure_label_left_barline(page: fitz.Page, page_rect: fitz.Rect, x_left: float, y_top: float, text: str) -> None:
+    x_left, y_top = _green_box_point_to_pdf_ink(page, x_left, y_top)
     tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
     x_text = min(max(0.0, float(x_left) - (tw / 2.0)), max(0.0, float(page_rect.width) - tw - 2.0))
     y_text = max(MEASURE_TEXT_SIZE + 2.0, float(y_top) - MEASURE_TEXT_Y_OFFSET)
