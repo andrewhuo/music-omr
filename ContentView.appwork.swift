@@ -49,7 +49,7 @@ private enum BackendConfig {
 
 private enum FrontendDebugConfig {
     static let debugSafeJobIDs = true
-    static let disableAutoResume = false
+    static let disableAutoResume = true
     static let overlayLoggingEnabled = true
     static let overlayLogMaxRowsPerPage = 5
 }
