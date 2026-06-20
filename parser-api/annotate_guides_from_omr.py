@@ -1514,6 +1514,49 @@ def _append_measure_outputs_for_system(
         )
 
 
+def _safe_round_float(value, digits: int = 3):
+    try:
+        return round(float(value), digits)
+    except Exception:
+        return None
+
+
+def _system_x_debug_payload(entry: dict, chosen_starts_info: dict) -> dict:
+    staffs: list[dict] = []
+    for staff_ctx in entry.get("staff_contexts") or []:
+        if not isinstance(staff_ctx, dict):
+            continue
+        barline_xs = staff_ctx.get("barline_xs") or []
+        staffs.append(
+            {
+                "staff_id": str(staff_ctx.get("staff_id") or ""),
+                "line_min_x": _safe_round_float(staff_ctx.get("line_min_x")),
+                "line_max_x": _safe_round_float(staff_ctx.get("line_max_x")),
+                "header_start": _safe_round_float(staff_ctx.get("header_start")),
+                "staff_left": _safe_round_float(staff_ctx.get("staff_left")),
+                "staff_right": _safe_round_float(staff_ctx.get("staff_right")),
+                "x_postpad": _safe_round_float(staff_ctx.get("x_start")),
+                "y_top": _safe_round_float(staff_ctx.get("y_top")),
+                "y_bottom": _safe_round_float(staff_ctx.get("y_bottom")),
+                "y_source": str(staff_ctx.get("y_source") or ""),
+                "candidate_source": str(staff_ctx.get("candidate_source") or ""),
+                "barline_count": int(staff_ctx.get("barline_count") or 0),
+                "barline_xs_preview": [
+                    _safe_round_float(x) for x in list(barline_xs)[:12]
+                ],
+            }
+        )
+
+    measure_starts = list(chosen_starts_info.get("measure_starts") or [])
+    return {
+        "staff_count": len(staffs),
+        "selected_staff_count": len(entry.get("selected_measure_rows") or []),
+        "final_measure_starts": [_safe_round_float(x) for x in measure_starts],
+        "final_measure_right_edge": _safe_round_float(chosen_starts_info.get("row_tail")),
+        "staffs": staffs,
+    }
+
+
 def _neighbor_median_measure_count(system_rows: list[dict], target_index: int) -> float | None:
     if target_index < 0 or target_index >= len(system_rows):
         return None
@@ -2273,10 +2316,16 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         "y_top": float(y_top),
                         "y_bottom": float(y_bot),
                         "staff_barline_ids": list(staff_barline_ids),
+                        "line_min_x": float(line_min_x) if line_min_x is not None else None,
+                        "line_max_x": float(line_max_x) if line_max_x is not None else None,
+                        "header_start": float(header_start) if header_start is not None else None,
                         "staff_left": staff_left_raw,
                         "staff_right": staff_right_effective,
                         "x_start": float(x_postpad),
                         "y_source": y_source,
+                        "candidate_source": candidate_source,
+                        "barline_xs": [float(x) for x in staff_barline_xs],
+                        "barline_count": int(len(staff_barline_xs)),
                         "staff_start_mark_index": int(staff_start_mark_index),
                     }
                 )
@@ -2467,6 +2516,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         if chosen_connector_info.get("first_gap_ratio") is not None
                         else None
                     ),
+                    "score_x_debug": _system_x_debug_payload(entry, chosen_starts_info),
                 }
             )
 

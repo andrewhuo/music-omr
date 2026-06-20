@@ -324,6 +324,58 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
         self.assertFalse(info["suppress"])
         self.assertEqual(info["reason"], "first_barline_misaligned")
 
+    def test_system_x_debug_payload_includes_staff_and_final_measure_x(self):
+        entry = {
+            "selected_measure_rows": [{"x_start": 10.0}, {"x_start": 10.5}],
+            "staff_contexts": [
+                {
+                    "staff_id": "1",
+                    "line_min_x": 31.2345,
+                    "line_max_x": 501.9876,
+                    "header_start": 28.0,
+                    "staff_left": 30.0,
+                    "staff_right": 505.0,
+                    "x_start": 24.0,
+                    "y_top": 20.0,
+                    "y_bottom": 40.0,
+                    "y_source": "staff_lines",
+                    "candidate_source": "staff_ids",
+                    "barline_count": 4,
+                    "barline_xs": [62.0, 202.0, 342.0, 482.0],
+                },
+                {
+                    "staff_id": "2",
+                    "line_min_x": 32.0,
+                    "line_max_x": 502.0,
+                    "header_start": 28.5,
+                    "staff_left": 30.5,
+                    "staff_right": 505.5,
+                    "x_start": 24.5,
+                    "y_top": 50.0,
+                    "y_bottom": 70.0,
+                    "y_source": "staff_lines",
+                    "candidate_source": "staff_ids_plus_overlap",
+                    "barline_count": 4,
+                    "barline_xs": [62.5, 202.5, 342.5, 482.5],
+                },
+            ],
+        }
+        chosen_starts_info = {
+            "measure_starts": [62.0, 202.0, 342.0, 482.0],
+            "row_tail": 520.0,
+        }
+
+        payload = MOD._system_x_debug_payload(entry, chosen_starts_info)
+
+        self.assertEqual(payload["staff_count"], 2)
+        self.assertEqual(payload["selected_staff_count"], 2)
+        self.assertEqual(payload["final_measure_starts"], [62.0, 202.0, 342.0, 482.0])
+        self.assertEqual(payload["final_measure_right_edge"], 520.0)
+        self.assertEqual(payload["staffs"][0]["line_min_x"], 31.235)
+        self.assertEqual(payload["staffs"][0]["x_postpad"], 24.0)
+        self.assertEqual(payload["staffs"][1]["candidate_source"], "staff_ids_plus_overlap")
+        self.assertEqual(payload["staffs"][1]["barline_xs_preview"], [62.5, 202.5, 342.5, 482.5])
+
     def test_second_pass_can_supplement_incomplete_staff_barline_ids(self):
         system_inters = ET.Element("inters")
         bar1 = _barline_el(1, "1", 100.0, 10.0, 50.0)

@@ -4492,6 +4492,11 @@ jobs:
                                   if recovery_row.get("grand_staff_first_gap_ratio") is not None
                                   else None
                               ),
+                              "score_x_debug": (
+                                  recovery_row.get("score_x_debug")
+                                  if isinstance(recovery_row.get("score_x_debug"), dict)
+                                  else None
+                              ),
                           }
                       )
 
