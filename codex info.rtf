@@ -156,11 +156,6 @@ Notes\
 - Pickup logic is intentionally limited to the first measure of the score in V1.\
 - We are not adding a note-value counting lesson yet because the model does not get time-signature data directly.\
 \
-Current Plan Status\
-- Current focus: use the saved per-measure time signature to add later-measure completeness awareness in AI Suggest.\
-- Current AI scope: single staff and piano/grand staff.\
-- Keep it cheap and conservative: one AI prompt per system, no OMR time-signature trust, and no non-first-measure pickup yet.\
-\
 Cloud Shell deploy memory\
 - Deploy from Google Cloud Shell.\
 - Repo path: cd ~/music-omr\
@@ -169,8 +164,6 @@ Cloud Shell deploy memory\
 - Do not use Mac paths in Cloud Shell.\
 \
 Eventual fixes and follow-up work\
-- Completed: AI Suggest now saves the active time signature for every measure using AI-detected switch points and backend carry-forward logic.\
-- Completed: AI Suggest now saves per-measure completeness and short unclear debug reasons, while still keeping pickup limited until a later step.\
 \
 - Keep full scores out of AI V1 until backend geometry is stronger, then make it work for scores too.\
 - Later test and design pickup detection for every measure, not only the first measure, using saved per-measure time signatures and completeness.\
@@ -186,5 +179,6 @@ Eventual fixes and follow-up work\
 - Decide backend cleanup / retention policy for old files and previous runs.\
 - Define the 2 types of paying service and their permissions/advantages.\
 - Later pricing idea: cheaper batch-AI plan and pricier fast-AI plan.\
+- Clean up backend, remove debug code, test everything.\
 - Do user interface cleanup, polishing, and beautification after the core AI/backend behavior is solid enough.\
 }
