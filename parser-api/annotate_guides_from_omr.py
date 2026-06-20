@@ -1291,20 +1291,20 @@ def _select_measure_rows_for_system(
     return []
 
 
-def _detect_grand_staff_connector_suppression(
+def _detect_multi_staff_fake_start_suppression(
     selected_measure_rows: list[dict],
     expected_spacing: float,
 ) -> dict:
     info = {
         "suppress": False,
-        "reason": "not_grand_staff",
+        "reason": "not_multi_staff",
         "first_gap": None,
         "first_barline_x": None,
         "next_3_median_width": None,
         "first_gap_ratio": None,
     }
 
-    if len(selected_measure_rows) != 2:
+    if len(selected_measure_rows) < 2:
         return info
     if any(str(row.get("y_source") or "") != "staff_lines" for row in selected_measure_rows):
         info["reason"] = "non_staff_line_rows"
@@ -1366,7 +1366,7 @@ def _detect_grand_staff_connector_suppression(
     info["first_gap"] = float(_median(first_gaps)) if first_gaps else None
     info["first_barline_x"] = float(_median(first_barlines)) if first_barlines else None
 
-    if len(first_barlines) != 2 or abs(first_barlines[0] - first_barlines[1]) > alignment_tol:
+    if (max(first_barlines) - min(first_barlines)) > alignment_tol:
         info["reason"] = "first_barline_misaligned"
         return info
 
@@ -1394,6 +1394,13 @@ def _detect_grand_staff_connector_suppression(
     info["suppress"] = True
     info["reason"] = "shared_small_left_connector_relative"
     return info
+
+
+def _detect_grand_staff_connector_suppression(
+    selected_measure_rows: list[dict],
+    expected_spacing: float,
+) -> dict:
+    return _detect_multi_staff_fake_start_suppression(selected_measure_rows, expected_spacing)
 
 
 def _build_measure_starts_for_system(

@@ -158,7 +158,91 @@ class AnnotateGuidesFromOmrTests(unittest.TestCase):
         info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
 
         self.assertFalse(info["suppress"])
-        self.assertEqual(info["reason"], "not_grand_staff")
+        self.assertEqual(info["reason"], "not_multi_staff")
+
+    def test_multi_staff_connector_suppression_detects_score_tiny_left_box(self):
+        rows = [
+            {
+                "x_start": 30.0,
+                "y_top": 20.0,
+                "y_bottom": 40.0,
+                "staff_right": 520.0,
+                "barline_xs": [62.0, 202.0, 342.0, 482.0],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 30.3,
+                "y_top": 50.0,
+                "y_bottom": 70.0,
+                "staff_right": 520.0,
+                "barline_xs": [62.5, 202.5, 342.5, 482.5],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 29.8,
+                "y_top": 80.0,
+                "y_bottom": 100.0,
+                "staff_right": 520.0,
+                "barline_xs": [61.8, 201.8, 341.8, 481.8],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 30.2,
+                "y_top": 110.0,
+                "y_bottom": 130.0,
+                "staff_right": 520.0,
+                "barline_xs": [62.3, 202.3, 342.3, 482.3],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+        ]
+
+        info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
+        starts_with_drop = MOD._build_measure_starts_for_system(rows, 30.0, 540.0, drop_x_start=True)
+
+        self.assertTrue(info["suppress"])
+        self.assertEqual(info["reason"], "shared_small_left_connector_relative")
+        self.assertLess(info["first_gap_ratio"], 0.25)
+        self.assertEqual(starts_with_drop["measure_starts"], [61.8, 201.8, 341.8, 481.8])
+
+    def test_multi_staff_connector_suppression_skips_score_normal_first_measure(self):
+        rows = [
+            {
+                "x_start": 30.0,
+                "y_top": 20.0,
+                "y_bottom": 40.0,
+                "staff_right": 520.0,
+                "barline_xs": [96.0, 202.0, 342.0, 482.0],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 30.5,
+                "y_top": 50.0,
+                "y_bottom": 70.0,
+                "staff_right": 520.0,
+                "barline_xs": [96.5, 202.5, 342.5, 482.5],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+            {
+                "x_start": 29.8,
+                "y_top": 80.0,
+                "y_bottom": 100.0,
+                "staff_right": 520.0,
+                "barline_xs": [95.8, 201.8, 341.8, 481.8],
+                "barline_count": 4,
+                "y_source": "staff_lines",
+            },
+        ]
+
+        info = MOD._detect_grand_staff_connector_suppression(rows, 10.0)
+
+        self.assertFalse(info["suppress"])
+        self.assertEqual(info["reason"], "first_gap_too_wide_absolute")
 
     def test_grand_staff_connector_suppression_keeps_staves_aligned(self):
         rows = [
