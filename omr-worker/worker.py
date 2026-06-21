@@ -3002,7 +3002,7 @@ def _measure_crop_spec(
 
     width = max(1.0, x_right - x_left)
     height = max(1.0, y_bottom - y_top)
-    x_pad = max(AI_MEASURE_CROP_MIN_X_PAD, width * AI_MEASURE_CROP_X_PAD_RATIO)
+    x_pad = 0.0
     pad_top = max(AI_MEASURE_CROP_MIN_TOP_PAD, height * AI_MEASURE_CROP_TOP_PAD_RATIO)
     pad_bottom = max(AI_MEASURE_CROP_MIN_BOTTOM_PAD, height * AI_MEASURE_CROP_BOTTOM_PAD_RATIO)
 

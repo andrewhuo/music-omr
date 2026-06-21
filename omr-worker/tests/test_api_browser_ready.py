@@ -525,12 +525,12 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         clip = spec["clip"]
         padding = spec["padding"]
-        self.assertEqual(padding.get("left"), 8.0)
-        self.assertEqual(padding.get("right"), 8.0)
+        self.assertEqual(padding.get("left"), 0.0)
+        self.assertEqual(padding.get("right"), 0.0)
         self.assertEqual(padding.get("top"), 20.0)
         self.assertEqual(padding.get("bottom"), 20.0)
-        self.assertEqual(clip.x0, 22.0)
-        self.assertEqual(clip.x1, 98.0)
+        self.assertEqual(clip.x0, 30.0)
+        self.assertEqual(clip.x1, 90.0)
         self.assertEqual(clip.y0, 25.0)
         self.assertEqual(clip.y1, 80.0)
 
@@ -580,8 +580,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         clip = spec["clip"]
         self.assertAlmostEqual(padding.get("top"), 52.0)
         self.assertAlmostEqual(padding.get("bottom"), 52.0)
-        self.assertEqual(padding.get("left"), 8.0)
-        self.assertEqual(padding.get("right"), 8.0)
+        self.assertEqual(padding.get("left"), 0.0)
+        self.assertEqual(padding.get("right"), 0.0)
+        self.assertEqual(clip.x0, 40.0)
+        self.assertEqual(clip.x1, 130.0)
         self.assertAlmostEqual(clip.y0, 98.5)
         self.assertAlmostEqual(clip.y1, 200.5)
 
