@@ -829,6 +829,55 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
 
+    def test_merge_ai_suggestions_state_keeps_decision_debug(self):
+        base = WORKER._empty_ai_suggestions_state(111, "test-state", 1)
+        debug = {
+            "active_meter_read": "2/4",
+            "duration_judgment": "short",
+            "rhythm_basis": "chord_single_event",
+            "decision_reason": "short_for_meter",
+            "debug_note": "I saw one chord event in 2/4, so it looked short.",
+        }
+        system_suggestions = {
+            "version": "ai_suggestions_v1",
+            "provider": "claude",
+            "by_measure_id": {"p1_s0_m0": {"label": "pickup", "confidence": "medium", "rest_count": None}},
+            "decision_debug_by_measure_id": {"p1_s0_m0": debug},
+            "time_signatures_by_measure_id": {"p1_s0_m0": {"active_time_signature": "2/4", "time_signature_source": "explicit_here"}},
+            "measure_completeness_by_measure_id": {"p1_s0_m0": {"measure_completeness": "incomplete", "measure_completeness_source": "ai"}},
+            "warnings": [],
+            "summary": {"systems_processed": 1, "measures_seen": 1, "suggestions_kept": 1, "normal_measures_omitted": 0},
+        }
+
+        merged = WORKER._merge_ai_suggestions_state(base, system_suggestions, 111, "test-state")
+
+        self.assertEqual(merged.get("decision_debug_by_measure_id"), {"p1_s0_m0": debug})
+
+    def test_merge_ai_suggestions_state_keeps_decision_debug_for_omitted_normal(self):
+        base = WORKER._empty_ai_suggestions_state(111, "test-state", 1)
+        debug = {
+            "active_meter_read": "2/4",
+            "duration_judgment": "full",
+            "rhythm_basis": "multiple_events",
+            "decision_reason": "fills_meter",
+            "debug_note": "I saw enough rhythm to fill the 2/4 measure.",
+        }
+        system_suggestions = {
+            "version": "ai_suggestions_v1",
+            "provider": "claude",
+            "by_measure_id": {},
+            "decision_debug_by_measure_id": {"p1_s0_m0": debug},
+            "time_signatures_by_measure_id": {"p1_s0_m0": {"active_time_signature": "2/4", "time_signature_source": "explicit_here"}},
+            "measure_completeness_by_measure_id": {"p1_s0_m0": {"measure_completeness": "full", "measure_completeness_source": "ai"}},
+            "warnings": [],
+            "summary": {"systems_processed": 1, "measures_seen": 1, "suggestions_kept": 0, "normal_measures_omitted": 1},
+        }
+
+        merged = WORKER._merge_ai_suggestions_state(base, system_suggestions, 111, "test-state")
+
+        self.assertEqual(merged.get("by_measure_id"), {})
+        self.assertEqual(merged.get("decision_debug_by_measure_id"), {"p1_s0_m0": debug})
+
     def test_ai_suggest_step_passes_and_updates_remembered_time_signature_between_systems(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}

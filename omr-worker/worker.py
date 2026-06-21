@@ -1962,6 +1962,7 @@ def _empty_ai_suggestions_state(
         "model": _requested_anthropic_model_name(),
         "source_run_id": int(run_id),
         "by_measure_id": {},
+        "decision_debug_by_measure_id": {},
         "time_signatures_by_measure_id": {},
         "measure_completeness_by_measure_id": {},
         "warnings": [],
@@ -2109,6 +2110,8 @@ def _merge_ai_suggestions_state(
     base = dict(existing) if isinstance(existing, dict) else _empty_ai_suggestions_state(run_id, source_state_version, 0)
     by_measure_id = dict(base.get("by_measure_id") or {})
     by_measure_id.update(dict(system_suggestions.get("by_measure_id") or {}))
+    decision_debug_by_measure_id = dict(base.get("decision_debug_by_measure_id") or {})
+    decision_debug_by_measure_id.update(dict(system_suggestions.get("decision_debug_by_measure_id") or {}))
     time_signatures_by_measure_id = dict(base.get("time_signatures_by_measure_id") or {})
     time_signatures_by_measure_id.update(dict(system_suggestions.get("time_signatures_by_measure_id") or {}))
     measure_completeness_by_measure_id = dict(base.get("measure_completeness_by_measure_id") or {})
@@ -2124,6 +2127,7 @@ def _merge_ai_suggestions_state(
     if source_state_version_txt:
         base["source_state_version"] = source_state_version_txt
     base["by_measure_id"] = by_measure_id
+    base["decision_debug_by_measure_id"] = decision_debug_by_measure_id
     base["time_signatures_by_measure_id"] = time_signatures_by_measure_id
     base["measure_completeness_by_measure_id"] = measure_completeness_by_measure_id
     base["warnings"] = warnings
