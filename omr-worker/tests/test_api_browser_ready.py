@@ -640,7 +640,14 @@ class BrowserReadyApiTests(unittest.TestCase):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
         mapping_summary = self._sample_mapping_summary()
-        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest", method="POST", headers={}, files={}, json={})
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/ai-suggest",
+            method="POST",
+            headers={},
+            files={},
+            json={},
+            get_json=lambda silent=True: {"score_type": "grand"},
+        )
         with (
             patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
             patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
@@ -662,12 +669,57 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_total"), 2)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("score_type"), "grand")
         self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "claude-sonnet-4-6")
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("last_time_signature_update"))
         self.assertEqual((body.get("ai_suggest_run") or {}).get("time_signature_updates"), [])
         self.assertIn("ai_suggestions", mapping_summary)
         self.assertEqual(((mapping_summary.get("ai_suggest_run") or {}).get("status")), "running")
+        self.assertEqual(((mapping_summary.get("ai_suggest_run") or {}).get("score_type")), "grand")
+
+    def test_ai_suggest_start_accepts_missing_score_type_for_old_apps(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/ai-suggest",
+            method="POST",
+            headers={},
+            files={},
+            json={},
+            get_json=lambda silent=True: {},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 200)
+        self.assertIsNone((body.get("ai_suggest_run") or {}).get("score_type"))
+
+    def test_ai_suggest_start_rejects_invalid_score_type(self):
+        mapping_summary = self._sample_mapping_summary()
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/ai-suggest",
+            method="POST",
+            headers={},
+            files={},
+            json={},
+            get_json=lambda silent=True: {"score_type": "banana"},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(self._sample_artifacts(), mapping_summary, 111)),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 400)
+        self.assertEqual(((body.get("error") or {}).get("code")), "invalid_score_type")
 
     def test_build_ai_batch_trace_payload_records_statuses_and_order(self):
         systems = [

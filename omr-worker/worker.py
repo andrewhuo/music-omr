@@ -105,6 +105,7 @@ AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncer
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
 AI_SUGGESTION_COMPLETENESS_ALLOWED = {"full", "incomplete", "unclear"}
+AI_SCORE_TYPES_ALLOWED = {"single", "grand", "score"}
 AI_SUGGESTION_UNCLEAR_REASONS_ALLOWED = {
     "time_signature_not_clear",
     "too_dense_to_count",
@@ -1984,6 +1985,7 @@ def _new_ai_suggest_run_state(
     source_state_version: str | None,
     systems_total: int,
     status: str = AI_SUGGEST_RUN_STATUS_RUNNING,
+    score_type: str | None = None,
 ) -> dict:
     now_txt = _utc_now().isoformat().replace("+00:00", "Z")
     row = {
@@ -1997,6 +1999,7 @@ def _new_ai_suggest_run_state(
         "next_system_index": max(0, int(systems_total)) if status == AI_SUGGEST_RUN_STATUS_COMPLETED else 0,
         "source_run_id": int(run_id),
         "source_state_version": str(source_state_version or "").strip() or None,
+        "score_type": _normalize_ai_score_type(score_type),
         "model": _requested_anthropic_model_name(),
         "last_error": None,
         "remembered_time_signature": None,
@@ -2004,6 +2007,11 @@ def _new_ai_suggest_run_state(
         "time_signature_updates": [],
     }
     return row
+
+
+def _normalize_ai_score_type(raw_value) -> str | None:
+    text = str(raw_value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return text if text in AI_SCORE_TYPES_ALLOWED else None
 
 
 def _normalize_ai_time_signature_value(raw_value) -> str | None:
@@ -5869,6 +5877,30 @@ def ai_suggest_job(job_id: str):
             409,
         )
 
+    request_payload = request.get_json(silent=True) or {}
+    if not isinstance(request_payload, dict):
+        request_payload = {}
+    raw_score_type = request_payload.get("score_type")
+    score_type = _normalize_ai_score_type(raw_score_type)
+    if raw_score_type is not None and score_type is None:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "invalid_score_type",
+                        "message": "score_type must be single, grand, or score",
+                        "retryable": False,
+                        "provider_status": 400,
+                        "detail": "invalid_score_type",
+                    },
+                }
+            ),
+            400,
+        )
+
     systems = editable_state.get("systems")
     if not isinstance(systems, list):
         systems = []
@@ -5895,6 +5927,7 @@ def ai_suggest_job(job_id: str):
         source_state_version,
         len(system_batches),
         status=run_status,
+        score_type=score_type,
     )
     try:
         _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])

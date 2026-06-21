@@ -80,6 +80,29 @@ private struct CreateJobRequest: Encodable {
     let job_id: String
 }
 
+private enum AIScoreType: String, CaseIterable, Identifiable, Encodable {
+    case single
+    case grand
+    case score
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .single:
+            return "Single Staff"
+        case .grand:
+            return "Grand Staff / Piano"
+        case .score:
+            return "Full Score"
+        }
+    }
+}
+
+private struct AISuggestRequest: Encodable {
+    let score_type: String
+}
+
 private struct CreateJobResponse: Decodable {
     let job_id: String
     let run_id: Int?
@@ -124,6 +147,7 @@ private struct AISuggestRunState: Decodable {
     let next_system_index: Int?
     let source_run_id: Int?
     let source_state_version: String?
+    let score_type: String?
     let last_error: BackendErrorPayload?
 }
 
@@ -708,6 +732,7 @@ struct ContentView: View {
     @State private var isReviewingAISuggestions = false
     @State private var currentAISuggestionMeasureID: String?
     @State private var isGeneratingAISuggestions = false
+    @State private var showAIScoreTypeMenu = false
     @State private var aiSuggestRun: AISuggestRunState?
     @State private var endingMeasureKinds: [String: EndingKind] = [:]
     @State private var guidedEndingSelectionPhase: GuidedEndingSelectionPhase = .selectingEnding1
@@ -974,6 +999,20 @@ struct ContentView: View {
         } message: {
             Text(pendingManualFixDeleteMessage)
         }
+        .confirmationDialog(
+            "Choose score type",
+            isPresented: $showAIScoreTypeMenu,
+            titleVisibility: .visible
+        ) {
+            ForEach(AIScoreType.allCases) { scoreType in
+                Button(scoreType.title) {
+                    Task { await generateAISuggestions(scoreType: scoreType) }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Choose the layout so AI Suggest uses the right rules.")
+        }
         .onChange(of: labelsMode) { _, mode in
             guard !isBusy else { return }
             guard currentJobID != nil else { return }
@@ -1070,7 +1109,7 @@ struct ContentView: View {
 
     private var generateAISuggestionsButton: some View {
         Button {
-            Task { await generateAISuggestions() }
+            showAIScoreTypeMenu = true
         } label: {
             Label(
                 isAISuggestRunning ? "Generating..." : (isAISuggestFailed ? "Retry AI Suggestions" : "Generate AI Suggestions"),
@@ -3063,7 +3102,7 @@ struct ContentView: View {
         }
     }
 
-    private func generateAISuggestions() async {
+    private func generateAISuggestions(scoreType: AIScoreType) async {
         guard let jobID = currentJobID else {
             actionError = "No active job"
             return
@@ -3081,7 +3120,7 @@ struct ContentView: View {
         do {
             phase = .processing
             detailNote = "Generating AI suggestions..."
-            let response = try await apiGenerateAISuggestions(jobID: jobID)
+            let response = try await apiGenerateAISuggestions(jobID: jobID, scoreType: scoreType)
             guard isTokenCurrent(token, expectedJobID: jobID) else { return }
             currentRunID = response.run_id ?? currentRunID
             refreshAISuggestionOverlay(using: response.ai_suggestions, run: response.ai_suggest_run)
@@ -3254,10 +3293,12 @@ struct ContentView: View {
         return try JSONDecoder().decode(JobStateResponse.self, from: data)
     }
 
-    private func apiGenerateAISuggestions(jobID: String) async throws -> AISuggestResponse {
+    private func apiGenerateAISuggestions(jobID: String, scoreType: AIScoreType) async throws -> AISuggestResponse {
         let endpoint = BackendConfig.baseURL.appending(path: "api/omr/jobs/\(jobID)/ai-suggest")
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(AISuggestRequest(score_type: scoreType.rawValue))
 
         let (data, response) = try await URLSession.shared.data(for: request)
         try validateHTTP(response: response, data: data)
