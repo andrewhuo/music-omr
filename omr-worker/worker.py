@@ -1942,6 +1942,7 @@ def _current_ai_suggest_run(
         "next_system_index": max(0, _safe_int(row.get("next_system_index"), 0)),
         "source_run_id": int(run_id) if isinstance(run_id, int) and run_id > 0 else _safe_int(row.get("source_run_id"), 0),
         "source_state_version": str(row.get("source_state_version") or source_state_version or "").strip() or None,
+        "score_type": _normalize_ai_score_type(row.get("score_type")),
         "model": str(row.get("model") or _requested_anthropic_model_name()).strip() or "unknown",
         "last_error": row.get("last_error") if isinstance(row.get("last_error"), dict) else None,
         "remembered_time_signature": remembered_time_signature,
@@ -3350,6 +3351,138 @@ def _build_old_style_multi_rest_reference_content() -> tuple[list[dict], int]:
     return content, len(example_rows)
 
 
+def _ai_prompt_base_rules() -> list[str]:
+    return [
+        "Each image contains exactly one already-detected measure.",
+        "Do not infer additional measures from rhythmic groupings, repeat dots, barline decorations, edge marks, spacing, or decorations.",
+        "Process the provided measures left to right in order.",
+        "Start with remembered_time_signature_in as the active time signature, unless it is null.",
+        "A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.",
+        "Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.",
+        "If a clearly visible new time signature appears at a measure, update the active time signature from that measure onward within this same system.",
+        "If a new time signature is unclear or only partly visible, keep the previous active time signature.",
+        "Only label pickup when is_first_measure_of_score is true.",
+        "If is_first_measure_of_score is false, do not label pickup.",
+        "For every measure, also judge measure_completeness as full, incomplete, or unclear.",
+        "If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason using one of these exact codes only: time_signature_not_clear, too_dense_to_count, crop_cut_off, split_may_be_wrong, ornament_or_tie_confusion, not_enough_visual_evidence.",
+        "Do not write sentences for unclear_reason. Use only one short code or omit the field.",
+        "Use the visible time signature in the crop to judge completeness.",
+    ]
+
+
+def _ai_prompt_meter_rules() -> list[str]:
+    return [
+        "Read meter as top/bottom: top is how many beat-units fill a full measure; bottom is which note value is one beat-unit.",
+        "Count written note/rest durations only. Never count visual width, spacing, number of noteheads, or number of staves as beats.",
+        "Chords or stacked notes count as exactly one rhythmic event using the written note value. Do not count each notehead separately.",
+        "For the first measure only: if total written duration is less than the active meter, label pickup and set measure_completeness to incomplete. If it reaches the active meter, label normal and full.",
+        "If a non-first measure clearly looks too short for its active time signature, use label uncertain, not normal.",
+        "Do not label later incomplete measures as pickup yet.",
+        "Use uncertain with maybe_label pickup only when the active time signature or rhythmic duration cannot be read reliably because the notation is unclear, dense, or cut off.",
+        "If the visible rhythmic duration clearly fills the active time signature, label normal and set measure_completeness to full.",
+        "A whole note, two half notes, or other sparse-looking content in the first measure is usually a slow full measure, not a pickup. Do not label pickup just because the first measure looks sparse or simple.",
+        "Be very conservative about later completeness. Only use incomplete when the measure clearly looks too short; otherwise use unclear.",
+        "Use uncertain instead of pickup only when there is not enough visual evidence to determine the meter or rhythmic duration.",
+    ]
+
+
+def _ai_prompt_single_rules() -> list[str]:
+    return [
+        "This is single-staff music. Judge rhythm using only this one staff.",
+        *_ai_prompt_meter_rules(),
+        "Examples: in 2/4, one quarter-note chord is 1 of 2 beats, so pickup if first measure unless another beat or rest follows. In 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure unless more duration follows. In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
+        "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
+        "In the older style, the vertical bars may be short or long, and there may be more than one.",
+        "Label multi_measure_rest only when there is a clear multi-measure rest symbol and a visible count of 2 or more.",
+        "A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.",
+        "If label is multi_measure_rest, include integer rest_count of 2 or more. A visible count of 1 means the measure is normal, not multi_measure_rest.",
+        "A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.",
+    ]
+
+
+def _ai_prompt_grand_rules() -> list[str]:
+    return [
+        "This is grand-staff/piano music. The two staves share one measure duration.",
+        "The same time signature may appear on both staves; use one shared meter for the whole vertical measure.",
+        "Do not count by staves. Count time only.",
+        "Treble and bass are not beat 1 and beat 2.",
+        "Vertically aligned notes/rests in treble and bass happen at the same time and count as one time position.",
+        "Never add treble plus bass as separate beats.",
+        "Use one clear staff's written rhythm/rests as the timing guide for the whole measure. The other staff may rest or be silent.",
+        *_ai_prompt_meter_rules(),
+        "A chord/stack is exactly one rhythmic event, no matter how many noteheads it has. Use the top notehead/stem group only to identify the written note value.",
+        "If the guide staff shows less duration than the active meter, the whole first measure is pickup/incomplete.",
+        "Example: in 2/4, one aligned quarter-note chord across both staves is one beat total, not two beats and not one beat per notehead. If it is the whole first measure, label pickup/incomplete unless another beat or rest follows.",
+        "Example: in 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure unless more duration follows.",
+        "Example: in 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
+        "Label multi_measure_rest only if both staves clearly share the same multi-measure rest count of 2 or more.",
+        "If one staff has music, no count, or a different count, do not return multi_measure_rest.",
+    ]
+
+
+def _ai_prompt_score_rules() -> list[str]:
+    return [
+        "This is full-score music. All staves share one measure duration.",
+        "Do not count by instruments. Count time only.",
+        "Different instruments are not beat 1, beat 2, beat 3, etc.",
+        "Vertically aligned notes/rests across instruments happen at the same time and count as one time position.",
+        "Never add instruments together as separate beats.",
+        "Use the clearest staff/instrument's written rhythm/rests as the timing guide when other instruments rest or are silent.",
+        *_ai_prompt_meter_rules(),
+        "A chord/stack is exactly one rhythmic event, no matter how many noteheads it has. Use the top notehead/stem group only to identify the written note value.",
+        "If the guide staff shows less duration than the active meter, the whole first measure is pickup/incomplete.",
+        "Example: in 2/4, if all visible instruments show one aligned quarter-note event, that is one beat total, not multiple beats. If it is the whole first measure, label pickup/incomplete unless another beat or rest follows.",
+        "Example: in 4/4, one half-note event is 2 of 4 beats, so pickup if first measure unless more duration follows.",
+        "Example: in 6/8, one dotted-quarter event is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
+        "For full score V1, do not use multi_measure_rest jumps.",
+        "If one instrument has a multi-measure rest but another instrument plays, the score measure is still counted normally.",
+        "Return uncertain if a full-score rest situation is unclear.",
+    ]
+
+
+def _ai_prompt_output_rules() -> list[str]:
+    return [
+        "If label is uncertain and you have a tentative guess, maybe_label may be pickup or multi_measure_rest, and maybe_rest_count is only allowed for maybe_label multi_measure_rest.",
+        "If maybe_label is multi_measure_rest, always include maybe_rest_count if the count number is at all readable. Only omit maybe_rest_count if the number is completely unreadable.",
+        "A wrong confident answer is worse than uncertain.",
+        "Do not skip any provided measure_id.",
+        "Do not output labels outside the allowed set.",
+        "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
+        "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes plus debug_note: 1-3 short sentences, max 50 words, explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "Return JSON only.",
+    ]
+
+
+def _ai_prompt_legacy_rules() -> list[str]:
+    return [
+        *_ai_prompt_base_rules(),
+        "In grand-staff or piano crops, the same time signature may appear on both staves; use the shared meter for the whole measure.",
+        *_ai_prompt_meter_rules(),
+        "In grand-staff or full-score music, vertically aligned notes/rests across staves happen at the same time, not one after another. Do not add treble plus bass or multiple instruments as separate beats; count the timeline horizontally.",
+        "For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves. One staff may play while the other rests or is silent; do not require both staves to have notes.",
+        "Examples: in 2/4, one quarter-note chord is 1 of 2 beats, so pickup if first measure. In 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure. In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first unless more duration follows. If all visible staves show one aligned quarter-note event in 2/4, that is one beat total, so pickup if first unless another beat or rest follows.",
+        "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
+        "In the older style, the vertical bars may be short or long, and there may be more than one.",
+        "A confident multi_measure_rest label requires a clearly readable count number of 2 or more. Without a visible count number, return uncertain.",
+        "A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.",
+        "If label is multi_measure_rest, include integer rest_count of 2 or more. A visible count of 1 means the measure is normal, not multi_measure_rest.",
+        "A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.",
+        "For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count. If one staff has music, no count, or a different count, do not return multi_measure_rest.",
+        *_ai_prompt_output_rules(),
+    ]
+
+
+def _ai_prompt_rules_for_score_type(score_type: str | None) -> list[str]:
+    normalized = _normalize_ai_score_type(score_type)
+    if normalized == "single":
+        return [*_ai_prompt_base_rules(), *_ai_prompt_single_rules(), *_ai_prompt_output_rules()]
+    if normalized == "grand":
+        return [*_ai_prompt_base_rules(), *_ai_prompt_grand_rules(), *_ai_prompt_output_rules()]
+    if normalized == "score":
+        return [*_ai_prompt_base_rules(), *_ai_prompt_score_rules(), *_ai_prompt_output_rules()]
+    return _ai_prompt_legacy_rules()
+
+
 def _build_system_measure_request(
     job_id: str,
     run_id: int,
@@ -3362,6 +3495,7 @@ def _build_system_measure_request(
     artifacts: dict | None = None,
     debug_crop_rows: list[dict] | None = None,
     remembered_time_signature_in: str | None = None,
+    score_type: str | None = None,
 ) -> tuple[dict, int]:
     content: list[dict] = []
     system_id = str(system_row.get("system_id") or "").strip()
@@ -3371,52 +3505,12 @@ def _build_system_measure_request(
         "run_id": int(run_id),
         "system_id": system_id,
         "page_number": int(page_number),
+        "score_type": _normalize_ai_score_type(score_type),
         "remembered_time_signature_in": _normalize_ai_time_signature_value(remembered_time_signature_in),
         "instructions": {
             "task": "Classify each already-detected sheet-music measure conservatively.",
             "allowed_labels": ["normal", "pickup", "multi_measure_rest", "uncertain"],
-            "rules": [
-                "Each image contains exactly one already-detected measure.",
-                "Do not infer additional measures from internal rhythmic groupings, repeat dots, or barline decorations.",
-                "Process the provided measures left to right in order.",
-                "Start with remembered_time_signature_in as the active time signature, unless it is null.",
-                "A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.",
-                "In grand-staff or piano crops, the same time signature may appear on both staves; use the shared meter for the whole measure.",
-                "Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.",
-                "If a clearly visible new time signature appears at a measure, update the active time signature from that measure onward within this same system.",
-                "If a new time signature is unclear or only partly visible, keep the previous active time signature.",
-                "Only label pickup when is_first_measure_of_score is true.",
-                "If is_first_measure_of_score is false, do not label pickup.",
-                "For every measure, also judge measure_completeness as full, incomplete, or unclear.",
-                "If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason using one of these exact codes only: time_signature_not_clear, too_dense_to_count, crop_cut_off, split_may_be_wrong, ornament_or_tie_confusion, not_enough_visual_evidence.",
-                "Do not write sentences for unclear_reason. Use only one short code or omit the field.",
-                "Use the visible time signature in the crop to judge completeness.",
-                "Read meter as top/bottom: top is how many beat-units fill a full measure; bottom is which note value is one beat-unit.",
-                "Count written note/rest durations, not noteheads, spacing, or visual width. Chords or stacked notes count once using the chord's written note value.",
-                "In grand-staff or full-score music, vertically aligned notes/rests across staves happen at the same time, not one after another. Do not add treble plus bass or multiple instruments as separate beats; count the timeline horizontally.",
-                "For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves. One staff may play while the other rests or is silent; do not require both staves to have notes.",
-                "For the first measure only: if total written duration is less than the active meter, label pickup and set measure_completeness to incomplete. If it reaches the active meter, label normal and full.",
-                "If a non-first measure clearly looks too short for its active time signature, use label uncertain, not normal.",
-                "Do not label later incomplete measures as pickup yet.",
-                "Examples: in 2/4, one quarter-note chord is 1 of 2 beats, so pickup if first measure. In 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure. In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first unless more duration follows. If all visible staves show one aligned quarter-note event in 2/4, that is one beat total, so pickup if first unless another beat or rest follows.",
-                "Use uncertain with maybe_label pickup only when the active time signature or rhythmic duration cannot be read reliably because the notation is unclear, dense, or cut off.",
-                "If the visible rhythmic duration clearly fills the active time signature, label normal and set measure_completeness to full.",
-                "A whole note, two half notes, or other sparse-looking content in the first measure is usually a slow full measure, not a pickup. Do not label pickup just because the first measure looks sparse or simple.",
-                "Be very conservative about later completeness. Only use incomplete when the measure clearly looks too short; otherwise use unclear.",
-                "Do not default a visibly short first measure to normal. When the visible duration is shorter than the active meter and the choice is pickup or normal, choose pickup.",
-                "Use uncertain instead of pickup only when there is not enough visual evidence to determine the meter or rhythmic duration.",
-                "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
-                "In the older style, the vertical bars may be short or long, and there may be more than one.",
-                "A confident multi_measure_rest label requires a clearly readable count number of 2 or more. Without a visible count number, return uncertain.",
-                "A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.",
-                "If label is multi_measure_rest, include integer rest_count of 2 or more. A visible count of 1 means the measure is normal, not multi_measure_rest.",
-                "A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.",
-                "For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count. If one staff has music, no count, or a different count, do not return multi_measure_rest.",
-                "If label is uncertain and you have a tentative guess, maybe_label may be pickup or multi_measure_rest, and maybe_rest_count is only allowed for maybe_label multi_measure_rest.",
-                "If maybe_label is multi_measure_rest, always include maybe_rest_count if the count number is at all readable. Only omit maybe_rest_count if the number is completely unreadable.",
-                "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes plus debug_note: 1-3 short sentences, max 50 words, explaining what you saw rhythmically, what meter you used, and why you chose the label.",
-                "Return JSON only.",
-            ],
+            "rules": _ai_prompt_rules_for_score_type(score_type),
             "output_shape": {
                 "provider": "claude",
                 "suggestions": [
@@ -3540,6 +3634,7 @@ def _generate_ai_suggestions_for_system_batch(
     source_state_version: str | None,
     artifacts: dict,
     remembered_time_signature_in: str | None = None,
+    score_type: str | None = None,
 ) -> dict:
     model_name = str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
     if not model_name or not _anthropic_api_key():
@@ -3581,6 +3676,7 @@ def _generate_ai_suggestions_for_system_batch(
                 artifacts=artifacts if debug_enabled else None,
                 debug_crop_rows=debug_crop_rows if debug_enabled else None,
                 remembered_time_signature_in=remembered_time_signature_in,
+                score_type=score_type,
             )
             message = _anthropic_messages_create(payload)
             parsed = _parse_anthropic_suggestions_message(message)
@@ -3633,6 +3729,7 @@ def _generate_ai_suggestions_for_job(
     editable_state: dict,
     mapping_summary: dict,
     artifacts: dict,
+    score_type: str | None = None,
 ) -> dict:
     model_name = str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
     if not model_name or not _anthropic_api_key():
@@ -3688,6 +3785,7 @@ def _generate_ai_suggestions_for_job(
                     next_system_row=next_system_row,
                     artifacts=artifacts if debug_enabled else None,
                     debug_crop_rows=debug_crop_rows if debug_enabled else None,
+                    score_type=score_type,
                 )
                 reference_examples_attached = max(
                     int(reference_examples_attached),
@@ -6214,6 +6312,7 @@ def ai_suggest_job_step(job_id: str):
     debug_crops = None
     reference_examples_attached = 0
     remembered_time_signature_in = _normalize_ai_time_signature_value(ai_suggest_run.get("remembered_time_signature"))
+    score_type = _normalize_ai_score_type(ai_suggest_run.get("score_type"))
     try:
         system_result = _generate_ai_suggestions_for_system_batch(
             job_id,
@@ -6224,6 +6323,7 @@ def ai_suggest_job_step(job_id: str):
             source_state_version,
             artifacts,
             remembered_time_signature_in=remembered_time_signature_in,
+            score_type=score_type,
         )
         if isinstance(system_result, dict):
             debug_crops = system_result.pop("debug_crops", None)

@@ -838,6 +838,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             "remembered_time_signature": None,
             "last_time_signature_update": None,
             "time_signature_updates": [],
+            "score_type": "grand",
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
         with (
@@ -1285,6 +1286,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             "remembered_time_signature": None,
             "last_time_signature_update": None,
             "time_signature_updates": [],
+            "score_type": "grand",
         }
         WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
         with (
@@ -1316,6 +1318,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         called_measures = mock_generate.call_args.args[4]
         self.assertEqual([row.get("measure_id") for row in called_measures], ["p1_s0_m1"])
+        self.assertEqual(mock_generate.call_args.kwargs.get("score_type"), "grand")
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_total"), 2)
 
     def test_ai_suggest_step_final_system_marks_completed(self):
@@ -2340,7 +2343,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertNotIn("model", parsed)
         self.assertEqual(((parsed.get("suggestions") or [])[0] or {}).get("measure_id"), "p1_s0_m0")
 
-    def test_build_system_measure_request_includes_stronger_pickup_rules(self):
+    def _build_ai_prompt_intro(self, score_type=None):
         mapping_summary = self._sample_mapping_summary()
         editable_state = mapping_summary.get("editable_state") or {}
         system_row = (editable_state.get("systems") or [])[0]
@@ -2359,6 +2362,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                 page,
                 pdf_source="corrected",
                 remembered_time_signature_in="3/4",
+                score_type=score_type,
             )
 
         _, expected_reference_examples = WORKER._build_old_style_multi_rest_reference_content()
@@ -2366,8 +2370,67 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertNotIn("reference_examples_attached", payload)
 
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
-        intro = json.loads((content[0] or {}).get("text") or "{}")
+        return json.loads((content[0] or {}).get("text") or "{}")
+
+    def test_build_system_measure_request_single_prompt_excludes_multi_staff_rules(self):
+        intro = self._build_ai_prompt_intro(score_type="single")
+
         self.assertEqual(intro.get("remembered_time_signature_in"), "3/4")
+        self.assertEqual(intro.get("score_type"), "single")
+        rules = ((intro.get("instructions") or {}).get("rules")) or []
+        rules_text = "\n".join(str(row) for row in rules)
+        self.assertIn("This is single-staff music. Judge rhythm using only this one staff.", rules_text)
+        self.assertIn("Read meter as top/bottom: top is how many beat-units fill a full measure", rules_text)
+        self.assertIn("Chords or stacked notes count as exactly one rhythmic event", rules_text)
+        self.assertIn("Examples: in 2/4, one quarter-note chord is 1 of 2 beats", rules_text)
+        self.assertIn("A multi-measure rest may use either the modern H-bar style", rules_text)
+        self.assertNotIn("Treble and bass are not beat 1 and beat 2", rules_text)
+        self.assertNotIn("Different instruments are not beat 1", rules_text)
+        self.assertNotIn("For full score V1, do not use multi_measure_rest jumps", rules_text)
+        output_shape = ((intro.get("instructions") or {}).get("output_shape") or {})
+        suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
+        self.assertEqual(suggestion_shape.get("measure_completeness"), "full|incomplete|unclear")
+        self.assertEqual(
+            suggestion_shape.get("unclear_reason"),
+            "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
+        )
+        self.assertIsInstance(suggestion_shape.get("decision_debug"), dict)
+        self.assertIn("active_meter_read", suggestion_shape.get("decision_debug") or {})
+        self.assertIn("debug_note", suggestion_shape.get("decision_debug") or {})
+        time_update_shape = ((output_shape.get("time_signature_updates") or [])[0] or {})
+        self.assertIn("2/4", time_update_shape.get("new_time_signature") or "")
+
+    def test_build_system_measure_request_grand_prompt_includes_treble_bass_rules(self):
+        intro = self._build_ai_prompt_intro(score_type="grand")
+
+        self.assertEqual(intro.get("score_type"), "grand")
+        rules = ((intro.get("instructions") or {}).get("rules")) or []
+        rules_text = "\n".join(str(row) for row in rules)
+        self.assertIn("This is grand-staff/piano music. The two staves share one measure duration.", rules_text)
+        self.assertIn("Treble and bass are not beat 1 and beat 2.", rules_text)
+        self.assertIn("Never add treble plus bass as separate beats.", rules_text)
+        self.assertIn("Use one clear staff's written rhythm/rests as the timing guide", rules_text)
+        self.assertIn("Label multi_measure_rest only if both staves clearly share the same multi-measure rest count", rules_text)
+        self.assertNotIn("Different instruments are not beat 1", rules_text)
+
+    def test_build_system_measure_request_score_prompt_includes_score_rules_without_multi_rest_jump(self):
+        intro = self._build_ai_prompt_intro(score_type="score")
+
+        self.assertEqual(intro.get("score_type"), "score")
+        rules = ((intro.get("instructions") or {}).get("rules")) or []
+        rules_text = "\n".join(str(row) for row in rules)
+        self.assertIn("This is full-score music. All staves share one measure duration.", rules_text)
+        self.assertIn("Different instruments are not beat 1, beat 2, beat 3", rules_text)
+        self.assertIn("Never add instruments together as separate beats.", rules_text)
+        self.assertIn("For full score V1, do not use multi_measure_rest jumps.", rules_text)
+        self.assertNotIn("Label multi_measure_rest only if both staves clearly share", rules_text)
+        self.assertNotIn("A visible count of 2 or more above that old-style symbol is strong evidence", rules_text)
+
+    def test_build_system_measure_request_missing_score_type_uses_legacy_prompt(self):
+        intro = self._build_ai_prompt_intro(score_type=None)
+
+        self.assertEqual(intro.get("remembered_time_signature_in"), "3/4")
+        self.assertIsNone(intro.get("score_type"))
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
         self.assertIn("Process the provided measures left to right in order.", rules_text)
@@ -2382,8 +2445,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Use the visible time signature in the crop to judge completeness.", rules_text)
         self.assertIn("Read meter as top/bottom: top is how many beat-units fill a full measure", rules_text)
         self.assertIn("bottom is which note value is one beat-unit", rules_text)
-        self.assertIn("Count written note/rest durations, not noteheads, spacing, or visual width.", rules_text)
-        self.assertIn("Chords or stacked notes count once using the chord's written note value.", rules_text)
+        self.assertIn("Count written note/rest durations only.", rules_text)
+        self.assertIn("Chords or stacked notes count as exactly one rhythmic event", rules_text)
         self.assertIn("In grand-staff or full-score music, vertically aligned notes/rests across staves happen at the same time", rules_text)
         self.assertIn("Do not add treble plus bass or multiple instruments as separate beats", rules_text)
         self.assertIn("count the timeline horizontally", rules_text)
@@ -2399,20 +2462,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats", rules_text)
         self.assertIn("If all visible staves show one aligned quarter-note event in 2/4", rules_text)
         self.assertIn("Use uncertain with maybe_label pickup only when the active time signature or rhythmic duration cannot be read reliably", rules_text)
-        self.assertIn("Do not default a visibly short first measure to normal.", rules_text)
         self.assertIn("Use uncertain instead of pickup only when there is not enough visual evidence", rules_text)
-        output_shape = ((intro.get("instructions") or {}).get("output_shape") or {})
-        suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
-        self.assertEqual(suggestion_shape.get("measure_completeness"), "full|incomplete|unclear")
-        self.assertEqual(
-            suggestion_shape.get("unclear_reason"),
-            "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
-        )
-        self.assertIsInstance(suggestion_shape.get("decision_debug"), dict)
-        self.assertIn("active_meter_read", suggestion_shape.get("decision_debug") or {})
-        self.assertIn("debug_note", suggestion_shape.get("decision_debug") or {})
-        time_update_shape = ((output_shape.get("time_signature_updates") or [])[0] or {})
-        self.assertIn("2/4", time_update_shape.get("new_time_signature") or "")
 
     def test_render_corrected_pdf_applies_label_erase_before_labels(self):
         page = _FakePage(_FakeRect(0, 0, 200, 160))
