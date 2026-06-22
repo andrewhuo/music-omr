@@ -2355,40 +2355,24 @@ def _ai_suggest_normalization_warning(measure_row: dict | None, message: str) ->
 
 def _derive_ai_measure_time_signatures_by_measure_id(
     ordered_measures: list[dict],
-    remembered_time_signature_in: str | None,
     valid_time_signature_updates: list[dict],
 ) -> dict[str, dict]:
-    updates_by_measure_id: dict[str, str] = {}
+    expected_measure_ids = {
+        str((measure_row or {}).get("measure_id") or "").strip()
+        for measure_row in ordered_measures
+        if str((measure_row or {}).get("measure_id") or "").strip()
+    }
+    result: dict[str, dict] = {}
     for row in valid_time_signature_updates:
         measure_id = str((row or {}).get("measure_id") or "").strip()
         new_time_signature = _normalize_ai_time_signature_value((row or {}).get("new_time_signature"))
         if not measure_id or not new_time_signature:
             continue
-        updates_by_measure_id[measure_id] = new_time_signature
-
-    active_time_signature = _normalize_ai_time_signature_value(remembered_time_signature_in)
-    have_seen_explicit_update = False
-    result: dict[str, dict] = {}
-    for measure_row in ordered_measures:
-        measure_id = str((measure_row or {}).get("measure_id") or "").strip()
-        if not measure_id:
+        if measure_id not in expected_measure_ids:
             continue
-
-        explicit_time_signature = updates_by_measure_id.get(measure_id)
-        if explicit_time_signature is not None:
-            active_time_signature = explicit_time_signature
-            have_seen_explicit_update = True
-            time_signature_source = "explicit_here"
-        elif active_time_signature is None:
-            time_signature_source = "unknown"
-        elif have_seen_explicit_update:
-            time_signature_source = "inherited"
-        else:
-            time_signature_source = "remembered"
-
         result[measure_id] = {
-            "active_time_signature": active_time_signature,
-            "time_signature_source": time_signature_source,
+            "active_time_signature": new_time_signature,
+            "time_signature_source": "explicit_here",
         }
     return result
 
@@ -2644,7 +2628,6 @@ def _normalize_ai_suggestions_result(
     systems_processed = len(_sorted_system_rows(editable_state.get("systems") or []))
     warnings = _normalize_ai_suggest_warnings(raw_result.get("warnings"))
     warnings.extend(normalization_warnings)
-    previous_time_signature = _normalize_ai_time_signature_value(remembered_time_signature_in)
     raw_time_signature_updates = raw_result.get("time_signature_updates")
     valid_time_signature_updates: list[dict] = []
     if raw_time_signature_updates is not None and not isinstance(raw_time_signature_updates, list):
@@ -2686,36 +2669,20 @@ def _normalize_ai_suggestions_result(
             normalized_update["measure_id"] = measure_id
             valid_time_signature_updates.append(normalized_update)
 
-    remembered_time_signature_out = previous_time_signature
     raw_time_signature_out = raw_result.get("remembered_time_signature_out")
-    if raw_time_signature_out is not None:
-        normalized_time_signature_out = _normalize_ai_time_signature_value(raw_time_signature_out)
-        if normalized_time_signature_out is None:
-            warnings.append(
-                _ai_suggest_normalization_warning(
-                    fallback_measure_row,
-                    "Ignored invalid remembered_time_signature_out and kept the previous remembered value.",
-                )
+    if raw_time_signature_out is not None and _normalize_ai_time_signature_value(raw_time_signature_out) is None:
+        warnings.append(
+            _ai_suggest_normalization_warning(
+                fallback_measure_row,
+                "Ignored invalid remembered_time_signature_out because meter tracking is disabled.",
             )
-        else:
-            remembered_time_signature_out = normalized_time_signature_out
+        )
 
-    last_time_signature_update = None
-    if remembered_time_signature_out is not None and valid_time_signature_updates:
-        for row in reversed(valid_time_signature_updates):
-            if str(row.get("new_time_signature") or "") == remembered_time_signature_out:
-                last_time_signature_update = row
-                break
-    elif raw_time_signature_out is not None and remembered_time_signature_out is not None and remembered_time_signature_out != previous_time_signature:
-        last_time_signature_update = {
-            "system_id": system_id or None,
-            "measure_id": None,
-            "new_time_signature": remembered_time_signature_out,
-        }
+    remembered_time_signature_out = None
+    last_time_signature_update = valid_time_signature_updates[-1] if valid_time_signature_updates else None
 
     time_signatures_by_measure_id = _derive_ai_measure_time_signatures_by_measure_id(
         ordered_measures,
-        previous_time_signature,
         valid_time_signature_updates,
     )
     for measure_id, entry in kept_by_measure_id.items():
@@ -3356,17 +3323,18 @@ def _ai_prompt_base_rules() -> list[str]:
         "Each image contains exactly one already-detected measure.",
         "Do not infer additional measures from rhythmic groupings, repeat dots, barline decorations, edge marks, spacing, or decorations.",
         "Process the provided measures left to right in order.",
-        "Start with remembered_time_signature_in as the active time signature, unless it is null.",
         "A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.",
         "Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.",
-        "If a clearly visible new time signature appears at a measure, update the active time signature from that measure onward within this same system.",
-        "If a new time signature is unclear or only partly visible, keep the previous active time signature.",
+        "Do not remember, inherit, carry, or track time signatures across measures.",
+        "Only read a time signature if it is visible in the current crop.",
+        "Only use meter for first-measure pickup judgment.",
+        "For multi-measure rests, ignore meter completely.",
         "Only label pickup when is_first_measure_of_score is true.",
         "If is_first_measure_of_score is false, do not label pickup.",
         "For every measure, also judge measure_completeness as full, incomplete, or unclear.",
         "If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason using one of these exact codes only: time_signature_not_clear, too_dense_to_count, crop_cut_off, split_may_be_wrong, ornament_or_tie_confusion, not_enough_visual_evidence.",
         "Do not write sentences for unclear_reason. Use only one short code or omit the field.",
-        "Use the visible time signature in the crop to judge completeness.",
+        "For later non-rest measures, do not judge beat completeness unless the visible notation makes uncertainty necessary.",
     ]
 
 
@@ -3389,6 +3357,7 @@ def _ai_prompt_meter_rules() -> list[str]:
 def _ai_prompt_single_rules() -> list[str]:
     return [
         "This is single-staff music. Judge rhythm using only this one staff.",
+        "First check whether the crop is a multi-measure rest. If there is a clear rest symbol and visible count of 2 or more, return multi_measure_rest immediately and do not inspect meter.",
         *_ai_prompt_meter_rules(),
         "Examples: in 2/4, one quarter-note chord is 1 of 2 beats, so pickup if first measure unless another beat or rest follows. In 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure unless more duration follows. In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
         "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
@@ -3403,7 +3372,8 @@ def _ai_prompt_single_rules() -> list[str]:
 def _ai_prompt_grand_rules() -> list[str]:
     return [
         "This is grand-staff/piano music. The two staves share one measure duration.",
-        "The same time signature may appear on both staves; use one shared meter for the whole vertical measure.",
+        "First check whether the crop is a multi-measure rest. If both staves clearly share the same rest symbol and visible count of 2 or more, return multi_measure_rest immediately and do not inspect meter.",
+        "The same time signature may appear on both staves; if visible in this crop, use one shared meter for the whole vertical measure.",
         "Do not count by staves. Count time only.",
         "Treble and bass are not beat 1 and beat 2.",
         "Vertically aligned notes/rests in treble and bass happen at the same time and count as one time position.",
@@ -3456,14 +3426,14 @@ def _ai_prompt_output_rules() -> list[str]:
 def _ai_prompt_legacy_rules() -> list[str]:
     return [
         *_ai_prompt_base_rules(),
-        "In grand-staff or piano crops, the same time signature may appear on both staves; use the shared meter for the whole measure.",
+        "In grand-staff or piano crops, the same time signature may appear on both staves; if visible in this crop, use one shared meter for the whole measure.",
         *_ai_prompt_meter_rules(),
         "In grand-staff or full-score music, vertically aligned notes/rests across staves happen at the same time, not one after another. Do not add treble plus bass or multiple instruments as separate beats; count the timeline horizontally.",
         "For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves. One staff may play while the other rests or is silent; do not require both staves to have notes.",
         "Examples: in 2/4, one quarter-note chord is 1 of 2 beats, so pickup if first measure. In 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure. In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first unless more duration follows. If all visible staves show one aligned quarter-note event in 2/4, that is one beat total, so pickup if first unless another beat or rest follows.",
         "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
         "In the older style, the vertical bars may be short or long, and there may be more than one.",
-        "A confident multi_measure_rest label requires a clearly readable count number of 2 or more. Without a visible count number, return uncertain.",
+        "Check multi-measure rests before meter. A confident multi_measure_rest label requires a clearly readable count number of 2 or more. Without a visible count number, return uncertain.",
         "A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.",
         "If label is multi_measure_rest, include integer rest_count of 2 or more. A visible count of 1 means the measure is normal, not multi_measure_rest.",
         "A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.",
@@ -3506,7 +3476,7 @@ def _build_system_measure_request(
         "system_id": system_id,
         "page_number": int(page_number),
         "score_type": _normalize_ai_score_type(score_type),
-        "remembered_time_signature_in": _normalize_ai_time_signature_value(remembered_time_signature_in),
+        "remembered_time_signature_in": None,
         "instructions": {
             "task": "Classify each already-detected sheet-music measure conservatively.",
             "allowed_labels": ["normal", "pickup", "multi_measure_rest", "uncertain"],
@@ -3533,13 +3503,6 @@ def _build_system_measure_request(
                     }
                 ],
                 "warnings": [{"type": "string", "system_id": "string", "system_index": "integer", "message": "string"}],
-                "remembered_time_signature_out": "string|null",
-                "time_signature_updates": [
-                    {
-                        "measure_id": "string",
-                        "new_time_signature": "visible meter such as 2/4, 3/4, 4/4, 6/8, common_time, cut_time, or null",
-                    }
-                ],
             },
         },
         "measures": [
@@ -6329,9 +6292,8 @@ def ai_suggest_job_step(job_id: str):
             debug_crops = system_result.pop("debug_crops", None)
             reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
             current_system_id = str(system_row.get("system_id") or "").strip() or None
-            ai_suggest_run["remembered_time_signature"] = _normalize_ai_time_signature_value(
-                system_result.pop("remembered_time_signature_out", remembered_time_signature_in)
-            )
+            system_result.pop("remembered_time_signature_out", None)
+            ai_suggest_run["remembered_time_signature"] = None
             previous_last_time_signature_update = _normalize_ai_time_signature_update_row(
                 ai_suggest_run.get("last_time_signature_update"),
             )

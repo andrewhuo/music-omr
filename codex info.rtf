@@ -2,7 +2,6 @@
 \cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica-Light;}
 {\colortbl;\red255\green255\blue255;}
 {\*\expandedcolortbl;;}
-\vieww11520\viewh8400\viewkind0
 \pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
 
 \f0\fs24 \cf0 Sheet Music Labeler: Codex Working Summary\
@@ -27,22 +26,25 @@ Universal rules\
 - Process measures left to right.\
 - A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.\
 - Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.\
-- If a clearly visible new time signature appears at a measure, update the active time signature from that measure onward.\
-- If a new time signature is unclear or partly visible, keep the previous active time signature.\
+- Do not remember, inherit, carry, or track time signatures across measures.\
+- Only read a time signature if it is visible in the current crop.\
+- Only use meter for first-measure pickup judgment.\
+- For multi-measure rests, ignore meter completely.\
 - Only label pickup when is_first_measure_of_score = true. If false, do not label pickup.\
 - For every measure, judge measure_completeness as full, incomplete, or unclear.\
 \
 Single-staff rhythm rules\
 - This is single-staff music. Judge rhythm using only this one staff.\
+- First check whether the crop is a multi-measure rest. If there is a clear rest symbol and visible count of 2 or more, return multi_measure_rest immediately and do not inspect meter.\
 - Read meter as top/bottom: top is how many beat-units fill a full measure; bottom is which note value is one beat-unit.\
 - Count written note/rest durations only. Never count visual width, spacing, or number of noteheads as beats.\
 - Chords/stacked notes count as exactly one rhythmic event using the written note value. Do not count each notehead separately.\
 - For the first measure only: if total written duration is less than the active meter, label pickup and measure_completeness incomplete. If it reaches the active meter, label normal and full.\
 - If a non-first measure looks short, label uncertain, not pickup.\
-- Use uncertain only when the meter or rhythm cannot be read reliably.\
+- Use uncertain only when the needed visible meter or rhythm cannot be read reliably.\
 \
 Single-staff multi-measure rest rules\
-- Label multi_measure_rest only when there is a clear multi-measure rest symbol and a visible count of 2 or more.\
+- Check multi-measure rests before meter. Label multi_measure_rest only when there is a clear multi-measure rest symbol and a visible count of 2 or more.\
 - The symbol may be a modern H-bar or older horizontal bar plus vertical bars.\
 - A visible count of 1 is normal, not multi_measure_rest.\
 - If the count or symbol is unclear, return uncertain, with maybe_label multi_measure_rest if useful.\
@@ -71,15 +73,18 @@ Universal rules\
 - Do NOT infer extra measures from rhythmic groups, repeat dots, double barlines, edge marks, spacing, or decorations.\
 - Process measures left to right.\
 - A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.\
-- The same time signature may appear on both staves; use one shared meter for the whole vertical measure.\
+- The same time signature may appear on both staves; if visible in this crop, use one shared meter for the whole vertical measure.\
 - Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.\
-- If a clearly visible new time signature appears at a measure, update the active time signature from that measure onward.\
-- If a new time signature is unclear or partly visible, keep the previous active time signature.\
+- Do not remember, inherit, carry, or track time signatures across measures.\
+- Only read a time signature if it is visible in the current crop.\
+- Only use meter for first-measure pickup judgment.\
+- For multi-measure rests, ignore meter completely.\
 - Only label pickup when is_first_measure_of_score = true. If false, do not label pickup.\
 - For every measure, judge measure_completeness as full, incomplete, or unclear.\
 \
 Aggressive grand-staff rhythm rules\
 - This is grand-staff/piano music. The two staves share one measure duration.\
+- First check whether the crop is a multi-measure rest. If both staves clearly share the same rest symbol and visible count of 2 or more, return multi_measure_rest immediately and do not inspect meter.\
 - Do not count by staves. Count time only.\
 - Treble and bass are not beat 1 and beat 2.\
 - Vertically aligned notes/rests in treble and bass happen at the same time and count as one time position.\
@@ -92,10 +97,10 @@ Aggressive grand-staff rhythm rules\
 - Example: in 2/4, one aligned quarter-note chord across both staves is one beat total, not two beats and not one beat per notehead. If it is the whole first measure, label pickup/incomplete unless another beat or rest follows.\
 - Example: in 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure unless more duration follows.\
 - Example: in 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.\
-- Use uncertain only when the meter or rhythm cannot be read reliably.\
+- Use uncertain only when the needed visible meter or rhythm cannot be read reliably.\
 \
 Grand-staff multi-measure rest rules\
-- Label multi_measure_rest only if both staves clearly share the same multi-measure rest count of 2 or more.\
+- Check multi-measure rests before meter. Label multi_measure_rest only if both staves clearly share the same multi-measure rest count of 2 or more.\
 - If one staff has music, no count, or a different count, do not return multi_measure_rest.\
 - If the count or symbol is unclear, return uncertain, with maybe_label multi_measure_rest if useful.\
 \
@@ -124,8 +129,10 @@ Universal rules\
 - Process measures left to right.\
 - A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.\
 - Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.\
-- If a clearly visible new time signature appears at a measure, update the active time signature from that measure onward.\
-- If a new time signature is unclear or partly visible, keep the previous active time signature.\
+- Do not remember, inherit, carry, or track time signatures across measures.\
+- Only read a time signature if it is visible in the current crop.\
+- Only use meter for first-measure pickup judgment.\
+- For multi-measure rests, ignore meter completely.\
 - Only label pickup when is_first_measure_of_score = true. If false, do not label pickup.\
 - For every measure, judge measure_completeness as full, incomplete, or unclear.\
 \
@@ -143,7 +150,7 @@ Aggressive full-score rhythm rules\
 - Example: in 2/4, if all visible instruments show one aligned quarter-note event, that is one beat total, not multiple beats. If it is the whole first measure, label pickup/incomplete unless another beat or rest follows.\
 - Example: in 4/4, one half-note event is 2 of 4 beats, so pickup if first measure unless more duration follows.\
 - Example: in 6/8, one dotted-quarter event is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.\
-- Use uncertain only when the meter or rhythm cannot be read reliably.\
+- Use uncertain only when the needed visible meter or rhythm cannot be read reliably.\
 \
 Full-score multi-measure rest rules\
 - For full score V1, do not use multi_measure_rest jumps.\
@@ -176,10 +183,10 @@ Cloud Shell deploy memory\
 Eventual fixes and follow-up work\
 \
 - Keep full scores out of AI V1 until backend geometry is stronger, then make it work for scores too.\
-- Later test and design pickup detection for every measure, not only the first measure, using saved per-measure time signatures and completeness.\
 - No need for every measure pickup detection\
 - Make sure that instead of Ai returning \'93unsure\'94, have it return what it thinks it is\
 - After the single-page layout work is stable, do multipage reliability testing for one-staff PDFs, piano/grand-staff PDFs, and later full scores.\
+- allow the movement of labels, turn them into a tangible object like the green rectangles, so user interface can be easier to use and more modern looking.\
 - Add better ending handling later, including first/second endings and ending-aware structure logic, as part of a stronger V2.\
 - Add stronger network/SSL/request reliability testing and error handling: retry safe transient failures, show clearer user-facing error messages, and log enough detail to tell app-side vs server-side vs simulator/network issues.\
 - Keep resume/reload behavior reliable.\
@@ -192,5 +199,5 @@ Eventual fixes and follow-up work\
 - Define the 2 types of paying service and their permissions/advantages.\
 - Later pricing idea: cheaper batch-AI plan and pricier fast-AI plan.\
 - Clean up backend, remove debug code, test everything.\
-- Do user interface cleanup, polishing, and beautification after the core AI/backend behavior is solid enough.\
+- Do user interface cleanup, polishing, and beautification after the core AI/backend behavior is solid enough. User interface like the drawing interface on iPad, main drawing screen(pdf renderer), and small bar that can be moved to either 4 sides with all the edit functions. No title, all edit functions on bar, and settings. \
 }

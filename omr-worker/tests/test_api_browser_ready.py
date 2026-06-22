@@ -873,7 +873,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(body.get("status"), "running")
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
-        self.assertEqual((body.get("ai_suggest_run") or {}).get("remembered_time_signature"), "3/4")
+        self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertEqual((((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")), "p1_s0_m0")
         self.assertEqual(
             (body.get("ai_suggest_run") or {}).get("time_signature_updates"),
@@ -933,7 +933,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(merged.get("by_measure_id"), {})
         self.assertEqual(merged.get("decision_debug_by_measure_id"), {"p1_s0_m0": debug})
 
-    def test_ai_suggest_step_passes_and_updates_remembered_time_signature_between_systems(self):
+    def test_ai_suggest_step_does_not_carry_remembered_time_signature_between_systems(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
         mapping_summary = self._sample_mapping_summary()
@@ -983,7 +983,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(mock_generate.call_args.kwargs.get("remembered_time_signature_in"), "3/4")
-        self.assertEqual((body.get("ai_suggest_run") or {}).get("remembered_time_signature"), "4/4")
+        self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertEqual((((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")), "p1_s1_m0")
         self.assertEqual(
             (body.get("ai_suggest_run") or {}).get("time_signature_updates"),
@@ -1245,7 +1245,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(body.get("status"), "running")
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
-        self.assertEqual((body.get("ai_suggest_run") or {}).get("remembered_time_signature"), "3/4")
+        self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertEqual(
             (body.get("ai_suggest_run") or {}).get("time_signature_updates"),
             [{"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"}],
@@ -2033,8 +2033,6 @@ class BrowserReadyApiTests(unittest.TestCase):
                 "system_id": "p1_s0",
                 "order_index_in_system": 0,
                 "is_first_measure_of_score": True,
-                "active_time_signature": None,
-                "time_signature_source": "unknown",
                 "measure_completeness": "unclear",
                 "measure_completeness_source": "ai",
                 "unclear_reason": "split_may_be_wrong",
@@ -2156,8 +2154,6 @@ class BrowserReadyApiTests(unittest.TestCase):
                 "system_id": "p1_s0",
                 "order_index_in_system": 1,
                 "is_first_measure_of_score": False,
-                "active_time_signature": "3/4",
-                "time_signature_source": "remembered",
                 "measure_completeness": "incomplete",
                 "measure_completeness_source": "ai",
             },
@@ -2165,7 +2161,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         warnings = normalized.get("warnings") or []
         self.assertTrue(any("Downgraded later normal suggestion to uncertain" in str((row or {}).get("message") or "") for row in warnings))
 
-    def test_normalize_ai_suggestions_result_tracks_remembered_time_signature_for_every_measure(self):
+    def test_normalize_ai_suggestions_result_does_not_track_remembered_time_signature_for_every_measure(self):
         editable_state = {
             "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
             "measures": [
@@ -2201,16 +2197,10 @@ class BrowserReadyApiTests(unittest.TestCase):
                 "m2": {"measure_completeness": "full", "measure_completeness_source": "ai"},
             },
         )
-        self.assertEqual(
-            normalized.get("time_signatures_by_measure_id"),
-            {
-                "m0": {"active_time_signature": "3/4", "time_signature_source": "remembered"},
-                "m1": {"active_time_signature": "3/4", "time_signature_source": "remembered"},
-                "m2": {"active_time_signature": "3/4", "time_signature_source": "remembered"},
-            },
-        )
+        self.assertEqual(normalized.get("time_signatures_by_measure_id"), {})
+        self.assertIsNone(normalized.get("remembered_time_signature_out"))
 
-    def test_normalize_ai_suggestions_result_tracks_explicit_and_inherited_time_signature_per_measure(self):
+    def test_normalize_ai_suggestions_result_keeps_only_explicit_time_signature_updates(self):
         editable_state = {
             "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
             "measures": [
@@ -2242,9 +2232,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(
             normalized.get("time_signatures_by_measure_id"),
             {
-                "m0": {"active_time_signature": "4/4", "time_signature_source": "remembered"},
                 "m1": {"active_time_signature": "3/4", "time_signature_source": "explicit_here"},
-                "m2": {"active_time_signature": "3/4", "time_signature_source": "inherited"},
             },
         )
         self.assertEqual(
@@ -2263,7 +2251,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             },
         )
 
-    def test_normalize_ai_suggestions_result_tracks_unknown_until_first_explicit_time_signature(self):
+    def test_normalize_ai_suggestions_result_does_not_inherit_after_explicit_time_signature(self):
         editable_state = {
             "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
             "measures": [
@@ -2295,15 +2283,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(
             normalized.get("time_signatures_by_measure_id"),
             {
-                "m0": {"active_time_signature": None, "time_signature_source": "unknown"},
                 "m1": {"active_time_signature": "6/8", "time_signature_source": "explicit_here"},
-                "m2": {"active_time_signature": "6/8", "time_signature_source": "inherited"},
             },
         )
-        self.assertEqual(
-            normalized.get("by_measure_id", {}).get("m2", {}).get("time_signature_source"),
-            "inherited",
-        )
+        self.assertNotIn("time_signature_source", normalized.get("by_measure_id", {}).get("m2", {}))
         self.assertEqual(
             normalized.get("by_measure_id", {}).get("m2", {}).get("measure_completeness"),
             "incomplete",
@@ -2375,11 +2358,13 @@ class BrowserReadyApiTests(unittest.TestCase):
     def test_build_system_measure_request_single_prompt_excludes_multi_staff_rules(self):
         intro = self._build_ai_prompt_intro(score_type="single")
 
-        self.assertEqual(intro.get("remembered_time_signature_in"), "3/4")
+        self.assertIsNone(intro.get("remembered_time_signature_in"))
         self.assertEqual(intro.get("score_type"), "single")
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
         self.assertIn("This is single-staff music. Judge rhythm using only this one staff.", rules_text)
+        self.assertIn("Do not remember, inherit, carry, or track time signatures across measures.", rules_text)
+        self.assertIn("First check whether the crop is a multi-measure rest.", rules_text)
         self.assertIn("Read meter as top/bottom: top is how many beat-units fill a full measure", rules_text)
         self.assertIn("Chords or stacked notes count as exactly one rhythmic event", rules_text)
         self.assertIn("Examples: in 2/4, one quarter-note chord is 1 of 2 beats", rules_text)
@@ -2397,8 +2382,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIsInstance(suggestion_shape.get("decision_debug"), dict)
         self.assertIn("active_meter_read", suggestion_shape.get("decision_debug") or {})
         self.assertIn("debug_note", suggestion_shape.get("decision_debug") or {})
-        time_update_shape = ((output_shape.get("time_signature_updates") or [])[0] or {})
-        self.assertIn("2/4", time_update_shape.get("new_time_signature") or "")
+        self.assertNotIn("time_signature_updates", output_shape)
+        self.assertNotIn("remembered_time_signature_out", output_shape)
 
     def test_build_system_measure_request_grand_prompt_includes_treble_bass_rules(self):
         intro = self._build_ai_prompt_intro(score_type="grand")
@@ -2407,6 +2392,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
         self.assertIn("This is grand-staff/piano music. The two staves share one measure duration.", rules_text)
+        self.assertIn("First check whether the crop is a multi-measure rest.", rules_text)
         self.assertIn("Treble and bass are not beat 1 and beat 2.", rules_text)
         self.assertIn("Never add treble plus bass as separate beats.", rules_text)
         self.assertIn("Use one clear staff's written rhythm/rests as the timing guide", rules_text)
@@ -2429,20 +2415,20 @@ class BrowserReadyApiTests(unittest.TestCase):
     def test_build_system_measure_request_missing_score_type_uses_legacy_prompt(self):
         intro = self._build_ai_prompt_intro(score_type=None)
 
-        self.assertEqual(intro.get("remembered_time_signature_in"), "3/4")
+        self.assertIsNone(intro.get("remembered_time_signature_in"))
         self.assertIsNone(intro.get("score_type"))
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
         self.assertIn("Process the provided measures left to right in order.", rules_text)
-        self.assertIn("Start with remembered_time_signature_in as the active time signature", rules_text)
+        self.assertNotIn("Start with remembered_time_signature_in as the active time signature", rules_text)
         self.assertIn("A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature", rules_text)
         self.assertIn("In grand-staff or piano crops, the same time signature may appear on both staves", rules_text)
         self.assertIn("Ignore fingering/count numbers near notes, above the staff, or below the staff.", rules_text)
-        self.assertIn("If a clearly visible new time signature appears at a measure, update the active time signature", rules_text)
+        self.assertIn("Do not remember, inherit, carry, or track time signatures across measures.", rules_text)
         self.assertIn("For every measure, also judge measure_completeness as full, incomplete, or unclear.", rules_text)
         self.assertIn("If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason", rules_text)
         self.assertIn("Do not write sentences for unclear_reason. Use only one short code or omit the field.", rules_text)
-        self.assertIn("Use the visible time signature in the crop to judge completeness.", rules_text)
+        self.assertIn("Only use meter for first-measure pickup judgment.", rules_text)
         self.assertIn("Read meter as top/bottom: top is how many beat-units fill a full measure", rules_text)
         self.assertIn("bottom is which note value is one beat-unit", rules_text)
         self.assertIn("Count written note/rest durations only.", rules_text)
