@@ -3331,7 +3331,8 @@ def _ai_prompt_base_rules() -> list[str]:
         "For multi-measure rests, ignore meter completely.",
         "Only label pickup when is_first_measure_of_score is true.",
         "If is_first_measure_of_score is false, do not label pickup.",
-        "For every measure, also judge measure_completeness as full, incomplete, or unclear.",
+        "Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, clear normal = full, unclear = unclear.",
+        "Prefer useful suggestions over silence. If a crop strongly looks like pickup or multi_measure_rest, suggest it even with medium or low confidence.",
         "If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason using one of these exact codes only: time_signature_not_clear, too_dense_to_count, crop_cut_off, split_may_be_wrong, ornament_or_tie_confusion, not_enough_visual_evidence.",
         "Do not write sentences for unclear_reason. Use only one short code or omit the field.",
         "For later non-rest measures, do not judge beat completeness unless the visible notation makes uncertainty necessary.",
@@ -3388,16 +3389,34 @@ def _ai_prompt_score_pickup_rules() -> list[str]:
 def _ai_prompt_single_rules() -> list[str]:
     return [
         "This is single-staff music. Judge rhythm using only this one staff.",
-        "First check whether the crop is a multi-measure rest. If there is a clear rest symbol and visible count of 2 or more, return multi_measure_rest immediately and do not inspect meter.",
-        *_ai_prompt_duration_basics(),
-        *_ai_prompt_single_pickup_rules(),
-        "Examples: in 2/4, one quarter-note chord is 1 of 2 beats, so pickup if first measure unless another beat or rest follows. In 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure unless more duration follows. In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
-        "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
-        "In the older style, the vertical bars may be short or long, and there may be more than one.",
-        "Label multi_measure_rest only when there is a clear multi-measure rest symbol and a visible count of 2 or more.",
-        "A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.",
-        "If label is multi_measure_rest, include integer rest_count of 2 or more. A visible count of 1 means the measure is normal, not multi_measure_rest.",
-        "A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.",
+        "Single-staff pickup rules:",
+        "Only check pickup when is_first_measure_of_score is true.",
+        "Use the visible meter in this crop only.",
+        "Read meter as top/bottom: top = how many beat-units fill a full measure; bottom = which note value is one beat-unit.",
+        "Bottom number examples: 4 means quarter-note beats, 8 means eighth-note beats, 2 means half-note beats.",
+        "Count written note/rest durations only. Never count visual width, spacing, or number of noteheads as beats.",
+        "Common values in quarter-note units: whole = 4, half = 2, quarter = 1, eighth = 1/2, sixteenth = 1/4.",
+        "A dot adds half the note value: dotted half = 3 quarters, dotted quarter = 1.5 quarters, dotted eighth = 3/4 quarter.",
+        "Rests count toward the meter exactly like notes.",
+        "Chords/stacked notes count as exactly one rhythmic event using the written note value. Do not count each notehead separately.",
+        "Count this one staff's written duration only.",
+        "If the first measure's written duration is less than the visible meter, label pickup and set measure_completeness to incomplete.",
+        "Only label normal/full if the written notes/rests clearly add up to the full visible meter.",
+        "If first-measure pickup is possible but the visible meter or rhythm is unclear, use uncertain with maybe_label pickup.",
+        "Examples: in 2/4, one quarter note or quarter-note chord is 1 of 2 beats, so pickup if first measure unless another quarter beat/rest follows. In 3/4, three quarter-note beats make a full measure; one or two quarter beats is pickup if first measure. In 6/8, six eighth-note beats make a full measure; one dotted-quarter note is 3 of 6 eighth beats, so pickup if first measure unless more duration follows.",
+        "Single-staff multi-measure rest rules:",
+        "Check multi-measure rests before pickup or meter. Do not inspect meter for multi-measure rests.",
+        "Use the old-style reference images as examples only; the real measure crops come after them. Old-style rests can look different from modern H-bars.",
+        "A multi-measure rest symbol can be a modern H-bar or thick horizontal block across the staff.",
+        "A multi-measure rest symbol can also be old-style vertical bars, horizontal bars, or small bar pieces inside the staff.",
+        "Normal quarter/eighth/half/whole rests are not multi-measure rests by themselves.",
+        "Number first, symbol second: a readable big number 2 or higher above/near a rest-like old/modern symbol means multi_measure_rest.",
+        "Use the printed big number as rest_count. Do not require the bar pattern to visually match the count.",
+        "Do not return uncertain just because the symbol is messy, unfamiliar, or old-looking.",
+        "A visible count of 1 is normal, not multi_measure_rest.",
+        "If there is no readable count, do not return a confident multi_measure_rest.",
+        "If it is clearly only a normal one-measure rest, label normal.",
+        "Use uncertain only when the count is unreadable or the number may be a rehearsal/measure number instead of a rest count.",
     ]
 
 
@@ -3455,6 +3474,22 @@ def _ai_prompt_output_rules() -> list[str]:
     ]
 
 
+def _ai_prompt_single_output_rules() -> list[str]:
+    return [
+        "Allowed labels: normal, pickup, multi_measure_rest, uncertain.",
+        "Do not skip any provided measure_id.",
+        "Do not output labels outside the allowed set.",
+        "Overusing uncertain is worse than a reasonable confident suggestion.",
+        "Use uncertain only when the visual evidence is truly unreadable or conflicting.",
+        "For multi-rest: if readable count 2 or higher plus rest-like multi-rest symbol, output multi_measure_rest.",
+        "For multi-rest: use uncertain only when the number is hard to read or might not be a rest count.",
+        "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
+        "If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable, include maybe_rest_count.",
+        "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes plus debug_note: 1-3 short sentences, max 50 words, explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "Return JSON only.",
+    ]
+
+
 def _ai_prompt_legacy_rules() -> list[str]:
     return [
         *_ai_prompt_base_rules(),
@@ -3478,7 +3513,7 @@ def _ai_prompt_legacy_rules() -> list[str]:
 def _ai_prompt_rules_for_score_type(score_type: str | None) -> list[str]:
     normalized = _normalize_ai_score_type(score_type)
     if normalized == "single":
-        return [*_ai_prompt_base_rules(), *_ai_prompt_single_rules(), *_ai_prompt_output_rules()]
+        return [*_ai_prompt_base_rules(), *_ai_prompt_single_rules(), *_ai_prompt_single_output_rules()]
     if normalized == "grand":
         return [*_ai_prompt_base_rules(), *_ai_prompt_grand_rules(), *_ai_prompt_output_rules()]
     if normalized == "score":
