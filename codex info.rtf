@@ -31,21 +31,25 @@ Universal rules\
 - Only use meter for first-measure pickup judgment.\
 - For multi-measure rests, ignore meter completely.\
 - Only label pickup when is_first_measure_of_score = true. If false, do not label pickup.\
-- For every measure, judge measure_completeness as full, incomplete, or unclear.\
-\
-Single-staff rhythm basics\
-- This is single-staff music. Judge rhythm using only this one staff.\
-- Read meter as top/bottom: top is how many beat-units fill a full measure; bottom is which note value is one beat-unit.\
-- Count written note/rest durations only. Never count visual width, spacing, or number of noteheads as beats.\
-- Chords/stacked notes count as exactly one rhythmic event using the written note value. Do not count each notehead separately.\
+- Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, clear normal = full, unclear = unclear.\
+- Prefer useful suggestions over silence. If a crop strongly looks like pickup or multi_measure_rest, suggest it even with medium or low confidence.\
 \
 Single-staff pickup rules\
+- This is single-staff music. Judge rhythm using only this one staff.\
 - Only check pickup when is_first_measure_of_score = true.\
 - Use the visible meter in this crop only.\
+- Read meter as top/bottom: top = how many beat-units fill a full measure; bottom = which note value is one beat-unit.\
+- Bottom number examples: 4 means quarter-note beats, 8 means eighth-note beats, 2 means half-note beats.\
+- Count written note/rest durations only. Never count visual width, spacing, or number of noteheads as beats.\
+- Common values in quarter-note units: whole = 4, half = 2, quarter = 1, eighth = 1/2, sixteenth = 1/4.\
+- A dot adds half the note value: dotted half = 3 quarters, dotted quarter = 1.5 quarters, dotted eighth = 3/4 quarter.\
+- Rests count toward the meter exactly like notes.\
+- Chords/stacked notes count as exactly one rhythmic event using the written note value. Do not count each notehead separately.\
 - Count this one staff's written duration only.\
 - If the first measure's written duration is less than the visible meter, label pickup and measure_completeness incomplete.\
-- If it reaches the visible meter, label normal and full.\
+- Only label normal/full if the written notes/rests clearly add up to the full visible meter.\
 - If first-measure pickup is possible but the visible meter or rhythm is unclear, use uncertain with maybe_label pickup.\
+- Examples: in 2/4, one quarter note or quarter-note chord is 1 of 2 beats, so pickup if first measure unless another quarter beat/rest follows. In 3/4, three quarter-note beats make a full measure; one or two quarter beats is pickup if first measure. In 6/8, six eighth-note beats make a full measure; one dotted-quarter note is 3 of 6 eighth beats, so pickup if first measure unless more duration follows.\
 \
 Single-staff multi-measure rest rules\
 - Check multi-measure rests before pickup or meter. Label multi_measure_rest only when there is a clear multi-measure rest symbol and a visible count of 2 or more.\
@@ -84,9 +88,10 @@ Universal rules\
 - Only use meter for first-measure pickup judgment.\
 - For multi-measure rests, ignore meter completely.\
 - Only label pickup when is_first_measure_of_score = true. If false, do not label pickup.\
-- For every measure, judge measure_completeness as full, incomplete, or unclear.\
+- Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, clear normal = full, unclear = unclear.\
+- Prefer useful suggestions over silence. If a crop strongly looks like pickup or multi_measure_rest, suggest it even with medium or low confidence.\
 \
-Grand-staff rhythm basics\
+Grand-staff pickup rules\
 - This is grand-staff/piano music. The two staves share one measure duration.\
 - Do not count by staves. Count time only.\
 - Treble and bass are not beat 1 and beat 2.\
@@ -96,7 +101,6 @@ Grand-staff rhythm basics\
 - Count written note/rest durations only. Never count visual width, spacing, number of noteheads, or number of staves as beats.\
 - A chord/stack is exactly one rhythmic event, no matter how many noteheads it has. Use the top notehead/stem group only to identify the written note value.\
 \
-Grand-staff pickup rules\
 - Only check pickup when is_first_measure_of_score = true.\
 - Use the visible meter in this crop only; if the same meter appears on both staves, treat it as one shared meter.\
 - Treble and bass happen at the same time; never add them as separate beats.\
@@ -140,9 +144,10 @@ Universal rules\
 - Only use meter for first-measure pickup judgment.\
 - For multi-measure rests, ignore meter completely.\
 - Only label pickup when is_first_measure_of_score = true. If false, do not label pickup.\
-- For every measure, judge measure_completeness as full, incomplete, or unclear.\
+- Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, clear normal = full, unclear = unclear.\
+- Prefer useful suggestions over silence. If a crop strongly looks like pickup or multi_measure_rest, suggest it even with medium or low confidence.\
 \
-Full-score rhythm basics\
+Full-score pickup rules\
 - This is full-score music. All staves share one measure duration.\
 - Do not count by instruments. Count time only.\
 - Different instruments are not beat 1, beat 2, beat 3, etc.\
@@ -152,7 +157,6 @@ Full-score rhythm basics\
 - Count written note/rest durations only. Never count visual width, spacing, number of noteheads, or number of staves as beats.\
 - A chord/stack is exactly one rhythmic event, no matter how many noteheads it has. Use the top notehead/stem group only to identify the written note value.\
 \
-Full-score pickup rules\
 - Only check pickup when is_first_measure_of_score = true.\
 - Use the visible meter in this crop only.\
 - Instruments happen at the same time; never add instruments as separate beats.\
