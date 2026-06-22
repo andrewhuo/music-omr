@@ -3338,19 +3338,50 @@ def _ai_prompt_base_rules() -> list[str]:
     ]
 
 
-def _ai_prompt_meter_rules() -> list[str]:
+def _ai_prompt_duration_basics() -> list[str]:
     return [
         "Read meter as top/bottom: top is how many beat-units fill a full measure; bottom is which note value is one beat-unit.",
         "Count written note/rest durations only. Never count visual width, spacing, number of noteheads, or number of staves as beats.",
         "Chords or stacked notes count as exactly one rhythmic event using the written note value. Do not count each notehead separately.",
-        "For the first measure only: if total written duration is less than the active meter, label pickup and set measure_completeness to incomplete. If it reaches the active meter, label normal and full.",
-        "If a non-first measure clearly looks too short for its active time signature, use label uncertain, not normal.",
-        "Do not label later incomplete measures as pickup yet.",
-        "Use uncertain with maybe_label pickup only when the active time signature or rhythmic duration cannot be read reliably because the notation is unclear, dense, or cut off.",
-        "If the visible rhythmic duration clearly fills the active time signature, label normal and set measure_completeness to full.",
+        "For later non-first measures, do not label pickup.",
+        "Use uncertain with maybe_label pickup only when first-measure pickup is possible but the visible meter or rhythmic duration cannot be read reliably because the notation is unclear, dense, or cut off.",
         "A whole note, two half notes, or other sparse-looking content in the first measure is usually a slow full measure, not a pickup. Do not label pickup just because the first measure looks sparse or simple.",
-        "Be very conservative about later completeness. Only use incomplete when the measure clearly looks too short; otherwise use unclear.",
-        "Use uncertain instead of pickup only when there is not enough visual evidence to determine the meter or rhythmic duration.",
+        "Use uncertain instead of pickup only when there is not enough visual evidence to determine the first measure's visible meter or rhythmic duration.",
+    ]
+
+
+def _ai_prompt_single_pickup_rules() -> list[str]:
+    return [
+        "Single-staff pickup rules:",
+        "Only check pickup when is_first_measure_of_score is true.",
+        "Use the visible meter in this crop only.",
+        "Count this one staff's written duration only.",
+        "If the first measure's written duration is less than the visible meter, label pickup and set measure_completeness to incomplete.",
+        "If it reaches the visible meter, label normal and set measure_completeness to full.",
+    ]
+
+
+def _ai_prompt_grand_pickup_rules() -> list[str]:
+    return [
+        "Grand-staff pickup rules:",
+        "Only check pickup when is_first_measure_of_score is true.",
+        "Use the visible meter in this crop only; if the same meter appears on both staves, treat it as one shared meter.",
+        "Treble and bass happen at the same time; never add them as separate beats.",
+        "Use one clear staff's written rhythm/rests as the timing guide for the whole measure.",
+        "If the guide staff's duration is less than the visible meter, the whole first measure is pickup/incomplete.",
+        "If the guide staff reaches the visible meter, label normal and set measure_completeness to full.",
+    ]
+
+
+def _ai_prompt_score_pickup_rules() -> list[str]:
+    return [
+        "Full-score pickup rules:",
+        "Only check pickup when is_first_measure_of_score is true.",
+        "Use the visible meter in this crop only.",
+        "Instruments happen at the same time; never add instruments as separate beats.",
+        "Use the clearest staff/instrument's written rhythm/rests as the timing guide for the whole measure.",
+        "If the guide staff's duration is less than the visible meter, the whole first measure is pickup/incomplete.",
+        "If the guide staff reaches the visible meter, label normal and set measure_completeness to full.",
     ]
 
 
@@ -3358,7 +3389,8 @@ def _ai_prompt_single_rules() -> list[str]:
     return [
         "This is single-staff music. Judge rhythm using only this one staff.",
         "First check whether the crop is a multi-measure rest. If there is a clear rest symbol and visible count of 2 or more, return multi_measure_rest immediately and do not inspect meter.",
-        *_ai_prompt_meter_rules(),
+        *_ai_prompt_duration_basics(),
+        *_ai_prompt_single_pickup_rules(),
         "Examples: in 2/4, one quarter-note chord is 1 of 2 beats, so pickup if first measure unless another beat or rest follows. In 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure unless more duration follows. In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
         "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
         "In the older style, the vertical bars may be short or long, and there may be more than one.",
@@ -3379,9 +3411,9 @@ def _ai_prompt_grand_rules() -> list[str]:
         "Vertically aligned notes/rests in treble and bass happen at the same time and count as one time position.",
         "Never add treble plus bass as separate beats.",
         "Use one clear staff's written rhythm/rests as the timing guide for the whole measure. The other staff may rest or be silent.",
-        *_ai_prompt_meter_rules(),
+        *_ai_prompt_duration_basics(),
+        *_ai_prompt_grand_pickup_rules(),
         "A chord/stack is exactly one rhythmic event, no matter how many noteheads it has. Use the top notehead/stem group only to identify the written note value.",
-        "If the guide staff shows less duration than the active meter, the whole first measure is pickup/incomplete.",
         "Example: in 2/4, one aligned quarter-note chord across both staves is one beat total, not two beats and not one beat per notehead. If it is the whole first measure, label pickup/incomplete unless another beat or rest follows.",
         "Example: in 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure unless more duration follows.",
         "Example: in 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
@@ -3398,9 +3430,9 @@ def _ai_prompt_score_rules() -> list[str]:
         "Vertically aligned notes/rests across instruments happen at the same time and count as one time position.",
         "Never add instruments together as separate beats.",
         "Use the clearest staff/instrument's written rhythm/rests as the timing guide when other instruments rest or are silent.",
-        *_ai_prompt_meter_rules(),
+        *_ai_prompt_duration_basics(),
+        *_ai_prompt_score_pickup_rules(),
         "A chord/stack is exactly one rhythmic event, no matter how many noteheads it has. Use the top notehead/stem group only to identify the written note value.",
-        "If the guide staff shows less duration than the active meter, the whole first measure is pickup/incomplete.",
         "Example: in 2/4, if all visible instruments show one aligned quarter-note event, that is one beat total, not multiple beats. If it is the whole first measure, label pickup/incomplete unless another beat or rest follows.",
         "Example: in 4/4, one half-note event is 2 of 4 beats, so pickup if first measure unless more duration follows.",
         "Example: in 6/8, one dotted-quarter event is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
@@ -3427,7 +3459,8 @@ def _ai_prompt_legacy_rules() -> list[str]:
     return [
         *_ai_prompt_base_rules(),
         "In grand-staff or piano crops, the same time signature may appear on both staves; if visible in this crop, use one shared meter for the whole measure.",
-        *_ai_prompt_meter_rules(),
+        *_ai_prompt_duration_basics(),
+        *_ai_prompt_grand_pickup_rules(),
         "In grand-staff or full-score music, vertically aligned notes/rests across staves happen at the same time, not one after another. Do not add treble plus bass or multiple instruments as separate beats; count the timeline horizontally.",
         "For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves. One staff may play while the other rests or is silent; do not require both staves to have notes.",
         "Examples: in 2/4, one quarter-note chord is 1 of 2 beats, so pickup if first measure. In 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure. In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first unless more duration follows. If all visible staves show one aligned quarter-note event in 2/4, that is one beat total, so pickup if first unless another beat or rest follows.",
