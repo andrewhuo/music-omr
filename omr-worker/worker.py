@@ -3426,22 +3426,47 @@ def _ai_prompt_single_rules() -> list[str]:
 
 def _ai_prompt_grand_rules() -> list[str]:
     return [
-        "This is grand-staff/piano music. The two staves share one measure duration.",
-        "First check whether the crop is a multi-measure rest. If both staves clearly share the same rest symbol and visible count of 2 or more, return multi_measure_rest immediately and do not inspect meter.",
-        "The same time signature may appear on both staves; if visible in this crop, use one shared meter for the whole vertical measure.",
-        "Do not count by staves. Count time only.",
-        "Treble and bass are not beat 1 and beat 2.",
-        "Vertically aligned notes/rests in treble and bass happen at the same time and count as one time position.",
-        "Never add treble plus bass as separate beats.",
-        "Use one clear staff's written rhythm/rests as the timing guide for the whole measure. The other staff may rest or be silent.",
-        *_ai_prompt_duration_basics(),
-        *_ai_prompt_grand_pickup_rules(),
-        "A chord/stack is exactly one rhythmic event, no matter how many noteheads it has. Use the top notehead/stem group only to identify the written note value.",
-        "Example: in 2/4, one aligned quarter-note chord across both staves is one beat total, not two beats and not one beat per notehead. If it is the whole first measure, label pickup/incomplete unless another beat or rest follows.",
-        "Example: in 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure unless more duration follows.",
-        "Example: in 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
-        "Label multi_measure_rest only if both staves clearly share the same multi-measure rest count of 2 or more.",
-        "If one staff has music, no count, or a different count, do not return multi_measure_rest.",
+        "Grand-staff main rule:",
+        "For all AI Suggest decisions in grand-staff/piano music, use only the top staff/treble staff.",
+        "Ignore the bottom staff completely for time signature, pickup, and multi-measure rest.",
+        "Do not inspect, compare, add, or use the bottom staff as fallback.",
+        "If the top staff is hard to read, unreadable, empty, or cut off, do not switch to the bottom staff; use unknown or uncertain instead.",
+        "Grand-staff pickup rules:",
+        "This is grand-staff/piano music. For pickup counting, use only the top staff/treble staff.",
+        "Ignore the bottom staff completely for pickup duration. Do not inspect it, use it as fallback, compare it, or add it.",
+        "Do not use bottom-staff notes or rests to decide whether the measure is full.",
+        "Only check pickup when is_first_measure_of_score is true.",
+        "Use only the top staff's visible meter in this crop.",
+        "If the same meter appears on both staves, ignore the bottom duplicate.",
+        "If the top staff meter is unreadable, use unknown/uncertain.",
+        "Read meter as top/bottom: top = how many beat-units fill a full measure; bottom = which note value is one beat-unit.",
+        "Bottom number examples: 4 means quarter-note beats, 8 means eighth-note beats, 2 means half-note beats.",
+        "Common time looks like a large C after the clef/key signature and means 4/4.",
+        "Cut time looks like a large C with a vertical slash through it and means 2/2.",
+        "Count the top staff's written note/rest durations only. Never count visual width, spacing, number of noteheads, or number of staves as beats.",
+        "Common values in quarter-note units: whole = 4, half = 2, quarter = 1, eighth = 1/2, sixteenth = 1/4.",
+        "A dotted note has a small black dot immediately to the right of the notehead. The dot adds half the note value: dotted half = 3 quarters, dotted quarter = 1.5 quarters, dotted eighth = 3/4 quarter.",
+        "A triplet is marked by a small 3 above or below a group; the 3 may have a bracket or appear over beamed notes.",
+        "Three triplet notes fit into the time normally taken by two of the same note value. Example: three triplet eighth notes equal one quarter-note beat.",
+        "A chord/stack on the top staff is exactly one rhythmic event, no matter how many noteheads it has. Use the written note value.",
+        "If the top staff's written duration is less than the visible meter, the whole first measure is pickup/incomplete.",
+        "Only label normal/full if the top staff clearly fills the visible meter.",
+        "If the top staff meter/rhythm is unreadable or cut off, use uncertain with maybe_label pickup.",
+        "Examples: in 2/4, one top-staff quarter note/chord is 1 of 2 beats, so pickup if first measure unless another quarter beat/rest follows. In 3/4, one or two top-staff quarter beats is pickup if first measure. In 6/8, one top-staff dotted quarter is 3 of 6 eighth beats, so pickup if first measure unless more duration follows.",
+        "Grand-staff multi-measure rest rules:",
+        "For grand-staff multi-measure rest, use only the top staff/treble staff.",
+        "Check multi-measure rests before pickup or meter. Do not inspect meter for multi-measure rests.",
+        "Use the old-style reference images as examples only; the real measure crops come after them. Old-style rests can look different from modern H-bars.",
+        "A multi-measure rest symbol can be a modern H-bar or thick horizontal block across the staff.",
+        "A multi-measure rest symbol can also be old-style vertical bars, horizontal bars, or small bar pieces inside the staff.",
+        "Normal quarter/eighth/half/whole rests are not multi-measure rests by themselves.",
+        "Number first, symbol second: a readable big number 2 or higher above/near a rest-like old/modern symbol means multi_measure_rest.",
+        "Use the printed big number as rest_count. Do not require the bar pattern to visually match the count.",
+        "Do not return uncertain just because the symbol is messy, unfamiliar, or old-looking.",
+        "A visible count of 1 is normal, not multi_measure_rest.",
+        "If there is no readable count, do not return a confident multi_measure_rest.",
+        "If it is clearly only a normal one-measure rest, label normal.",
+        "Use uncertain only when the count is unreadable or the number may be a rehearsal/measure number instead of a rest count.",
     ]
 
 
@@ -3494,6 +3519,22 @@ def _ai_prompt_single_output_rules() -> list[str]:
     ]
 
 
+def _ai_prompt_grand_output_rules() -> list[str]:
+    return [
+        "Allowed labels: normal, pickup, multi_measure_rest, uncertain.",
+        "Do not skip any provided measure_id.",
+        "Do not output labels outside the allowed set.",
+        "Overusing uncertain is worse than a reasonable confident suggestion.",
+        "Use uncertain only when the top-staff visual evidence is truly unreadable or conflicting.",
+        "For multi-rest: if the top staff has readable count 2 or higher plus rest-like multi-rest symbol, output multi_measure_rest.",
+        "For multi-rest: use uncertain only when the top-staff number is hard to read or might not be a rest count.",
+        "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
+        "If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable, include maybe_rest_count.",
+        "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes plus debug_note: 1-3 short sentences, max 50 words, explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "Return JSON only.",
+    ]
+
+
 def _ai_prompt_legacy_rules() -> list[str]:
     return [
         *_ai_prompt_base_rules(),
@@ -3519,7 +3560,7 @@ def _ai_prompt_rules_for_score_type(score_type: str | None) -> list[str]:
     if normalized == "single":
         return [*_ai_prompt_base_rules(), *_ai_prompt_single_rules(), *_ai_prompt_single_output_rules()]
     if normalized == "grand":
-        return [*_ai_prompt_base_rules(), *_ai_prompt_grand_rules(), *_ai_prompt_output_rules()]
+        return [*_ai_prompt_base_rules(), *_ai_prompt_grand_rules(), *_ai_prompt_grand_output_rules()]
     if normalized == "score":
         return [*_ai_prompt_base_rules(), *_ai_prompt_score_rules(), *_ai_prompt_output_rules()]
     return _ai_prompt_legacy_rules()
