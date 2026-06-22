@@ -40,9 +40,13 @@ Single-staff pickup rules\
 - Use the visible meter in this crop only.\
 - Read meter as top/bottom: top = how many beat-units fill a full measure; bottom = which note value is one beat-unit.\
 - Bottom number examples: 4 means quarter-note beats, 8 means eighth-note beats, 2 means half-note beats.\
+- Common time looks like a large C after the clef/key signature and means 4/4.\
+- Cut time looks like a large C with a vertical slash through it and means 2/2.\
 - Count written note/rest durations only. Never count visual width, spacing, or number of noteheads as beats.\
 - Common values in quarter-note units: whole = 4, half = 2, quarter = 1, eighth = 1/2, sixteenth = 1/4.\
-- A dot adds half the note value: dotted half = 3 quarters, dotted quarter = 1.5 quarters, dotted eighth = 3/4 quarter.\
+- A dotted note has a small black dot immediately to the right of the notehead. The dot adds half the note value: dotted half = 3 quarters, dotted quarter = 1.5 quarters, dotted eighth = 3/4 quarter.\
+- A triplet is marked by a small 3 above or below a group; the 3 may have a bracket or appear over beamed notes.\
+- Three triplet notes fit into the time normally taken by two of the same note value. Example: three triplet eighth notes equal one quarter-note beat.\
 - Rests count toward the meter exactly like notes.\
 - Chords/stacked notes count as exactly one rhythmic event using the written note value. Do not count each notehead separately.\
 - Count this one staff's written duration only.\
@@ -67,9 +71,13 @@ Single-staff multi-measure rest rules\
 \
 Output rules\
 - Allowed labels: normal, pickup, multi_measure_rest, uncertain.\
-- A wrong confident answer is worse than uncertain.\
 - Do not skip any measure_id. Every input measure_id must appear exactly once.\
+- Overusing uncertain is worse than a reasonable confident suggestion.\
+- Use uncertain only when the visual evidence is truly unreadable or conflicting.\
+- For multi-rest: if readable count 2 or higher plus rest-like multi-rest symbol, output multi_measure_rest.\
+- For multi-rest: use uncertain only when the number is hard to read or might not be a rest count.\
 - If label is multi_measure_rest, rest_count must be an integer >= 2. Otherwise rest_count must be null.\
+- If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable, include maybe_rest_count.\
 - For the first measure only, decision_debug is required. Include short codes plus debug_note, max 50 words.\
 - Return JSON only. No markdown.\
 \
