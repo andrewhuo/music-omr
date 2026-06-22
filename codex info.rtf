@@ -52,10 +52,18 @@ Single-staff pickup rules\
 - Examples: in 2/4, one quarter note or quarter-note chord is 1 of 2 beats, so pickup if first measure unless another quarter beat/rest follows. In 3/4, three quarter-note beats make a full measure; one or two quarter beats is pickup if first measure. In 6/8, six eighth-note beats make a full measure; one dotted-quarter note is 3 of 6 eighth beats, so pickup if first measure unless more duration follows.\
 \
 Single-staff multi-measure rest rules\
-- Check multi-measure rests before pickup or meter. Label multi_measure_rest only when there is a clear multi-measure rest symbol and a visible count of 2 or more.\
-- The symbol may be a modern H-bar or older horizontal bar plus vertical bars.\
+- Check multi-measure rests before pickup or meter. Do not inspect meter for multi-measure rests.\
+- Use the old-style reference images as examples only; the real measure crops come after them. Old-style rests can look different from modern H-bars.\
+- A multi-measure rest symbol can be a modern H-bar or thick horizontal block across the staff.\
+- A multi-measure rest symbol can also be old-style vertical bars, horizontal bars, or small bar pieces inside the staff.\
+- Normal quarter/eighth/half/whole rests are not multi-measure rests by themselves.\
+- Number first, symbol second: a readable big number 2 or higher above/near a rest-like old/modern symbol means multi_measure_rest.\
+- Use the printed big number as rest_count. Do not require the bar pattern to visually match the count.\
+- Do not return uncertain just because the symbol is messy, unfamiliar, or old-looking.\
 - A visible count of 1 is normal, not multi_measure_rest.\
-- If the count or symbol is unclear, return uncertain, with maybe_label multi_measure_rest if useful.\
+- If there is no readable count, do not return a confident multi_measure_rest.\
+- If it is clearly only a normal one-measure rest, label normal.\
+- Use uncertain only when the count is unreadable or the number may be a rehearsal/measure number instead of a rest count.\
 \
 Output rules\
 - Allowed labels: normal, pickup, multi_measure_rest, uncertain.\
