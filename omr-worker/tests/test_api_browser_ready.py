@@ -1852,6 +1852,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                         "duration_judgment": "short",
                         "rhythm_basis": "chord_single_event",
                         "decision_reason": "short_for_meter",
+                        "notehead_fill_read": "filled",
+                        "stem_or_beam_read": "stem",
+                        "dot_seen": "false",
+                        "note_value_read": "quarter",
+                        "counted_beat_units": "1 quarter beat",
                         "debug_note": "I saw one stacked chord event in 2/4, so I judged it short.",
                     },
                 }
@@ -1866,6 +1871,11 @@ class BrowserReadyApiTests(unittest.TestCase):
             "duration_judgment": "short",
             "rhythm_basis": "chord_single_event",
             "decision_reason": "short_for_meter",
+            "notehead_fill_read": "filled",
+            "stem_or_beam_read": "stem",
+            "dot_seen": "false",
+            "note_value_read": "quarter",
+            "counted_beat_units": "1 quarter beat",
             "debug_note": "I saw one stacked chord event in 2/4, so I judged it short.",
         }
         self.assertEqual(normalized.get("decision_debug_by_measure_id"), {"m0": expected_debug})
@@ -1910,6 +1920,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                     "duration_judgment": "full",
                     "rhythm_basis": "multiple_events",
                     "decision_reason": "fills_meter",
+                    "notehead_fill_read": "unclear",
+                    "stem_or_beam_read": "unclear",
+                    "dot_seen": "unclear",
+                    "note_value_read": "unclear",
+                    "counted_beat_units": "unclear",
                     "debug_note": "I saw enough rhythm to fill the visible 2/4 measure.",
                 }
             },
@@ -1937,6 +1952,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                         "duration_judgment": "very long explanation",
                         "rhythm_basis": "unknown rhythm words",
                         "decision_reason": "because I think so",
+                        "notehead_fill_read": "black",
+                        "stem_or_beam_read": "stemmy",
+                        "dot_seen": "maybe",
+                        "note_value_read": "dotted half quarter",
+                        "counted_beat_units": " ".join(f"beat{i}" for i in range(12)),
                         "debug_note": " ".join(f"word{i}" for i in range(60)),
                     },
                 },
@@ -1968,6 +1988,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                     "duration_judgment": "unclear",
                     "rhythm_basis": "unclear",
                     "decision_reason": "other",
+                    "notehead_fill_read": "unclear",
+                    "stem_or_beam_read": "unclear",
+                    "dot_seen": "unclear",
+                    "note_value_read": "unclear",
+                    "counted_beat_units": "unclear",
                     "debug_note": " ".join(f"word{i}" for i in range(50)),
                 }
             },
@@ -2373,6 +2398,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("open notehead with stem = half note", rules_text)
         self.assertIn("open notehead without stem = whole note", rules_text)
         self.assertIn("filled notehead with flag or beam = eighth note", rules_text)
+        self.assertIn("identify notehead fill before deciding note value", rules_text)
+        self.assertIn("A filled black notehead cannot be a half note", rules_text)
+        self.assertIn("black = quarter/eighth family, open = half/whole family", rules_text)
         self.assertIn("A dot immediately to the right of a note/rest adds half its value.", rules_text)
         self.assertIn("A triplet is marked by a small 3 above or below a group", rules_text)
         self.assertIn("three triplet eighth notes equal one quarter-note beat", rules_text)
@@ -2398,6 +2426,11 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         self.assertIsInstance(suggestion_shape.get("decision_debug"), dict)
         self.assertIn("active_meter_read", suggestion_shape.get("decision_debug") or {})
+        self.assertIn("notehead_fill_read", suggestion_shape.get("decision_debug") or {})
+        self.assertIn("stem_or_beam_read", suggestion_shape.get("decision_debug") or {})
+        self.assertIn("dot_seen", suggestion_shape.get("decision_debug") or {})
+        self.assertIn("note_value_read", suggestion_shape.get("decision_debug") or {})
+        self.assertIn("counted_beat_units", suggestion_shape.get("decision_debug") or {})
         self.assertIn("debug_note", suggestion_shape.get("decision_debug") or {})
         self.assertNotIn("time_signature_updates", output_shape)
         self.assertNotIn("remembered_time_signature_out", output_shape)
@@ -2415,6 +2448,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Use only the top staff's visible meter in this crop.", rules_text)
         self.assertIn("Common time looks like a large C after the clef/key signature and means 4/4.", rules_text)
         self.assertIn("Basic note values: filled notehead with stem = quarter note", rules_text)
+        self.assertIn("identify the top-staff notehead fill before deciding note value", rules_text)
+        self.assertIn("A filled black notehead cannot be a half note", rules_text)
+        self.assertIn("black = quarter/eighth family, open = half/whole family", rules_text)
         self.assertIn("A dot immediately to the right of a note/rest adds half its value.", rules_text)
         self.assertIn("A triplet is marked by a small 3 above or below a group", rules_text)
         self.assertIn("For the first measure, arithmetic wins over context", rules_text)
@@ -2473,13 +2509,14 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("One staff may play while the other rests or is silent", rules_text)
         self.assertIn("Use the visible meter in this crop only", rules_text)
         self.assertIn("For the first measure of the score only, decision_debug is required. Do not omit it.", rules_text)
-        self.assertIn("debug_note: 1-3 short sentences, max 50 words", rules_text)
+        self.assertIn("debug_note explaining what you saw rhythmically", rules_text)
         self.assertIn("Examples: in 2/4, one quarter-note chord is 1 of 2 beats", rules_text)
         self.assertIn("In 4/4, one half-note chord is 2 of 4 beats", rules_text)
         self.assertIn("In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats", rules_text)
         self.assertIn("If all visible staves show one aligned quarter-note event in 2/4", rules_text)
         self.assertIn("Use uncertain with maybe_label pickup only when first-measure pickup is possible", rules_text)
         self.assertIn("Use uncertain instead of pickup only when there is not enough visual evidence", rules_text)
+        self.assertIn("notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units", rules_text)
 
     def test_render_corrected_pdf_applies_label_erase_before_labels(self):
         page = _FakePage(_FakeRect(0, 0, 200, 160))

@@ -130,6 +130,10 @@ AI_SUGGESTION_DEBUG_REASON_ALLOWED = {
     "not_first_measure",
     "other",
 }
+AI_SUGGESTION_DEBUG_NOTEHEAD_FILL_ALLOWED = {"filled", "open", "unclear"}
+AI_SUGGESTION_DEBUG_STEM_OR_BEAM_ALLOWED = {"stem", "flag_or_beam", "none", "unclear"}
+AI_SUGGESTION_DEBUG_DOT_SEEN_ALLOWED = {"true", "false", "unclear"}
+AI_SUGGESTION_DEBUG_NOTE_VALUE_ALLOWED = {"quarter", "half", "whole", "eighth", "other", "unclear"}
 AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
 AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
 AI_OLD_STYLE_REFERENCE_EXAMPLES = (
@@ -2314,6 +2318,21 @@ def _normalize_ai_debug_note(raw_value, max_words: int = 50) -> str:
     return text
 
 
+def _normalize_ai_debug_short_text(raw_value, max_words: int = 8) -> str:
+    if raw_value is None:
+        return "unclear"
+    text = re.sub(r"\s+", " ", str(raw_value).strip())
+    if not text:
+        return "unclear"
+    lowered = text.lower()
+    if lowered in {"unknown", "none", "null", "n/a"}:
+        return "unclear"
+    words = text.split()
+    if len(words) > max_words:
+        return "unclear"
+    return text
+
+
 def _normalize_ai_decision_debug(raw_debug) -> dict | None:
     if not isinstance(raw_debug, dict):
         return None
@@ -2327,11 +2346,32 @@ def _normalize_ai_decision_debug(raw_debug) -> dict | None:
     reason = str(raw_debug.get("decision_reason") or "").strip().lower()
     if reason not in AI_SUGGESTION_DEBUG_REASON_ALLOWED:
         reason = "other"
+    notehead_fill = str(raw_debug.get("notehead_fill_read") or "").strip().lower()
+    if notehead_fill not in AI_SUGGESTION_DEBUG_NOTEHEAD_FILL_ALLOWED:
+        notehead_fill = "unclear"
+    stem_or_beam = str(raw_debug.get("stem_or_beam_read") or "").strip().lower()
+    if stem_or_beam not in AI_SUGGESTION_DEBUG_STEM_OR_BEAM_ALLOWED:
+        stem_or_beam = "unclear"
+    raw_dot_seen = raw_debug.get("dot_seen")
+    if isinstance(raw_dot_seen, bool):
+        dot_seen = "true" if raw_dot_seen else "false"
+    else:
+        dot_seen = str(raw_dot_seen or "").strip().lower()
+    if dot_seen not in AI_SUGGESTION_DEBUG_DOT_SEEN_ALLOWED:
+        dot_seen = "unclear"
+    note_value = str(raw_debug.get("note_value_read") or "").strip().lower()
+    if note_value not in AI_SUGGESTION_DEBUG_NOTE_VALUE_ALLOWED:
+        note_value = "unclear"
     return {
         "active_meter_read": active_meter,
         "duration_judgment": duration,
         "rhythm_basis": rhythm,
         "decision_reason": reason,
+        "notehead_fill_read": notehead_fill,
+        "stem_or_beam_read": stem_or_beam,
+        "dot_seen": dot_seen,
+        "note_value_read": note_value,
+        "counted_beat_units": _normalize_ai_debug_short_text(raw_debug.get("counted_beat_units")),
         "debug_note": _normalize_ai_debug_note(raw_debug.get("debug_note")),
     }
 
@@ -3398,6 +3438,9 @@ def _ai_prompt_single_rules() -> list[str]:
         "Cut time looks like a large C with a vertical slash through it and means 2/2.",
         "Count written note/rest durations only. Never count visual width, spacing, or number of noteheads as beats.",
         "Basic note values: filled notehead with stem = quarter note; open notehead with stem = half note; open notehead without stem = whole note; filled notehead with flag or beam = eighth note.",
+        "For first-measure pickup debug, identify notehead fill before deciding note value.",
+        "A filled black notehead cannot be a half note; half note requires an open/white notehead.",
+        "If unsure, use notehead fill first: black = quarter/eighth family, open = half/whole family.",
         "A dot immediately to the right of a note/rest adds half its value.",
         "A triplet is marked by a small 3 above or below a group; the 3 may have a bracket or appear over beamed notes.",
         "Three triplet notes fit into the time normally taken by two of the same note value. Example: three triplet eighth notes equal one quarter-note beat.",
@@ -3445,6 +3488,9 @@ def _ai_prompt_grand_rules() -> list[str]:
         "Cut time looks like a large C with a vertical slash through it and means 2/2.",
         "Count the top staff's written note/rest durations only. Never count visual width, spacing, number of noteheads, or number of staves as beats.",
         "Basic note values: filled notehead with stem = quarter note; open notehead with stem = half note; open notehead without stem = whole note; filled notehead with flag or beam = eighth note.",
+        "For first-measure pickup debug, identify the top-staff notehead fill before deciding note value.",
+        "A filled black notehead cannot be a half note; half note requires an open/white notehead.",
+        "If unsure, use notehead fill first: black = quarter/eighth family, open = half/whole family.",
         "A dot immediately to the right of a note/rest adds half its value.",
         "A triplet is marked by a small 3 above or below a group; the 3 may have a bracket or appear over beamed notes.",
         "Three triplet notes fit into the time normally taken by two of the same note value. Example: three triplet eighth notes equal one quarter-note beat.",
@@ -3498,7 +3544,7 @@ def _ai_prompt_output_rules() -> list[str]:
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
-        "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes plus debug_note: 1-3 short sentences, max 50 words, explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
 
@@ -3514,7 +3560,7 @@ def _ai_prompt_single_output_rules() -> list[str]:
         "For multi-rest: use uncertain only when the number is hard to read or might not be a rest count.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable, include maybe_rest_count.",
-        "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes plus debug_note: 1-3 short sentences, max 50 words, explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
 
@@ -3530,7 +3576,7 @@ def _ai_prompt_grand_output_rules() -> list[str]:
         "For multi-rest: use uncertain only when the top-staff number is hard to read or might not be a rest count.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable, include maybe_rest_count.",
-        "For the first measure of the score only, decision_debug is required. Do not omit it. Use short codes plus debug_note: 1-3 short sentences, max 50 words, explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
 
@@ -3611,6 +3657,11 @@ def _build_system_measure_request(
                             "duration_judgment": "full|short|unclear|null",
                             "rhythm_basis": "single_event|chord_single_event|multiple_events|rest_or_silence|unclear|null",
                             "decision_reason": "fills_meter|short_for_meter|meter_unclear|rhythm_unclear|not_first_measure|other|null",
+                            "notehead_fill_read": "filled|open|unclear|null",
+                            "stem_or_beam_read": "stem|flag_or_beam|none|unclear|null",
+                            "dot_seen": "true|false|unclear|null",
+                            "note_value_read": "quarter|half|whole|eighth|other|unclear|null",
+                            "counted_beat_units": "short text like 1 quarter beat|3 quarter beats|unclear|null",
                             "debug_note": "1-3 short sentences, max 50 words|null",
                         },
                     }
