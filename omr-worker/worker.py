@@ -4672,7 +4672,7 @@ def _apply_post_measure_rest(
 ) -> int:
     exact_rest_count = _safe_int(rest_measures.get(measure_id), 0) if measure_id else 0
     if exact_rest_count > 0:
-        return int(label_value) + 1 + exact_rest_count
+        return int(label_value) + exact_rest_count
     return int(current_value)
 
 

@@ -487,12 +487,12 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual(applied, [{"type": "set_rest_measure", "measure_id": "p1_s1_m1", "value": 3}])
         self.assertEqual(state.get("rest_measures"), {"p1_s1_m1": 3})
         values = [int(row["current_value"]) for row in systems]
-        self.assertEqual(values, [1, 4, 10, 13])
+        self.assertEqual(values, [1, 4, 9, 12])
         measure_values = {row["measure_id"]: int(row["current_value"]) for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s1_m1"], 5)
-        self.assertEqual(measure_values["p1_s1_m2"], 9)
-        self.assertEqual(measure_values["p1_s2_m0"], 10)
-        self.assertEqual(measure_values["p2_s0_m0"], 13)
+        self.assertEqual(measure_values["p1_s1_m2"], 8)
+        self.assertEqual(measure_values["p1_s2_m0"], 9)
+        self.assertEqual(measure_values["p2_s0_m0"], 12)
 
     def test_set_rest_measure_replaces_saved_count(self):
         state = self._sample_state()
@@ -1040,12 +1040,12 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         )
         values = [int(row["current_value"]) for row in systems]
-        self.assertEqual(values, [1, 4, 25, 28])
+        self.assertEqual(values, [1, 4, 24, 27])
         measure_values = {row["measure_id"]: int(row["current_value"]) for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s1_m1"], 20)
-        self.assertEqual(measure_values["p1_s1_m2"], 24)
-        self.assertEqual(measure_values["p1_s2_m0"], 25)
-        self.assertEqual(measure_values["p2_s0_m0"], 28)
+        self.assertEqual(measure_values["p1_s1_m2"], 23)
+        self.assertEqual(measure_values["p1_s2_m0"], 24)
+        self.assertEqual(measure_values["p2_s0_m0"], 27)
 
     def test_set_measure_number_and_rest_measure_near_system_boundary_shift_downstream_systems(self):
         state = self._sample_state()
@@ -1065,11 +1065,11 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         )
         values = [int(row["current_value"]) for row in systems]
-        self.assertEqual(values, [1, 4, 7, 33])
+        self.assertEqual(values, [1, 4, 7, 32])
         measure_values = {row["measure_id"]: int(row["current_value"]) for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s2_m2"], 30)
-        self.assertEqual(measure_values["p2_s0_m0"], 33)
-        self.assertEqual(measure_values["p2_s0_m1"], 34)
+        self.assertEqual(measure_values["p2_s0_m0"], 32)
+        self.assertEqual(measure_values["p2_s0_m1"], 33)
 
     def test_set_measure_number_and_larger_rest_follow_forced_number_not_natural_sequence(self):
         state = self._sample_state()
@@ -1089,12 +1089,12 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         )
         values = [int(row["current_value"]) for row in systems]
-        self.assertEqual(values, [1, 46, 49, 52])
+        self.assertEqual(values, [1, 45, 48, 51])
         measure_values = {row["measure_id"]: int(row["current_value"]) for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s0_m2"], 40)
-        self.assertEqual(measure_values["p1_s1_m0"], 46)
-        self.assertEqual(measure_values["p1_s1_m1"], 47)
-        self.assertEqual(measure_values["p1_s1_m2"], 48)
+        self.assertEqual(measure_values["p1_s1_m0"], 45)
+        self.assertEqual(measure_values["p1_s1_m1"], 46)
+        self.assertEqual(measure_values["p1_s1_m2"], 47)
 
     def test_exact_rest_measure_wins_over_legacy_rest_staff_on_same_system(self):
         state = self._sample_state()
@@ -1102,11 +1102,11 @@ class RelabelLogicTests(unittest.TestCase):
         state["rest_measures"] = {"p1_s1_m1": 3}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [int(row["current_value"]) for row in systems]
-        self.assertEqual(values, [1, 4, 10, 13])
+        self.assertEqual(values, [1, 4, 9, 12])
         measure_values = {row["measure_id"]: int(row["current_value"]) for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s1_m1"], 5)
-        self.assertEqual(measure_values["p1_s2_m0"], 10)
-        self.assertEqual(measure_values["p2_s0_m0"], 13)
+        self.assertEqual(measure_values["p1_s2_m0"], 9)
+        self.assertEqual(measure_values["p2_s0_m0"], 12)
 
     def test_set_ending_applied_recomputes_labels(self):
         state = self._sample_state()
@@ -1220,15 +1220,15 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         )
         values = [int(row["current_value"]) for row in systems]
-        self.assertEqual(values, [1, 4, 8, 11])
+        self.assertEqual(values, [1, 4, 7, 10])
         measure_values = {
             row["measure_id"]: int(row["current_value"])
             for row in state.get("measures") or []
         }
         self.assertEqual(measure_values["p1_s1_m1"], 5)
         self.assertEqual(measure_values["p1_s1_m2"], 5)
-        self.assertEqual(measure_values["p1_s2_m0"], 8)
-        self.assertEqual(measure_values["p2_s0_m0"], 11)
+        self.assertEqual(measure_values["p1_s2_m0"], 7)
+        self.assertEqual(measure_values["p2_s0_m0"], 10)
 
     def test_set_measure_number_ending_and_rest_cross_system_keep_downstream_labels_correct(self):
         state = self._sample_state()
@@ -1252,17 +1252,17 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         )
         values = [int(row["current_value"]) for row in systems]
-        self.assertEqual(values, [1, 4, 30, 35])
+        self.assertEqual(values, [1, 4, 30, 34])
         measure_values = {
             row["measure_id"]: int(row["current_value"])
             for row in state.get("measures") or []
         }
         self.assertEqual(measure_values["p1_s1_m2"], 30)
         self.assertEqual(measure_values["p1_s2_m0"], 30)
-        self.assertEqual(measure_values["p1_s2_m1"], 33)
-        self.assertEqual(measure_values["p1_s2_m2"], 34)
-        self.assertEqual(measure_values["p2_s0_m0"], 35)
-        self.assertEqual(measure_values["p2_s0_m1"], 36)
+        self.assertEqual(measure_values["p1_s2_m1"], 32)
+        self.assertEqual(measure_values["p1_s2_m2"], 33)
+        self.assertEqual(measure_values["p2_s0_m0"], 34)
+        self.assertEqual(measure_values["p2_s0_m1"], 35)
 
     def test_pickup_at_ending_boundary_does_not_leak_stale_branch_state_forward(self):
         state = self._sample_state()
@@ -1497,8 +1497,8 @@ class RelabelLogicTests(unittest.TestCase):
             (
                 "one exact rest",
                 {"rest_measures": {"p1_s1_m1": 3}},
-                ["1", "4", "10", "13"],
-                {"p1_s1_m1": "5", "p1_s1_m2": "9"},
+                ["1", "4", "9", "12"],
+                {"p1_s1_m1": "5", "p1_s1_m2": "8"},
             ),
             (
                 "one ending branch pair",
