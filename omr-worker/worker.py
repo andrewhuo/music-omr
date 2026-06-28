@@ -3518,21 +3518,43 @@ def _ai_prompt_grand_rules() -> list[str]:
 
 def _ai_prompt_score_rules() -> list[str]:
     return [
-        "This is full-score music. All staves share one measure duration.",
-        "Do not count by instruments. Count time only.",
-        "Different instruments are not beat 1, beat 2, beat 3, etc.",
-        "Vertically aligned notes/rests across instruments happen at the same time and count as one time position.",
-        "Never add instruments together as separate beats.",
-        "Use the clearest staff/instrument's written rhythm/rests as the timing guide when other instruments rest or are silent.",
-        *_ai_prompt_duration_basics(),
-        *_ai_prompt_score_pickup_rules(),
-        "A chord/stack is exactly one rhythmic event, no matter how many noteheads it has. Use the top notehead/stem group only to identify the written note value.",
-        "Example: in 2/4, if all visible instruments show one aligned quarter-note event, that is one beat total, not multiple beats. If it is the whole first measure, label pickup/incomplete unless another beat or rest follows.",
-        "Example: in 4/4, one half-note event is 2 of 4 beats, so pickup if first measure unless more duration follows.",
-        "Example: in 6/8, one dotted-quarter event is 3 of 6 eighth-beats, so pickup if first measure unless more duration follows.",
-        "For full score V1, do not use multi_measure_rest jumps.",
-        "If one instrument has a multi-measure rest but another instrument plays, the score measure is still counted normally.",
-        "Return uncertain if a full-score rest situation is unclear.",
+        "Full-score pickup rules:",
+        "For pickup detection in full scores, use only the top visible staff.",
+        "Ignore all lower staves completely for pickup duration.",
+        "Do not inspect, compare, add, or use lower staves as fallback.",
+        "Only check pickup when is_first_measure_of_score is true.",
+        "Use only the top staff's visible meter in this crop.",
+        "If the top staff meter is unreadable but common/cut/numeric meter is partially visible, make the best reasonable meter read and continue.",
+        "Use uncertain only if no meter can be reasonably read at all.",
+        "Read meter as top/bottom: top = how many beat-units fill a full measure; bottom = which note value is one beat-unit.",
+        "Bottom number examples: 4 means quarter-note beats, 8 means eighth-note beats, 2 means half-note beats.",
+        "Common time looks like a large C after the clef/key signature and means 4/4.",
+        "Cut time looks like a large C with a vertical slash through it and means 2/2.",
+        "Count the top staff's written note/rest durations only. Never count visual width, spacing, number of noteheads, number of staves, or number of instruments as beats.",
+        "Basic note values: filled notehead with stem = quarter note; open notehead with stem = half note; open notehead without stem = whole note; filled notehead with flag or beam = eighth note.",
+        "For first-measure pickup debug, identify the top-staff notehead fill before deciding note value.",
+        "A filled black notehead cannot be a half note; half note requires an open/white notehead.",
+        "If unsure, use notehead fill first: black = quarter/eighth family, open = half/whole family.",
+        "A dot immediately to the right of a note/rest adds half its value.",
+        "A triplet is marked by a small 3 above or below a group; the 3 may have a bracket or appear over beamed notes.",
+        "Three triplet notes fit into the time normally taken by two of the same note value. Example: three triplet eighth notes equal one quarter-note beat.",
+        "A chord/stack on the top staff is exactly one rhythmic event, no matter how many noteheads it has. Use the written note value.",
+        "If the top staff's written duration is less than the visible meter, the whole first measure is pickup/incomplete.",
+        "For the first measure, arithmetic wins over context; do not call a short first measure full because it looks intentional, musical, complete, or like an opening gesture.",
+        "For the first measure, if the top-staff written duration looks clearly shorter than a normal full measure, prefer pickup over normal.",
+        "For pickup, overusing uncertain is worse than a reasonable wrong pickup suggestion.",
+        "Do not use uncertain just because the notation is old, small, light, or slightly messy.",
+        "Only label normal/full if the top staff clearly fills the visible meter.",
+        "If you cannot confidently choose pickup, but the top staff may be short, use uncertain with maybe_label pickup.",
+        "If the top staff meter/rhythm is completely unreadable, empty, or cut off, use uncertain with maybe_label pickup.",
+        "Full-score multi-measure rest rules:",
+        "For full score V1, NEVER return multi_measure_rest.",
+        "Do not look for multi-measure rests in full-score crops.",
+        "Do not use any printed rest count, H-bar, old-style rest symbol, or instrument rest to skip score measures.",
+        "A rest count on one staff only means that instrument may be resting; it does not mean the score should skip measures.",
+        "Even if multiple staves show rest symbols, full-score V1 must still count visible score measures normally.",
+        "If a full-score rest situation is confusing, label normal or uncertain, but never multi_measure_rest.",
+        "rest_count must always be null for full-score prompts.",
     ]
 
 
@@ -3581,6 +3603,17 @@ def _ai_prompt_grand_output_rules() -> list[str]:
     ]
 
 
+def _ai_prompt_score_output_rules() -> list[str]:
+    return [
+        "Allowed labels: normal, pickup, uncertain.",
+        "For pickup, overusing uncertain is worse than a reasonable pickup suggestion. For all other cases, use uncertain when evidence is truly unreadable.",
+        "Do not skip any measure_id. Every input measure_id must appear exactly once.",
+        "For full score V1, never output multi_measure_rest, and rest_count must always be null.",
+        "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "Return JSON only.",
+    ]
+
+
 def _ai_prompt_legacy_rules() -> list[str]:
     return [
         *_ai_prompt_base_rules(),
@@ -3608,7 +3641,7 @@ def _ai_prompt_rules_for_score_type(score_type: str | None) -> list[str]:
     if normalized == "grand":
         return [*_ai_prompt_base_rules(), *_ai_prompt_grand_rules(), *_ai_prompt_grand_output_rules()]
     if normalized == "score":
-        return [*_ai_prompt_base_rules(), *_ai_prompt_score_rules(), *_ai_prompt_output_rules()]
+        return [*_ai_prompt_base_rules(), *_ai_prompt_score_rules(), *_ai_prompt_score_output_rules()]
     return _ai_prompt_legacy_rules()
 
 
@@ -3629,28 +3662,32 @@ def _build_system_measure_request(
     content: list[dict] = []
     system_id = str(system_row.get("system_id") or "").strip()
     page_number = _safe_int(system_row.get("page"), _safe_int((measure_rows[0] if measure_rows else {}).get("page"), 1))
+    normalized_score_type = _normalize_ai_score_type(score_type)
+    score_allowed_labels = ["normal", "pickup", "uncertain"] if normalized_score_type == "score" else ["normal", "pickup", "multi_measure_rest", "uncertain"]
+    score_label_shape = "normal|pickup|uncertain" if normalized_score_type == "score" else "normal|pickup|multi_measure_rest|uncertain"
+    score_maybe_label_shape = "pickup|null" if normalized_score_type == "score" else "pickup|multi_measure_rest|null"
     intro = {
         "job_id": str(job_id),
         "run_id": int(run_id),
         "system_id": system_id,
         "page_number": int(page_number),
-        "score_type": _normalize_ai_score_type(score_type),
+        "score_type": normalized_score_type,
         "remembered_time_signature_in": None,
         "instructions": {
             "task": "Classify each already-detected sheet-music measure conservatively.",
-            "allowed_labels": ["normal", "pickup", "multi_measure_rest", "uncertain"],
+            "allowed_labels": score_allowed_labels,
             "rules": _ai_prompt_rules_for_score_type(score_type),
             "output_shape": {
                 "provider": "claude",
                 "suggestions": [
                     {
                         "measure_id": "string",
-                        "label": "normal|pickup|multi_measure_rest|uncertain",
+                        "label": score_label_shape,
                         "measure_completeness": "full|incomplete|unclear",
                         "unclear_reason": "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
                         "rest_count": "integer|null",
                         "confidence": "low|medium|high",
-                        "maybe_label": "pickup|multi_measure_rest|null",
+                        "maybe_label": score_maybe_label_shape,
                         "maybe_rest_count": "integer|null",
                         "decision_debug": {
                             "active_meter_read": "2/4|3/4|4/4|6/8|common_time|cut_time|unknown|null",
