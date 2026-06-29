@@ -61,7 +61,7 @@ ANTHROPIC_MAX_TOKENS = max(256, int(os.environ.get("ANTHROPIC_MAX_TOKENS", "1800
 AI_PROVIDER = str(os.environ.get("AI_PROVIDER", "bedrock") or "bedrock").strip().lower()
 AWS_REGION = str(os.environ.get("AWS_REGION", "us-east-1") or "us-east-1").strip()
 BEDROCK_MODEL_ID = str(
-    os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-haiku-4-5-20251001-v1:0") or ""
+    os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-haiku-4-5-20251001-v1:0") or ""
 ).strip()
 BEDROCK_ANTHROPIC_VERSION = str(
     os.environ.get("BEDROCK_ANTHROPIC_VERSION", "bedrock-2023-05-31") or "bedrock-2023-05-31"

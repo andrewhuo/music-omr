@@ -192,7 +192,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         os.environ["CORS_ALLOW_ORIGINS"] = "http://localhost:5173"
         os.environ["AI_PROVIDER"] = "bedrock"
         os.environ["AWS_REGION"] = "us-east-1"
-        os.environ["BEDROCK_MODEL_ID"] = "anthropic.claude-haiku-4-5-20251001-v1:0"
+        os.environ["BEDROCK_MODEL_ID"] = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
         os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-6"
         os.environ["ANTHROPIC_API_KEY"] = "test-key"
         WORKER.request = SimpleNamespace(path="", method="GET", headers={}, files={}, json={})
@@ -673,7 +673,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("score_type"), "grand")
-        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("last_time_signature_update"))
         self.assertEqual((body.get("ai_suggest_run") or {}).get("time_signature_updates"), [])
@@ -884,7 +884,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
 
     def test_merge_ai_suggestions_state_keeps_decision_debug(self):
@@ -1148,7 +1148,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         by_measure_id = result.get("by_measure_id") or {}
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "pickup")
-        self.assertEqual((result.get("model") or ""), "anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((result.get("model") or ""), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((result.get("pdf_source") or ""), "corrected")
 
     def test_ai_suggest_system_batches_skip_excluded_measures_and_empty_systems(self):
@@ -1385,7 +1385,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 2)
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0", "p1_s1_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 2)
 
     def test_ai_suggest_step_completes_cleanly_when_all_measures_are_excluded(self):
@@ -1535,7 +1535,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         fake_boto3 = types.ModuleType("boto3")
         fake_boto3.client = lambda service, region_name=None: _FakeBedrockClient()
         payload = {
-            "model": "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "model": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": [{"type": "text", "text": "Return JSON."}]}],
         }
@@ -1545,7 +1545,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(result.get("content")[0].get("text"), "{}")
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].get("modelId"), "anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual(calls[0].get("modelId"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         sent_body = json.loads(calls[0].get("body").decode("utf-8"))
         self.assertEqual(sent_body.get("anthropic_version"), "bedrock-2023-05-31")
         self.assertEqual(sent_body.get("max_tokens"), 64)
@@ -1796,7 +1796,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
 
-        self.assertEqual(normalized.get("model"), "anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual(normalized.get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         by_measure_id = normalized.get("by_measure_id") or {}
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "uncertain")
         self.assertNotIn("maybe_label", by_measure_id.get("p1_s0_m0") or {})
