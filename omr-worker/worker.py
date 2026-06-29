@@ -58,6 +58,14 @@ ANTHROPIC_MODEL = str(os.environ.get("ANTHROPIC_MODEL", "") or "").strip()
 ANTHROPIC_VERSION = str(os.environ.get("ANTHROPIC_VERSION", "2023-06-01") or "2023-06-01").strip() or "2023-06-01"
 ANTHROPIC_TIMEOUT_SEC = max(5.0, float(os.environ.get("ANTHROPIC_TIMEOUT_SEC", "90") or "90"))
 ANTHROPIC_MAX_TOKENS = max(256, int(os.environ.get("ANTHROPIC_MAX_TOKENS", "1800") or "1800"))
+AI_PROVIDER = str(os.environ.get("AI_PROVIDER", "bedrock") or "bedrock").strip().lower()
+AWS_REGION = str(os.environ.get("AWS_REGION", "us-east-1") or "us-east-1").strip()
+BEDROCK_MODEL_ID = str(
+    os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-haiku-4-5-20251001-v1:0") or ""
+).strip()
+BEDROCK_ANTHROPIC_VERSION = str(
+    os.environ.get("BEDROCK_ANTHROPIC_VERSION", "bedrock-2023-05-31") or "bedrock-2023-05-31"
+).strip() or "bedrock-2023-05-31"
 AI_MEASURE_CROP_SCALE = max(1.0, float(os.environ.get("AI_MEASURE_CROP_SCALE", "2.0") or "2.0"))
 AI_MEASURE_CROP_X_PAD_RATIO = max(0.0, float(os.environ.get("AI_MEASURE_CROP_X_PAD_RATIO", "0.08") or "0.08"))
 AI_MEASURE_CROP_MIN_X_PAD = max(0.0, float(os.environ.get("AI_MEASURE_CROP_MIN_X_PAD", "8") or "8"))
@@ -1909,8 +1917,28 @@ def _current_ai_suggestions(mapping_summary: dict | None) -> dict | None:
     return ai_suggestions if isinstance(ai_suggestions, dict) else None
 
 
+def _requested_ai_provider_name() -> str:
+    provider = str(os.environ.get("AI_PROVIDER", AI_PROVIDER) or "").strip().lower()
+    if provider in {"bedrock", "anthropic"}:
+        return provider
+    return "unknown"
+
+
 def _configured_anthropic_model_name() -> str:
     return str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
+
+
+def _configured_bedrock_model_id() -> str:
+    return str(os.environ.get("BEDROCK_MODEL_ID", BEDROCK_MODEL_ID) or "").strip()
+
+
+def _requested_ai_model_name() -> str:
+    provider = _requested_ai_provider_name()
+    if provider == "bedrock":
+        return _configured_bedrock_model_id() or "unknown"
+    if provider == "anthropic":
+        return _configured_anthropic_model_name() or "unknown"
+    return "unknown"
 
 
 def _requested_anthropic_model_name() -> str:
@@ -1947,7 +1975,7 @@ def _current_ai_suggest_run(
         "source_run_id": int(run_id) if isinstance(run_id, int) and run_id > 0 else _safe_int(row.get("source_run_id"), 0),
         "source_state_version": str(row.get("source_state_version") or source_state_version or "").strip() or None,
         "score_type": _normalize_ai_score_type(row.get("score_type")),
-        "model": str(row.get("model") or _requested_anthropic_model_name()).strip() or "unknown",
+        "model": str(row.get("model") or _requested_ai_model_name()).strip() or "unknown",
         "last_error": row.get("last_error") if isinstance(row.get("last_error"), dict) else None,
         "remembered_time_signature": remembered_time_signature,
         "last_time_signature_update": last_time_signature_update,
@@ -1964,8 +1992,8 @@ def _empty_ai_suggestions_state(
     ai_suggestions = {
         "version": AI_SUGGESTIONS_VERSION,
         "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
-        "provider": "claude",
-        "model": _requested_anthropic_model_name(),
+        "provider": _requested_ai_provider_name(),
+        "model": _requested_ai_model_name(),
         "source_run_id": int(run_id),
         "by_measure_id": {},
         "decision_debug_by_measure_id": {},
@@ -2005,7 +2033,7 @@ def _new_ai_suggest_run_state(
         "source_run_id": int(run_id),
         "source_state_version": str(source_state_version or "").strip() or None,
         "score_type": _normalize_ai_score_type(score_type),
-        "model": _requested_anthropic_model_name(),
+        "model": _requested_ai_model_name(),
         "last_error": None,
         "remembered_time_signature": None,
         "last_time_signature_update": None,
@@ -2133,8 +2161,8 @@ def _merge_ai_suggestions_state(
     warnings.extend(list(system_suggestions.get("warnings") or []))
     base["version"] = AI_SUGGESTIONS_VERSION
     base["generated_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
-    base["provider"] = str(system_suggestions.get("provider") or base.get("provider") or "claude").strip() or "claude"
-    base["model"] = _requested_anthropic_model_name()
+    base["provider"] = str(system_suggestions.get("provider") or base.get("provider") or _requested_ai_provider_name()).strip() or _requested_ai_provider_name()
+    base["model"] = _requested_ai_model_name()
     base["source_run_id"] = int(run_id)
     source_state_version_txt = str(source_state_version or "").strip()
     if source_state_version_txt:
@@ -2663,8 +2691,8 @@ def _normalize_ai_suggestions_result(
             detail_bits.append(f"unexpected_measure_ids={','.join(extra[:10])}")
         raise AiSuggestError(detail=f"malformed_response: incomplete suggestions {' '.join(detail_bits).strip()}".strip())
 
-    provider = str(raw_result.get("provider") or "claude").strip() or "claude"
-    model = _requested_anthropic_model_name()
+    provider = str(raw_result.get("provider") or _requested_ai_provider_name()).strip() or _requested_ai_provider_name()
+    model = _requested_ai_model_name()
     systems_processed = len(_sorted_system_rows(editable_state.get("systems") or []))
     warnings = _normalize_ai_suggest_warnings(raw_result.get("warnings"))
     warnings.extend(normalization_warnings)
@@ -2764,6 +2792,14 @@ def _anthropic_api_key() -> str:
     return str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip()
 
 
+def _aws_region_name() -> str:
+    return str(os.environ.get("AWS_REGION", AWS_REGION) or "").strip()
+
+
+def _bedrock_anthropic_version() -> str:
+    return str(os.environ.get("BEDROCK_ANTHROPIC_VERSION", BEDROCK_ANTHROPIC_VERSION) or "").strip() or "bedrock-2023-05-31"
+
+
 def _is_anthropic_overload_error(exc: AiSuggestError | Exception) -> bool:
     if not isinstance(exc, AiSuggestError):
         return False
@@ -2832,9 +2868,56 @@ def _anthropic_messages_create(payload: dict) -> dict:
                 "AI_SUGGEST_OVERLOAD_RETRY attempt=%s next_delay_sec=%s model=%s",
                 attempt,
                 delay_sec,
-                str(payload.get("model") or _requested_anthropic_model_name()),
+                str(payload.get("model") or _requested_ai_model_name()),
             )
             time.sleep(delay_sec)
+
+
+def _bedrock_messages_create_once(payload: dict) -> dict:
+    model_id = _configured_bedrock_model_id()
+    region_name = _aws_region_name()
+    if not model_id or not region_name:
+        raise AiSuggestError(provider_status=503, detail="provider_not_configured")
+    try:
+        import boto3
+    except Exception as exc:
+        raise AiSuggestError(provider_status=503, detail=f"provider_not_configured: boto3 unavailable {_safe_error_text(exc)}") from exc
+
+    body = dict(payload or {})
+    body.pop("model", None)
+    body["anthropic_version"] = _bedrock_anthropic_version()
+    try:
+        client = boto3.client("bedrock-runtime", region_name=region_name)
+        response = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(body).encode("utf-8"),
+            contentType="application/json",
+            accept="application/json",
+        )
+        raw_body = response.get("body")
+        raw = raw_body.read() if hasattr(raw_body, "read") else raw_body
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        data = json.loads(str(raw or ""))
+        if not isinstance(data, dict):
+            raise AiSuggestError(provider_status=502, detail="malformed_provider_response")
+        return data
+    except AiSuggestError:
+        raise
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        metadata = response.get("ResponseMetadata") if isinstance(response, dict) else {}
+        status = _safe_int((metadata or {}).get("HTTPStatusCode"), 502)
+        raise AiSuggestError(provider_status=status or 502, detail=_safe_error_text(exc)) from exc
+
+
+def _ai_messages_create(payload: dict) -> dict:
+    provider = _requested_ai_provider_name()
+    if provider == "bedrock":
+        return _bedrock_messages_create_once(payload)
+    if provider == "anthropic":
+        return _anthropic_messages_create(payload)
+    raise AiSuggestError(provider_status=503, detail="provider_not_configured")
 
 
 def _strip_json_fences(text: str) -> str:
@@ -2876,7 +2959,7 @@ def _parse_anthropic_suggestions_message(message: dict) -> dict:
         raise AiSuggestError(detail=f"malformed_response: invalid json {_safe_error_text(exc)}")
     if not isinstance(parsed, dict):
         raise AiSuggestError(detail="malformed_response: root must be object")
-    parsed.setdefault("provider", "claude")
+    parsed.setdefault("provider", _requested_ai_provider_name())
     parsed.pop("model", None)
     return parsed
 
@@ -3678,7 +3761,7 @@ def _build_system_measure_request(
             "allowed_labels": score_allowed_labels,
             "rules": _ai_prompt_rules_for_score_type(score_type),
             "output_shape": {
-                "provider": "claude",
+                "provider": _requested_ai_provider_name(),
                 "suggestions": [
                     {
                         "measure_id": "string",
@@ -3781,7 +3864,7 @@ def _build_system_measure_request(
 
     return (
         {
-            "model": str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip(),
+            "model": _requested_ai_model_name(),
             "max_tokens": ANTHROPIC_MAX_TOKENS,
             "messages": [{"role": "user", "content": content}],
         },
@@ -3800,8 +3883,8 @@ def _generate_ai_suggestions_for_system_batch(
     remembered_time_signature_in: str | None = None,
     score_type: str | None = None,
 ) -> dict:
-    model_name = str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
-    if not model_name or not _anthropic_api_key():
+    model_name = _requested_ai_model_name()
+    if not model_name or model_name == "unknown":
         raise AiSuggestError(provider_status=503, detail="provider_not_configured")
 
     debug_enabled = _ai_suggest_debug_enabled()
@@ -3842,7 +3925,7 @@ def _generate_ai_suggestions_for_system_batch(
                 remembered_time_signature_in=remembered_time_signature_in,
                 score_type=score_type,
             )
-            message = _anthropic_messages_create(payload)
+            message = _ai_messages_create(payload)
             parsed = _parse_anthropic_suggestions_message(message)
             system_suggestions = parsed.get("suggestions")
             if not isinstance(system_suggestions, list):
@@ -3895,8 +3978,8 @@ def _generate_ai_suggestions_for_job(
     artifacts: dict,
     score_type: str | None = None,
 ) -> dict:
-    model_name = str(os.environ.get("ANTHROPIC_MODEL", ANTHROPIC_MODEL) or "").strip()
-    if not model_name or not _anthropic_api_key():
+    model_name = _requested_ai_model_name()
+    if not model_name or model_name == "unknown":
         raise AiSuggestError(provider_status=503, detail="provider_not_configured")
 
     systems = _sorted_system_rows(editable_state.get("systems") or [])
@@ -3955,7 +4038,7 @@ def _generate_ai_suggestions_for_job(
                     int(reference_examples_attached),
                     int(payload_reference_examples_attached),
                 )
-                message = _anthropic_messages_create(payload)
+                message = _ai_messages_create(payload)
                 parsed = _parse_anthropic_suggestions_message(message)
                 system_suggestions = parsed.get("suggestions")
                 if not isinstance(system_suggestions, list):
@@ -4000,7 +4083,7 @@ def _generate_ai_suggestions_for_job(
             doc.close()
 
     result = {
-        "provider": "claude",
+        "provider": _requested_ai_provider_name(),
         "model": model_name,
         "suggestions": suggestions,
         "warnings": warnings,

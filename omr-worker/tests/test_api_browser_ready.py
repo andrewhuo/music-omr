@@ -190,6 +190,9 @@ class _FakeUploadFile:
 class BrowserReadyApiTests(unittest.TestCase):
     def setUp(self):
         os.environ["CORS_ALLOW_ORIGINS"] = "http://localhost:5173"
+        os.environ["AI_PROVIDER"] = "bedrock"
+        os.environ["AWS_REGION"] = "us-east-1"
+        os.environ["BEDROCK_MODEL_ID"] = "anthropic.claude-haiku-4-5-20251001-v1:0"
         os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-6"
         os.environ["ANTHROPIC_API_KEY"] = "test-key"
         WORKER.request = SimpleNamespace(path="", method="GET", headers={}, files={}, json={})
@@ -670,7 +673,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("score_type"), "grand")
-        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "claude-sonnet-4-6")
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("last_time_signature_update"))
         self.assertEqual((body.get("ai_suggest_run") or {}).get("time_signature_updates"), [])
@@ -881,7 +884,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
 
     def test_merge_ai_suggestions_state_keeps_decision_debug(self):
@@ -1128,7 +1131,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         with (
             patch.object(WORKER, "_resolve_ai_crop_pdf_source", return_value=(Path("/tmp/audiveris_out_corrected.pdf"), "corrected")),
             patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
-            patch.object(WORKER, "_anthropic_messages_create", return_value=message),
+            patch.object(WORKER, "_ai_messages_create", return_value=message),
             patch.object(WORKER.fitz, "open", return_value=fake_doc),
             patch.object(WORKER.fitz, "Rect", _FakeRect),
         ):
@@ -1145,7 +1148,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         by_measure_id = result.get("by_measure_id") or {}
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "pickup")
-        self.assertEqual((result.get("model") or ""), "claude-sonnet-4-6")
+        self.assertEqual((result.get("model") or ""), "anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((result.get("pdf_source") or ""), "corrected")
 
     def test_ai_suggest_system_batches_skip_excluded_measures_and_empty_systems(self):
@@ -1217,7 +1220,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
             patch.object(WORKER, "_resolve_ai_crop_pdf_source", return_value=(Path("/tmp/audiveris_out_corrected.pdf"), "corrected")),
             patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
-            patch.object(WORKER, "_anthropic_messages_create", return_value=message),
+            patch.object(WORKER, "_ai_messages_create", return_value=message),
             patch.object(WORKER.fitz, "open", return_value=fake_doc),
             patch.object(WORKER.fitz, "Rect", _FakeRect),
             patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=True),
@@ -1382,7 +1385,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 2)
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0", "p1_s1_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "claude-sonnet-4-6")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 2)
 
     def test_ai_suggest_step_completes_cleanly_when_all_measures_are_excluded(self):
@@ -1516,6 +1519,63 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(create_once.call_count, 1)
         self.assertEqual(sleep_mock.call_count, 0)
+
+    def test_bedrock_messages_create_invokes_runtime_with_anthropic_body(self):
+        calls: list[dict] = []
+
+        class _FakeBody:
+            def read(self):
+                return json.dumps({"content": [{"type": "text", "text": "{}"}]}).encode("utf-8")
+
+        class _FakeBedrockClient:
+            def invoke_model(self, **kwargs):
+                calls.append(kwargs)
+                return {"body": _FakeBody()}
+
+        fake_boto3 = types.ModuleType("boto3")
+        fake_boto3.client = lambda service, region_name=None: _FakeBedrockClient()
+        payload = {
+            "model": "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Return JSON."}]}],
+        }
+
+        with patch.dict(sys.modules, {"boto3": fake_boto3}):
+            result = WORKER._bedrock_messages_create_once(payload)
+
+        self.assertEqual(result.get("content")[0].get("text"), "{}")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].get("modelId"), "anthropic.claude-haiku-4-5-20251001-v1:0")
+        sent_body = json.loads(calls[0].get("body").decode("utf-8"))
+        self.assertEqual(sent_body.get("anthropic_version"), "bedrock-2023-05-31")
+        self.assertEqual(sent_body.get("max_tokens"), 64)
+        self.assertNotIn("model", sent_body)
+
+    def test_parse_bedrock_suggestions_message_uses_same_json_parser(self):
+        message = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": '{"suggestions":[{"measure_id":"p1_s0_m0","label":"pickup","rest_count":null,"confidence":"medium"}],"warnings":[]}',
+                }
+            ],
+        }
+
+        parsed = WORKER._parse_anthropic_suggestions_message(message)
+
+        self.assertEqual(parsed.get("provider"), "bedrock")
+        self.assertEqual(((parsed.get("suggestions") or [])[0] or {}).get("label"), "pickup")
+
+    def test_ai_messages_create_can_use_anthropic_fallback_when_requested(self):
+        success = {"content": [{"type": "text", "text": "{}"}], "model": "claude-sonnet-4-6"}
+        with (
+            patch.dict(os.environ, {"AI_PROVIDER": "anthropic"}),
+            patch.object(WORKER, "_anthropic_messages_create", return_value=success) as anthropic_create,
+        ):
+            result = WORKER._ai_messages_create({"model": "claude-sonnet-4-6"})
+
+        self.assertEqual(result, success)
+        anthropic_create.assert_called_once()
 
     def test_dismiss_ai_suggestion_removes_only_target(self):
         artifacts = self._sample_artifacts()
@@ -1736,7 +1796,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
 
-        self.assertEqual(normalized.get("model"), "claude-sonnet-4-6")
+        self.assertEqual(normalized.get("model"), "anthropic.claude-haiku-4-5-20251001-v1:0")
         by_measure_id = normalized.get("by_measure_id") or {}
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "uncertain")
         self.assertNotIn("maybe_label", by_measure_id.get("p1_s0_m0") or {})
@@ -2330,7 +2390,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             ],
         }
         parsed = WORKER._parse_anthropic_suggestions_message(message)
-        self.assertEqual(parsed.get("provider"), "claude")
+        self.assertEqual(parsed.get("provider"), "bedrock")
         self.assertNotIn("model", parsed)
         self.assertEqual(((parsed.get("suggestions") or [])[0] or {}).get("measure_id"), "p1_s0_m0")
 
@@ -2347,7 +2407,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             ],
         }
         parsed = WORKER._parse_anthropic_suggestions_message(message)
-        self.assertEqual(parsed.get("provider"), "claude")
+        self.assertEqual(parsed.get("provider"), "bedrock")
         self.assertNotIn("model", parsed)
         self.assertEqual(((parsed.get("suggestions") or [])[0] or {}).get("measure_id"), "p1_s0_m0")
 
@@ -2785,7 +2845,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                 patch.object(WORKER, "AI_REFERENCE_EXAMPLES_DIR", tmp_path),
                 patch.object(WORKER, "_resolve_ai_crop_pdf_source", return_value=(Path("/tmp/audiveris_out_corrected.pdf"), "corrected")),
                 patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
-                patch.object(WORKER, "_anthropic_messages_create", side_effect=_capture_payload),
+                patch.object(WORKER, "_ai_messages_create", side_effect=_capture_payload),
                 patch.object(WORKER.fitz, "open", return_value=fake_doc),
                 patch.object(WORKER.fitz, "Rect", _FakeRect),
             ):
