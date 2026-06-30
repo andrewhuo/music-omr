@@ -403,6 +403,16 @@ class BrowserReadyApiTests(unittest.TestCase):
                             "version": "system_state_v1",
                             "qa": {"ok": True},
                             "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1"}],
+                            "label_boxes": [
+                                {
+                                    "label_id": "label:p1_s0_m0",
+                                    "measure_id": "p1_s0_m0",
+                                    "page": 1,
+                                    "text": "1",
+                                    "rect": {"left": 10, "top": 5, "right": 20, "bottom": 18},
+                                    "hidden": False,
+                                }
+                            ],
                         }
                     },
                     111,
@@ -417,6 +427,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("editable_state") or {}).get("manual_rows"), [])
         self.assertEqual((body.get("editable_state") or {}).get("rest_measures"), {})
         self.assertEqual((body.get("editable_state") or {}).get("pickup_measures"), {})
+        self.assertEqual(len((body.get("editable_state") or {}).get("label_boxes") or []), 1)
         self.assertEqual((body.get("editable_state") or {}).get("staff_boxes"), [])
         self.assertIsNone(body.get("ai_suggestions"))
         self.assertEqual(((body.get("ai_suggest_run") or {}).get("status")), "idle")
@@ -2656,6 +2667,87 @@ class BrowserReadyApiTests(unittest.TestCase):
         first_rect = page.draw_rect_calls[0]["rect"]
         self.assertEqual((first_rect.x0, first_rect.y0, first_rect.x1, first_rect.y1), (4.0, 8.0, 38.0, 26.0))
         self.assertEqual(page.insert_text_calls[0]["text"], "1")
+        label_rect = page.draw_rect_calls[1]["rect"]
+        self.assertEqual(
+            editable_state.get("label_boxes"),
+            [
+                {
+                    "label_id": "label:p1_s0_m0",
+                    "measure_id": "p1_s0_m0",
+                    "page": 1,
+                    "text": "1",
+                    "rect": {
+                        "left": label_rect.x0,
+                        "top": label_rect.y0,
+                        "right": label_rect.x1,
+                        "bottom": label_rect.y1,
+                    },
+                    "hidden": False,
+                }
+            ],
+        )
+
+    def test_render_corrected_pdf_label_boxes_follow_system_only_mode(self):
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+        fake_doc = _FakeDoc([page])
+        systems = [
+            {"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1"},
+            {"system_id": "p1_s1", "page": 1, "system_index": 1, "current_value": "3"},
+        ]
+        measures = [
+            {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 20, "y_top": 30, "y_bottom": 60},
+            {"measure_id": "p1_s0_m1", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 1, "x_left": 60, "y_top": 30, "y_bottom": 60},
+            {"measure_id": "p1_s1_m0", "system_id": "p1_s1", "page": 1, "system_index": 1, "measure_local_index": 0, "x_left": 20, "y_top": 90, "y_bottom": 120},
+        ]
+        editable_state = {"labels_mode": "system_only", "systems": systems, "measures": measures}
+
+        with (
+            patch.object(WORKER.fitz, "open", return_value=fake_doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+            patch.object(WORKER.fitz, "get_text_length", return_value=6.0),
+        ):
+            drawn = WORKER._render_corrected_pdf(
+                Path("/tmp/in.pdf"),
+                Path("/tmp/out.pdf"),
+                systems,
+                {},
+                measures,
+                "system_only",
+                editable_state=editable_state,
+            )
+
+        self.assertEqual(drawn, 2)
+        self.assertEqual([box["measure_id"] for box in editable_state.get("label_boxes") or []], ["p1_s0_m0", "p1_s1_m0"])
+        self.assertEqual([box["text"] for box in editable_state.get("label_boxes") or []], ["1", "3"])
+
+    def test_render_corrected_pdf_label_boxes_follow_all_measures_mode(self):
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+        fake_doc = _FakeDoc([page])
+        systems = [{"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1"}]
+        measures = [
+            {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 20, "y_top": 30, "y_bottom": 60},
+            {"measure_id": "p1_s0_m1", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 1, "x_left": 60, "y_top": 30, "y_bottom": 60},
+        ]
+        editable_state = {"labels_mode": "all_measures", "systems": systems, "measures": measures}
+
+        with (
+            patch.object(WORKER.fitz, "open", return_value=fake_doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+            patch.object(WORKER.fitz, "get_text_length", return_value=6.0),
+        ):
+            drawn = WORKER._render_corrected_pdf(
+                Path("/tmp/in.pdf"),
+                Path("/tmp/out.pdf"),
+                systems,
+                {},
+                measures,
+                "all_measures",
+                editable_state=editable_state,
+            )
+
+        self.assertEqual(drawn, 2)
+        self.assertEqual([box["measure_id"] for box in editable_state.get("label_boxes") or []], ["p1_s0_m0", "p1_s0_m1"])
+        self.assertEqual([box["text"] for box in editable_state.get("label_boxes") or []], ["1", "2"])
 
     def test_label_ink_point_without_cropbox_uses_green_box_coords(self):
         page = _FakePage(_FakeRect(0, 0, 200, 160))

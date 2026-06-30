@@ -906,6 +906,72 @@ def _label_position(anchor_x: float, anchor_y_top: float, page_width: float, pag
     return x_text, y_text, tw
 
 
+def _label_rect_payload(rect) -> dict:
+    return {
+        "left": round(float(rect.x0), 3),
+        "top": round(float(rect.y0), 3),
+        "right": round(float(rect.x1), 3),
+        "bottom": round(float(rect.y1), 3),
+    }
+
+
+def _measure_label_layout_left_barline(page: fitz.Page, page_rect: fitz.Rect, x_left: float, y_top: float, text: str) -> dict | None:
+    x_left, y_top = _green_box_point_to_pdf_ink(page, x_left, y_top)
+    tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
+    x_text = min(max(0.0, float(x_left) - (tw / 2.0)), max(0.0, float(page_rect.width) - tw - 2.0))
+    y_text = max(MEASURE_TEXT_SIZE + 2.0, float(y_top) - MEASURE_TEXT_Y_OFFSET)
+    y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, float(page_rect.height) - 2.0))
+
+    th = float(MEASURE_TEXT_SIZE + 2.0)
+    bg = fitz.Rect(x_text - 1.0, y_text - th + 1.0, x_text + tw + 1.0, y_text + 1.0)
+    x0 = max(0.0, min(bg.x0, page_rect.width))
+    y0 = max(0.0, min(bg.y0, page_rect.height))
+    x1 = max(0.0, min(bg.x1, page_rect.width))
+    y1 = max(0.0, min(bg.y1, page_rect.height))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    bg_rect = fitz.Rect(x0, y0, x1, y1)
+    return {
+        "text_point": (float(x_text), float(y_text)),
+        "text_width": float(tw),
+        "text_height": float(th),
+        "background_rect": bg_rect,
+        "rect": _label_rect_payload(bg_rect),
+    }
+
+
+def _draw_measure_label_layout(page: fitz.Page, layout: dict, text: str) -> None:
+    bg_rect = layout.get("background_rect")
+    if bg_rect is not None:
+        page.draw_rect(bg_rect, color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
+    x_text, y_text = layout.get("text_point") or (0.0, 0.0)
+    page.insert_text((x_text, y_text), text, fontsize=MEASURE_TEXT_SIZE, color=MEASURE_TEXT_COLOR)
+
+
+def _label_box_from_layout(measure: dict, label: str, layout: dict) -> dict | None:
+    measure_id = str(measure.get("measure_id") or "").strip()
+    page_no = _safe_int(measure.get("page"), 0)
+    rect = layout.get("rect")
+    if not measure_id or page_no <= 0 or not isinstance(rect, dict):
+        return None
+    return {
+        "label_id": f"label:{measure_id}",
+        "measure_id": measure_id,
+        "page": page_no,
+        "text": str(label),
+        "rect": rect,
+        "hidden": False,
+    }
+
+
+def _editable_label_boxes(editable_state: dict) -> list[dict]:
+    raw_boxes = editable_state.get("label_boxes")
+    if isinstance(raw_boxes, list):
+        return [box for box in raw_boxes if isinstance(box, dict)]
+    editable_state["label_boxes"] = []
+    return editable_state["label_boxes"]
+
+
 def _editable_state_version(editable_state: dict) -> str:
     payload = {
         "version": editable_state.get("version"),
@@ -4115,21 +4181,9 @@ def _draw_measure_label(page: fitz.Page, page_rect: fitz.Rect, anchor_x: float, 
 
 
 def _draw_measure_label_left_barline(page: fitz.Page, page_rect: fitz.Rect, x_left: float, y_top: float, text: str) -> None:
-    x_left, y_top = _green_box_point_to_pdf_ink(page, x_left, y_top)
-    tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
-    x_text = min(max(0.0, float(x_left) - (tw / 2.0)), max(0.0, float(page_rect.width) - tw - 2.0))
-    y_text = max(MEASURE_TEXT_SIZE + 2.0, float(y_top) - MEASURE_TEXT_Y_OFFSET)
-    y_text = min(y_text, max(MEASURE_TEXT_SIZE + 2.0, float(page_rect.height) - 2.0))
-
-    th = float(MEASURE_TEXT_SIZE + 2.0)
-    bg = fitz.Rect(x_text - 1.0, y_text - th + 1.0, x_text + tw + 1.0, y_text + 1.0)
-    x0 = max(0.0, min(bg.x0, page_rect.width))
-    y0 = max(0.0, min(bg.y0, page_rect.height))
-    x1 = max(0.0, min(bg.x1, page_rect.width))
-    y1 = max(0.0, min(bg.y1, page_rect.height))
-    if x1 > x0 and y1 > y0:
-        page.draw_rect(fitz.Rect(x0, y0, x1, y1), color=MEASURE_TEXT_BG_COLOR, fill=MEASURE_TEXT_BG_COLOR)
-    page.insert_text((x_text, y_text), text, fontsize=MEASURE_TEXT_SIZE, color=MEASURE_TEXT_COLOR)
+    layout = _measure_label_layout_left_barline(page, page_rect, x_left, y_top, text)
+    if layout is not None:
+        _draw_measure_label_layout(page, layout, text)
 
 
 def _erase_label_area(page: fitz.Page, page_rect: fitz.Rect, area: dict) -> bool:
@@ -5777,6 +5831,7 @@ def _render_corrected_pdf(
     editable_state = editable_state or {}
     doc = fitz.open(str(input_pdf))
     drawn = 0
+    label_boxes: list[dict] = []
 
     # Manual label erases are intentionally narrow and are applied before
     # current labels are redrawn.
@@ -5809,7 +5864,13 @@ def _render_corrected_pdf(
             except Exception:
                 continue
             page = doc[page_no - 1]
-            _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
+            layout = _measure_label_layout_left_barline(page, page.rect, x_left, y_top, label)
+            if layout is None:
+                continue
+            _draw_measure_label_layout(page, layout, label)
+            label_box = _label_box_from_layout(measure, label, layout)
+            if label_box is not None:
+                label_boxes.append(label_box)
             drawn += 1
     else:
         # Staff-start mode reuses the same computed measure labels, but only
@@ -5824,9 +5885,16 @@ def _render_corrected_pdf(
             except Exception:
                 continue
             page = doc[page_no - 1]
-            _draw_measure_label_left_barline(page, page.rect, x_left, y_top, label)
+            layout = _measure_label_layout_left_barline(page, page.rect, x_left, y_top, label)
+            if layout is None:
+                continue
+            _draw_measure_label_layout(page, layout, label)
+            label_box = _label_box_from_layout(measure, label, layout)
+            if label_box is not None:
+                label_boxes.append(label_box)
             drawn += 1
 
+    editable_state["label_boxes"] = label_boxes
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_pdf))
     doc.close()
@@ -6127,6 +6195,7 @@ def get_job_state(job_id: str):
             "rest_measures": editable_state.get("rest_measures") or {},
             "pickup_measures": editable_state.get("pickup_measures") or {},
             "label_erase_areas": _editable_label_erase_areas(editable_state),
+            "label_boxes": _editable_label_boxes(editable_state),
             "rest_systems": editable_state.get("rest_systems") or {},
             "qa": qa,
             "systems": systems,
