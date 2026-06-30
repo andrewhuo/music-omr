@@ -203,6 +203,31 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual([row.get("reason") for row in rejected], ["invalid_label_erase_area", "invalid_label_erase_area", "invalid_label_erase_area"])
         self.assertEqual(state.get("label_erase_areas"), [])
 
+    def test_hide_label_persists(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "hide_label", "value": "label:p1_s0_m0"}],
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "hide_label", "label_id": "label:p1_s0_m0", "measure_id": "p1_s0_m0"}])
+        self.assertEqual(state.get("hidden_label_ids"), ["label:p1_s0_m0"])
+
+    def test_hide_label_rejects_invalid_id(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "hide_label", "value": "p1_s0_m0"},
+                {"type": "hide_label", "value": "label:not_a_measure"},
+            ],
+        )
+
+        self.assertEqual(applied, [])
+        self.assertEqual([row.get("reason") for row in rejected], ["invalid_label_id", "invalid_label_id"])
+        self.assertEqual(state.get("hidden_label_ids"), [])
+
     def test_measure_anchor_reflows_forward(self):
         state = self._sample_state()
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(
