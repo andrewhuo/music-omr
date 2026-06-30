@@ -228,6 +228,48 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual([row.get("reason") for row in rejected], ["invalid_label_id", "invalid_label_id"])
         self.assertEqual(state.get("hidden_label_ids"), [])
 
+    def test_move_label_persists(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "move_label", "label_id": "label:p1_s0_m0", "page": 1, "left": 42.25, "top": 13.75}],
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(
+            applied,
+            [
+                {
+                    "type": "move_label",
+                    "label_id": "label:p1_s0_m0",
+                    "measure_id": "p1_s0_m0",
+                    "page": 1,
+                    "left": 42.25,
+                    "top": 13.75,
+                }
+            ],
+        )
+        self.assertEqual(state.get("label_positions"), {"label:p1_s0_m0": {"page": 1, "left": 42.25, "top": 13.75}})
+
+    def test_move_label_rejects_invalid_id_or_position(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "move_label", "label_id": "p1_s0_m0", "page": 1, "left": 42, "top": 13},
+                {"type": "move_label", "label_id": "label:not_a_measure", "page": 1, "left": 42, "top": 13},
+                {"type": "move_label", "label_id": "label:p1_s0_m0", "page": 0, "left": 42, "top": 13},
+                {"type": "move_label", "label_id": "label:p1_s0_m0", "page": 1, "left": -1, "top": 13},
+            ],
+        )
+
+        self.assertEqual(applied, [])
+        self.assertEqual(
+            [row.get("reason") for row in rejected],
+            ["invalid_label_id", "invalid_label_id", "invalid_label_position", "invalid_label_position"],
+        )
+        self.assertEqual(state.get("label_positions"), {})
+
     def test_measure_anchor_reflows_forward(self):
         state = self._sample_state()
         systems, applied, rejected, _ = WORKER._apply_relabel_edits(

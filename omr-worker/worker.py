@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -940,6 +941,29 @@ def _measure_label_layout_left_barline(page: fitz.Page, page_rect: fitz.Rect, x_
     }
 
 
+def _measure_label_layout_at_top_left(page_rect: fitz.Rect, left: float, top: float, text: str) -> dict | None:
+    tw = float(fitz.get_text_length(text, fontsize=MEASURE_TEXT_SIZE))
+    th = float(MEASURE_TEXT_SIZE + 2.0)
+    x_text = min(max(1.0, float(left) + 1.0), max(1.0, float(page_rect.width) - tw - 1.0))
+    y_bg_top = min(max(0.0, float(top)), max(0.0, float(page_rect.height) - th))
+    y_text = y_bg_top + th - 1.0
+    bg = fitz.Rect(x_text - 1.0, y_text - th + 1.0, x_text + tw + 1.0, y_text + 1.0)
+    x0 = max(0.0, min(bg.x0, page_rect.width))
+    y0 = max(0.0, min(bg.y0, page_rect.height))
+    x1 = max(0.0, min(bg.x1, page_rect.width))
+    y1 = max(0.0, min(bg.y1, page_rect.height))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    bg_rect = fitz.Rect(x0, y0, x1, y1)
+    return {
+        "text_point": (float(x_text), float(y_text)),
+        "text_width": float(tw),
+        "text_height": float(th),
+        "background_rect": bg_rect,
+        "rect": _label_rect_payload(bg_rect),
+    }
+
+
 def _draw_measure_label_layout(page: fitz.Page, layout: dict, text: str) -> None:
     bg_rect = layout.get("background_rect")
     if bg_rect is not None:
@@ -988,6 +1012,32 @@ def _editable_hidden_label_ids(editable_state: dict) -> list[str]:
     return editable_state["hidden_label_ids"]
 
 
+def _editable_label_positions(editable_state: dict) -> dict:
+    raw_positions = editable_state.get("label_positions")
+    if not isinstance(raw_positions, dict):
+        editable_state["label_positions"] = {}
+        return editable_state["label_positions"]
+    cleaned = {}
+    for raw_label_id, raw_position in raw_positions.items():
+        label_id = str(raw_label_id or "").strip()
+        if not label_id.startswith("label:") or not isinstance(raw_position, dict):
+            continue
+        try:
+            left = float(raw_position.get("left"))
+            top = float(raw_position.get("top"))
+        except Exception:
+            continue
+        if not math.isfinite(left) or not math.isfinite(top):
+            continue
+        page = _safe_int(raw_position.get("page"), 0)
+        saved = {"left": round(left, 3), "top": round(top, 3)}
+        if page > 0:
+            saved["page"] = page
+        cleaned[label_id] = saved
+    editable_state["label_positions"] = cleaned
+    return editable_state["label_positions"]
+
+
 def _editable_state_version(editable_state: dict) -> str:
     payload = {
         "version": editable_state.get("version"),
@@ -1003,6 +1053,7 @@ def _editable_state_version(editable_state: dict) -> str:
         "endings": editable_state.get("endings") or {},
         "label_erase_areas": editable_state.get("label_erase_areas") or [],
         "hidden_label_ids": editable_state.get("hidden_label_ids") or [],
+        "label_positions": editable_state.get("label_positions") or {},
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
@@ -5759,6 +5810,51 @@ def _apply_hide_label_edit(
     applied.append({"type": "hide_label", "label_id": label_id, "measure_id": measure_id})
 
 
+def _apply_move_label_edit(
+    raw_edit: dict,
+    measure_ids: set[str],
+    editable_state: dict,
+    applied: list[dict],
+    rejected: list[dict],
+) -> None:
+    raw_label_id = raw_edit.get("label_id")
+    if raw_label_id is None:
+        raw_label_id = raw_edit.get("value")
+    label_id = str(raw_label_id or "").strip()
+    if not label_id.startswith("label:"):
+        rejected.append({"edit": raw_edit, "reason": "invalid_label_id"})
+        return
+    measure_id = label_id[len("label:") :].strip()
+    if not measure_id or measure_id not in measure_ids:
+        rejected.append({"edit": raw_edit, "reason": "invalid_label_id"})
+        return
+
+    page = _safe_int(raw_edit.get("page"), 0)
+    try:
+        left = float(raw_edit.get("left"))
+        top = float(raw_edit.get("top"))
+    except Exception:
+        rejected.append({"edit": raw_edit, "reason": "invalid_label_position"})
+        return
+    if page <= 0 or not math.isfinite(left) or not math.isfinite(top) or left < 0 or top < 0 or left > 5000 or top > 5000:
+        rejected.append({"edit": raw_edit, "reason": "invalid_label_position"})
+        return
+
+    positions = _editable_label_positions(editable_state)
+    positions[label_id] = {"page": page, "left": round(left, 3), "top": round(top, 3)}
+    editable_state["label_positions"] = positions
+    applied.append(
+        {
+            "type": "move_label",
+            "label_id": label_id,
+            "measure_id": measure_id,
+            "page": page,
+            "left": round(left, 3),
+            "top": round(top, 3),
+        }
+    )
+
+
 def _apply_relabel_edits(
     editable_state: dict,
     edits: list[dict],
@@ -5856,12 +5952,17 @@ def _apply_relabel_edits(
             _apply_hide_label_edit(raw_edit, measure_ids, editable_state, applied, rejected)
             continue
 
+        if edit_type == "move_label":
+            _apply_move_label_edit(raw_edit, measure_ids, editable_state, applied, rejected)
+            continue
+
         rejected.append({"edit": raw_edit, "reason": "unsupported_edit_type"})
 
     editable_state["measure_number_overrides"] = measure_overrides
     editable_state["labels_mode"] = labels_mode
     _editable_label_erase_areas(editable_state)
     _editable_hidden_label_ids(editable_state)
+    _editable_label_positions(editable_state)
     systems, measures, _, _ = _refresh_editable_state_systems_and_measures(
         editable_state,
         ending_debug_ctx=ending_debug_ctx,
@@ -5883,6 +5984,7 @@ def _render_corrected_pdf(
     drawn = 0
     label_boxes: list[dict] = []
     hidden_label_ids = set(_editable_hidden_label_ids(editable_state))
+    label_positions = _editable_label_positions(editable_state)
 
     # Manual label erases are intentionally narrow and are applied before
     # current labels are redrawn.
@@ -5916,9 +6018,17 @@ def _render_corrected_pdf(
                 continue
             page = doc[page_no - 1]
             layout = _measure_label_layout_left_barline(page, page.rect, x_left, y_top, label)
+            label_id = f"label:{mid}"
+            saved_position = label_positions.get(label_id)
+            if isinstance(saved_position, dict):
+                layout = _measure_label_layout_at_top_left(
+                    page.rect,
+                    saved_position.get("left", 0.0),
+                    saved_position.get("top", 0.0),
+                    label,
+                )
             if layout is None:
                 continue
-            label_id = f"label:{mid}"
             hidden = label_id in hidden_label_ids
             if not hidden:
                 _draw_measure_label_layout(page, layout, label)
@@ -5940,10 +6050,18 @@ def _render_corrected_pdf(
                 continue
             page = doc[page_no - 1]
             layout = _measure_label_layout_left_barline(page, page.rect, x_left, y_top, label)
-            if layout is None:
-                continue
             measure_id = str(measure.get("measure_id") or "").strip()
             label_id = f"label:{measure_id}"
+            saved_position = label_positions.get(label_id)
+            if isinstance(saved_position, dict):
+                layout = _measure_label_layout_at_top_left(
+                    page.rect,
+                    saved_position.get("left", 0.0),
+                    saved_position.get("top", 0.0),
+                    label,
+                )
+            if layout is None:
+                continue
             hidden = label_id in hidden_label_ids
             if not hidden:
                 _draw_measure_label_layout(page, layout, label)
@@ -6254,6 +6372,7 @@ def get_job_state(job_id: str):
             "pickup_measures": editable_state.get("pickup_measures") or {},
             "label_erase_areas": _editable_label_erase_areas(editable_state),
             "hidden_label_ids": _editable_hidden_label_ids(editable_state),
+            "label_positions": _editable_label_positions(editable_state),
             "label_boxes": _editable_label_boxes(editable_state),
             "rest_systems": editable_state.get("rest_systems") or {},
             "qa": qa,

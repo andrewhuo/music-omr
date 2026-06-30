@@ -2783,6 +2783,86 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(len(editable_state.get("label_boxes") or []), 1)
         self.assertTrue(editable_state["label_boxes"][0]["hidden"])
 
+    def test_render_corrected_pdf_draws_moved_label_and_reports_moved_box(self):
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+        fake_doc = _FakeDoc([page])
+        systems = [{"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1"}]
+        measures = [
+            {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 20, "y_top": 30, "y_bottom": 60},
+        ]
+        editable_state = {
+            "labels_mode": "system_only",
+            "systems": systems,
+            "measures": measures,
+            "label_positions": {"label:p1_s0_m0": {"page": 1, "left": 44.0, "top": 18.0}},
+        }
+
+        with (
+            patch.object(WORKER.fitz, "open", return_value=fake_doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+            patch.object(WORKER.fitz, "get_text_length", return_value=6.0),
+        ):
+            drawn = WORKER._render_corrected_pdf(
+                Path("/tmp/in.pdf"),
+                Path("/tmp/out.pdf"),
+                systems,
+                {},
+                measures,
+                "system_only",
+                editable_state=editable_state,
+            )
+
+        self.assertEqual(drawn, 1)
+        self.assertEqual(page.insert_text_calls[0]["point"], (45.0, 29.0))
+        self.assertEqual(
+            editable_state.get("label_boxes"),
+            [
+                {
+                    "label_id": "label:p1_s0_m0",
+                    "measure_id": "p1_s0_m0",
+                    "page": 1,
+                    "text": "1",
+                    "rect": {"left": 44.0, "top": 18.0, "right": 52.0, "bottom": 30.0},
+                    "hidden": False,
+                }
+            ],
+        )
+
+    def test_render_corrected_pdf_hidden_label_wins_over_moved_label(self):
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+        fake_doc = _FakeDoc([page])
+        systems = [{"system_id": "p1_s0", "page": 1, "system_index": 0, "current_value": "1"}]
+        measures = [
+            {"measure_id": "p1_s0_m0", "system_id": "p1_s0", "page": 1, "system_index": 0, "measure_local_index": 0, "x_left": 20, "y_top": 30, "y_bottom": 60},
+        ]
+        editable_state = {
+            "labels_mode": "system_only",
+            "systems": systems,
+            "measures": measures,
+            "hidden_label_ids": ["label:p1_s0_m0"],
+            "label_positions": {"label:p1_s0_m0": {"page": 1, "left": 44.0, "top": 18.0}},
+        }
+
+        with (
+            patch.object(WORKER.fitz, "open", return_value=fake_doc),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+            patch.object(WORKER.fitz, "get_text_length", return_value=6.0),
+        ):
+            drawn = WORKER._render_corrected_pdf(
+                Path("/tmp/in.pdf"),
+                Path("/tmp/out.pdf"),
+                systems,
+                {},
+                measures,
+                "system_only",
+                editable_state=editable_state,
+            )
+
+        self.assertEqual(drawn, 0)
+        self.assertEqual(page.insert_text_calls, [])
+        self.assertTrue(editable_state["label_boxes"][0]["hidden"])
+        self.assertEqual(editable_state["label_boxes"][0]["rect"], {"left": 44.0, "top": 18.0, "right": 52.0, "bottom": 30.0})
+
     def test_label_ink_point_without_cropbox_uses_green_box_coords(self):
         page = _FakePage(_FakeRect(0, 0, 200, 160))
 
