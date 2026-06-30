@@ -22,6 +22,8 @@ Universal rules\
 - You are NOT detecting measures, finding barlines, or renumbering music.\
 - The backend already gives the true measures and their order.\
 - Each crop contains exactly one already-detected measure.\
+- Staff means one set of 5 horizontal music lines for one instrument or voice.\
+- System means the full horizontal row of music containing all staves on that line of the score.\
 - Do NOT infer extra measures from rhythmic groups, repeat dots, double barlines, edge marks, spacing, or decorations.\
 - Process measures left to right.\
 - A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.\
@@ -98,6 +100,8 @@ Universal rules\
 - You are NOT detecting measures, finding barlines, or renumbering music.\
 - The backend already gives the true measures and their order.\
 - Each crop contains exactly one already-detected measure.\
+- Staff means one set of 5 horizontal music lines for one instrument or voice.\
+- System means the full horizontal row of music containing all staves on that line of the score.\
 - Do NOT infer extra measures from rhythmic groups, repeat dots, double barlines, edge marks, spacing, or decorations.\
 - Process measures left to right.\
 - A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.\
@@ -185,6 +189,8 @@ Universal rules\
 - You are NOT detecting measures, finding barlines, or renumbering music.\
 - The backend already gives the true measures and their order.\
 - Each crop contains exactly one already-detected measure.\
+- Staff means one set of 5 horizontal music lines for one instrument or voice.\
+- System means the full horizontal row of music containing all staves on that line of the score.\
 - Do NOT infer extra measures from rhythmic groups, repeat dots, double barlines, edge marks, spacing, or decorations.\
 - Process measures left to right.\
 - A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.\
@@ -202,34 +208,34 @@ Universal rules\
 - Otherwise, later measures should be normal unless they are a valid multi_measure_rest.\
 \
 Full-score pickup rules\
-- For pickup detection in full scores, use only the top visible staff.\
-- Ignore all lower staves completely for pickup duration.\
-- Do not inspect, compare, add, or use lower staves as fallback.\
+- For score pickup, start at the top visible staff.\
+- If a staff shows only a full-measure rest in the first measure, skip to the next staff down.\
+- Use the first staff with notes or readable rhythm; do not add multiple staves.\
+- If every staff is resting or unreadable, use uncertain with maybe_label pickup.\
 - Only check pickup when is_first_measure_of_score = true.\
-- Use only the top staff's visible meter in this crop.\
-- If the top staff meter is unreadable but common/cut/numeric meter is partially visible, make the best reasonable meter read and continue.\
+- Use the first active staff's visible meter in this crop.\
+- If the first active staff meter is unreadable but common/cut/numeric meter is partially visible, make the best reasonable meter read and continue.\
 - Use uncertain only if no meter can be reasonably read at all.\
 - Read meter as top/bottom: top = how many beat-units fill a full measure; bottom = which note value is one beat-unit.\
 - Bottom number examples: 4 means quarter-note beats, 8 means eighth-note beats, 2 means half-note beats.\
 - Common time looks like a large C after the clef/key signature and means 4/4.\
 - Cut time looks like a large C with a vertical slash through it and means 2/2.\
-- Count the top staff's written note/rest durations only. Never count visual width, spacing, number of noteheads, number of staves, or number of instruments as beats.\
+- Count the first active staff's written note/rest durations only. Never count visual width, spacing, number of noteheads, number of staves, or number of instruments as beats.\
 - Basic note values: filled notehead with stem = quarter note; open notehead with stem = half note; open notehead without stem = whole note; filled notehead with flag or beam = eighth note.\
-- For first-measure pickup debug, identify the top-staff notehead fill before deciding note value.\
+- For first-measure pickup debug, identify the first active staff's notehead fill before deciding note value.\
 - A filled black notehead cannot be a half note; half note requires an open/white notehead.\
 - If unsure, use notehead fill first: black = quarter/eighth family, open = half/whole family.\
 - A dot immediately to the right of a note/rest adds half its value.\
 - A triplet is marked by a small 3 above or below a group; the 3 may have a bracket or appear over beamed notes.\
 - Three triplet notes fit into the time normally taken by two of the same note value. Example: three triplet eighth notes equal one quarter-note beat.\
-- A chord/stack on the top staff is exactly one rhythmic event, no matter how many noteheads it has. Use the written note value.\
-- If the top staff's written duration is less than the visible meter, the whole first measure is pickup/incomplete.\
+- A chord/stack on the first active staff is exactly one rhythmic event, no matter how many noteheads it has. Use the written note value.\
+- If the first active staff's written duration is less than the visible meter, the whole first measure is pickup/incomplete.\
 - For the first measure, arithmetic wins over context; do not call a short first measure full because it looks intentional, musical, complete, or like an opening gesture.\
-- For the first measure, if the top-staff written duration looks clearly shorter than a normal full measure, prefer pickup over normal.\
 - For pickup, overusing uncertain is worse than a reasonable wrong pickup suggestion.\
 - Do not use uncertain just because the notation is old, small, light, or slightly messy.\
-- Only label normal/full if the top staff clearly fills the visible meter.\
-- If you cannot confidently choose pickup, but the top staff may be short, use uncertain with maybe_label pickup.\
-- If the top staff meter/rhythm is completely unreadable, empty, or cut off, use uncertain with maybe_label pickup.\
+- Only label normal/full if the first active staff clearly fills the visible meter.\
+- If you cannot confidently choose pickup, but the first active staff may be short, use uncertain with maybe_label pickup.\
+- If the first active staff meter/rhythm is completely unreadable, empty, or cut off, use uncertain with maybe_label pickup.\
 \
 Full-score multi-measure rest rules\
 - For full score V1, NEVER return multi_measure_rest.\
