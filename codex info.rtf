@@ -33,6 +33,10 @@ Universal rules\
 - Only label pickup when is_first_measure_of_score = true. If false, do not label pickup.\
 - Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, clear normal = full, unclear = unclear.\
 - Prefer useful suggestions over silence. If a crop strongly looks like pickup or multi_measure_rest, suggest it even with medium or low confidence.\
+- For non-first measures, do not judge pickup or beat completeness.\
+- Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.\
+- For non-first measures, only use uncertain when the crop itself is visually unusable, the measure split/box appears wrong, or a possible multi-measure rest count is unreadable.\
+- Otherwise, later measures should be normal unless they are a valid multi_measure_rest.\
 \
 Single-staff pickup rules\
 - This is single-staff music. Judge rhythm using only this one staff.\
@@ -106,6 +110,10 @@ Universal rules\
 - Only label pickup when is_first_measure_of_score = true. If false, do not label pickup.\
 - Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, clear normal = full, unclear = unclear.\
 - Prefer useful suggestions over silence. If a crop strongly looks like pickup or multi_measure_rest, suggest it even with medium or low confidence.\
+- For non-first measures, do not judge pickup or beat completeness.\
+- Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.\
+- For non-first measures, only use uncertain when the crop itself is visually unusable, the measure split/box appears wrong, or a possible multi-measure rest count is unreadable.\
+- Otherwise, later measures should be normal unless they are a valid multi_measure_rest.\
 \
 Grand-staff main rule\
 - For all AI Suggest decisions in grand-staff/piano music, use only the top staff/treble staff.\
@@ -188,6 +196,10 @@ Universal rules\
 - Only label pickup when is_first_measure_of_score = true. If false, do not label pickup.\
 - Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, clear normal = full, unclear = unclear.\
 - Prefer useful suggestions over silence. If a crop strongly looks like pickup or multi_measure_rest, suggest it even with medium or low confidence.\
+- For non-first measures, do not judge pickup or beat completeness.\
+- Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.\
+- For non-first measures, only use uncertain when the crop itself is visually unusable, the measure split/box appears wrong, or a possible multi-measure rest count is unreadable.\
+- Otherwise, later measures should be normal unless they are a valid multi_measure_rest.\
 \
 Full-score pickup rules\
 - For pickup detection in full scores, use only the top visible staff.\

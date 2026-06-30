@@ -2545,10 +2545,10 @@ def _normalize_ai_suggestions_result(
             normalization_warnings.append(
                 _ai_suggest_normalization_warning(
                     measure_row,
-                    f"Downgraded later normal suggestion to uncertain for {measure_id} because measure_completeness was incomplete.",
+                    f"Ignored later normal incomplete completeness for {measure_id}; later measures do not use pickup completeness.",
                 )
             )
-            label = "uncertain"
+            measure_completeness = "full"
 
         unclear_reason = None
         if raw_unclear_reason is not None:
@@ -3458,7 +3458,10 @@ def _ai_prompt_base_rules() -> list[str]:
         "Prefer useful suggestions over silence. If a crop strongly looks like pickup or multi_measure_rest, suggest it even with medium or low confidence.",
         "If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason using one of these exact codes only: time_signature_not_clear, too_dense_to_count, crop_cut_off, split_may_be_wrong, ornament_or_tie_confusion, not_enough_visual_evidence.",
         "Do not write sentences for unclear_reason. Use only one short code or omit the field.",
-        "For later non-rest measures, do not judge beat completeness unless the visible notation makes uncertainty necessary.",
+        "For non-first measures, do not judge pickup or beat completeness.",
+        "Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.",
+        "For non-first measures, only use uncertain when the crop itself is visually unusable, the measure split/box appears wrong, or a possible multi-measure rest count is unreadable.",
+        "Otherwise, later measures should be normal unless they are a valid multi_measure_rest.",
     ]
 
 

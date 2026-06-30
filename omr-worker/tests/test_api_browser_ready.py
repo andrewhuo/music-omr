@@ -2195,7 +2195,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         warnings = normalized.get("warnings") or []
         self.assertTrue(any("Dropped invalid unclear_reason" in str((row or {}).get("message") or "") for row in warnings))
 
-    def test_normalize_ai_suggestions_result_downgrades_later_normal_incomplete_to_uncertain(self):
+    def test_normalize_ai_suggestions_result_ignores_later_normal_incomplete_completeness(self):
         editable_state = {
             "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
             "measures": [
@@ -2226,25 +2226,13 @@ class BrowserReadyApiTests(unittest.TestCase):
             normalized.get("measure_completeness_by_measure_id"),
             {
                 "m0": {"measure_completeness": "full", "measure_completeness_source": "ai"},
-                "m1": {"measure_completeness": "incomplete", "measure_completeness_source": "ai"},
+                "m1": {"measure_completeness": "full", "measure_completeness_source": "ai"},
                 "m2": {"measure_completeness": "unclear", "measure_completeness_source": "ai"},
             },
         )
-        self.assertEqual(
-            normalized.get("by_measure_id", {}).get("m1"),
-            {
-                "label": "uncertain",
-                "rest_count": None,
-                "confidence": "medium",
-                "system_id": "p1_s0",
-                "order_index_in_system": 1,
-                "is_first_measure_of_score": False,
-                "measure_completeness": "incomplete",
-                "measure_completeness_source": "ai",
-            },
-        )
+        self.assertNotIn("m1", normalized.get("by_measure_id", {}))
         warnings = normalized.get("warnings") or []
-        self.assertTrue(any("Downgraded later normal suggestion to uncertain" in str((row or {}).get("message") or "") for row in warnings))
+        self.assertTrue(any("Ignored later normal incomplete completeness" in str((row or {}).get("message") or "") for row in warnings))
 
     def test_normalize_ai_suggestions_result_does_not_track_remembered_time_signature_for_every_measure(self):
         editable_state = {
@@ -2473,6 +2461,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Number first, symbol second: a readable big number 2 or higher", rules_text)
         self.assertIn("Do not return uncertain just because the symbol is messy", rules_text)
         self.assertIn("Overusing uncertain is worse than a reasonable confident suggestion.", rules_text)
+        self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
+        self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
+        self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
+        self.assertIn("Otherwise, later measures should be normal unless they are a valid multi_measure_rest.", rules_text)
         self.assertIn("If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable", rules_text)
         self.assertNotIn("Treble and bass are not beat 1 and beat 2", rules_text)
         self.assertNotIn("Different instruments are not beat 1", rules_text)
@@ -2519,6 +2511,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("For grand-staff multi-measure rest, use only the top staff/treble staff.", rules_text)
         self.assertIn("Number first, symbol second: a readable big number 2 or higher", rules_text)
         self.assertIn("Overusing uncertain is worse than a reasonable confident suggestion.", rules_text)
+        self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
+        self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
+        self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
+        self.assertIn("Otherwise, later measures should be normal unless they are a valid multi_measure_rest.", rules_text)
         self.assertIn("if the top staff has readable count 2 or higher plus rest-like multi-rest symbol", rules_text)
         self.assertNotIn("Label multi_measure_rest only if both staves clearly share the same multi-measure rest count", rules_text)
         self.assertNotIn("Use one clear staff's written rhythm/rests as the timing guide", rules_text)
@@ -2547,6 +2543,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("For the first measure, arithmetic wins over context", rules_text)
         self.assertIn("prefer pickup over normal", rules_text)
         self.assertIn("overusing uncertain is worse than a reasonable wrong pickup suggestion", rules_text)
+        self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
+        self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
+        self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
+        self.assertIn("Otherwise, later measures should be normal unless they are a valid multi_measure_rest.", rules_text)
         self.assertIn("Full-score multi-measure rest rules:", rules_text)
         self.assertIn("For full score V1, NEVER return multi_measure_rest.", rules_text)
         self.assertIn("rest_count must always be null for full-score prompts.", rules_text)
@@ -2588,6 +2588,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("count the timeline horizontally", rules_text)
         self.assertIn("For later non-first measures, do not label pickup.", rules_text)
         self.assertIn("If is_first_measure_of_score is false, do not label pickup.", rules_text)
+        self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
+        self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
+        self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
+        self.assertIn("Otherwise, later measures should be normal unless they are a valid multi_measure_rest.", rules_text)
         self.assertIn("Grand-staff pickup rules:", rules_text)
         self.assertIn("One staff may play while the other rests or is silent", rules_text)
         self.assertIn("Use the visible meter in this crop only", rules_text)
