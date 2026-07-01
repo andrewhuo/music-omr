@@ -285,6 +285,99 @@ Eventual fixes and follow-up work\
   Resume/state note:\
   - Small stale-resume cleanup means: if the app tries to open an old saved job and the run files are missing/expired, show a calm message or clear the stale saved job. This is only error handling.\
   - Full resume/reconnect is a separate later feature: make unfinished jobs reliably discoverable and resumable instead of relying on fragile automatic resume.\
+  Reliability hardening 8-step map:\
+  1. Backend GCS Retry Helper\
+  Fixes storage/network hiccups:\
+  - GCS upload failure\
+  - GCS download failure\
+  - temporary storage 503\
+  - storage timeout\
+  - corrected PDF upload failed\
+  - mapping summary upload failed\
+  - run info upload failed\
+  - AI/debug crop upload failed\
+  - temporary signed/download storage issue\
+\
+  2. Structured Backend Error Responses\
+  Fixes confusing backend errors:\
+  - raw failed to load state errors\
+  - random HTTP 500\
+  - generic Processing failed\
+  - unknown backend crash message\
+  - app guessing errors from strings\
+  - app/backend version mismatch messages\
+  - unclear upload/relabel/AI/parser errors\
+\
+  3. State Loading Hardening\
+  Fixes old/missing/bad job state:\
+  - run_info.json missing\
+  - mapping_summary.json missing\
+  - corrupt JSON\
+  - editable_state missing\
+  - stale run mismatch\
+  - deleted/expired GCS files\
+  - old resume job points to gone files\
+  - job says success but artifacts are missing\
+\
+  4. Relabel Safe-Write Hardening\
+  Fixes manual edit corruption risk:\
+  - edit applies but corrected PDF render fails\
+  - corrected PDF upload fails\
+  - mapping summary upload fails after edit\
+  - unsupported edit type\
+  - invalid edit payload\
+  - unknown measure ID\
+  - two edits happen close together\
+  - app/backend edit-version mismatch\
+\
+  5. GitHub / Job Creation Hardening\
+  Fixes workflow/start-job failures:\
+  - GitHub token bad/missing\
+  - workflow missing\
+  - workflow dispatch failed\
+  - GitHub API unreachable\
+  - GitHub rate limit\
+  - run ID discovery failed\
+  - pending job has no run ID yet\
+  - job store write failed\
+  - job ID conflict\
+  - invalid GCS URI\
+\
+  6. AI Partial Failure Hardening\
+  Fixes AI long-run problems:\
+  - one system fails and whole AI run stops\
+  - AI completes some systems then fails\
+  - Bedrock timeout/throttle/service unavailable\
+  - malformed AI JSON\
+  - missing measure IDs\
+  - unknown measure IDs\
+  - state changes during AI run\
+  - multipage AI too expensive/long\
+  - user loses partial AI progress\
+\
+  7. Parser Failure Reports\
+  Fixes OMR/parser mystery failures:\
+  - Audiveris fails\
+  - no XML output\
+  - wrong page count\
+  - missing page image\
+  - empty systems\
+  - empty measures\
+  - bad system/barline mapping\
+  - coordinate conversion bad\
+  - parser timeout\
+  - parser partial success but unclear output\
+\
+  8. Full Resume / Reconnect\
+  Fixes bigger app continuity problems:\
+  - app restart during upload/process/AI/edit\
+  - half-loaded state\
+  - user wants to reconnect to unfinished job\
+  - old signed URL expired during session\
+  - local saved job from older app version\
+  - corrupted local saved state\
+  - cleanup deleted files before app reopened\
+  - previous job not discoverable/recoverable\
 - Keep resume/reload behavior reliable.\
 - allow multiple people to run at one time\
 - Add a cancel-run control so the user can stop a bad or unwanted run cleanly.\
