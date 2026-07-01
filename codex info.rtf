@@ -281,7 +281,10 @@ Eventual fixes and follow-up work\
   3. AI provider failed: Bedrock bad credentials, wrong model ID, timeout, throttling/rate limit, service unavailable, malformed AI JSON, missing measure IDs.\
   4. Bad/missing state: old resume job, stale run mismatch, deleted/expired GCS files, missing or corrupt mapping_summary/run_info/editable_state.\
   Code fail spots to harden: app apiUploadPDF, apiCreateJob, apiGetJob, apiFetchState, downloadPDF, apiGenerateAISuggestions, apiStepAISuggestions, apiRelabel; backend upload_pdf, create_job, get_job, get_job_state, relabel_job, ai_suggest_job, ai_suggest_job_step; parser OMR zip/XML/page picture/system/barline/mapping paths.\
-  Preferred order: app retry helper for safe requests, Bedrock retry for temporary AI errors, clearer backend error codes/messages, missing/expired file handling, then resume/reconnect.\
+  Preferred order: app retry helper for safe requests (done), clearer app messages (done), Bedrock retry for temporary AI errors, missing/expired stale-job handling, then full resume/reconnect.\
+  Resume/state note:\
+  - Small stale-resume cleanup means: if the app tries to open an old saved job and the run files are missing/expired, show a calm message or clear the stale saved job. This is only error handling.\
+  - Full resume/reconnect is a separate later feature: make unfinished jobs reliably discoverable and resumable instead of relying on fragile automatic resume.\
 - Keep resume/reload behavior reliable.\
 - allow multiple people to run at one time\
 - Add a cancel-run control so the user can stop a bad or unwanted run cleanly.\
