@@ -1562,6 +1562,47 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sent_body.get("max_tokens"), 64)
         self.assertNotIn("model", sent_body)
 
+    def test_bedrock_messages_create_retries_temporary_error_then_succeeds(self):
+        temporary_1 = WORKER.AiSuggestError(provider_status=503, detail="ServiceUnavailableException: try again")
+        temporary_2 = WORKER.AiSuggestError(provider_status=429, detail="ThrottlingException: rate exceeded")
+        success = {"content": [{"type": "text", "text": "{}"}]}
+        with (
+            patch.object(WORKER, "_bedrock_messages_create_once", side_effect=[temporary_1, temporary_2, success]) as create_once,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            result = WORKER._bedrock_messages_create({"model": "global.anthropic.claude-haiku-4-5-20251001-v1:0"})
+
+        self.assertEqual(result, success)
+        self.assertEqual(create_once.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [0.7, 1.5])
+
+    def test_bedrock_messages_create_fails_after_temporary_retries(self):
+        temporary = WORKER.AiSuggestError(provider_status=503, detail="ServiceUnavailableException: try again")
+        with (
+            patch.object(WORKER, "_bedrock_messages_create_once", side_effect=[temporary, temporary, temporary, temporary]) as create_once,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            with self.assertRaises(WORKER.AiSuggestError) as ctx:
+                WORKER._bedrock_messages_create({"model": "global.anthropic.claude-haiku-4-5-20251001-v1:0"})
+
+        self.assertEqual(create_once.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [0.7, 1.5, 3.0])
+        self.assertEqual(getattr(ctx.exception, "retry_attempts", None), 4)
+        self.assertIn("bedrock_retry_attempts=4", ctx.exception.detail)
+        self.assertIn("bedrock_retry_delays_sec=0.7,1.5,3", ctx.exception.detail)
+
+    def test_bedrock_messages_create_does_not_retry_permanent_error(self):
+        bad_credentials = WORKER.AiSuggestError(provider_status=403, detail="InvalidSignatureException: bad AWS secret")
+        with (
+            patch.object(WORKER, "_bedrock_messages_create_once", side_effect=bad_credentials) as create_once,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            with self.assertRaises(WORKER.AiSuggestError):
+                WORKER._bedrock_messages_create({"model": "global.anthropic.claude-haiku-4-5-20251001-v1:0"})
+
+        self.assertEqual(create_once.call_count, 1)
+        self.assertEqual(sleep_mock.call_count, 0)
+
     def test_parse_bedrock_suggestions_message_uses_same_json_parser(self):
         message = {
             "content": [

@@ -144,6 +144,7 @@ AI_SUGGESTION_DEBUG_STEM_OR_BEAM_ALLOWED = {"stem", "flag_or_beam", "none", "unc
 AI_SUGGESTION_DEBUG_DOT_SEEN_ALLOWED = {"true", "false", "unclear"}
 AI_SUGGESTION_DEBUG_NOTE_VALUE_ALLOWED = {"quarter", "half", "whole", "eighth", "other", "unclear"}
 AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
+BEDROCK_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
 AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
 AI_OLD_STYLE_REFERENCE_EXAMPLES = (
     {
@@ -2943,6 +2944,36 @@ def _is_anthropic_overload_error(exc: AiSuggestError | Exception) -> bool:
     return "overloaded_error" in detail
 
 
+def _is_bedrock_retryable_error(exc: AiSuggestError | Exception) -> bool:
+    if not isinstance(exc, AiSuggestError):
+        return False
+    detail = str(getattr(exc, "detail", "") or "").lower()
+    if "provider_not_configured" in detail or "malformed_provider_response" in detail:
+        return False
+    permanent_markers = (
+        "invalidsignatureexception",
+        "accessdeniedexception",
+        "unauthorized",
+        "validationexception",
+        "on-demand throughput isn",
+        "not authorized",
+    )
+    if any(marker in detail for marker in permanent_markers):
+        return False
+    retryable_markers = (
+        "throttlingexception",
+        "serviceunavailableexception",
+        "internalserverexception",
+        "modeltimeoutexception",
+        "timeout",
+        "timed out",
+        "connection",
+    )
+    if any(marker in detail for marker in retryable_markers):
+        return True
+    return int(getattr(exc, "provider_status", 0) or 0) in {408, 429, 500, 502, 503, 504}
+
+
 def _anthropic_messages_create_once(payload: dict) -> dict:
     api_key = _anthropic_api_key()
     if not api_key:
@@ -3045,10 +3076,40 @@ def _bedrock_messages_create_once(payload: dict) -> dict:
         raise AiSuggestError(provider_status=status or 502, detail=_safe_error_text(exc)) from exc
 
 
+def _bedrock_messages_create(payload: dict) -> dict:
+    delays = tuple(float(delay) for delay in BEDROCK_RETRY_DELAYS_SEC if float(delay) > 0)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _bedrock_messages_create_once(payload)
+        except AiSuggestError as exc:
+            if not _is_bedrock_retryable_error(exc):
+                raise
+            if attempt > len(delays):
+                detail = str(exc.detail or "").strip()
+                delay_txt = ",".join(str(int(delay) if float(delay).is_integer() else delay) for delay in delays)
+                suffix = f" bedrock_retry_attempts={attempt}"
+                if delay_txt:
+                    suffix += f" bedrock_retry_delays_sec={delay_txt}"
+                exc.detail = f"{detail}{suffix}" if detail else suffix.strip()
+                exc.retry_attempts = attempt
+                raise
+            delay_sec = delays[attempt - 1]
+            logger.warning(
+                "AI_SUGGEST_BEDROCK_RETRY attempt=%s next_delay_sec=%s status=%s model=%s",
+                attempt,
+                delay_sec,
+                int(getattr(exc, "provider_status", 0) or 0),
+                _configured_bedrock_model_id() or str(payload.get("model") or _requested_ai_model_name()),
+            )
+            time.sleep(delay_sec)
+
+
 def _ai_messages_create(payload: dict) -> dict:
     provider = _requested_ai_provider_name()
     if provider == "bedrock":
-        return _bedrock_messages_create_once(payload)
+        return _bedrock_messages_create(payload)
     if provider == "anthropic":
         return _anthropic_messages_create(payload)
     raise AiSuggestError(provider_status=503, detail="provider_not_configured")
