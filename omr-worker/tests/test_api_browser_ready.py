@@ -1603,6 +1603,151 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(create_once.call_count, 1)
         self.assertEqual(sleep_mock.call_count, 0)
 
+    def test_gcs_upload_retries_temporary_errors_then_succeeds(self):
+        calls: list[tuple[str, str]] = []
+
+        class _TempGcsError(Exception):
+            response = {"ResponseMetadata": {"HTTPStatusCode": 503}}
+
+        class _FakeBlob:
+            def __init__(self):
+                self.remaining_failures = 2
+
+            def upload_from_string(self, data, content_type=None):
+                calls.append((str(data), str(content_type)))
+                if self.remaining_failures > 0:
+                    self.remaining_failures -= 1
+                    raise _TempGcsError("Service unavailable")
+
+        blob = _FakeBlob()
+
+        class _FakeBucket:
+            def blob(self, _name):
+                return blob
+
+        class _FakeClient:
+            def bucket(self, _name):
+                return _FakeBucket()
+
+        with (
+            patch.object(WORKER, "_gcs_client", return_value=_FakeClient()),
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+            patch("builtins.print") as print_mock,
+        ):
+            WORKER._upload_bytes_to_gcs(b"abc", "gs://bucket/path.bin", content_type="application/octet-stream")
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [0.7, 1.5])
+        self.assertIn("GCS_RETRY operation=upload_bytes attempt=2/4 delay=0.7", print_mock.call_args_list[0].args[0])
+
+    def test_gcs_download_json_retries_temporary_error_then_succeeds(self):
+        class _TempGcsError(Exception):
+            response = {"ResponseMetadata": {"HTTPStatusCode": 504}}
+
+        class _FakeBlob:
+            def __init__(self):
+                self.remaining_failures = 1
+                self.calls = 0
+
+            def download_as_bytes(self):
+                self.calls += 1
+                if self.remaining_failures > 0:
+                    self.remaining_failures -= 1
+                    raise _TempGcsError("Gateway timeout")
+                return b'{"ok": true}'
+
+        blob = _FakeBlob()
+
+        class _FakeBucket:
+            def blob(self, _name):
+                return blob
+
+        class _FakeClient:
+            def bucket(self, _name):
+                return _FakeBucket()
+
+        with (
+            patch.object(WORKER, "_gcs_client", return_value=_FakeClient()),
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            result = WORKER._download_gcs_json("gs://bucket/state.json")
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(blob.calls, 2)
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [0.7])
+
+    def test_gcs_missing_object_is_not_retried(self):
+        class _MissingGcsError(Exception):
+            response = {"ResponseMetadata": {"HTTPStatusCode": 404}}
+
+        class _FakeBlob:
+            def __init__(self):
+                self.calls = 0
+
+            def download_as_bytes(self):
+                self.calls += 1
+                raise _MissingGcsError("No such object")
+
+        blob = _FakeBlob()
+
+        class _FakeBucket:
+            def blob(self, _name):
+                return blob
+
+        class _FakeClient:
+            def bucket(self, _name):
+                return _FakeBucket()
+
+        with (
+            patch.object(WORKER, "_gcs_client", return_value=_FakeClient()),
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            with self.assertRaises(_MissingGcsError):
+                WORKER._download_gcs_json("gs://bucket/missing.json")
+
+        self.assertEqual(blob.calls, 1)
+        self.assertEqual(sleep_mock.call_count, 0)
+
+    def test_gcs_invalid_uri_is_not_retried(self):
+        with (
+            patch.object(WORKER, "_gcs_client") as client_mock,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            with self.assertRaises(ValueError):
+                WORKER._download_gcs_json("not-gcs")
+
+        self.assertEqual(client_mock.call_count, 0)
+        self.assertEqual(sleep_mock.call_count, 0)
+
+    def test_gcs_corrupt_json_after_download_is_not_retried(self):
+        class _FakeBlob:
+            def __init__(self):
+                self.calls = 0
+
+            def download_as_bytes(self):
+                self.calls += 1
+                return b"not json"
+
+        blob = _FakeBlob()
+
+        class _FakeBucket:
+            def blob(self, _name):
+                return blob
+
+        class _FakeClient:
+            def bucket(self, _name):
+                return _FakeBucket()
+
+        with (
+            patch.object(WORKER, "_gcs_client", return_value=_FakeClient()),
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            with self.assertRaises(json.JSONDecodeError):
+                WORKER._download_gcs_json("gs://bucket/bad.json")
+
+        self.assertEqual(blob.calls, 1)
+        self.assertEqual(sleep_mock.call_count, 0)
+
     def test_parse_bedrock_suggestions_message_uses_same_json_parser(self):
         message = {
             "content": [

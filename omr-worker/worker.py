@@ -145,6 +145,7 @@ AI_SUGGESTION_DEBUG_DOT_SEEN_ALLOWED = {"true", "false", "unclear"}
 AI_SUGGESTION_DEBUG_NOTE_VALUE_ALLOWED = {"quarter", "half", "whole", "eighth", "other", "unclear"}
 AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
 BEDROCK_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
+GCS_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
 AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
 AI_OLD_STYLE_REFERENCE_EXAMPLES = (
     {
@@ -534,16 +535,20 @@ def _signed_http_url_for_gs(uri: str) -> str:
         bucket_name, blob_name = _gs_uri_to_bucket_blob(uri)
         bucket = _gcs_client().bucket(bucket_name)
         blob = bucket.blob(blob_name)
-        if not blob.exists():
+        if not _gcs_retry("signed_url_exists", uri, lambda: blob.exists()):
             return ""
         ttl_sec = max(60, _safe_int(os.environ.get("ARTIFACT_SIGNED_URL_TTL_SEC"), ARTIFACT_SIGNED_URL_TTL_SEC))
         expiry = timedelta(seconds=ttl_sec)
         try:
             return str(
-                blob.generate_signed_url(
-                    version="v4",
-                    expiration=expiry,
-                    method="GET",
+                _gcs_retry(
+                    "signed_url",
+                    uri,
+                    lambda: blob.generate_signed_url(
+                        version="v4",
+                        expiration=expiry,
+                        method="GET",
+                    ),
                 )
             )
         except Exception as exc:
@@ -556,12 +561,16 @@ def _signed_http_url_for_gs(uri: str) -> str:
             if not access_token or not service_account_email:
                 raise
             return str(
-                blob.generate_signed_url(
-                    version="v4",
-                    expiration=expiry,
-                    method="GET",
-                    service_account_email=service_account_email,
-                    access_token=access_token,
+                _gcs_retry(
+                    "signed_url_iam",
+                    uri,
+                    lambda: blob.generate_signed_url(
+                        version="v4",
+                        expiration=expiry,
+                        method="GET",
+                        service_account_email=service_account_email,
+                        access_token=access_token,
+                    ),
                 )
             )
     except Exception as exc:
@@ -707,18 +716,83 @@ def _parse_gs_uri(uri: str) -> tuple[str, str]:
     return bucket, blob
 
 
+def _gcs_error_status(exc: Exception) -> int:
+    response = getattr(exc, "response", None)
+    metadata = response.get("ResponseMetadata") if isinstance(response, dict) else {}
+    status = _safe_int((metadata or {}).get("HTTPStatusCode"), 0)
+    if status:
+        return status
+    status = _safe_int(getattr(exc, "code", 0), 0)
+    if status:
+        return status
+    return _safe_int(getattr(exc, "status_code", 0), 0)
+
+
+def _is_gcs_retryable_error(exc: Exception) -> bool:
+    status = _gcs_error_status(exc)
+    if status in {408, 429, 500, 502, 503, 504}:
+        return True
+    if status in {400, 401, 403, 404}:
+        return False
+    detail = _safe_error_text(exc).lower()
+    permanent_markers = (
+        "not found",
+        "no such object",
+        "permission denied",
+        "forbidden",
+        "unauthorized",
+        "invalid gcs uri",
+        "invalid bucket",
+    )
+    if any(marker in detail for marker in permanent_markers):
+        return False
+    temporary_markers = (
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "temporarily unavailable",
+        "service unavailable",
+        "too many requests",
+        "rate limit",
+    )
+    return any(marker in detail for marker in temporary_markers)
+
+
+def _gcs_retry(operation: str, uri: str, fn):
+    delays = tuple(float(delay) for delay in GCS_RETRY_DELAYS_SEC if float(delay) > 0)
+    total_attempts = 1 + len(delays)
+    attempt = 1
+    while True:
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_gcs_retryable_error(exc) or attempt >= total_attempts:
+                raise
+            delay_sec = delays[attempt - 1]
+            delay_txt = str(int(delay_sec) if delay_sec.is_integer() else delay_sec)
+            reason = _gcs_error_status(exc) or _safe_error_text(exc)
+            print(
+                f"GCS_RETRY operation={operation} attempt={attempt + 1}/{total_attempts} "
+                f"delay={delay_txt} uri={uri} reason={reason}"
+            )
+            time.sleep(delay_sec)
+            attempt += 1
+
+
 def _gcs_uri_exists(uri: str) -> bool:
     bucket_name, blob_name = _parse_gs_uri(uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    return bool(blob.exists())
+    return bool(_gcs_retry("exists", uri, lambda: blob.exists()))
 
 
 def _download_gcs_json(uri: str) -> dict:
     bucket_name, blob_name = _parse_gs_uri(uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    raw = blob.download_as_bytes()
+    raw = _gcs_retry("download_json", uri, lambda: blob.download_as_bytes())
     data = json.loads(raw.decode("utf-8", errors="replace"))
     if not isinstance(data, dict):
         raise ValueError(f"expected JSON object at {uri}")
@@ -730,30 +804,36 @@ def _download_gcs_to_file(uri: str, dest_path: Path) -> None:
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    blob.download_to_filename(str(dest_path))
+    _gcs_retry("download_file", uri, lambda: blob.download_to_filename(str(dest_path)))
 
 
 def _upload_file_to_gcs(src_path: Path, dest_uri: str, content_type: str | None = None) -> None:
     bucket_name, blob_name = _parse_gs_uri(dest_uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    blob.upload_from_filename(str(src_path), content_type=content_type)
+    _gcs_retry("upload_file", dest_uri, lambda: blob.upload_from_filename(str(src_path), content_type=content_type))
 
 
 def _upload_bytes_to_gcs(data: bytes, dest_uri: str, content_type: str | None = None) -> None:
     bucket_name, blob_name = _parse_gs_uri(dest_uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    blob.upload_from_string(data, content_type=content_type or "application/octet-stream")
+    _gcs_retry(
+        "upload_bytes",
+        dest_uri,
+        lambda: blob.upload_from_string(data, content_type=content_type or "application/octet-stream"),
+    )
 
 
 def _upload_json_to_gcs(data: dict, dest_uri: str) -> None:
     bucket_name, blob_name = _parse_gs_uri(dest_uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    blob.upload_from_string(
-        json.dumps(data, indent=2, sort_keys=True) + "\n",
-        content_type="application/json",
+    payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    _gcs_retry(
+        "upload_json",
+        dest_uri,
+        lambda: blob.upload_from_string(payload, content_type="application/json"),
     )
 
 
