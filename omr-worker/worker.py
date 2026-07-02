@@ -2029,6 +2029,46 @@ def _safe_error_text(exc: Exception | str, max_len: int = 220) -> str:
     return f"{txt[:max_len]}..."
 
 
+def _backend_error_payload(
+    code: str,
+    message: str,
+    *,
+    retryable: bool = False,
+    detail: Exception | str | None = None,
+    provider_status: int | None = None,
+) -> dict:
+    error = {
+        "code": str(code or "backend_internal_error"),
+        "message": str(message or "Backend request failed."),
+        "retryable": bool(retryable),
+    }
+    if detail is not None:
+        error["detail"] = _safe_error_text(detail)
+    if provider_status is not None:
+        error["provider_status"] = int(provider_status)
+    return error
+
+
+def _backend_error_response(
+    code: str,
+    message: str,
+    status_code: int,
+    *,
+    retryable: bool = False,
+    detail: Exception | str | None = None,
+    **fields,
+):
+    payload = dict(fields)
+    payload["error"] = _backend_error_payload(
+        code,
+        message,
+        retryable=retryable,
+        detail=detail,
+        provider_status=status_code,
+    )
+    return jsonify(payload), int(status_code)
+
+
 def _rejected_reason_counts(rejected: list[dict] | None) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rejected or []:
@@ -6241,33 +6281,30 @@ def process_stub():
 def upload_pdf():
     file_obj = request.files.get("file")
     if file_obj is None:
-        return jsonify({"error": "file is required"}), 400
+        return _backend_error_response("upload_invalid", "file is required", 400)
 
     filename = str(file_obj.filename or "").strip()
     content_type = str(file_obj.mimetype or file_obj.content_type or "").strip().lower()
     looks_pdf = filename.lower().endswith(".pdf") or content_type in ("application/pdf", "application/x-pdf")
     if not looks_pdf:
-        return jsonify({"error": "file must be a PDF"}), 400
+        return _backend_error_response("upload_invalid", "file must be a PDF", 400)
 
     try:
         raw = file_obj.read()
     except Exception as exc:
-        return jsonify({"error": f"failed to read upload: {_safe_error_text(exc)}"}), 400
+        return _backend_error_response("upload_invalid", "failed to read upload", 400, detail=exc)
 
     if not raw:
-        return jsonify({"error": "empty file"}), 400
+        return _backend_error_response("upload_invalid", "empty file", 400)
 
     max_bytes = _max_upload_bytes()
     if len(raw) > max_bytes:
-        return (
-            jsonify(
-                {
-                    "error": "file too large",
-                    "max_upload_mb": max(1, _safe_int(os.environ.get("MAX_UPLOAD_MB"), MAX_UPLOAD_MB)),
-                    "size_bytes": len(raw),
-                }
-            ),
+        return _backend_error_response(
+            "upload_invalid",
+            "file too large",
             413,
+            max_upload_mb=max(1, _safe_int(os.environ.get("MAX_UPLOAD_MB"), MAX_UPLOAD_MB)),
+            size_bytes=len(raw),
         )
 
     upload_id = uuid.uuid4().hex[:16]
@@ -6280,7 +6317,7 @@ def upload_pdf():
         try:
             _upload_file_to_gcs(tmp_pdf, pdf_gcs_uri, content_type="application/pdf")
         except Exception as exc:
-            return jsonify({"error": f"failed to upload pdf: {_safe_error_text(exc)}"}), 500
+            return _backend_error_response("upload_failed", "failed to upload pdf", 502, retryable=True, detail=exc)
 
     return (
         jsonify(
@@ -6300,9 +6337,9 @@ def create_job():
     data = request.json or {}
     pdf_gcs_uri = str(data.get("pdf_gcs_uri") or "").strip()
     if not pdf_gcs_uri:
-        return jsonify({"error": "pdf_gcs_uri is required"}), 400
+        return _backend_error_response("upload_invalid", "pdf_gcs_uri is required", 400)
     if not pdf_gcs_uri.startswith("gs://"):
-        return jsonify({"error": "pdf_gcs_uri must start with gs://"}), 400
+        return _backend_error_response("upload_invalid", "pdf_gcs_uri must start with gs://", 400)
 
     requested_job_id = str(data.get("job_id") or "").strip()
     if not requested_job_id:
@@ -6315,8 +6352,14 @@ def create_job():
         workflow_id_used = _dispatch_workflow(pdf_gcs_uri, artifact_key=artifact_key) or GITHUB_WORKFLOW_ID
         run_id = _discover_run_id(dispatched_at, expected_sha, workflow_id=workflow_id_used)
     except GitHubAPIError as exc:
-        return jsonify({"error": exc.message, "status_code": exc.status_code}), (
-            exc.status_code if 400 <= exc.status_code <= 599 else 500
+        status = exc.status_code if 400 <= exc.status_code <= 599 else 500
+        return _backend_error_response(
+            "job_create_failed",
+            exc.message,
+            status,
+            retryable=status in {408, 429, 500, 502, 503, 504},
+            detail=exc,
+            status_code=exc.status_code,
         )
 
     _pending_set(
@@ -6412,7 +6455,7 @@ def get_job(job_id: str):
     else:
         run_id, rec, _ = _resolve_run_id_from_job_id(job_id)
         if rec is None:
-            return jsonify({"error": f"unknown job_id: {job_id}"}), 404
+            return _backend_error_response("job_unknown", "unknown job_id", 404, detail=job_id, job_id=job_id)
         if run_id is None:
             return jsonify(
                 {
@@ -6428,8 +6471,14 @@ def get_job(job_id: str):
     try:
         run = _get_run(int(run_id))
     except GitHubAPIError as exc:
-        return jsonify({"error": exc.message, "status_code": exc.status_code}), (
-            exc.status_code if 400 <= exc.status_code <= 599 else 500
+        status = exc.status_code if 400 <= exc.status_code <= 599 else 500
+        return _backend_error_response(
+            "job_create_failed",
+            exc.message,
+            status,
+            retryable=status in {408, 429, 500, 502, 503, 504},
+            detail=exc,
+            status_code=exc.status_code,
         )
 
     response = {
@@ -6459,29 +6508,42 @@ def get_job(job_id: str):
 def get_job_state(job_id: str):
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     if err:
-        return jsonify({"error": err, "job_id": job_id}), 409
+        return _backend_error_response("job_not_ready", str(err), 409, retryable=True, detail=err, job_id=job_id)
     artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
 
     try:
         artifacts, mapping_summary, _ = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
     except StaleArtifactsError as exc:
-        return (
-            jsonify(
-                {
-                    "error": "requested job_id does not match single-latest artifacts",
-                    "job_id": job_id,
-                    "requested_run_id": exc.requested_run_id,
-                    "artifact_run_id": exc.artifact_run_id,
-                }
-            ),
+        return _backend_error_response(
+            "state_stale",
+            "requested job_id does not match single-latest artifacts",
             409,
+            detail="stale_run_mismatch",
+            job_id=job_id,
+            requested_run_id=exc.requested_run_id,
+            artifact_run_id=exc.artifact_run_id,
         )
     except Exception as exc:
-        return jsonify({"error": f"failed to load state: {exc}", "job_id": job_id, "run_id": run_id}), 502
+        return _backend_error_response(
+            "state_load_failed",
+            "failed to load state",
+            502,
+            retryable=True,
+            detail=exc,
+            job_id=job_id,
+            run_id=run_id,
+        )
 
     editable_state = mapping_summary.get("editable_state") or {}
     if not isinstance(editable_state, dict):
-        return jsonify({"error": "editable_state missing in mapping_summary", "job_id": job_id, "run_id": run_id}), 409
+        return _backend_error_response(
+            "state_missing",
+            "editable_state missing in mapping_summary",
+            409,
+            detail="editable_state_missing",
+            job_id=job_id,
+            run_id=run_id,
+        )
 
     systems = editable_state.get("systems")
     if not isinstance(systems, list):
@@ -6538,81 +6600,53 @@ def ai_suggest_job(job_id: str):
     started = time.time()
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     if err:
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": str(err),
-                        "retryable": True,
-                        "provider_status": 409,
-                        "detail": "state_load_failed",
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "ai_suggest_failed",
+            str(err),
             409,
+            retryable=True,
+            detail="state_load_failed",
+            job_id=job_id,
+            status="failed",
         )
 
     artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
     try:
         artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
     except StaleArtifactsError as exc:
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(exc.requested_run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": "requested job_id does not match single-latest artifacts",
-                        "retryable": True,
-                        "provider_status": 409,
-                        "detail": "stale_run_mismatch",
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "ai_suggest_failed",
+            "requested job_id does not match single-latest artifacts",
             409,
+            retryable=True,
+            detail="stale_run_mismatch",
+            job_id=job_id,
+            run_id=int(exc.requested_run_id),
+            status="failed",
         )
     except Exception as exc:
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": "failed to load state for AI suggestions",
-                        "retryable": True,
-                        "provider_status": 502,
-                        "detail": _safe_error_text(exc),
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "ai_suggest_failed",
+            "failed to load state for AI suggestions",
             502,
+            retryable=True,
+            detail=exc,
+            job_id=job_id,
+            run_id=int(run_id),
+            status="failed",
         )
 
     editable_state = mapping_summary.get("editable_state") or {}
     if not isinstance(editable_state, dict):
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": "editable_state missing in mapping_summary",
-                        "retryable": True,
-                        "provider_status": 409,
-                        "detail": "editable_state_missing",
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "ai_suggest_failed",
+            "editable_state missing in mapping_summary",
             409,
+            retryable=True,
+            detail="editable_state_missing",
+            job_id=job_id,
+            run_id=int(run_id),
+            status="failed",
         )
 
     request_payload = request.get_json(silent=True) or {}
@@ -6621,22 +6655,14 @@ def ai_suggest_job(job_id: str):
     raw_score_type = request_payload.get("score_type")
     score_type = _normalize_ai_score_type(raw_score_type)
     if raw_score_type is not None and score_type is None:
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "invalid_score_type",
-                        "message": "score_type must be single, grand, or score",
-                        "retryable": False,
-                        "provider_status": 400,
-                        "detail": "invalid_score_type",
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "invalid_score_type",
+            "score_type must be single, grand, or score",
             400,
+            detail="invalid_score_type",
+            job_id=job_id,
+            run_id=int(run_id),
+            status="failed",
         )
 
     systems = editable_state.get("systems")
@@ -6670,22 +6696,15 @@ def ai_suggest_job(job_id: str):
     try:
         _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
     except Exception as exc:
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(artifact_run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": "failed to initialize AI suggestion run",
-                        "retryable": True,
-                        "provider_status": 500,
-                        "detail": _safe_error_text(exc),
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "ai_suggest_failed",
+            "failed to initialize AI suggestion run",
             500,
+            retryable=True,
+            detail=exc,
+            job_id=job_id,
+            run_id=int(artifact_run_id),
+            status="failed",
         )
 
     if _ai_suggest_debug_enabled():
@@ -6726,81 +6745,53 @@ def ai_suggest_job_step(job_id: str):
     started = time.time()
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     if err:
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": str(err),
-                        "retryable": True,
-                        "provider_status": 409,
-                        "detail": "state_load_failed",
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "ai_suggest_failed",
+            str(err),
             409,
+            retryable=True,
+            detail="state_load_failed",
+            job_id=job_id,
+            status="failed",
         )
 
     artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
     try:
         artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
     except StaleArtifactsError as exc:
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(exc.requested_run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": "requested job_id does not match single-latest artifacts",
-                        "retryable": True,
-                        "provider_status": 409,
-                        "detail": "stale_run_mismatch",
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "ai_suggest_failed",
+            "requested job_id does not match single-latest artifacts",
             409,
+            retryable=True,
+            detail="stale_run_mismatch",
+            job_id=job_id,
+            run_id=int(exc.requested_run_id),
+            status="failed",
         )
     except Exception as exc:
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": "failed to load state for AI suggestions",
-                        "retryable": True,
-                        "provider_status": 502,
-                        "detail": _safe_error_text(exc),
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "ai_suggest_failed",
+            "failed to load state for AI suggestions",
             502,
+            retryable=True,
+            detail=exc,
+            job_id=job_id,
+            run_id=int(run_id),
+            status="failed",
         )
 
     editable_state = mapping_summary.get("editable_state") or {}
     if not isinstance(editable_state, dict):
-        return (
-            jsonify(
-                {
-                    "job_id": job_id,
-                    "run_id": int(run_id),
-                    "status": "failed",
-                    "error": {
-                        "code": "ai_suggest_failed",
-                        "message": "editable_state missing in mapping_summary",
-                        "retryable": True,
-                        "provider_status": 409,
-                        "detail": "editable_state_missing",
-                    },
-                }
-            ),
+        return _backend_error_response(
+            "ai_suggest_failed",
+            "editable_state missing in mapping_summary",
             409,
+            retryable=True,
+            detail="editable_state_missing",
+            job_id=job_id,
+            run_id=int(run_id),
+            status="failed",
         )
 
     systems = editable_state.get("systems")
@@ -7045,22 +7036,15 @@ def ai_suggest_job_step(job_id: str):
         try:
             _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
         except Exception as persist_exc:
-            return (
-                jsonify(
-                    {
-                        "job_id": job_id,
-                        "run_id": int(artifact_run_id),
-                        "status": "failed",
-                        "error": {
-                            "code": "ai_suggest_failed",
-                            "message": "failed to persist AI suggestion failure state",
-                            "retryable": True,
-                            "provider_status": 500,
-                            "detail": _safe_error_text(persist_exc),
-                        },
-                    }
-                ),
+            return _backend_error_response(
+                "ai_suggest_failed",
+                "failed to persist AI suggestion failure state",
                 500,
+                retryable=True,
+                detail=persist_exc,
+                job_id=job_id,
+                run_id=int(artifact_run_id),
+                status="failed",
             )
         response = {
             "job_id": job_id,
@@ -7102,7 +7086,16 @@ def relabel_job(job_id: str):
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=resolve_run "
             f"reason=state_load_failed detail={_safe_error_text(err)}"
         )
-        return jsonify({"error": err, "job_id": job_id, "trace_id": trace_id, "debug_result": "validation_error"}), 409
+        return _backend_error_response(
+            "state_load_failed",
+            str(err),
+            409,
+            retryable=True,
+            detail=err,
+            job_id=job_id,
+            trace_id=trace_id,
+            debug_result="validation_error",
+        )
 
     try:
         artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
@@ -7137,35 +7130,32 @@ def relabel_job(job_id: str):
                 f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=trace_persist "
                 f"reason=mapping_upload_failed detail={_safe_error_text(trace_exc)}"
             )
-        return (
-            jsonify(
-                {
-                    "error": "requested job_id does not match single-latest artifacts",
-                    "job_id": job_id,
-                    "requested_run_id": exc.requested_run_id,
-                    "artifact_run_id": exc.artifact_run_id,
-                    "trace_id": trace_id,
-                    "debug_result": "stale_conflict",
-                }
-            ),
+        return _backend_error_response(
+            "state_stale",
+            "requested job_id does not match single-latest artifacts",
             409,
+            detail="stale_run_mismatch",
+            job_id=job_id,
+            requested_run_id=exc.requested_run_id,
+            artifact_run_id=exc.artifact_run_id,
+            trace_id=trace_id,
+            debug_result="stale_conflict",
         )
     except Exception as exc:
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=load_artifacts "
             f"reason=state_load_failed detail={_safe_error_text(exc)}"
         )
-        return (
-            jsonify(
-                {
-                    "error": f"failed to load artifacts: {exc}",
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "trace_id": trace_id,
-                    "debug_result": "internal_error",
-                }
-            ),
+        return _backend_error_response(
+            "state_load_failed",
+            "failed to load artifacts",
             502,
+            retryable=True,
+            detail=exc,
+            job_id=job_id,
+            run_id=run_id,
+            trace_id=trace_id,
+            debug_result="internal_error",
         )
 
     mapping_uri = artifacts["mapping_summary"]
@@ -7197,17 +7187,15 @@ def relabel_job(job_id: str):
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=validate_state "
             "reason=editable_state_missing detail=editable_state missing in mapping_summary"
         )
-        return (
-            jsonify(
-                {
-                    "error": "editable_state missing in mapping_summary",
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "trace_id": trace_id,
-                    "debug_result": "validation_error",
-                }
-            ),
+        return _backend_error_response(
+            "state_missing",
+            "editable_state missing in mapping_summary",
             409,
+            detail="editable_state_missing",
+            job_id=job_id,
+            run_id=run_id,
+            trace_id=trace_id,
+            debug_result="validation_error",
         )
     labels_mode_before = str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY).strip().lower()
     if labels_mode_before not in LABELS_MODE_ALLOWED:
@@ -7246,16 +7234,14 @@ def relabel_job(job_id: str):
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=validate_payload "
             "reason=invalid_payload detail=edits array is required"
         )
-        return (
-            jsonify(
-                {
-                    "error": "edits array is required",
-                    "job_id": job_id,
-                    "trace_id": trace_id,
-                    "debug_result": "validation_error",
-                }
-            ),
+        return _backend_error_response(
+            "edit_invalid",
+            "edits array is required",
             400,
+            detail="invalid_payload",
+            job_id=job_id,
+            trace_id=trace_id,
+            debug_result="validation_error",
         )
 
     state_version_before = _editable_state_version(editable_state)
@@ -7329,17 +7315,16 @@ def relabel_job(job_id: str):
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=apply_edits "
             f"reason={reason} detail={_safe_error_text(exc)}"
         )
-        return (
-            jsonify(
-                {
-                    "error": str(exc),
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "trace_id": trace_id,
-                    "debug_result": "validation_error",
-                }
-            ),
+        code = "edit_unsupported" if "unsupported_edit_type" in str(exc) else "edit_invalid"
+        return _backend_error_response(
+            code,
+            str(exc),
             400,
+            detail=exc,
+            job_id=job_id,
+            run_id=run_id,
+            trace_id=trace_id,
+            debug_result="validation_error",
         )
     except Exception as exc:
         trace = {
@@ -7366,17 +7351,15 @@ def relabel_job(job_id: str):
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=apply_edits "
             f"reason=internal_error detail={_safe_error_text(exc)}"
         )
-        return (
-            jsonify(
-                {
-                    "error": f"failed to process edits: {exc}",
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "trace_id": trace_id,
-                    "debug_result": "internal_error",
-                }
-            ),
+        return _backend_error_response(
+            "relabel_failed",
+            "failed to process edits",
             500,
+            detail=exc,
+            job_id=job_id,
+            run_id=run_id,
+            trace_id=trace_id,
+            debug_result="internal_error",
         )
 
     redraw_ms = 0
@@ -7427,17 +7410,17 @@ def relabel_job(job_id: str):
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=render_pdf "
             f"reason={reason} detail={error_txt}"
         )
-        return (
-            jsonify(
-                {
-                    "error": f"failed to render corrected pdf: {exc}",
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "trace_id": trace_id,
-                    "debug_result": "render_error",
-                }
-            ),
+        error_code = "state_load_failed" if reason == "pdf_download_failed" else "pdf_render_failed"
+        return _backend_error_response(
+            error_code,
+            "failed to render corrected pdf",
             500,
+            retryable=True,
+            detail=exc,
+            job_id=job_id,
+            run_id=run_id,
+            trace_id=trace_id,
+            debug_result="render_error",
         )
 
     editable_state["systems"] = systems
@@ -7545,17 +7528,16 @@ def relabel_job(job_id: str):
         trace["reason"] = "invalid_payload"
 
     if not _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id):
-        return (
-            jsonify(
-                {
-                    "error": "failed to upload mapping_summary",
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "trace_id": trace_id,
-                    "debug_result": "upload_error",
-                }
-            ),
+        return _backend_error_response(
+            "artifact_upload_failed",
+            "failed to upload mapping_summary",
             500,
+            retryable=True,
+            detail="mapping_summary_upload_failed",
+            job_id=job_id,
+            run_id=run_id,
+            trace_id=trace_id,
+            debug_result="upload_error",
         )
 
     print(
@@ -7598,25 +7580,31 @@ def relabel_job(job_id: str):
 def dismiss_ai_suggestion(job_id: str, measure_id: str):
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     if err:
-        return jsonify({"error": err, "job_id": job_id}), 409
+        return _backend_error_response("state_load_failed", str(err), 409, retryable=True, detail=err, job_id=job_id)
     artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
 
     try:
         _, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
     except StaleArtifactsError as exc:
-        return (
-            jsonify(
-                {
-                    "error": "requested job_id does not match single-latest artifacts",
-                    "job_id": job_id,
-                    "requested_run_id": exc.requested_run_id,
-                    "artifact_run_id": exc.artifact_run_id,
-                }
-            ),
+        return _backend_error_response(
+            "state_stale",
+            "requested job_id does not match single-latest artifacts",
             409,
+            detail="stale_run_mismatch",
+            job_id=job_id,
+            requested_run_id=exc.requested_run_id,
+            artifact_run_id=exc.artifact_run_id,
         )
     except Exception as exc:
-        return jsonify({"error": f"failed to load state: {exc}", "job_id": job_id, "run_id": run_id}), 502
+        return _backend_error_response(
+            "state_load_failed",
+            "failed to load state",
+            502,
+            retryable=True,
+            detail=exc,
+            job_id=job_id,
+            run_id=run_id,
+        )
 
     ai_suggestions = _current_ai_suggestions(mapping_summary)
     target_measure_id = str(measure_id or "").strip()
@@ -7698,8 +7686,15 @@ def cleanup_job_artifacts(job_id: str):
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     if run_id is None:
         if rec is None:
-            return jsonify({"error": f"unknown job_id: {job_id}"}), 404
-        return jsonify({"error": err or "run_id is not available yet", "job_id": job_id}), 409
+            return _backend_error_response("job_unknown", "unknown job_id", 404, detail=job_id, job_id=job_id)
+        return _backend_error_response(
+            "job_not_ready",
+            err or "run_id is not available yet",
+            409,
+            retryable=True,
+            detail=err or "run_id_missing",
+            job_id=job_id,
+        )
 
     payload = request.json or {}
     delete_corrected_pdf = _safe_bool(payload.get("delete_corrected_pdf", True), True)

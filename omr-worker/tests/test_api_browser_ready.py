@@ -309,7 +309,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         WORKER.request = SimpleNamespace(path="/api/omr/uploads", method="POST", headers={}, files={}, json={})
         body, status = _unpack(WORKER.upload_pdf())
         self.assertEqual(status, 400)
-        self.assertEqual(body.get("error"), "file is required")
+        self.assertEqual(((body.get("error") or {}).get("code")), "upload_invalid")
+        self.assertEqual(((body.get("error") or {}).get("message")), "file is required")
+        self.assertFalse(((body.get("error") or {}).get("retryable")))
 
         WORKER.request = SimpleNamespace(
             path="/api/omr/uploads",
@@ -320,7 +322,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         body, status = _unpack(WORKER.upload_pdf())
         self.assertEqual(status, 400)
-        self.assertEqual(body.get("error"), "file must be a PDF")
+        self.assertEqual(((body.get("error") or {}).get("code")), "upload_invalid")
+        self.assertEqual(((body.get("error") or {}).get("message")), "file must be a PDF")
 
         with patch.object(WORKER, "_max_upload_bytes", return_value=10):
             WORKER.request = SimpleNamespace(
@@ -332,7 +335,9 @@ class BrowserReadyApiTests(unittest.TestCase):
             )
             body, status = _unpack(WORKER.upload_pdf())
         self.assertEqual(status, 413)
-        self.assertEqual(body.get("error"), "file too large")
+        self.assertEqual(((body.get("error") or {}).get("code")), "upload_invalid")
+        self.assertEqual(((body.get("error") or {}).get("message")), "file too large")
+        self.assertEqual(body.get("max_upload_mb"), 25)
 
         with patch.object(WORKER, "_upload_file_to_gcs", return_value=None):
             WORKER.request = SimpleNamespace(
@@ -346,6 +351,94 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertTrue(str(body.get("pdf_gcs_uri") or "").startswith("gs://"))
         self.assertGreater(int(body.get("size_bytes") or 0), 0)
+
+    def test_structured_backend_error_responses(self):
+        body, status = _unpack(
+            WORKER._backend_error_response(
+                "state_load_failed",
+                "failed to load state",
+                502,
+                retryable=True,
+                detail="x" * 300,
+                job_id="job-1",
+            )
+        )
+        self.assertEqual(status, 502)
+        self.assertEqual(body.get("job_id"), "job-1")
+        error = body.get("error") or {}
+        self.assertEqual(error.get("code"), "state_load_failed")
+        self.assertEqual(error.get("message"), "failed to load state")
+        self.assertTrue(error.get("retryable"))
+        self.assertEqual(error.get("provider_status"), 502)
+        self.assertLessEqual(len(str(error.get("detail") or "")), 223)
+
+    def test_get_job_unknown_returns_structured_error(self):
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/missing", method="GET", headers={}, files={}, json={})
+        with patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(None, None, "unknown job_id: missing")):
+            body, status = _unpack(WORKER.get_job("missing"))
+        self.assertEqual(status, 404)
+        self.assertEqual(((body.get("error") or {}).get("code")), "job_unknown")
+        self.assertEqual(((body.get("error") or {}).get("message")), "unknown job_id")
+
+    def test_state_load_failure_returns_structured_error(self):
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/state", method="GET", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_job_artifact_key", return_value="key"),
+            patch.object(WORKER, "_load_mapping_for_run", side_effect=RuntimeError("temporary storage issue")),
+        ):
+            body, status = _unpack(WORKER.get_job_state("111"))
+        self.assertEqual(status, 502)
+        self.assertEqual(((body.get("error") or {}).get("code")), "state_load_failed")
+        self.assertTrue(((body.get("error") or {}).get("retryable")))
+
+    def test_state_missing_editable_state_returns_structured_error(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = {"editable_state": "bad"}
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/state", method="GET", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_job_artifact_key", return_value="key"),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+        ):
+            body, status = _unpack(WORKER.get_job_state("111"))
+        self.assertEqual(status, 409)
+        self.assertEqual(((body.get("error") or {}).get("code")), "state_missing")
+        self.assertEqual(((body.get("error") or {}).get("detail")), "editable_state_missing")
+
+    def test_relabel_unsupported_edit_error_is_structured(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={"edits": [{"type": "unknown"}]},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_apply_relabel_edits", side_effect=ValueError("unsupported_edit_type")),
+            patch.object(WORKER, "_persist_relabel_trace", return_value=True),
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+        self.assertEqual(status, 400)
+        self.assertEqual(((body.get("error") or {}).get("code")), "edit_unsupported")
+        self.assertEqual(body.get("debug_result"), "validation_error")
+
+    def test_ai_suggest_state_load_error_is_structured(self):
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_job_artifact_key", return_value="key"),
+            patch.object(WORKER, "_load_mapping_for_run", side_effect=RuntimeError("state missing")),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+        self.assertEqual(status, 502)
+        self.assertEqual(((body.get("error") or {}).get("code")), "ai_suggest_failed")
+        self.assertEqual(((body.get("error") or {}).get("message")), "failed to load state for AI suggestions")
+        self.assertTrue(((body.get("error") or {}).get("retryable")))
 
     def test_artifacts_http_present_on_responses(self):
         artifacts = self._sample_artifacts()
