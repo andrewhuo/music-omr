@@ -562,6 +562,124 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertFalse(error.get("retryable"))
         self.assertEqual(body.get("stage"), "github_ref_lookup")
 
+    def test_create_job_rejects_invalid_gcs_uri_before_github(self):
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs",
+            method="POST",
+            headers={},
+            files={},
+            json={"pdf_gcs_uri": "gs://bucket"},
+        )
+        with patch.object(WORKER, "_get_ref_sha") as ref_mock:
+            body, status = _unpack(WORKER.create_job())
+
+        self.assertEqual(status, 400)
+        self.assertEqual(((body.get("error") or {}).get("code")), "upload_invalid")
+        ref_mock.assert_not_called()
+
+    def test_create_job_conflicting_job_id_gets_fresh_id(self):
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs",
+            method="POST",
+            headers={},
+            files={},
+            json={"pdf_gcs_uri": "gs://bucket/input.pdf", "job_id": "same-job"},
+        )
+
+        def fake_store_get(job_id):
+            return {"job_id": job_id} if job_id == "same-job" else None
+
+        with (
+            patch.object(WORKER, "_job_store_get", side_effect=fake_store_get),
+            patch.object(WORKER, "_get_ref_sha", return_value="abc"),
+            patch.object(WORKER, "_dispatch_workflow", return_value="worker.yml"),
+            patch.object(WORKER, "_discover_run_id", return_value=None),
+            patch.object(WORKER, "_job_store_upsert", return_value=None),
+        ):
+            body, status = _unpack(WORKER.create_job())
+
+        self.assertEqual(status, 202)
+        self.assertEqual(body.get("job_id"), "same-job-2")
+        self.assertEqual(body.get("run_id"), None)
+        self.assertIn("same-job-2", WORKER._PENDING_DISPATCHES)
+
+    def test_job_store_upsert_retries_temporary_failure_then_succeeds(self):
+        calls = []
+
+        class _Doc:
+            def set(self, data, merge=False):
+                calls.append((data, merge))
+                if len(calls) < 3:
+                    raise WORKER.GitHubAPIError(503, "service unavailable")
+
+        class _Collection:
+            def document(self, _job_id):
+                return _Doc()
+
+        class _Client:
+            def collection(self, _name):
+                return _Collection()
+
+        with (
+            patch.object(WORKER, "_job_store_client", return_value=_Client()),
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            warning = WORKER._job_store_upsert("job-1", {"status": "queued"})
+
+        self.assertIsNone(warning)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_create_job_returns_warning_when_job_store_save_fails(self):
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs",
+            method="POST",
+            headers={},
+            files={},
+            json={"pdf_gcs_uri": "gs://bucket/input.pdf"},
+        )
+        with (
+            patch.object(WORKER, "_get_ref_sha", return_value="abc"),
+            patch.object(WORKER, "_dispatch_workflow", return_value="worker.yml"),
+            patch.object(WORKER, "_discover_run_id", return_value=None),
+            patch.object(
+                WORKER,
+                "_job_store_upsert",
+                return_value={
+                    "code": "job_store_save_failed",
+                    "message": "job started but durable job-store save failed",
+                    "retryable": True,
+                    "detail": "service unavailable",
+                },
+            ),
+        ):
+            body, status = _unpack(WORKER.create_job())
+
+        self.assertEqual(status, 202)
+        self.assertEqual(body.get("run_id"), None)
+        self.assertEqual(((body.get("warning") or {}).get("code")), "job_store_save_failed")
+        self.assertIn(body.get("job_id"), WORKER._PENDING_DISPATCHES)
+
+    def test_pending_job_later_resolves_to_run_id(self):
+        now = WORKER._utc_now()
+        WORKER._PENDING_DISPATCHES["pending-job"] = {
+            "dispatch_id": "pending-job",
+            "dispatched_at": now,
+            "expected_sha": "abc",
+            "run_id": None,
+            "workflow_id": "worker.yml",
+        }
+        with (
+            patch.object(WORKER, "_discover_run_id", return_value=12345) as discover_mock,
+            patch.object(WORKER, "_job_store_upsert", return_value=None) as upsert_mock,
+        ):
+            run_id, rec = WORKER._ensure_run_id_for_pending("pending-job")
+
+        self.assertEqual(run_id, 12345)
+        self.assertEqual((rec or {}).get("run_id"), 12345)
+        discover_mock.assert_called_once()
+        upsert_mock.assert_called_once()
+
     def test_routes_preserve_typed_state_load_error(self):
         err = WORKER.StateLoadError(
             "state_missing",

@@ -736,17 +736,79 @@ def _job_store_client():
     return _JOB_STORE_CLIENT
 
 
-def _job_store_upsert(job_id: str, payload: dict) -> None:
+def _is_job_store_retryable_error(exc: Exception) -> bool:
+    status = _gcs_error_status(exc)
+    if status in {408, 429, 500, 502, 503, 504}:
+        return True
+    if status in {400, 401, 403, 404}:
+        return False
+    detail = _safe_error_text(exc).lower()
+    permanent_markers = (
+        "permission denied",
+        "forbidden",
+        "unauthorized",
+        "invalid",
+        "not found",
+    )
+    if any(marker in detail for marker in permanent_markers):
+        return False
+    temporary_markers = (
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "temporarily unavailable",
+        "service unavailable",
+        "too many requests",
+        "rate limit",
+    )
+    return any(marker in detail for marker in temporary_markers)
+
+
+def _job_store_retry(operation: str, job_id: str, fn):
+    delays = tuple(float(delay) for delay in GCS_RETRY_DELAYS_SEC if float(delay) > 0)
+    total_attempts = 1 + len(delays)
+    attempt = 1
+    while True:
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_job_store_retryable_error(exc) or attempt >= total_attempts:
+                raise
+            delay_sec = delays[attempt - 1]
+            delay_txt = str(int(delay_sec) if delay_sec.is_integer() else delay_sec)
+            reason = _gcs_error_status(exc) or _safe_error_text(exc)
+            print(
+                f"JOB_STORE_RETRY operation={operation} attempt={attempt + 1}/{total_attempts} "
+                f"delay={delay_txt} job_id={job_id} reason={reason}"
+            )
+            time.sleep(delay_sec)
+            attempt += 1
+
+
+def _job_store_upsert(job_id: str, payload: dict) -> dict | None:
     client = _job_store_client()
     if client is None:
-        return
+        return None
     data = dict(payload or {})
     data["job_id"] = str(job_id)
     data["updated_at_utc"] = _to_utc_z(_utc_now())
     try:
-        client.collection(JOB_STORE_COLLECTION).document(str(job_id)).set(data, merge=True)
+        _job_store_retry(
+            "upsert",
+            str(job_id),
+            lambda: client.collection(JOB_STORE_COLLECTION).document(str(job_id)).set(data, merge=True),
+        )
+        return None
     except Exception as exc:
         print(f"JOB_STORE_UPSERT_WARN job_id={job_id} detail={_safe_error_text(exc)}")
+        return {
+            "code": "job_store_save_failed",
+            "message": "job started but durable job-store save failed",
+            "retryable": _is_job_store_retryable_error(exc),
+            "detail": _safe_error_text(exc),
+        }
 
 
 def _job_store_get(job_id: str) -> dict | None:
@@ -754,7 +816,11 @@ def _job_store_get(job_id: str) -> dict | None:
     if client is None:
         return None
     try:
-        snap = client.collection(JOB_STORE_COLLECTION).document(str(job_id)).get()
+        snap = _job_store_retry(
+            "get",
+            str(job_id),
+            lambda: client.collection(JOB_STORE_COLLECTION).document(str(job_id)).get(),
+        )
         if not bool(getattr(snap, "exists", False)):
             return None
         data = snap.to_dict()
@@ -6576,6 +6642,10 @@ def create_job():
         return _backend_error_response("upload_invalid", "pdf_gcs_uri is required", 400)
     if not pdf_gcs_uri.startswith("gs://"):
         return _backend_error_response("upload_invalid", "pdf_gcs_uri must start with gs://", 400)
+    try:
+        _parse_gs_uri(pdf_gcs_uri)
+    except ValueError as exc:
+        return _backend_error_response("upload_invalid", "invalid pdf_gcs_uri", 400, detail=exc)
 
     requested_job_id = str(data.get("job_id") or "").strip()
     if not requested_job_id:
@@ -6612,7 +6682,7 @@ def create_job():
             "workflow_id": workflow_id_used,
         },
     )
-    _job_store_upsert(
+    job_store_warning = _job_store_upsert(
         dispatch_id,
         {
             "created_at_utc": _to_utc_z(dispatched_at),
@@ -6643,6 +6713,8 @@ def create_job():
         response["artifacts"] = artifacts
         response["artifacts_http"] = _artifact_http_uris_for_run(int(run_id), artifacts)
         response["storage_mode"] = _storage_mode_for_artifacts(artifacts)
+    if job_store_warning:
+        response["warning"] = job_store_warning
 
     return jsonify(response), 202
 
