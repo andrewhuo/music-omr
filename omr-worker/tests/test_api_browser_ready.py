@@ -440,6 +440,128 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(((body.get("error") or {}).get("message")), "failed to load state for AI suggestions")
         self.assertTrue(((body.get("error") or {}).get("retryable")))
 
+    def test_github_dispatch_retries_temporary_errors_then_succeeds(self):
+        calls = []
+
+        def fake_request(method, path, payload=None, query=None):
+            calls.append((method, path))
+            if len(calls) < 3:
+                raise WORKER.GitHubAPIError(503, "service unavailable")
+            return None
+
+        with (
+            patch.object(WORKER, "_workflow_id_candidates", return_value=["worker.yml"]),
+            patch.object(WORKER, "_gh_request", side_effect=fake_request),
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            used = WORKER._dispatch_workflow("gs://bucket/input.pdf", artifact_key="job-1")
+
+        self.assertEqual(used, "worker.yml")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_github_run_lookup_retries_502_then_succeeds(self):
+        with (
+            patch.object(
+                WORKER,
+                "_gh_request",
+                side_effect=[
+                    WORKER.GitHubAPIError(502, "GitHub API unreachable"),
+                    {"id": 111, "status": "completed", "conclusion": "success"},
+                ],
+            ) as request_mock,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            run = WORKER._get_run(111)
+
+        self.assertEqual(run.get("id"), 111)
+        self.assertEqual(request_mock.call_count, 2)
+        self.assertEqual(sleep_mock.call_count, 1)
+
+    def test_github_ref_lookup_retries_429_then_succeeds(self):
+        with (
+            patch.object(
+                WORKER,
+                "_gh_request",
+                side_effect=[
+                    WORKER.GitHubAPIError(429, "rate limit"),
+                    {"sha": "abc123"},
+                ],
+            ) as request_mock,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            sha = WORKER._get_ref_sha("main")
+
+        self.assertEqual(sha, "abc123")
+        self.assertEqual(request_mock.call_count, 2)
+        self.assertEqual(sleep_mock.call_count, 1)
+
+    def test_github_retry_does_not_retry_permanent_errors(self):
+        with (
+            patch.object(WORKER, "_gh_request", side_effect=WORKER.GitHubAPIError(401, "Bad credentials")) as request_mock,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            with self.assertRaises(WORKER.GitHubAPIError):
+                WORKER._get_ref_sha("main")
+
+        self.assertEqual(request_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
+        with (
+            patch.object(WORKER, "_workflow_id_candidates", return_value=["missing.yml"]),
+            patch.object(WORKER, "_gh_request", side_effect=WORKER.GitHubAPIError(404, "Not Found")) as request_mock,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            with self.assertRaises(WORKER.GitHubAPIError):
+                WORKER._dispatch_workflow("gs://bucket/input.pdf")
+
+        self.assertEqual(request_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
+    def test_create_job_github_failure_includes_stage(self):
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs",
+            method="POST",
+            headers={},
+            files={},
+            json={"pdf_gcs_uri": "gs://bucket/input.pdf"},
+        )
+        with (
+            patch.object(WORKER, "_gh_request", side_effect=WORKER.GitHubAPIError(503, "GitHub API unavailable")) as request_mock,
+            patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
+        ):
+            body, status = _unpack(WORKER.create_job())
+
+        self.assertEqual(status, 503)
+        error = body.get("error") or {}
+        self.assertEqual(error.get("code"), "job_create_failed")
+        self.assertTrue(error.get("retryable"))
+        self.assertEqual(body.get("stage"), "github_ref_lookup")
+        self.assertIn("github_ref_lookup", str(error.get("detail") or ""))
+        self.assertEqual(request_mock.call_count, 4)
+        self.assertEqual(sleep_mock.call_count, 3)
+
+    def test_create_job_bad_github_config_is_not_retryable(self):
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs",
+            method="POST",
+            headers={},
+            files={},
+            json={"pdf_gcs_uri": "gs://bucket/input.pdf"},
+        )
+        with patch.object(
+            WORKER,
+            "_get_ref_sha",
+            side_effect=WORKER.GitHubAPIError(500, "GITHUB_TOKEN is not configured", stage="github_ref_lookup"),
+        ):
+            body, status = _unpack(WORKER.create_job())
+
+        self.assertEqual(status, 500)
+        error = body.get("error") or {}
+        self.assertEqual(error.get("code"), "job_create_failed")
+        self.assertFalse(error.get("retryable"))
+        self.assertEqual(body.get("stage"), "github_ref_lookup")
+
     def test_routes_preserve_typed_state_load_error(self):
         err = WORKER.StateLoadError(
             "state_missing",

@@ -146,6 +146,7 @@ AI_SUGGESTION_DEBUG_NOTE_VALUE_ALLOWED = {"quarter", "half", "whole", "eighth", 
 AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
 BEDROCK_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
 GCS_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
+GITHUB_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
 AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
 AI_OLD_STYLE_REFERENCE_EXAMPLES = (
     {
@@ -167,10 +168,11 @@ _JOB_STORE_CLIENT = None
 
 
 class GitHubAPIError(RuntimeError):
-    def __init__(self, status_code: int, message: str):
+    def __init__(self, status_code: int, message: str, *, stage: str = ""):
         super().__init__(message)
         self.status_code = int(status_code)
         self.message = str(message)
+        self.stage = str(stage or "")
 
 
 class StateLoadError(RuntimeError):
@@ -344,6 +346,59 @@ def _gh_headers() -> dict[str, str]:
     }
 
 
+def _is_github_retryable_error(exc: GitHubAPIError) -> bool:
+    status = int(getattr(exc, "status_code", 0) or 0)
+    detail = _safe_error_text(getattr(exc, "message", exc)).lower()
+    permanent_markers = (
+        "bad credentials",
+        "not found",
+        "workflow does not have",
+        "not configured",
+        "permission",
+        "forbidden",
+        "unauthorized",
+    )
+    if any(marker in detail for marker in permanent_markers):
+        return False
+    if status in {408, 429, 500, 502, 503, 504}:
+        return True
+    if status in {400, 401, 403, 404, 422}:
+        return False
+    temporary_markers = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "rate limit",
+    )
+    return any(marker in detail for marker in temporary_markers)
+
+
+def _github_retry(stage: str, fn):
+    delays = tuple(float(delay) for delay in GITHUB_RETRY_DELAYS_SEC if float(delay) > 0)
+    total_attempts = 1 + len(delays)
+    attempt = 1
+    while True:
+        try:
+            return fn()
+        except GitHubAPIError as exc:
+            if not getattr(exc, "stage", ""):
+                exc.stage = str(stage or "")
+            if not _is_github_retryable_error(exc) or attempt >= total_attempts:
+                raise
+            delay_sec = delays[attempt - 1]
+            delay_txt = str(int(delay_sec) if delay_sec.is_integer() else delay_sec)
+            print(
+                f"GITHUB_RETRY stage={stage} attempt={attempt + 1}/{total_attempts} "
+                f"delay={delay_txt} status={exc.status_code} reason={_safe_error_text(exc.message)}"
+            )
+            time.sleep(delay_sec)
+            attempt += 1
+
+
 def _gh_request(method: str, path: str, payload: dict | None = None, query: dict | None = None) -> dict | None:
     url = f"{GITHUB_API_BASE}{path}"
     if query:
@@ -369,9 +424,12 @@ def _gh_request(method: str, path: str, payload: dict | None = None, query: dict
 
 
 def _get_ref_sha(ref_name: str) -> str | None:
-    data = _gh_request(
-        "GET",
-        f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits/{urlparse.quote(ref_name, safe='')}",
+    data = _github_retry(
+        "github_ref_lookup",
+        lambda: _gh_request(
+            "GET",
+            f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits/{urlparse.quote(ref_name, safe='')}",
+        ),
     )
     if not isinstance(data, dict):
         return None
@@ -396,10 +454,13 @@ def _workflow_id_candidates(primary: str) -> list[str]:
         _add(f".github/workflows/{base}")
 
     try:
-        payload = _gh_request(
-            "GET",
-            f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows",
-            query={"per_page": 100},
+        payload = _github_retry(
+            "workflow_discovery",
+            lambda: _gh_request(
+                "GET",
+                f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows",
+                query={"per_page": 100},
+            ),
         )
         workflows = payload.get("workflows") if isinstance(payload, dict) else None
         if isinstance(workflows, list):
@@ -430,13 +491,16 @@ def _dispatch_workflow(pdf_gcs_uri: str, artifact_key: str | None = None) -> str
     last_exc: GitHubAPIError | None = None
     for workflow_id in _workflow_id_candidates(GITHUB_WORKFLOW_ID):
         try:
-            _gh_request(
-                "POST",
-                f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{urlparse.quote(workflow_id, safe='')}/dispatches",
-                payload={
-                    "ref": GITHUB_REF,
-                    "inputs": inputs,
-                },
+            _github_retry(
+                "workflow_dispatch",
+                lambda workflow_id=workflow_id: _gh_request(
+                    "POST",
+                    f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{urlparse.quote(workflow_id, safe='')}/dispatches",
+                    payload={
+                        "ref": GITHUB_REF,
+                        "inputs": inputs,
+                    },
+                ),
             )
             if workflow_id != GITHUB_WORKFLOW_ID:
                 print(f"WORKFLOW_DISPATCH_FALLBACK configured={GITHUB_WORKFLOW_ID} used={workflow_id}")
@@ -454,14 +518,17 @@ def _dispatch_workflow(pdf_gcs_uri: str, artifact_key: str | None = None) -> str
 
 def _list_workflow_dispatch_runs(limit: int = 30, workflow_id: str | None = None) -> list[dict]:
     selector = str(workflow_id or GITHUB_WORKFLOW_ID).strip() or GITHUB_WORKFLOW_ID
-    data = _gh_request(
-        "GET",
-        f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{urlparse.quote(selector, safe='')}/runs",
-        query={
-            "event": "workflow_dispatch",
-            "branch": GITHUB_REF,
-            "per_page": int(limit),
-        },
+    data = _github_retry(
+        "run_discovery",
+        lambda: _gh_request(
+            "GET",
+            f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{urlparse.quote(selector, safe='')}/runs",
+            query={
+                "event": "workflow_dispatch",
+                "branch": GITHUB_REF,
+                "per_page": int(limit),
+            },
+        ),
     )
     if not isinstance(data, dict):
         return []
@@ -2226,6 +2293,12 @@ def _state_load_error_response(exc: StateLoadError, **fields):
         detail=exc.detail or exc.message,
         **payload_fields,
     )
+
+
+def _github_error_detail(exc: GitHubAPIError, fallback_stage: str) -> str:
+    stage = str(getattr(exc, "stage", "") or fallback_stage or "github").strip()
+    detail = _safe_error_text(getattr(exc, "message", exc))
+    return f"{stage}: {detail}" if detail else stage
 
 
 def _rejected_reason_counts(rejected: list[dict] | None) -> dict[str, int]:
@@ -4632,9 +4705,12 @@ def _run_public_status(run: dict) -> str:
 
 
 def _get_run(run_id: int) -> dict:
-    data = _gh_request(
-        "GET",
-        f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{int(run_id)}",
+    data = _github_retry(
+        "run_status_lookup",
+        lambda: _gh_request(
+            "GET",
+            f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{int(run_id)}",
+        ),
     )
     if not isinstance(data, dict):
         raise GitHubAPIError(502, "GitHub run response was not an object")
@@ -6512,13 +6588,15 @@ def create_job():
         run_id = _discover_run_id(dispatched_at, expected_sha, workflow_id=workflow_id_used)
     except GitHubAPIError as exc:
         status = exc.status_code if 400 <= exc.status_code <= 599 else 500
+        stage = str(getattr(exc, "stage", "") or "job_create_failed")
         return _backend_error_response(
             "job_create_failed",
             exc.message,
             status,
-            retryable=status in {408, 429, 500, 502, 503, 504},
-            detail=exc,
-            status_code=exc.status_code,
+            retryable=_is_github_retryable_error(exc),
+            detail=_github_error_detail(exc, stage),
+            stage=stage,
+            github_status_code=exc.status_code,
         )
 
     _pending_set(
@@ -6631,13 +6709,15 @@ def get_job(job_id: str):
         run = _get_run(int(run_id))
     except GitHubAPIError as exc:
         status = exc.status_code if 400 <= exc.status_code <= 599 else 500
+        stage = str(getattr(exc, "stage", "") or "run_status_lookup")
         return _backend_error_response(
-            "job_create_failed",
+            "job_status_failed",
             exc.message,
             status,
-            retryable=status in {408, 429, 500, 502, 503, 504},
-            detail=exc,
-            status_code=exc.status_code,
+            retryable=_is_github_retryable_error(exc),
+            detail=_github_error_detail(exc, stage),
+            stage=stage,
+            github_status_code=exc.status_code,
         )
 
     response = {
