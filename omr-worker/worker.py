@@ -111,6 +111,7 @@ AI_SUGGEST_RUN_STATUS_IDLE = "idle"
 AI_SUGGEST_RUN_STATUS_RUNNING = "running"
 AI_SUGGEST_RUN_STATUS_COMPLETED = "completed"
 AI_SUGGEST_RUN_STATUS_FAILED = "failed"
+AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED = "partial_failed"
 AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
@@ -2512,6 +2513,7 @@ def _current_ai_suggest_run(
         AI_SUGGEST_RUN_STATUS_RUNNING,
         AI_SUGGEST_RUN_STATUS_COMPLETED,
         AI_SUGGEST_RUN_STATUS_FAILED,
+        AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED,
     }:
         status = AI_SUGGEST_RUN_STATUS_IDLE
     remembered_time_signature = _normalize_ai_time_signature_value(row.get("remembered_time_signature"))
@@ -3031,15 +3033,39 @@ def _normalize_ai_suggestions_result(
 
     for row in raw_suggestions:
         if not isinstance(row, dict):
-            raise AiSuggestError(detail="malformed_response: suggestion entry must be an object")
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    fallback_measure_row,
+                    "Dropped malformed suggestion row because it was not an object.",
+                )
+            )
+            continue
 
         measure_id = str(row.get("measure_id") or "").strip()
         if not measure_id:
-            raise AiSuggestError(detail="malformed_response: suggestion missing measure_id")
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    fallback_measure_row,
+                    "Dropped malformed suggestion row because measure_id was missing.",
+                )
+            )
+            continue
         if measure_id not in expected_measure_ids:
-            raise AiSuggestError(detail=f"malformed_response: unknown measure_id {measure_id}")
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    fallback_measure_row,
+                    f"Dropped suggestion with unknown measure_id {measure_id}.",
+                )
+            )
+            continue
         if measure_id in seen_measure_ids:
-            raise AiSuggestError(detail=f"malformed_response: duplicate measure_id {measure_id}")
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_rows_by_id.get(measure_id) or fallback_measure_row,
+                    f"Dropped duplicate suggestion for {measure_id}.",
+                )
+            )
+            continue
         seen_measure_ids.add(measure_id)
 
         label = str(row.get("label") or "").strip()
@@ -3238,12 +3264,20 @@ def _normalize_ai_suggestions_result(
     if seen_measure_ids != expected_measure_ids:
         missing = sorted(expected_measure_ids - seen_measure_ids)
         extra = sorted(seen_measure_ids - expected_measure_ids)
-        detail_bits = []
         if missing:
-            detail_bits.append(f"missing_measure_ids={','.join(missing[:10])}")
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    fallback_measure_row,
+                    f"AI response omitted expected measures: {','.join(missing[:10])}.",
+                )
+            )
         if extra:
-            detail_bits.append(f"unexpected_measure_ids={','.join(extra[:10])}")
-        raise AiSuggestError(detail=f"malformed_response: incomplete suggestions {' '.join(detail_bits).strip()}".strip())
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    fallback_measure_row,
+                    f"AI response included unexpected measures: {','.join(extra[:10])}.",
+                )
+            )
 
     provider = str(raw_result.get("provider") or _requested_ai_provider_name()).strip() or _requested_ai_provider_name()
     model = _requested_ai_model_name()
@@ -4549,20 +4583,6 @@ def _generate_ai_suggestions_for_system_batch(
             system_suggestions = parsed.get("suggestions")
             if not isinstance(system_suggestions, list):
                 raise AiSuggestError(detail=f"malformed_response: suggestions missing for {system_row.get('system_id')}")
-            expected_ids = {str(row.get("measure_id") or "").strip() for row in system_measures}
-            seen_ids: set[str] = set()
-            for row in system_suggestions:
-                if not isinstance(row, dict):
-                    raise AiSuggestError(detail=f"malformed_response: suggestion entry must be object for {system_row.get('system_id')}")
-                measure_id = str(row.get("measure_id") or "").strip()
-                if measure_id not in expected_ids:
-                    raise AiSuggestError(detail=f"malformed_response: unknown measure_id {measure_id} for {system_row.get('system_id')}")
-                if measure_id in seen_ids:
-                    raise AiSuggestError(detail=f"malformed_response: duplicate measure_id {measure_id} for {system_row.get('system_id')}")
-                seen_ids.add(measure_id)
-            if seen_ids != expected_ids:
-                missing = sorted(expected_ids - seen_ids)
-                raise AiSuggestError(detail=f"malformed_response: missing_measure_ids={','.join(missing[:10])} for {system_row.get('system_id')}")
 
             normalized = _normalize_ai_suggestions_result(
                 parsed,
@@ -7109,9 +7129,11 @@ def ai_suggest_job_step(job_id: str):
             response["debug_batch_trace"] = debug_batch_trace
         return jsonify(response), 409
 
-    if ai_suggest_run.get("source_state_version") and ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_RUNNING:
+    if ai_suggest_run.get("source_state_version") and ai_suggest_run.get("status") in {AI_SUGGEST_RUN_STATUS_RUNNING, AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED}:
         if str(ai_suggest_run.get("source_state_version") or "") != str(source_state_version or ""):
             now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+            completed_count = max(0, _safe_int(ai_suggest_run.get("systems_completed"), 0))
+            stopped_status = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED if completed_count > 0 else AI_SUGGEST_RUN_STATUS_FAILED
             error_payload = {
                 "code": "ai_suggest_failed",
                 "message": "AI suggestion source state changed during generation.",
@@ -7119,7 +7141,7 @@ def ai_suggest_job_step(job_id: str):
                 "provider_status": 409,
                 "detail": "source_state_version_mismatch",
             }
-            ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_FAILED
+            ai_suggest_run["status"] = stopped_status
             ai_suggest_run["updated_at_utc"] = now_txt
             ai_suggest_run["failed_at_utc"] = now_txt
             ai_suggest_run["last_error"] = error_payload
@@ -7130,7 +7152,7 @@ def ai_suggest_job_step(job_id: str):
                     {
                         "job_id": job_id,
                         "run_id": int(artifact_run_id),
-                        "status": AI_SUGGEST_RUN_STATUS_FAILED,
+                        "status": stopped_status,
                         "ai_suggestions": ai_suggestions,
                         "ai_suggest_run": ai_suggest_run,
                         "error": error_payload,
@@ -7279,7 +7301,9 @@ def ai_suggest_job_step(job_id: str):
     except Exception as exc:
         error_payload = _ai_suggest_error_payload(exc)
         now_txt = _utc_now().isoformat().replace("+00:00", "Z")
-        ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_FAILED
+        completed_count = max(0, _safe_int(ai_suggest_run.get("systems_completed"), 0))
+        stopped_status = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED if completed_count > 0 else AI_SUGGEST_RUN_STATUS_FAILED
+        ai_suggest_run["status"] = stopped_status
         ai_suggest_run["updated_at_utc"] = now_txt
         ai_suggest_run["failed_at_utc"] = now_txt
         ai_suggest_run["last_error"] = error_payload
@@ -7301,7 +7325,7 @@ def ai_suggest_job_step(job_id: str):
         response = {
             "job_id": job_id,
             "run_id": int(artifact_run_id),
-            "status": AI_SUGGEST_RUN_STATUS_FAILED,
+            "status": stopped_status,
             "ai_suggestions": ai_suggestions,
             "ai_suggest_run": ai_suggest_run,
             "error": error_payload,
