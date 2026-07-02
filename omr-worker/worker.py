@@ -8,6 +8,7 @@ import threading
 import uuid
 import hashlib
 import base64
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
@@ -7250,6 +7251,7 @@ def relabel_job(job_id: str):
     started = time.time()
     payload = request.json or {}
     edits = payload.get("edits")
+    requested_state_version = str(payload.get("state_version") or "").strip()
     edits_requested_count = len(edits) if isinstance(edits, list) else 0
 
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
@@ -7277,7 +7279,8 @@ def relabel_job(job_id: str):
         )
 
     try:
-        artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
+        artifacts, loaded_mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
+        mapping_summary = deepcopy(loaded_mapping_summary)
         editable_state = _editable_state_or_raise(mapping_summary)
     except StaleArtifactsError as exc:
         trace = {
@@ -7365,6 +7368,46 @@ def relabel_job(job_id: str):
     if reassign_count > 0:
         print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
 
+    state_version_before = _editable_state_version(editable_state)
+    if requested_state_version and requested_state_version != state_version_before:
+        trace = {
+            "trace_id": trace_id,
+            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "requested_run_id": int(run_id),
+            "artifact_run_id": int(artifact_run_id),
+            "state_version_before": state_version_before,
+            "requested_state_version": requested_state_version,
+            "edits_requested_count": edits_requested_count,
+            "applied_count": 0,
+            "rejected_count": 0,
+            "rejected_reason_counts": {"state_version_mismatch": 1},
+            "updated_system_ids_count": 0,
+            "labels_redrawn_count": 0,
+            "duration_ms": int((time.time() - started) * 1000),
+            "redraw_duration_ms": 0,
+            "result": "stale_conflict",
+            "reason": "state_version_mismatch",
+            "error_detail": "request state_version does not match current state",
+        }
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=validate_state_version "
+            "reason=state_version_mismatch detail=request state_version does not match current state"
+        )
+        return _backend_error_response(
+            "state_stale",
+            "state changed; reload before saving edits",
+            409,
+            retryable=False,
+            detail="state_version_mismatch",
+            job_id=job_id,
+            run_id=run_id,
+            trace_id=trace_id,
+            debug_result="stale_conflict",
+            state_version_before=state_version_before,
+            requested_state_version=requested_state_version,
+        )
+
     if not isinstance(edits, list) or len(edits) == 0:
         trace = {
             "trace_id": trace_id,
@@ -7385,7 +7428,6 @@ def relabel_job(job_id: str):
             "reason": "invalid_payload",
             "error_detail": "edits array is required",
         }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=validate_payload "
             "reason=invalid_payload detail=edits array is required"
@@ -7400,7 +7442,6 @@ def relabel_job(job_id: str):
             debug_result="validation_error",
         )
 
-    state_version_before = _editable_state_version(editable_state)
     ending_debug_ctx: dict | None = None
     if _relabel_has_ending_debug(editable_state, edits if isinstance(edits, list) else []):
         ending_debug_ctx = {
@@ -7466,7 +7507,6 @@ def relabel_job(job_id: str):
             "reason": reason,
             "error_detail": _safe_error_text(exc),
         }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=apply_edits "
             f"reason={reason} detail={_safe_error_text(exc)}"
@@ -7502,7 +7542,6 @@ def relabel_job(job_id: str):
             "reason": "internal_error",
             "error_detail": _safe_error_text(exc),
         }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=apply_edits "
             f"reason=internal_error detail={_safe_error_text(exc)}"
@@ -7519,11 +7558,15 @@ def relabel_job(job_id: str):
         )
 
     redraw_ms = 0
+    rollback_pdf_bytes: bytes | None = None
     try:
         with TemporaryDirectory(prefix="omr-relabel-") as tmp:
             tmpdir = Path(tmp)
             in_pdf = tmpdir / "audiveris_out.pdf"
             out_pdf = tmpdir / "audiveris_out_corrected.pdf"
+            rollback_pdf = tmpdir / "audiveris_out_corrected.rollback.pdf"
+            _download_gcs_to_file(corrected_pdf_uri, rollback_pdf)
+            rollback_pdf_bytes = rollback_pdf.read_bytes()
             _download_gcs_to_file(baseline_pdf_uri, in_pdf)
             redraw_started = time.time()
             labels_drawn = _render_corrected_pdf(
@@ -7561,7 +7604,6 @@ def relabel_job(job_id: str):
             "reason": reason,
             "error_detail": error_txt,
         }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=render_pdf "
             f"reason={reason} detail={error_txt}"
@@ -7684,6 +7726,17 @@ def relabel_job(job_id: str):
         trace["reason"] = "invalid_payload"
 
     if not _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id):
+        rollback_result = "not_available"
+        if rollback_pdf_bytes is not None:
+            try:
+                _upload_bytes_to_gcs(rollback_pdf_bytes, corrected_pdf_uri, content_type="application/pdf")
+                rollback_result = "restored"
+            except Exception as rollback_exc:
+                rollback_result = f"failed:{_safe_error_text(rollback_exc)}"
+                print(
+                    f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=rollback_pdf "
+                    f"reason=corrected_pdf_rollback_failed detail={_safe_error_text(rollback_exc)}"
+                )
         return _backend_error_response(
             "artifact_upload_failed",
             "failed to upload mapping_summary",
@@ -7694,6 +7747,7 @@ def relabel_job(job_id: str):
             run_id=run_id,
             trace_id=trace_id,
             debug_result="upload_error",
+            rollback_result=rollback_result,
         )
 
     print(

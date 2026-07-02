@@ -875,6 +875,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
             patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
             patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER.Path, "read_bytes", return_value=b"old-pdf"),
             patch.object(WORKER, "_render_corrected_pdf", return_value=2),
             patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
             patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
@@ -885,6 +886,111 @@ class BrowserReadyApiTests(unittest.TestCase):
         relabel = body.get("relabel") or {}
         self.assertEqual(relabel.get("labels_mode"), "all_measures")
         self.assertEqual(relabel.get("labels_redrawn_count"), 2)
+
+    def test_relabel_rejects_stale_state_version_before_render_or_upload(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={"state_version": "old-state", "edits": [{"type": "set_labels_mode", "value": "all_measures"}]},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_render_corrected_pdf") as render_mock,
+            patch.object(WORKER, "_upload_file_to_gcs") as upload_file_mock,
+            patch.object(WORKER, "_upload_json_to_gcs") as upload_json_mock,
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 409)
+        self.assertEqual(((body.get("error") or {}).get("code")), "state_stale")
+        self.assertEqual(body.get("debug_result"), "stale_conflict")
+        render_mock.assert_not_called()
+        upload_file_mock.assert_not_called()
+        upload_json_mock.assert_not_called()
+
+    def test_relabel_render_failure_does_not_save_mapping(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={"edits": [{"type": "set_labels_mode", "value": "all_measures"}]},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER.Path, "read_bytes", return_value=b"old-pdf"),
+            patch.object(WORKER, "_render_corrected_pdf", side_effect=RuntimeError("render boom")),
+            patch.object(WORKER, "_upload_file_to_gcs") as upload_file_mock,
+            patch.object(WORKER, "_upload_json_to_gcs") as upload_json_mock,
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 500)
+        self.assertEqual(((body.get("error") or {}).get("code")), "pdf_render_failed")
+        upload_file_mock.assert_not_called()
+        upload_json_mock.assert_not_called()
+
+    def test_relabel_corrected_pdf_upload_failure_does_not_save_mapping(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={"edits": [{"type": "set_labels_mode", "value": "all_measures"}]},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER.Path, "read_bytes", return_value=b"old-pdf"),
+            patch.object(WORKER, "_render_corrected_pdf", return_value=2),
+            patch.object(WORKER, "_upload_file_to_gcs", side_effect=RuntimeError("upload boom")),
+            patch.object(WORKER, "_upload_json_to_gcs") as upload_json_mock,
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 500)
+        self.assertEqual(((body.get("error") or {}).get("code")), "pdf_render_failed")
+        upload_json_mock.assert_not_called()
+
+    def test_relabel_mapping_upload_failure_restores_old_corrected_pdf(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        uploaded_bytes = []
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={"edits": [{"type": "set_labels_mode", "value": "all_measures"}]},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER.Path, "read_bytes", return_value=b"old-corrected-pdf"),
+            patch.object(WORKER, "_render_corrected_pdf", return_value=2),
+            patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=RuntimeError("mapping upload boom")),
+            patch.object(WORKER, "_upload_bytes_to_gcs", side_effect=lambda data, uri, content_type=None: uploaded_bytes.append((data, uri, content_type))),
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 500)
+        self.assertEqual(((body.get("error") or {}).get("code")), "artifact_upload_failed")
+        self.assertEqual(body.get("rollback_result"), "restored")
+        self.assertEqual(uploaded_bytes, [(b"old-corrected-pdf", artifacts["audiveris_out_corrected_pdf"], "application/pdf")])
 
     def test_measure_crop_spec_uses_full_vertical_padding_when_room_exists(self):
         page_rect = _FakeRect(0, 0, 200, 160)
@@ -1021,6 +1127,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
         mapping_summary = self._sample_mapping_summary()
+        uploaded_mappings = []
         WORKER.request = SimpleNamespace(
             path="/api/omr/jobs/111/ai-suggest",
             method="POST",
@@ -1706,6 +1813,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
         mapping_summary = self._sample_mapping_summary()
+        uploaded_mappings = []
         mapping_summary["ai_suggestions"] = {
             "version": "ai_suggestions_v1",
             "generated_at_utc": "2026-05-05T00:00:00Z",
@@ -2187,6 +2295,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
         mapping_summary = self._sample_mapping_summary()
+        uploaded_mappings = []
         mapping_summary["ai_suggestions"] = {
             "version": "ai_suggestions_v1",
             "generated_at_utc": "2026-04-30T12:00:00Z",
@@ -2221,25 +2330,28 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
             patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
             patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER.Path, "read_bytes", return_value=b"old-pdf"),
             patch.object(WORKER, "_render_corrected_pdf", return_value=2),
             patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
-            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=lambda data, uri: uploaded_mappings.append(deepcopy(data))),
         ):
             body, status = _unpack(WORKER.relabel_job("111"))
 
         self.assertEqual(status, 200)
-        remaining = ((mapping_summary.get("ai_suggestions") or {}).get("by_measure_id") or {})
-        remaining_time_signatures = ((mapping_summary.get("ai_suggestions") or {}).get("time_signatures_by_measure_id") or {})
-        remaining_completeness = ((mapping_summary.get("ai_suggestions") or {}).get("measure_completeness_by_measure_id") or {})
+        saved_mapping = uploaded_mappings[-1]
+        remaining = ((saved_mapping.get("ai_suggestions") or {}).get("by_measure_id") or {})
+        remaining_time_signatures = ((saved_mapping.get("ai_suggestions") or {}).get("time_signatures_by_measure_id") or {})
+        remaining_completeness = ((saved_mapping.get("ai_suggestions") or {}).get("measure_completeness_by_measure_id") or {})
         self.assertEqual(sorted(remaining.keys()), ["p1_s1_m0"])
         self.assertEqual(sorted(remaining_time_signatures.keys()), ["p1_s1_m0"])
         self.assertEqual(sorted(remaining_completeness.keys()), ["p1_s1_m0"])
-        self.assertEqual((((mapping_summary.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
+        self.assertEqual((((saved_mapping.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
 
     def test_relabel_replace_auto_rows_for_page_persists_excluded_boxes_and_clears_page_ai(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
         mapping_summary = deepcopy(self._sample_mapping_summary())
+        uploaded_mappings = []
         editable_state = mapping_summary.get("editable_state") or {}
         for measure in editable_state.get("measures") or []:
             measure["x_right"] = {
@@ -2307,18 +2419,20 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
             patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
             patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER.Path, "read_bytes", return_value=b"old-pdf"),
             patch.object(WORKER, "_render_corrected_pdf", return_value=2),
             patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
-            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=lambda data, uri: uploaded_mappings.append(deepcopy(data))),
         ):
             body, status = _unpack(WORKER.relabel_job("111"))
 
         self.assertEqual(status, 200)
-        editable = mapping_summary.get("editable_state") or {}
+        saved_mapping = uploaded_mappings[-1]
+        editable = saved_mapping.get("editable_state") or {}
         self.assertEqual(len(editable.get("auto_rows") or []), 2)
         measure_rows = {row.get("measure_id"): row for row in (editable.get("measures") or [])}
         self.assertTrue((measure_rows.get("p1_s0_m0") or {}).get("excluded_from_counting"))
-        ai = mapping_summary.get("ai_suggestions") or {}
+        ai = saved_mapping.get("ai_suggestions") or {}
         self.assertEqual(ai.get("by_measure_id") or {}, {})
         self.assertEqual(ai.get("time_signatures_by_measure_id") or {}, {})
         self.assertEqual(ai.get("measure_completeness_by_measure_id") or {}, {})
