@@ -173,11 +173,39 @@ class GitHubAPIError(RuntimeError):
         self.message = str(message)
 
 
-class StaleArtifactsError(RuntimeError):
+class StateLoadError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        detail: str = "",
+        retryable: bool = False,
+        status_code: int = 409,
+        requested_run_id: int | None = None,
+        artifact_run_id: int | None = None,
+    ):
+        super().__init__(message)
+        self.code = str(code or "state_load_failed")
+        self.message = str(message or "failed to load state")
+        self.detail = str(detail or "")
+        self.retryable = bool(retryable)
+        self.status_code = int(status_code)
+        self.requested_run_id = requested_run_id
+        self.artifact_run_id = artifact_run_id
+
+
+class StaleArtifactsError(StateLoadError):
     def __init__(self, requested_run_id: int, artifact_run_id: int):
-        super().__init__(
-            f"requested job_id does not match single-latest artifacts: "
-            f"requested_run_id={requested_run_id} artifact_run_id={artifact_run_id}"
+        StateLoadError.__init__(
+            self,
+            "state_stale",
+            "requested job_id does not match single-latest artifacts",
+            detail="stale_run_mismatch",
+            retryable=False,
+            status_code=409,
+            requested_run_id=int(requested_run_id),
+            artifact_run_id=int(artifact_run_id),
         )
         self.requested_run_id = int(requested_run_id)
         self.artifact_run_id = int(artifact_run_id)
@@ -896,6 +924,97 @@ def _resolve_run_id_from_job_id(job_id: str) -> tuple[int | None, dict | None, s
     return None, rec, "job has been dispatched but run_id is not available yet"
 
 
+def _state_file_exists(uri: str, detail: str) -> bool:
+    try:
+        return bool(_gcs_uri_exists(uri))
+    except Exception as exc:
+        raise StateLoadError(
+            "state_load_failed",
+            "failed to check state artifacts",
+            detail=f"{detail}: {_safe_error_text(exc)}",
+            retryable=_is_gcs_retryable_error(exc),
+            status_code=502,
+        ) from exc
+
+
+def _download_state_json(uri: str, detail: str) -> dict:
+    try:
+        return _download_gcs_json(uri)
+    except json.JSONDecodeError as exc:
+        raise StateLoadError(
+            "state_load_failed",
+            "state JSON is corrupt",
+            detail=f"{detail}_corrupt_json",
+            retryable=False,
+            status_code=409,
+        ) from exc
+    except ValueError as exc:
+        if "expected JSON object" in _safe_error_text(exc):
+            raise StateLoadError(
+                "state_load_failed",
+                "state JSON is not an object",
+                detail=f"{detail}_not_object",
+                retryable=False,
+                status_code=409,
+            ) from exc
+        raise StateLoadError(
+            "state_load_failed",
+            "failed to load state JSON",
+            detail=f"{detail}: {_safe_error_text(exc)}",
+            retryable=False,
+            status_code=409,
+        ) from exc
+    except Exception as exc:
+        raise StateLoadError(
+            "state_load_failed",
+            "failed to load state JSON",
+            detail=f"{detail}: {_safe_error_text(exc)}",
+            retryable=_is_gcs_retryable_error(exc),
+            status_code=502,
+        ) from exc
+
+
+def _load_state_artifacts_json(
+    artifacts: dict,
+    run_id_int: int,
+    *,
+    mode: str,
+) -> tuple[dict, dict, int]:
+    run_info_uri = str(artifacts.get("run_info") or "")
+    mapping_uri = str(artifacts.get("mapping_summary") or "")
+    if not _state_file_exists(run_info_uri, "run_info_missing"):
+        raise StateLoadError(
+            "state_missing",
+            "run_info.json missing",
+            detail="run_info_missing",
+            retryable=False,
+            status_code=404,
+        )
+    if not _state_file_exists(mapping_uri, "mapping_summary_missing"):
+        raise StateLoadError(
+            "state_missing",
+            "mapping_summary.json missing",
+            detail="mapping_summary_missing",
+            retryable=False,
+            status_code=404,
+        )
+
+    run_info = _download_state_json(run_info_uri, "run_info")
+    mapping_summary = _download_state_json(mapping_uri, "mapping_summary")
+    summary_run_id = _safe_int(run_info.get("run_id"), run_id_int if mode == "per_run_v1" else 0)
+    if summary_run_id and summary_run_id != run_id_int:
+        raise StaleArtifactsError(run_id_int, int(summary_run_id))
+    if not isinstance(mapping_summary, dict):
+        raise StateLoadError(
+            "state_load_failed",
+            "mapping_summary is not an object",
+            detail="mapping_summary_not_object",
+            retryable=False,
+            status_code=409,
+        )
+    return mapping_summary, run_info, int(summary_run_id or run_id_int)
+
+
 def _load_mapping_for_run(run_id: int, artifact_key: str | None = None) -> tuple[dict, dict, int]:
     run_id_int = int(run_id)
     key = _normalize_artifact_key(artifact_key)
@@ -908,32 +1027,56 @@ def _load_mapping_for_run(run_id: int, artifact_key: str | None = None) -> tuple
 
     for candidate in candidate_keys:
         artifacts = _artifact_uris_for_run(run_id_int, artifact_key=candidate)
-        if _gcs_uri_exists(artifacts["run_info"]) and _gcs_uri_exists(artifacts["mapping_summary"]):
-            run_info = _download_gcs_json(artifacts["run_info"])
-            mapping_summary = _download_gcs_json(artifacts["mapping_summary"])
-            summary_run_id = _safe_int(run_info.get("run_id"), run_id_int)
-            if summary_run_id and summary_run_id != run_id_int:
-                print(
-                    f"RUN_INFO_WARN requested_run_id={run_id_int} "
-                    f"run_info_run_id={summary_run_id} mode=per_run_v1"
-                )
-            if not isinstance(mapping_summary, dict):
-                raise ValueError("mapping_summary is not an object")
+        run_info_exists = _state_file_exists(artifacts["run_info"], "run_info_missing")
+        mapping_exists = _state_file_exists(artifacts["mapping_summary"], "mapping_summary_missing")
+        if run_info_exists and mapping_exists:
+            mapping_summary, _, summary_run_id = _load_state_artifacts_json(
+                artifacts,
+                run_id_int,
+                mode="per_run_v1",
+            )
             return artifacts, mapping_summary, int(summary_run_id or run_id_int)
+        if run_info_exists != mapping_exists:
+            missing_detail = "mapping_summary_missing" if run_info_exists else "run_info_missing"
+            missing_message = "mapping_summary.json missing" if run_info_exists else "run_info.json missing"
+            raise StateLoadError(
+                "state_missing",
+                missing_message,
+                detail=missing_detail,
+                retryable=False,
+                status_code=404,
+            )
 
     if not ALLOW_LEGACY_ARTIFACT_FALLBACK:
         key_note = f" artifact_key={key}" if key else ""
-        raise FileNotFoundError(f"per-run artifacts not found for run_id={run_id_int}{key_note}")
+        raise StateLoadError(
+            "state_missing",
+            "per-run artifacts not found",
+            detail=f"artifacts_missing{key_note}",
+            retryable=False,
+            status_code=404,
+        )
 
     legacy_artifacts = _legacy_artifact_uris_for_run(run_id_int)
-    run_info = _download_gcs_json(legacy_artifacts["run_info"])
-    mapping_summary = _download_gcs_json(legacy_artifacts["mapping_summary"])
-    summary_run_id = _safe_int(run_info.get("run_id"), 0)
-    if summary_run_id and summary_run_id != run_id_int:
-        raise StaleArtifactsError(run_id_int, int(summary_run_id))
-    if not isinstance(mapping_summary, dict):
-        raise ValueError("mapping_summary is not an object")
+    mapping_summary, _, summary_run_id = _load_state_artifacts_json(
+        legacy_artifacts,
+        run_id_int,
+        mode="legacy_single_latest",
+    )
     return legacy_artifacts, mapping_summary, int(summary_run_id or run_id_int)
+
+
+def _editable_state_or_raise(mapping_summary: dict) -> dict:
+    editable_state = mapping_summary.get("editable_state") if isinstance(mapping_summary, dict) else None
+    if not isinstance(editable_state, dict):
+        raise StateLoadError(
+            "state_missing",
+            "editable_state missing in mapping_summary",
+            detail="editable_state_missing",
+            retryable=False,
+            status_code=409,
+        )
+    return editable_state
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -2067,6 +2210,22 @@ def _backend_error_response(
         provider_status=status_code,
     )
     return jsonify(payload), int(status_code)
+
+
+def _state_load_error_response(exc: StateLoadError, **fields):
+    payload_fields = dict(fields)
+    if exc.requested_run_id is not None:
+        payload_fields.setdefault("requested_run_id", exc.requested_run_id)
+    if exc.artifact_run_id is not None:
+        payload_fields.setdefault("artifact_run_id", exc.artifact_run_id)
+    return _backend_error_response(
+        exc.code,
+        exc.message,
+        exc.status_code,
+        retryable=exc.retryable,
+        detail=exc.detail or exc.message,
+        **payload_fields,
+    )
 
 
 def _rejected_reason_counts(rejected: list[dict] | None) -> dict[str, int]:
@@ -6513,16 +6672,9 @@ def get_job_state(job_id: str):
 
     try:
         artifacts, mapping_summary, _ = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
-    except StaleArtifactsError as exc:
-        return _backend_error_response(
-            "state_stale",
-            "requested job_id does not match single-latest artifacts",
-            409,
-            detail="stale_run_mismatch",
-            job_id=job_id,
-            requested_run_id=exc.requested_run_id,
-            artifact_run_id=exc.artifact_run_id,
-        )
+        editable_state = _editable_state_or_raise(mapping_summary)
+    except StateLoadError as exc:
+        return _state_load_error_response(exc, job_id=job_id, run_id=run_id)
     except Exception as exc:
         return _backend_error_response(
             "state_load_failed",
@@ -6530,17 +6682,6 @@ def get_job_state(job_id: str):
             502,
             retryable=True,
             detail=exc,
-            job_id=job_id,
-            run_id=run_id,
-        )
-
-    editable_state = mapping_summary.get("editable_state") or {}
-    if not isinstance(editable_state, dict):
-        return _backend_error_response(
-            "state_missing",
-            "editable_state missing in mapping_summary",
-            409,
-            detail="editable_state_missing",
             job_id=job_id,
             run_id=run_id,
         )
@@ -6613,17 +6754,9 @@ def ai_suggest_job(job_id: str):
     artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
     try:
         artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
-    except StaleArtifactsError as exc:
-        return _backend_error_response(
-            "ai_suggest_failed",
-            "requested job_id does not match single-latest artifacts",
-            409,
-            retryable=True,
-            detail="stale_run_mismatch",
-            job_id=job_id,
-            run_id=int(exc.requested_run_id),
-            status="failed",
-        )
+        editable_state = _editable_state_or_raise(mapping_summary)
+    except StateLoadError as exc:
+        return _state_load_error_response(exc, job_id=job_id, run_id=int(run_id), status="failed")
     except Exception as exc:
         return _backend_error_response(
             "ai_suggest_failed",
@@ -6631,19 +6764,6 @@ def ai_suggest_job(job_id: str):
             502,
             retryable=True,
             detail=exc,
-            job_id=job_id,
-            run_id=int(run_id),
-            status="failed",
-        )
-
-    editable_state = mapping_summary.get("editable_state") or {}
-    if not isinstance(editable_state, dict):
-        return _backend_error_response(
-            "ai_suggest_failed",
-            "editable_state missing in mapping_summary",
-            409,
-            retryable=True,
-            detail="editable_state_missing",
             job_id=job_id,
             run_id=int(run_id),
             status="failed",
@@ -6758,17 +6878,9 @@ def ai_suggest_job_step(job_id: str):
     artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
     try:
         artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
-    except StaleArtifactsError as exc:
-        return _backend_error_response(
-            "ai_suggest_failed",
-            "requested job_id does not match single-latest artifacts",
-            409,
-            retryable=True,
-            detail="stale_run_mismatch",
-            job_id=job_id,
-            run_id=int(exc.requested_run_id),
-            status="failed",
-        )
+        editable_state = _editable_state_or_raise(mapping_summary)
+    except StateLoadError as exc:
+        return _state_load_error_response(exc, job_id=job_id, run_id=int(run_id), status="failed")
     except Exception as exc:
         return _backend_error_response(
             "ai_suggest_failed",
@@ -6776,19 +6888,6 @@ def ai_suggest_job_step(job_id: str):
             502,
             retryable=True,
             detail=exc,
-            job_id=job_id,
-            run_id=int(run_id),
-            status="failed",
-        )
-
-    editable_state = mapping_summary.get("editable_state") or {}
-    if not isinstance(editable_state, dict):
-        return _backend_error_response(
-            "ai_suggest_failed",
-            "editable_state missing in mapping_summary",
-            409,
-            retryable=True,
-            detail="editable_state_missing",
             job_id=job_id,
             run_id=int(run_id),
             status="failed",
@@ -7099,6 +7198,7 @@ def relabel_job(job_id: str):
 
     try:
         artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
+        editable_state = _editable_state_or_raise(mapping_summary)
     except StaleArtifactsError as exc:
         trace = {
             "trace_id": trace_id,
@@ -7141,6 +7241,18 @@ def relabel_job(job_id: str):
             trace_id=trace_id,
             debug_result="stale_conflict",
         )
+    except StateLoadError as exc:
+        print(
+            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=load_artifacts "
+            f"reason={exc.detail or exc.code} detail={_safe_error_text(exc.message)}"
+        )
+        return _state_load_error_response(
+            exc,
+            job_id=job_id,
+            run_id=run_id,
+            trace_id=trace_id,
+            debug_result="internal_error" if exc.status_code >= 500 else "validation_error",
+        )
     except Exception as exc:
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=load_artifacts "
@@ -7161,42 +7273,6 @@ def relabel_job(job_id: str):
     mapping_uri = artifacts["mapping_summary"]
     baseline_pdf_uri = artifacts["audiveris_out_pdf"]
     corrected_pdf_uri = artifacts["audiveris_out_corrected_pdf"]
-
-    editable_state = mapping_summary.get("editable_state") or {}
-    if not isinstance(editable_state, dict):
-        trace = {
-            "trace_id": trace_id,
-            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
-            "job_id": job_id,
-            "requested_run_id": int(run_id),
-            "artifact_run_id": int(artifact_run_id),
-            "edits_requested_count": edits_requested_count,
-            "applied_count": 0,
-            "rejected_count": 0,
-            "rejected_reason_counts": {},
-            "updated_system_ids_count": 0,
-            "labels_redrawn_count": 0,
-            "duration_ms": int((time.time() - started) * 1000),
-            "redraw_duration_ms": 0,
-            "result": "validation_error",
-            "reason": "editable_state_missing",
-            "error_detail": "editable_state missing in mapping_summary",
-        }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
-        print(
-            f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=validate_state "
-            "reason=editable_state_missing detail=editable_state missing in mapping_summary"
-        )
-        return _backend_error_response(
-            "state_missing",
-            "editable_state missing in mapping_summary",
-            409,
-            detail="editable_state_missing",
-            job_id=job_id,
-            run_id=run_id,
-            trace_id=trace_id,
-            debug_result="validation_error",
-        )
     labels_mode_before = str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY).strip().lower()
     if labels_mode_before not in LABELS_MODE_ALLOWED:
         labels_mode_before = LABELS_MODE_SYSTEM_ONLY
@@ -7585,16 +7661,9 @@ def dismiss_ai_suggestion(job_id: str, measure_id: str):
 
     try:
         _, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
-    except StaleArtifactsError as exc:
-        return _backend_error_response(
-            "state_stale",
-            "requested job_id does not match single-latest artifacts",
-            409,
-            detail="stale_run_mismatch",
-            job_id=job_id,
-            requested_run_id=exc.requested_run_id,
-            artifact_run_id=exc.artifact_run_id,
-        )
+        _editable_state_or_raise(mapping_summary)
+    except StateLoadError as exc:
+        return _state_load_error_response(exc, job_id=job_id, run_id=run_id)
     except Exception as exc:
         return _backend_error_response(
             "state_load_failed",

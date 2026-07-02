@@ -440,6 +440,158 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(((body.get("error") or {}).get("message")), "failed to load state for AI suggestions")
         self.assertTrue(((body.get("error") or {}).get("retryable")))
 
+    def test_routes_preserve_typed_state_load_error(self):
+        err = WORKER.StateLoadError(
+            "state_missing",
+            "mapping_summary.json missing",
+            detail="mapping_summary_missing",
+            retryable=False,
+            status_code=404,
+        )
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/state", method="GET", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_job_artifact_key", return_value="key"),
+            patch.object(WORKER, "_load_mapping_for_run", side_effect=err),
+        ):
+            body, status = _unpack(WORKER.get_job_state("111"))
+
+        self.assertEqual(status, 404)
+        self.assertEqual(((body.get("error") or {}).get("code")), "state_missing")
+        self.assertEqual(((body.get("error") or {}).get("detail")), "mapping_summary_missing")
+
+    def test_ai_route_preserves_typed_state_load_error(self):
+        err = WORKER.StateLoadError(
+            "state_stale",
+            "requested job_id does not match single-latest artifacts",
+            detail="stale_run_mismatch",
+            retryable=False,
+            status_code=409,
+            requested_run_id=111,
+            artifact_run_id=222,
+        )
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_job_artifact_key", return_value="key"),
+            patch.object(WORKER, "_load_mapping_for_run", side_effect=err),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 409)
+        self.assertEqual(((body.get("error") or {}).get("code")), "state_stale")
+        self.assertEqual(body.get("requested_run_id"), 111)
+        self.assertEqual(body.get("artifact_run_id"), 222)
+
+    def test_relabel_route_preserves_typed_state_load_error(self):
+        err = WORKER.StateLoadError(
+            "state_missing",
+            "run_info.json missing",
+            detail="run_info_missing",
+            retryable=False,
+            status_code=404,
+        )
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={"edits": [{"type": "set_measure_number", "measure_id": "p1_s0_m0", "value": "1"}]},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_job_artifact_key", return_value="key"),
+            patch.object(WORKER, "_load_mapping_for_run", side_effect=err),
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 404)
+        self.assertEqual(((body.get("error") or {}).get("code")), "state_missing")
+        self.assertEqual(((body.get("error") or {}).get("detail")), "run_info_missing")
+        self.assertEqual(body.get("debug_result"), "validation_error")
+
+    def test_state_loader_reports_missing_run_info(self):
+        def exists(uri):
+            return not str(uri).endswith("/run_info.json")
+
+        with (
+            patch.object(WORKER, "ALLOW_LEGACY_ARTIFACT_FALLBACK", False),
+            patch.object(WORKER, "_gcs_uri_exists", side_effect=exists),
+        ):
+            with self.assertRaises(WORKER.StateLoadError) as ctx:
+                WORKER._load_mapping_for_run(111, artifact_key="111")
+
+        self.assertEqual(ctx.exception.code, "state_missing")
+        self.assertEqual(ctx.exception.detail, "run_info_missing")
+        self.assertFalse(ctx.exception.retryable)
+
+    def test_state_loader_reports_missing_mapping_summary(self):
+        def exists(uri):
+            return not str(uri).endswith("/mapping_summary.json")
+
+        with (
+            patch.object(WORKER, "ALLOW_LEGACY_ARTIFACT_FALLBACK", False),
+            patch.object(WORKER, "_gcs_uri_exists", side_effect=exists),
+        ):
+            with self.assertRaises(WORKER.StateLoadError) as ctx:
+                WORKER._load_mapping_for_run(111, artifact_key="111")
+
+        self.assertEqual(ctx.exception.code, "state_missing")
+        self.assertEqual(ctx.exception.detail, "mapping_summary_missing")
+        self.assertFalse(ctx.exception.retryable)
+
+    def test_state_loader_reports_corrupt_mapping_summary(self):
+        def download(uri):
+            if str(uri).endswith("/run_info.json"):
+                return {"run_id": 111}
+            raise json.JSONDecodeError("bad json", "{", 0)
+
+        with (
+            patch.object(WORKER, "ALLOW_LEGACY_ARTIFACT_FALLBACK", False),
+            patch.object(WORKER, "_gcs_uri_exists", return_value=True),
+            patch.object(WORKER, "_download_gcs_json", side_effect=download),
+        ):
+            with self.assertRaises(WORKER.StateLoadError) as ctx:
+                WORKER._load_mapping_for_run(111, artifact_key="111")
+
+        self.assertEqual(ctx.exception.code, "state_load_failed")
+        self.assertEqual(ctx.exception.detail, "mapping_summary_corrupt_json")
+        self.assertFalse(ctx.exception.retryable)
+
+    def test_state_loader_rejects_stale_run_info(self):
+        with (
+            patch.object(WORKER, "ALLOW_LEGACY_ARTIFACT_FALLBACK", False),
+            patch.object(WORKER, "_gcs_uri_exists", return_value=True),
+            patch.object(WORKER, "_download_gcs_json", side_effect=[{"run_id": 222}, {"editable_state": {}}]),
+        ):
+            with self.assertRaises(WORKER.StaleArtifactsError) as ctx:
+                WORKER._load_mapping_for_run(111, artifact_key="111")
+
+        self.assertEqual(ctx.exception.code, "state_stale")
+        self.assertEqual(ctx.exception.detail, "stale_run_mismatch")
+        self.assertEqual(ctx.exception.requested_run_id, 111)
+        self.assertEqual(ctx.exception.artifact_run_id, 222)
+
+    def test_state_loader_successful_load(self):
+        mapping_summary = self._sample_mapping_summary()
+        with (
+            patch.object(WORKER, "ALLOW_LEGACY_ARTIFACT_FALLBACK", False),
+            patch.object(WORKER, "_gcs_uri_exists", return_value=True),
+            patch.object(WORKER, "_download_gcs_json", side_effect=[{"run_id": 111}, mapping_summary]),
+        ):
+            artifacts, loaded, artifact_run_id = WORKER._load_mapping_for_run(111, artifact_key="111")
+
+        self.assertEqual(artifact_run_id, 111)
+        self.assertIs(loaded, mapping_summary)
+        self.assertIn("mapping_summary", artifacts)
+
+    def test_editable_state_helper_reports_missing_state(self):
+        with self.assertRaises(WORKER.StateLoadError) as ctx:
+            WORKER._editable_state_or_raise({"editable_state": "bad"})
+
+        self.assertEqual(ctx.exception.code, "state_missing")
+        self.assertEqual(ctx.exception.detail, "editable_state_missing")
+
     def test_artifacts_http_present_on_responses(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
