@@ -692,6 +692,54 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(((mapping_summary.get("ai_suggest_run") or {}).get("status")), "running")
         self.assertEqual(((mapping_summary.get("ai_suggest_run") or {}).get("score_type")), "grand")
 
+    def test_ai_suggest_start_continues_partial_failed_run(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggestions"]["by_measure_id"] = {
+            "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"}
+        }
+        mapping_summary["ai_suggest_run"] = {
+            "status": "partial_failed",
+            "started_at_utc": "2026-05-05T00:00:00Z",
+            "updated_at_utc": "2026-05-05T00:00:01Z",
+            "completed_at_utc": None,
+            "failed_at_utc": "2026-05-05T00:00:01Z",
+            "systems_total": 2,
+            "systems_completed": 1,
+            "next_system_index": 1,
+            "source_run_id": 111,
+            "source_state_version": "test-state",
+            "last_error": {"message": "temporary failure"},
+            "score_type": "grand",
+        }
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/ai-suggest",
+            method="POST",
+            headers={},
+            files={},
+            json={},
+            get_json=lambda silent=True: {"score_type": "grand"},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("status"), "running")
+        run = body.get("ai_suggest_run") or {}
+        self.assertEqual(run.get("systems_completed"), 1)
+        self.assertEqual(run.get("next_system_index"), 1)
+        self.assertIsNone(run.get("last_error"))
+        self.assertIsNone(run.get("failed_at_utc"))
+        self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
+
     def test_ai_suggest_start_accepts_missing_score_type_for_old_apps(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
@@ -897,6 +945,83 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
+
+    def test_ai_suggest_step_partial_failed_keeps_completed_suggestions(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggestions"]["by_measure_id"] = {
+            "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"}
+        }
+        mapping_summary["ai_suggest_run"] = {
+            "status": "running",
+            "started_at_utc": "2026-05-05T00:00:00Z",
+            "updated_at_utc": "2026-05-05T00:00:00Z",
+            "completed_at_utc": None,
+            "failed_at_utc": None,
+            "systems_total": 2,
+            "systems_completed": 1,
+            "next_system_index": 1,
+            "source_run_id": 111,
+            "source_state_version": "test-state",
+            "last_error": None,
+            "score_type": "grand",
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(WORKER, "_generate_ai_suggestions_for_system_batch", side_effect=WORKER.AiSuggestError(provider_status=503, detail="temporary")),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job_step("111"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("status"), "partial_failed")
+        run = body.get("ai_suggest_run") or {}
+        self.assertEqual(run.get("systems_completed"), 1)
+        self.assertEqual(run.get("next_system_index"), 1)
+        self.assertEqual((run.get("last_error") or {}).get("provider_status"), 503)
+        self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
+
+    def test_ai_suggest_step_first_system_failure_stays_failed(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggest_run"] = {
+            "status": "running",
+            "started_at_utc": "2026-05-05T00:00:00Z",
+            "updated_at_utc": "2026-05-05T00:00:00Z",
+            "completed_at_utc": None,
+            "failed_at_utc": None,
+            "systems_total": 2,
+            "systems_completed": 0,
+            "next_system_index": 0,
+            "source_run_id": 111,
+            "source_state_version": "test-state",
+            "last_error": None,
+            "score_type": "grand",
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(WORKER, "_generate_ai_suggestions_for_system_batch", side_effect=WORKER.AiSuggestError(provider_status=503, detail="temporary")),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job_step("111"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("status"), "failed")
+        run = body.get("ai_suggest_run") or {}
+        self.assertEqual(run.get("systems_completed"), 0)
+        self.assertEqual(run.get("next_system_index"), 0)
 
     def test_merge_ai_suggestions_state_keeps_decision_debug(self):
         base = WORKER._empty_ai_suggestions_state(111, "test-state", 1)
@@ -1483,10 +1608,11 @@ class BrowserReadyApiTests(unittest.TestCase):
             body, status = _unpack(WORKER.ai_suggest_job_step("111"))
 
         self.assertEqual(status, 200)
-        self.assertEqual(body.get("status"), "failed")
+        self.assertEqual(body.get("status"), "partial_failed")
         self.assertEqual(((body.get("error") or {}).get("detail")), "timeout")
         self.assertEqual(mapping_summary.get("ai_suggestions"), original)
-        self.assertEqual((((mapping_summary.get("ai_suggest_run") or {}).get("status"))), "failed")
+        self.assertEqual((((mapping_summary.get("ai_suggest_run") or {}).get("status"))), "partial_failed")
+        self.assertEqual((((mapping_summary.get("ai_suggest_run") or {}).get("next_system_index"))), 1)
 
     def test_anthropic_messages_create_retries_overload_then_succeeds(self):
         overload_1 = WORKER.AiSuggestError(provider_status=529, detail='{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')

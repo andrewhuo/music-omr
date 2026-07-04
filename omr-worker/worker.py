@@ -111,6 +111,7 @@ AI_SUGGEST_RUN_STATUS_RUNNING = "running"
 AI_SUGGEST_RUN_STATUS_COMPLETED = "completed"
 AI_SUGGEST_RUN_STATUS_FAILED = "failed"
 AI_SUGGEST_RUN_STATUS_CANCELLED = "cancelled"
+AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED = "partial_failed"
 AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
@@ -2095,6 +2096,7 @@ def _current_ai_suggest_run(
         AI_SUGGEST_RUN_STATUS_COMPLETED,
         AI_SUGGEST_RUN_STATUS_FAILED,
         AI_SUGGEST_RUN_STATUS_CANCELLED,
+        AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED,
     }:
         status = AI_SUGGEST_RUN_STATUS_IDLE
     remembered_time_signature = _normalize_ai_time_signature_value(row.get("remembered_time_signature"))
@@ -6669,12 +6671,40 @@ def ai_suggest_job(job_id: str):
 
     source_state_version = _editable_state_version(editable_state)
     mapping_summary["editable_state"] = editable_state
+    existing_ai_suggestions = _current_ai_suggestions(mapping_summary)
+    existing_ai_suggest_run = _current_ai_suggest_run(mapping_summary, int(artifact_run_id), source_state_version)
+    system_batches = _ai_suggest_system_batches(editable_state)
+    if existing_ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED and isinstance(existing_ai_suggestions, dict):
+        now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+        existing_ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_RUNNING
+        existing_ai_suggest_run["updated_at_utc"] = now_txt
+        existing_ai_suggest_run["failed_at_utc"] = None
+        existing_ai_suggest_run["last_error"] = None
+        existing_ai_suggest_run["systems_total"] = len(system_batches)
+        if score_type:
+            existing_ai_suggest_run["score_type"] = score_type
+        mapping_summary["ai_suggestions"] = existing_ai_suggestions
+        mapping_summary["ai_suggest_run"] = existing_ai_suggest_run
+        _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        return jsonify(
+            {
+                "job_id": job_id,
+                "run_id": int(artifact_run_id),
+                "status": AI_SUGGEST_RUN_STATUS_RUNNING,
+                "ai_suggestions": existing_ai_suggestions,
+                "ai_suggest_run": existing_ai_suggest_run,
+                "storage_mode": _storage_mode_for_artifacts(artifacts),
+                "artifacts": artifacts,
+                "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+                "duration_ms": int((time.time() - started) * 1000),
+            }
+        ), 200
+
     mapping_summary["ai_suggestions"] = _empty_ai_suggestions_state(
         int(artifact_run_id),
         source_state_version,
         len(_ai_suggest_candidate_measures(editable_state)),
     )
-    system_batches = _ai_suggest_system_batches(editable_state)
     debug_batch_trace = None
     run_status = AI_SUGGEST_RUN_STATUS_RUNNING if system_batches else AI_SUGGEST_RUN_STATUS_COMPLETED
     mapping_summary["ai_suggest_run"] = _new_ai_suggest_run_state(
@@ -6918,7 +6948,7 @@ def ai_suggest_job_step(job_id: str):
                 200,
             )
 
-    if ai_suggest_run.get("status") in {AI_SUGGEST_RUN_STATUS_COMPLETED, AI_SUGGEST_RUN_STATUS_FAILED}:
+    if ai_suggest_run.get("status") in {AI_SUGGEST_RUN_STATUS_COMPLETED, AI_SUGGEST_RUN_STATUS_FAILED, AI_SUGGEST_RUN_STATUS_CANCELLED}:
         response = {
             "job_id": job_id,
             "run_id": int(artifact_run_id),
@@ -7053,9 +7083,13 @@ def ai_suggest_job_step(job_id: str):
     except Exception as exc:
         error_payload = _ai_suggest_error_payload(exc)
         now_txt = _utc_now().isoformat().replace("+00:00", "Z")
-        ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_FAILED
+        saved_completed_count = max(0, _safe_int(ai_suggest_run.get("systems_completed"), 0))
+        failed_status = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED if saved_completed_count > 0 else AI_SUGGEST_RUN_STATUS_FAILED
+        ai_suggest_run["status"] = failed_status
         ai_suggest_run["updated_at_utc"] = now_txt
         ai_suggest_run["failed_at_utc"] = now_txt
+        ai_suggest_run["systems_completed"] = saved_completed_count
+        ai_suggest_run["next_system_index"] = max(0, _safe_int(ai_suggest_run.get("next_system_index"), next_system_index))
         ai_suggest_run["last_error"] = error_payload
         mapping_summary["ai_suggest_run"] = ai_suggest_run
         mapping_summary["ai_suggestions"] = ai_suggestions
@@ -7082,7 +7116,7 @@ def ai_suggest_job_step(job_id: str):
         response = {
             "job_id": job_id,
             "run_id": int(artifact_run_id),
-            "status": AI_SUGGEST_RUN_STATUS_FAILED,
+            "status": failed_status,
             "ai_suggestions": ai_suggestions,
             "ai_suggest_run": ai_suggest_run,
             "error": error_payload,
