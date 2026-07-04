@@ -110,6 +110,7 @@ AI_SUGGEST_RUN_STATUS_IDLE = "idle"
 AI_SUGGEST_RUN_STATUS_RUNNING = "running"
 AI_SUGGEST_RUN_STATUS_COMPLETED = "completed"
 AI_SUGGEST_RUN_STATUS_FAILED = "failed"
+AI_SUGGEST_RUN_STATUS_CANCELLED = "cancelled"
 AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
@@ -2093,6 +2094,7 @@ def _current_ai_suggest_run(
         AI_SUGGEST_RUN_STATUS_RUNNING,
         AI_SUGGEST_RUN_STATUS_COMPLETED,
         AI_SUGGEST_RUN_STATUS_FAILED,
+        AI_SUGGEST_RUN_STATUS_CANCELLED,
     }:
         status = AI_SUGGEST_RUN_STATUS_IDLE
     remembered_time_signature = _normalize_ai_time_signature_value(row.get("remembered_time_signature"))
@@ -4344,6 +4346,8 @@ def _run_public_status(run: dict) -> str:
     if status == "completed":
         if conclusion == "success":
             return "succeeded"
+        if conclusion == "cancelled":
+            return "cancelled"
         return "failed"
     if status in ("queued", "requested", "waiting", "pending"):
         return "queued"
@@ -4360,6 +4364,28 @@ def _get_run(run_id: int) -> dict:
     if not isinstance(data, dict):
         raise GitHubAPIError(502, "GitHub run response was not an object")
     return data
+
+
+def _cancel_github_run(run_id: int) -> str:
+    try:
+        run = _get_run(int(run_id))
+        if str(run.get("status") or "").strip().lower() == "completed":
+            return "already_completed"
+    except GitHubAPIError as exc:
+        if exc.status_code == 404:
+            return "run_not_found"
+        raise
+
+    try:
+        _gh_request(
+            "POST",
+            f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{int(run_id)}/cancel",
+        )
+        return "cancel_requested"
+    except GitHubAPIError as exc:
+        if exc.status_code in {409, 422}:
+            return "already_finished"
+        raise
 
 
 def _pending_set(dispatch_id: str, record: dict) -> None:
@@ -6334,6 +6360,17 @@ def get_job(job_id: str):
         if rec is None:
             return jsonify({"error": f"unknown job_id: {job_id}"}), 404
         if run_id is None:
+            if str(rec.get("status") or "").strip().lower() == "cancelled":
+                return jsonify(
+                    {
+                        "job_id": job_id,
+                        "status": "cancelled",
+                        "run_id": None,
+                        "workflow": rec.get("workflow_id") or GITHUB_WORKFLOW_ID,
+                        "ref": rec.get("ref") or GITHUB_REF,
+                        "status_url": f"/api/omr/jobs/{job_id}",
+                    }
+                ), 200
             return jsonify(
                 {
                     "job_id": job_id,
@@ -6355,7 +6392,7 @@ def get_job(job_id: str):
     response = {
         "job_id": job_id,
         "run_id": int(run_id),
-        "status": _run_public_status(run),
+        "status": "cancelled" if isinstance(rec, dict) and str(rec.get("status") or "").strip().lower() == "cancelled" else _run_public_status(run),
         "github_status": run.get("status"),
         "github_conclusion": run.get("conclusion"),
         "ref": run.get("head_branch"),
@@ -6373,6 +6410,66 @@ def get_job(job_id: str):
     if isinstance(rec, dict) and rec.get("pdf_gcs_uri"):
         response["pdf_gcs_uri"] = rec.get("pdf_gcs_uri")
     return jsonify(response), 200
+
+
+@app.route("/api/omr/jobs/<job_id>/cancel", methods=["POST"])
+def cancel_job(job_id: str):
+    run_id, rec, err = _resolve_run_id_from_job_id(job_id)
+    if err and rec is None:
+        return jsonify({"error": err, "job_id": job_id}), 404
+
+    github_cancel_status = "not_started"
+    if isinstance(run_id, int):
+        try:
+            github_cancel_status = _cancel_github_run(int(run_id))
+        except GitHubAPIError as exc:
+            return (
+                jsonify(
+                    {
+                        "error": exc.message,
+                        "job_id": job_id,
+                        "run_id": int(run_id),
+                        "status": "cancel_failed",
+                        "status_code": exc.status_code,
+                    }
+                ),
+                exc.status_code if 400 <= exc.status_code <= 599 else 502,
+            )
+
+    now_txt = _to_utc_z(_utc_now())
+    merged = dict(rec or {})
+    merged.update(
+        {
+            "status": "cancelled",
+            "cancelled_at_utc": now_txt,
+            "run_id": int(run_id) if isinstance(run_id, int) else None,
+        }
+    )
+    _pending_set(job_id, merged)
+    _job_store_upsert(job_id, merged)
+
+    if isinstance(run_id, int):
+        try:
+            artifact_key = _job_artifact_key(job_id, int(run_id), merged)
+            artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
+            ai_run = mapping_summary.get("ai_suggest_run")
+            if isinstance(ai_run, dict) and str(ai_run.get("status") or "").strip().lower() == AI_SUGGEST_RUN_STATUS_RUNNING:
+                ai_run["status"] = AI_SUGGEST_RUN_STATUS_CANCELLED
+                ai_run["updated_at_utc"] = now_txt
+                ai_run["cancelled_at_utc"] = now_txt
+                mapping_summary["ai_suggest_run"] = ai_run
+                _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        except Exception as exc:
+            print(f"CANCEL_AI_STATE_WARN job_id={job_id} detail={_safe_error_text(exc)}")
+
+    return jsonify(
+        {
+            "job_id": job_id,
+            "run_id": int(run_id) if isinstance(run_id, int) else None,
+            "status": "cancelled",
+            "github_cancel_status": github_cancel_status,
+        }
+    ), 200
 
 
 @app.route("/api/omr/jobs/<job_id>/state", methods=["GET"])
