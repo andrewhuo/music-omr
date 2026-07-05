@@ -85,8 +85,27 @@ jobs:
       - name: Download input PDF
         run: |
           set -euo pipefail
+          retry_cmd() {
+            local label="$1"
+            shift
+            local delays=("0.7" "1.5" "3.0")
+            local attempt=1
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+              if [[ "${attempt}" -gt "${#delays[@]}" ]]; then
+                echo "RETRY_FAILED label=${label} attempts=${attempt}"
+                return 1
+              fi
+              local delay="${delays[$((attempt - 1))]}"
+              echo "WORKFLOW_RETRY label=${label} next_attempt=$((attempt + 1))/4 delay=${delay}"
+              sleep "${delay}"
+              attempt=$((attempt + 1))
+            done
+          }
           mkdir -p /tmp/work
-          gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
+          retry_cmd input_pdf_download gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
           ls -lh /tmp/work/input.pdf
 
       - name: Run Audiveris OMR
@@ -4802,9 +4821,28 @@ jobs:
 
           uploaded_count=0
           missing_count=0
+          retry_cmd() {
+            local label="$1"
+            shift
+            local delays=("0.7" "1.5" "3.0")
+            local attempt=1
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+              if [[ "${attempt}" -gt "${#delays[@]}" ]]; then
+                echo "RETRY_FAILED label=${label} attempts=${attempt}"
+                return 1
+              fi
+              local delay="${delays[$((attempt - 1))]}"
+              echo "WORKFLOW_RETRY label=${label} next_attempt=$((attempt + 1))/4 delay=${delay}"
+              sleep "${delay}"
+              attempt=$((attempt + 1))
+            done
+          }
 
           if [[ -f /tmp/work/annotated.pdf ]]; then
-            gsutil cp /tmp/work/annotated.pdf "${RUN_OUTPUT_PREFIX}/audiveris_out.pdf"
+            retry_cmd audiveris_out_upload gsutil cp /tmp/work/annotated.pdf "${RUN_OUTPUT_PREFIX}/audiveris_out.pdf"
             echo "uploaded_audiveris_out=${RUN_OUTPUT_PREFIX}/audiveris_out.pdf"
             uploaded_count=$((uploaded_count + 1))
           else
@@ -4813,7 +4851,7 @@ jobs:
           fi
 
           if [[ -f /tmp/work/run_info.json ]]; then
-            gsutil cp /tmp/work/run_info.json "${ARTIFACTS_PREFIX}/run_info.json"
+            retry_cmd run_info_upload gsutil cp /tmp/work/run_info.json "${ARTIFACTS_PREFIX}/run_info.json"
             echo "uploaded_artifact_run_info=${ARTIFACTS_PREFIX}/run_info.json"
             uploaded_count=$((uploaded_count + 1))
           else
@@ -4822,7 +4860,7 @@ jobs:
           fi
 
           if [[ -f /tmp/work/mapping_summary.json ]]; then
-            gsutil cp /tmp/work/mapping_summary.json "${ARTIFACTS_PREFIX}/mapping_summary.json"
+            retry_cmd mapping_summary_upload gsutil cp /tmp/work/mapping_summary.json "${ARTIFACTS_PREFIX}/mapping_summary.json"
             echo "uploaded_artifact_mapping_summary=${ARTIFACTS_PREFIX}/mapping_summary.json"
             uploaded_count=$((uploaded_count + 1))
           else
@@ -4833,7 +4871,7 @@ jobs:
           shopt -s nullglob
           for debug_png in /tmp/work/coordinate_debug/coordinate_debug_page_*.png; do
             name="$(basename "${debug_png}")"
-            gsutil cp "${debug_png}" "${ARTIFACTS_PREFIX}/${name}"
+            retry_cmd coordinate_debug_upload gsutil cp "${debug_png}" "${ARTIFACTS_PREFIX}/${name}"
             echo "uploaded_artifact_coordinate_debug=${ARTIFACTS_PREFIX}/${name}"
             uploaded_count=$((uploaded_count + 1))
           done

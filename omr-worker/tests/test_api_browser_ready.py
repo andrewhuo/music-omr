@@ -187,6 +187,10 @@ class _FakeUploadFile:
         return self._data
 
 
+class _TemporaryServiceError(Exception):
+    code = 503
+
+
 class BrowserReadyApiTests(unittest.TestCase):
     def setUp(self):
         os.environ["CORS_ALLOW_ORIGINS"] = "http://localhost:5173"
@@ -369,6 +373,40 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(body.get("artifacts_http"), artifacts_http)
 
+    def test_create_job_reuses_same_pdf_retry_request(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        rec = {
+            "status": "queued",
+            "run_id": 111,
+            "pdf_gcs_uri": "gs://bucket/input.pdf",
+            "artifact_key": "retry-job",
+            "workflow_id": "omr.yml",
+            "ref": "main",
+        }
+
+        with (
+            patch.object(WORKER, "_pending_record", return_value=rec),
+            patch.object(WORKER, "_job_store_get", return_value=None),
+            patch.object(WORKER, "_dispatch_workflow") as dispatch_workflow,
+            patch.object(WORKER, "_artifact_uris_for_existing_run", return_value=artifacts),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+        ):
+            WORKER.request = SimpleNamespace(
+                path="/api/omr/jobs",
+                method="POST",
+                headers={},
+                files={},
+                json={"pdf_gcs_uri": "gs://bucket/input.pdf", "job_id": "retry-job"},
+            )
+            body, status = _unpack(WORKER.create_job())
+
+        self.assertEqual(status, 202)
+        self.assertEqual(body.get("job_id"), "retry-job")
+        self.assertEqual(body.get("run_id"), 111)
+        self.assertEqual(body.get("artifacts_http"), artifacts_http)
+        dispatch_workflow.assert_not_called()
+
         with (
             patch.object(
                 WORKER,
@@ -518,6 +556,49 @@ class BrowserReadyApiTests(unittest.TestCase):
         relabel = body.get("relabel") or {}
         self.assertEqual(relabel.get("labels_mode"), "all_measures")
         self.assertEqual(relabel.get("labels_redrawn_count"), 2)
+
+    def test_relabel_mapping_upload_failure_restores_previous_corrected_pdf(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        restored = {"called": False, "data": b""}
+
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={"edits": [{"type": "set_labels_mode", "value": "all_measures"}]},
+        )
+
+        def fake_download(_uri, dest_path):
+            Path(dest_path).write_bytes(b"old corrected pdf")
+
+        def fake_restore(data, uri, content_type=None):
+            restored["called"] = True
+            restored["data"] = bytes(data)
+            restored["uri"] = uri
+            restored["content_type"] = content_type
+
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_download_gcs_to_file", side_effect=fake_download),
+            patch.object(WORKER, "_gcs_uri_exists", return_value=True),
+            patch.object(WORKER, "_render_corrected_pdf", return_value=2),
+            patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=Exception("temporary upload failed")),
+            patch.object(WORKER, "_upload_bytes_to_gcs", side_effect=fake_restore),
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 500)
+        self.assertEqual(body.get("debug_result"), "upload_error")
+        self.assertEqual(body.get("rollback_result"), "restored_previous_corrected_pdf")
+        self.assertTrue(restored["called"])
+        self.assertEqual(restored["data"], b"old corrected pdf")
+        self.assertEqual(restored["uri"], artifacts["audiveris_out_corrected_pdf"])
 
     def test_measure_crop_spec_uses_full_vertical_padding_when_room_exists(self):
         page_rect = _FakeRect(0, 0, 200, 160)
@@ -1830,6 +1911,11 @@ class BrowserReadyApiTests(unittest.TestCase):
             files={},
             json={"edits": [{"type": "set_pickup_measure", "measure_id": "p1_s0_m0", "value": True}]},
         )
+        uploaded_json = []
+
+        def fake_upload_json(data, _uri):
+            uploaded_json.append(deepcopy(data))
+
         with (
             patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
             patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
@@ -1837,18 +1923,19 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_download_gcs_to_file", return_value=None),
             patch.object(WORKER, "_render_corrected_pdf", return_value=2),
             patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
-            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=fake_upload_json),
         ):
             body, status = _unpack(WORKER.relabel_job("111"))
 
         self.assertEqual(status, 200)
-        remaining = ((mapping_summary.get("ai_suggestions") or {}).get("by_measure_id") or {})
-        remaining_time_signatures = ((mapping_summary.get("ai_suggestions") or {}).get("time_signatures_by_measure_id") or {})
-        remaining_completeness = ((mapping_summary.get("ai_suggestions") or {}).get("measure_completeness_by_measure_id") or {})
+        saved_mapping = uploaded_json[-1]
+        remaining = ((saved_mapping.get("ai_suggestions") or {}).get("by_measure_id") or {})
+        remaining_time_signatures = ((saved_mapping.get("ai_suggestions") or {}).get("time_signatures_by_measure_id") or {})
+        remaining_completeness = ((saved_mapping.get("ai_suggestions") or {}).get("measure_completeness_by_measure_id") or {})
         self.assertEqual(sorted(remaining.keys()), ["p1_s1_m0"])
         self.assertEqual(sorted(remaining_time_signatures.keys()), ["p1_s1_m0"])
         self.assertEqual(sorted(remaining_completeness.keys()), ["p1_s1_m0"])
-        self.assertEqual((((mapping_summary.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
+        self.assertEqual((((saved_mapping.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
 
     def test_relabel_replace_auto_rows_for_page_persists_excluded_boxes_and_clears_page_ai(self):
         artifacts = self._sample_artifacts()
@@ -1916,6 +2003,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                 ]
             },
         )
+        uploaded_json = []
+
+        def fake_upload_json(data, _uri):
+            uploaded_json.append(deepcopy(data))
+
         with (
             patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
             patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
@@ -1923,16 +2015,17 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_download_gcs_to_file", return_value=None),
             patch.object(WORKER, "_render_corrected_pdf", return_value=2),
             patch.object(WORKER, "_upload_file_to_gcs", return_value=None),
-            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=fake_upload_json),
         ):
             body, status = _unpack(WORKER.relabel_job("111"))
 
         self.assertEqual(status, 200)
-        editable = mapping_summary.get("editable_state") or {}
+        saved_mapping = uploaded_json[-1]
+        editable = saved_mapping.get("editable_state") or {}
         self.assertEqual(len(editable.get("auto_rows") or []), 2)
         measure_rows = {row.get("measure_id"): row for row in (editable.get("measures") or [])}
         self.assertTrue((measure_rows.get("p1_s0_m0") or {}).get("excluded_from_counting"))
-        ai = mapping_summary.get("ai_suggestions") or {}
+        ai = saved_mapping.get("ai_suggestions") or {}
         self.assertEqual(ai.get("by_measure_id") or {}, {})
         self.assertEqual(ai.get("time_signatures_by_measure_id") or {}, {})
         self.assertEqual(ai.get("measure_completeness_by_measure_id") or {}, {})
@@ -2118,6 +2211,110 @@ class BrowserReadyApiTests(unittest.TestCase):
         }
         self.assertEqual(normalized.get("decision_debug_by_measure_id"), {"m0": expected_debug})
         self.assertEqual((normalized.get("by_measure_id", {}).get("m0") or {}).get("decision_debug"), expected_debug)
+
+    def test_gcs_upload_retries_temporary_error_then_succeeds(self):
+        calls = {"upload": 0}
+
+        class _FakeBlob:
+            def upload_from_string(self, *_args, **_kwargs):
+                calls["upload"] += 1
+                if calls["upload"] < 3:
+                    raise _TemporaryServiceError("temporary 503")
+
+        class _FakeBucket:
+            def blob(self, _name):
+                return _FakeBlob()
+
+        class _FakeClient:
+            def bucket(self, _name):
+                return _FakeBucket()
+
+        with (
+            patch.object(WORKER, "_gcs_client", return_value=_FakeClient()),
+            patch.object(WORKER, "_sleep_for_retry") as sleep_retry,
+        ):
+            WORKER._upload_bytes_to_gcs(b"ok", "gs://bucket/path/file.bin")
+
+        self.assertEqual(calls["upload"], 3)
+        self.assertEqual([call.args[0] for call in sleep_retry.call_args_list], [0.7, 1.5])
+
+    def test_gcs_download_retries_then_succeeds(self):
+        calls = {"download": 0}
+
+        class _FakeBlob:
+            def download_as_bytes(self):
+                calls["download"] += 1
+                if calls["download"] == 1:
+                    raise _TemporaryServiceError("temporary 503")
+                return b'{"ok": true}'
+
+        class _FakeBucket:
+            def blob(self, _name):
+                return _FakeBlob()
+
+        class _FakeClient:
+            def bucket(self, _name):
+                return _FakeBucket()
+
+        with (
+            patch.object(WORKER, "_gcs_client", return_value=_FakeClient()),
+            patch.object(WORKER, "_sleep_for_retry") as sleep_retry,
+        ):
+            self.assertEqual(WORKER._download_gcs_json("gs://bucket/path/state.json"), {"ok": True})
+
+        self.assertEqual(calls["download"], 2)
+        self.assertEqual([call.args[0] for call in sleep_retry.call_args_list], [0.7])
+
+    def test_gcs_invalid_uri_and_corrupt_json_do_not_retry(self):
+        with patch.object(WORKER, "_sleep_for_retry") as sleep_retry:
+            with self.assertRaises(ValueError):
+                WORKER._upload_bytes_to_gcs(b"ok", "not-gcs")
+        sleep_retry.assert_not_called()
+
+        class _FakeBlob:
+            def download_as_bytes(self):
+                return b"not json"
+
+        class _FakeBucket:
+            def blob(self, _name):
+                return _FakeBlob()
+
+        class _FakeClient:
+            def bucket(self, _name):
+                return _FakeBucket()
+
+        with (
+            patch.object(WORKER, "_gcs_client", return_value=_FakeClient()),
+            patch.object(WORKER, "_sleep_for_retry") as sleep_retry,
+        ):
+            with self.assertRaises(json.JSONDecodeError):
+                WORKER._download_gcs_json("gs://bucket/path/state.json")
+        sleep_retry.assert_not_called()
+
+    def test_github_request_retries_temporary_error_then_succeeds(self):
+        with (
+            patch.object(
+                WORKER,
+                "_gh_request_once",
+                side_effect=[WORKER.GitHubAPIError(502, "temporary"), {"ok": True}],
+            ) as request_once,
+            patch.object(WORKER, "_sleep_for_retry") as sleep_retry,
+        ):
+            self.assertEqual(WORKER._gh_request("GET", "/test"), {"ok": True})
+
+        self.assertEqual(request_once.call_count, 2)
+        self.assertEqual([call.args[0] for call in sleep_retry.call_args_list], [0.7])
+
+    def test_github_request_does_not_retry_permanent_error(self):
+        with (
+            patch.object(WORKER, "_gh_request_once", side_effect=WORKER.GitHubAPIError(404, "missing")) as request_once,
+            patch.object(WORKER, "_sleep_for_retry") as sleep_retry,
+        ):
+            with self.assertRaises(WORKER.GitHubAPIError):
+                WORKER._gh_request("GET", "/missing")
+
+        self.assertEqual(request_once.call_count, 1)
+        sleep_retry.assert_not_called()
 
     def test_normalize_ai_suggestions_result_keeps_first_measure_decision_debug_on_omitted_normal(self):
         editable_state = {

@@ -8,6 +8,7 @@ import threading
 import uuid
 import hashlib
 import base64
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
@@ -147,6 +148,7 @@ AI_SUGGESTION_DEBUG_DOT_SEEN_ALLOWED = {"true", "false", "unclear"}
 AI_SUGGESTION_DEBUG_NOTE_VALUE_ALLOWED = {"quarter", "half", "whole", "eighth", "other", "unclear"}
 AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
 BEDROCK_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
+TRANSIENT_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
 AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
 AI_OLD_STYLE_REFERENCE_EXAMPLES = (
     {
@@ -317,7 +319,55 @@ def _gh_headers() -> dict[str, str]:
     }
 
 
-def _gh_request(method: str, path: str, payload: dict | None = None, query: dict | None = None) -> dict | None:
+def _retry_delay_text(delays: tuple[float, ...] | list[float]) -> str:
+    return ",".join(str(int(delay) if float(delay).is_integer() else delay) for delay in delays)
+
+
+def _status_from_exception(exc: Exception) -> int:
+    for attr in ("status_code", "code"):
+        raw = getattr(exc, attr, None)
+        try:
+            status = int(raw)
+            if status > 0:
+                return status
+        except Exception:
+            pass
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    try:
+        return int(status)
+    except Exception:
+        return 0
+
+
+def _is_retryable_status(status: int) -> bool:
+    return int(status or 0) in {408, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_text(exc: Exception) -> bool:
+    text = _safe_error_text(exc).lower()
+    retryable_markers = (
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "temporarily unavailable",
+        "service unavailable",
+        "try again",
+        "rate limit",
+        "too many requests",
+        "backend error",
+        "internal error",
+    )
+    return any(marker in text for marker in retryable_markers)
+
+
+def _sleep_for_retry(delay_sec: float) -> None:
+    time.sleep(float(delay_sec))
+
+
+def _gh_request_once(method: str, path: str, payload: dict | None = None, query: dict | None = None) -> dict | None:
     url = f"{GITHUB_API_BASE}{path}"
     if query:
         url = f"{url}?{urlparse.urlencode(query)}"
@@ -339,6 +389,36 @@ def _gh_request(method: str, path: str, payload: dict | None = None, query: dict
         raise GitHubAPIError(exc.code, msg) from exc
     except urlerror.URLError as exc:
         raise GitHubAPIError(502, f"GitHub API unreachable: {exc}") from exc
+
+
+def _is_github_retryable_error(exc: GitHubAPIError) -> bool:
+    return _is_retryable_status(int(getattr(exc, "status_code", 0) or 0))
+
+
+def _gh_request(method: str, path: str, payload: dict | None = None, query: dict | None = None) -> dict | None:
+    delays = tuple(float(delay) for delay in TRANSIENT_RETRY_DELAYS_SEC if float(delay) > 0)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _gh_request_once(method, path, payload=payload, query=query)
+        except GitHubAPIError as exc:
+            if not _is_github_retryable_error(exc):
+                raise
+            if attempt > len(delays):
+                exc.message = f"{exc.message} github_retry_attempts={attempt} github_retry_delays_sec={_retry_delay_text(delays)}"
+                raise
+            delay_sec = delays[attempt - 1]
+            logger.warning(
+                "GITHUB_RETRY operation=%s path=%s attempt=%s/%s delay=%s status=%s",
+                str(method or "").upper(),
+                path,
+                attempt + 1,
+                len(delays) + 1,
+                delay_sec,
+                int(getattr(exc, "status_code", 0) or 0),
+            )
+            _sleep_for_retry(delay_sec)
 
 
 def _get_ref_sha(ref_name: str) -> str | None:
@@ -536,7 +616,7 @@ def _signed_http_url_for_gs(uri: str) -> str:
         bucket_name, blob_name = _gs_uri_to_bucket_blob(uri)
         bucket = _gcs_client().bucket(bucket_name)
         blob = bucket.blob(blob_name)
-        if not blob.exists():
+        if not _with_gcs_retry("signed_url_exists", uri, lambda: blob.exists()):
             return ""
         ttl_sec = max(60, _safe_int(os.environ.get("ARTIFACT_SIGNED_URL_TTL_SEC"), ARTIFACT_SIGNED_URL_TTL_SEC))
         expiry = timedelta(seconds=ttl_sec)
@@ -633,34 +713,103 @@ def _job_store_client():
     return _JOB_STORE_CLIENT
 
 
-def _job_store_upsert(job_id: str, payload: dict) -> None:
+def _is_gcs_retryable_error(exc: Exception) -> bool:
+    status = _status_from_exception(exc)
+    if status:
+        return _is_retryable_status(status)
+    return _is_retryable_text(exc)
+
+
+def _with_gcs_retry(operation: str, uri: str, fn):
+    delays = tuple(float(delay) for delay in TRANSIENT_RETRY_DELAYS_SEC if float(delay) > 0)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_gcs_retryable_error(exc):
+                raise
+            if attempt > len(delays):
+                raise
+            delay_sec = delays[attempt - 1]
+            logger.warning(
+                "GCS_RETRY operation=%s attempt=%s/%s delay=%s uri=%s reason=%s",
+                operation,
+                attempt + 1,
+                len(delays) + 1,
+                delay_sec,
+                uri,
+                _safe_error_text(exc),
+            )
+            _sleep_for_retry(delay_sec)
+
+
+def _with_job_store_retry(operation: str, job_id: str, fn) -> bool:
+    delays = tuple(float(delay) for delay in TRANSIENT_RETRY_DELAYS_SEC if float(delay) > 0)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            fn()
+            return True
+        except Exception as exc:
+            if not _is_gcs_retryable_error(exc):
+                print(f"JOB_STORE_{operation}_WARN job_id={job_id} detail={_safe_error_text(exc)}")
+                return False
+            if attempt > len(delays):
+                print(
+                    f"JOB_STORE_{operation}_WARN job_id={job_id} "
+                    f"detail={_safe_error_text(exc)} retry_attempts={attempt}"
+                )
+                return False
+            delay_sec = delays[attempt - 1]
+            logger.warning(
+                "JOB_STORE_RETRY operation=%s job_id=%s attempt=%s/%s delay=%s reason=%s",
+                operation,
+                job_id,
+                attempt + 1,
+                len(delays) + 1,
+                delay_sec,
+                _safe_error_text(exc),
+            )
+            _sleep_for_retry(delay_sec)
+
+
+def _job_store_upsert(job_id: str, payload: dict) -> bool:
     client = _job_store_client()
     if client is None:
-        return
+        return True
     data = dict(payload or {})
     data["job_id"] = str(job_id)
     data["updated_at_utc"] = _to_utc_z(_utc_now())
-    try:
-        client.collection(JOB_STORE_COLLECTION).document(str(job_id)).set(data, merge=True)
-    except Exception as exc:
-        print(f"JOB_STORE_UPSERT_WARN job_id={job_id} detail={_safe_error_text(exc)}")
+    return _with_job_store_retry(
+        "UPSERT",
+        str(job_id),
+        lambda: client.collection(JOB_STORE_COLLECTION).document(str(job_id)).set(data, merge=True),
+    )
 
 
 def _job_store_get(job_id: str) -> dict | None:
     client = _job_store_client()
     if client is None:
         return None
-    try:
+    holder: dict[str, dict | None] = {"value": None}
+
+    def _read():
         snap = client.collection(JOB_STORE_COLLECTION).document(str(job_id)).get()
         if not bool(getattr(snap, "exists", False)):
-            return None
+            holder["value"] = None
+            return
         data = snap.to_dict()
         if isinstance(data, dict):
-            return data
-        return None
-    except Exception as exc:
-        print(f"JOB_STORE_GET_WARN job_id={job_id} detail={_safe_error_text(exc)}")
-        return None
+            holder["value"] = data
+            return
+        holder["value"] = None
+
+    if _with_job_store_retry("GET", str(job_id), _read):
+        return holder["value"]
+    return None
 
 
 def _derive_job_id_from_pdf_uri(pdf_gcs_uri: str) -> str:
@@ -687,8 +836,10 @@ def _job_artifact_key(job_id: str, run_id: int | None = None, rec: dict | None =
     return ""
 
 
-def _ensure_unique_job_id(base_job_id: str) -> str:
+def _ensure_unique_job_id(base_job_id: str, *, allow_same: bool = False) -> str:
     base = _normalize_artifact_key(base_job_id)[:96] or str(uuid.uuid4())
+    if allow_same:
+        return base
     if _pending_record(base) is None and _job_store_get(base) is None:
         return base
     for idx in range(2, 1000):
@@ -713,14 +864,14 @@ def _gcs_uri_exists(uri: str) -> bool:
     bucket_name, blob_name = _parse_gs_uri(uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    return bool(blob.exists())
+    return bool(_with_gcs_retry("exists", uri, lambda: blob.exists()))
 
 
 def _download_gcs_json(uri: str) -> dict:
     bucket_name, blob_name = _parse_gs_uri(uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    raw = blob.download_as_bytes()
+    raw = _with_gcs_retry("download_json", uri, lambda: blob.download_as_bytes())
     data = json.loads(raw.decode("utf-8", errors="replace"))
     if not isinstance(data, dict):
         raise ValueError(f"expected JSON object at {uri}")
@@ -732,30 +883,38 @@ def _download_gcs_to_file(uri: str, dest_path: Path) -> None:
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    blob.download_to_filename(str(dest_path))
+    _with_gcs_retry("download_file", uri, lambda: blob.download_to_filename(str(dest_path)))
 
 
 def _upload_file_to_gcs(src_path: Path, dest_uri: str, content_type: str | None = None) -> None:
+    if not Path(src_path).is_file():
+        raise FileNotFoundError(str(src_path))
     bucket_name, blob_name = _parse_gs_uri(dest_uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    blob.upload_from_filename(str(src_path), content_type=content_type)
+    _with_gcs_retry("upload_file", dest_uri, lambda: blob.upload_from_filename(str(src_path), content_type=content_type))
 
 
 def _upload_bytes_to_gcs(data: bytes, dest_uri: str, content_type: str | None = None) -> None:
     bucket_name, blob_name = _parse_gs_uri(dest_uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    blob.upload_from_string(data, content_type=content_type or "application/octet-stream")
+    _with_gcs_retry(
+        "upload_bytes",
+        dest_uri,
+        lambda: blob.upload_from_string(data, content_type=content_type or "application/octet-stream"),
+    )
 
 
 def _upload_json_to_gcs(data: dict, dest_uri: str) -> None:
     bucket_name, blob_name = _parse_gs_uri(dest_uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    blob.upload_from_string(
-        json.dumps(data, indent=2, sort_keys=True) + "\n",
-        content_type="application/json",
+    payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    _with_gcs_retry(
+        "upload_json",
+        dest_uri,
+        lambda: blob.upload_from_string(payload, content_type="application/json"),
     )
 
 
@@ -763,9 +922,9 @@ def _delete_gcs_uri_if_exists(uri: str) -> tuple[bool, bool]:
     bucket_name, blob_name = _parse_gs_uri(uri)
     bucket = _gcs_client().bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    if not bool(blob.exists()):
+    if not bool(_with_gcs_retry("exists", uri, lambda: blob.exists())):
         return False, False
-    blob.delete()
+    _with_gcs_retry("delete", uri, lambda: blob.delete())
     return True, True
 
 
@@ -6255,6 +6414,30 @@ def create_job():
     requested_job_id = str(data.get("job_id") or "").strip()
     if not requested_job_id:
         requested_job_id = _derive_job_id_from_pdf_uri(pdf_gcs_uri)
+    requested_job_id = _ensure_unique_job_id(requested_job_id or str(uuid.uuid4()), allow_same=True)
+    existing_rec = _pending_record(requested_job_id) or _job_store_get(requested_job_id)
+    if isinstance(existing_rec, dict) and str(existing_rec.get("pdf_gcs_uri") or "").strip() == pdf_gcs_uri:
+        run_id = _safe_int(existing_rec.get("run_id"), 0)
+        artifact_key = _job_artifact_key(requested_job_id, run_id if run_id > 0 else None, existing_rec)
+        _pending_set(requested_job_id, existing_rec)
+        response = {
+            "job_id": requested_job_id,
+            "artifact_key": artifact_key,
+            "status": str(existing_rec.get("status") or "queued"),
+            "run_id": run_id if run_id > 0 else None,
+            "workflow": existing_rec.get("workflow_id") or existing_rec.get("workflow") or GITHUB_WORKFLOW_ID,
+            "ref": existing_rec.get("ref") or GITHUB_REF,
+            "pdf_gcs_uri": pdf_gcs_uri,
+            "status_url": f"/api/omr/jobs/{requested_job_id}",
+            "warning": "reused existing job for repeated create request",
+        }
+        if run_id > 0:
+            artifacts = _artifact_uris_for_existing_run(int(run_id), artifact_key=artifact_key)
+            response["run_url"] = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/actions/runs/{run_id}"
+            response["artifacts"] = artifacts
+            response["artifacts_http"] = _artifact_http_uris_for_run(int(run_id), artifacts)
+            response["storage_mode"] = _storage_mode_for_artifacts(artifacts)
+        return jsonify(response), 202
     dispatch_id = _ensure_unique_job_id(requested_job_id or str(uuid.uuid4()))
     artifact_key = _job_artifact_key(dispatch_id)
     dispatched_at = _utc_now()
@@ -6279,7 +6462,7 @@ def create_job():
             "workflow_id": workflow_id_used,
         },
     )
-    _job_store_upsert(
+    durable_job_saved = _job_store_upsert(
         dispatch_id,
         {
             "created_at_utc": _to_utc_z(dispatched_at),
@@ -6310,6 +6493,8 @@ def create_job():
         response["artifacts"] = artifacts
         response["artifacts_http"] = _artifact_http_uris_for_run(int(run_id), artifacts)
         response["storage_mode"] = _storage_mode_for_artifacts(artifacts)
+    if not durable_job_saved:
+        response["warning"] = "job started but durable job-store save failed; in-memory tracking is active"
 
     return jsonify(response), 202
 
@@ -7219,9 +7404,14 @@ def relabel_job(job_id: str):
             502,
         )
 
+    persisted_mapping_summary = deepcopy(mapping_summary)
+    mapping_summary = deepcopy(mapping_summary)
     mapping_uri = artifacts["mapping_summary"]
     baseline_pdf_uri = artifacts["audiveris_out_pdf"]
     corrected_pdf_uri = artifacts["audiveris_out_corrected_pdf"]
+
+    def _persist_error_trace(trace_payload: dict) -> bool:
+        return _persist_relabel_trace(deepcopy(persisted_mapping_summary), mapping_uri, trace_payload, trace_id)
 
     editable_state = mapping_summary.get("editable_state") or {}
     if not isinstance(editable_state, dict):
@@ -7243,7 +7433,7 @@ def relabel_job(job_id: str):
             "reason": "editable_state_missing",
             "error_detail": "editable_state missing in mapping_summary",
         }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        _persist_error_trace(trace)
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=validate_state "
             "reason=editable_state_missing detail=editable_state missing in mapping_summary"
@@ -7292,7 +7482,7 @@ def relabel_job(job_id: str):
             "reason": "invalid_payload",
             "error_detail": "edits array is required",
         }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        _persist_error_trace(trace)
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=validate_payload "
             "reason=invalid_payload detail=edits array is required"
@@ -7375,7 +7565,7 @@ def relabel_job(job_id: str):
             "reason": reason,
             "error_detail": _safe_error_text(exc),
         }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        _persist_error_trace(trace)
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=apply_edits "
             f"reason={reason} detail={_safe_error_text(exc)}"
@@ -7412,7 +7602,7 @@ def relabel_job(job_id: str):
             "reason": "internal_error",
             "error_detail": _safe_error_text(exc),
         }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        _persist_error_trace(trace)
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=apply_edits "
             f"reason=internal_error detail={_safe_error_text(exc)}"
@@ -7431,11 +7621,14 @@ def relabel_job(job_id: str):
         )
 
     redraw_ms = 0
+    corrected_backup_bytes: bytes | None = None
+    corrected_pdf_uploaded = False
     try:
         with TemporaryDirectory(prefix="omr-relabel-") as tmp:
             tmpdir = Path(tmp)
             in_pdf = tmpdir / "audiveris_out.pdf"
             out_pdf = tmpdir / "audiveris_out_corrected.pdf"
+            backup_pdf = tmpdir / "previous_audiveris_out_corrected.pdf"
             _download_gcs_to_file(baseline_pdf_uri, in_pdf)
             redraw_started = time.time()
             labels_drawn = _render_corrected_pdf(
@@ -7448,7 +7641,14 @@ def relabel_job(job_id: str):
                 editable_state=editable_state,
             )
             redraw_ms = int((time.time() - redraw_started) * 1000)
+            try:
+                _download_gcs_to_file(corrected_pdf_uri, backup_pdf)
+                if backup_pdf.is_file():
+                    corrected_backup_bytes = backup_pdf.read_bytes()
+            except Exception as exc:
+                print(f"RELABEL_BACKUP_WARN trace_id={trace_id} detail={_safe_error_text(exc)}")
             _upload_file_to_gcs(out_pdf, corrected_pdf_uri, content_type="application/pdf")
+            corrected_pdf_uploaded = True
     except Exception as exc:
         reason = "pdf_render_failed"
         error_txt = _safe_error_text(exc)
@@ -7473,7 +7673,7 @@ def relabel_job(job_id: str):
             "reason": reason,
             "error_detail": error_txt,
         }
-        _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id)
+        _persist_error_trace(trace)
         print(
             f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=render_pdf "
             f"reason={reason} detail={error_txt}"
@@ -7596,6 +7796,21 @@ def relabel_job(job_id: str):
         trace["reason"] = "invalid_payload"
 
     if not _persist_relabel_trace(mapping_summary, mapping_uri, trace, trace_id):
+        rollback_result = "not_needed"
+        if corrected_pdf_uploaded:
+            try:
+                if corrected_backup_bytes:
+                    _upload_bytes_to_gcs(corrected_backup_bytes, corrected_pdf_uri, content_type="application/pdf")
+                    rollback_result = "restored_previous_corrected_pdf"
+                else:
+                    _delete_gcs_uri_if_exists(corrected_pdf_uri)
+                    rollback_result = "deleted_new_corrected_pdf"
+            except Exception as rollback_exc:
+                rollback_result = f"rollback_failed:{_safe_error_text(rollback_exc)}"
+                print(
+                    f"RELABEL_TRACE_ERROR trace_id={trace_id} stage=rollback_corrected_pdf "
+                    f"reason=rollback_failed detail={_safe_error_text(rollback_exc)}"
+                )
         return (
             jsonify(
                 {
@@ -7604,6 +7819,7 @@ def relabel_job(job_id: str):
                     "run_id": run_id,
                     "trace_id": trace_id,
                     "debug_result": "upload_error",
+                    "rollback_result": rollback_result,
                 }
             ),
             500,
