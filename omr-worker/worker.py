@@ -113,7 +113,8 @@ AI_SUGGEST_RUN_STATUS_COMPLETED = "completed"
 AI_SUGGEST_RUN_STATUS_FAILED = "failed"
 AI_SUGGEST_RUN_STATUS_CANCELLED = "cancelled"
 AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED = "partial_failed"
-AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
+AI_SUGGESTION_ENDING_LABELS = {"ending_1", "ending_2"}
+AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", *AI_SUGGESTION_ENDING_LABELS, "uncertain"}
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
 AI_SUGGESTION_COMPLETENESS_ALLOWED = {"full", "incomplete", "unclear"}
@@ -2839,6 +2840,8 @@ def _normalize_ai_suggestions_result(
             measure_completeness = "incomplete"
         elif label == "multi_measure_rest":
             measure_completeness = "full"
+        elif label in AI_SUGGESTION_ENDING_LABELS:
+            measure_completeness = "full"
         elif not is_first_measure_of_score and label == "normal" and measure_completeness == "incomplete":
             normalization_warnings.append(
                 _ai_suggest_normalization_warning(
@@ -2930,6 +2933,14 @@ def _normalize_ai_suggestions_result(
                     )
                 )
             entry["rest_count"] = int(rest_count)
+        elif label in AI_SUGGESTION_ENDING_LABELS:
+            if rest_count is not None or maybe_label is not None or maybe_rest_count is not None:
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Ignored extra fields on ending suggestion for {measure_id}.",
+                    )
+                )
         else:
             if rest_count is not None:
                 normalization_warnings.append(
@@ -3872,6 +3883,30 @@ def _ai_prompt_score_pickup_rules() -> list[str]:
     ]
 
 
+def _ai_prompt_ending_rules(score_type: str) -> list[str]:
+    if score_type == "single":
+        scope_rule = "For single-staff music, inspect above this one staff for ending brackets."
+    elif score_type == "grand":
+        scope_rule = "For grand-staff/piano music, inspect above the top staff only; do not duplicate ending labels for the bottom staff."
+    elif score_type == "score":
+        scope_rule = "For full-score music, inspect above the top visible staff/system only; do not duplicate ending labels for each instrument."
+    else:
+        scope_rule = "Inspect above the staff/system for ending brackets."
+    return [
+        "Ending / volta detection:",
+        scope_rule,
+        "Look above the staff/system for repeat-ending or volta brackets.",
+        "First ending markers include 1, 1., 1st, or prima volta.",
+        "Second ending markers include 2, 2., 2nd, or seconda volta.",
+        "A bracket start often looks like an upside-down L: a left vertical line drops down and a horizontal line connects to its top and continues right.",
+        "The bracket may end with a right vertical line, or the horizontal line may simply stop.",
+        "Only label the measure where the bracket clearly starts.",
+        "If the crop only shows a continuing horizontal line with no readable number/start, do not label it as a new ending.",
+        "If the bracket start is clear but the number is unreadable, return uncertain.",
+        "Do not return a finish/end measure for endings.",
+    ]
+
+
 def _ai_prompt_single_rules() -> list[str]:
     return [
         "This is single-staff music. Judge rhythm using only this one staff.",
@@ -3897,6 +3932,7 @@ def _ai_prompt_single_rules() -> list[str]:
         "For the first measure, arithmetic wins over context; do not call a short first measure full because it looks musically complete.",
         "Only label normal/full if the written notes/rests clearly add up to the full visible meter.",
         "If first-measure pickup is possible but the visible meter or rhythm is unclear, use uncertain with maybe_label pickup.",
+        *_ai_prompt_ending_rules("single"),
         "Single-staff multi-measure rest rules:",
         "Check multi-measure rests before pickup or meter. Do not inspect meter for multi-measure rests.",
         "Use the old-style reference images as examples only; the real measure crops come after them. Old-style rests can look different from modern H-bars.",
@@ -3945,6 +3981,7 @@ def _ai_prompt_grand_rules() -> list[str]:
         "For the first measure, arithmetic wins over context; do not call a short first measure full because it looks musically complete.",
         "Only label normal/full if the top staff clearly fills the visible meter.",
         "If the top staff meter/rhythm is unreadable or cut off, use uncertain with maybe_label pickup.",
+        *_ai_prompt_ending_rules("grand"),
         "Grand-staff multi-measure rest rules:",
         "For grand-staff multi-measure rest, use only the top staff/treble staff.",
         "Check multi-measure rests before pickup or meter. Do not inspect meter for multi-measure rests.",
@@ -3993,6 +4030,7 @@ def _ai_prompt_score_rules() -> list[str]:
         "Only label normal/full if the first active staff clearly fills the visible meter.",
         "If you cannot confidently choose pickup, but the first active staff may be short, use uncertain with maybe_label pickup.",
         "If the first active staff meter/rhythm is completely unreadable, empty, or cut off, use uncertain with maybe_label pickup.",
+        *_ai_prompt_ending_rules("score"),
         "Full-score multi-measure rest rules:",
         "For full score V1, NEVER return multi_measure_rest.",
         "Do not look for multi-measure rests in full-score crops.",
@@ -4019,7 +4057,7 @@ def _ai_prompt_output_rules() -> list[str]:
 
 def _ai_prompt_single_output_rules() -> list[str]:
     return [
-        "Allowed labels: normal, pickup, multi_measure_rest, uncertain.",
+        "Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2, uncertain.",
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
         "Overusing uncertain is worse than a reasonable confident suggestion.",
@@ -4027,6 +4065,8 @@ def _ai_prompt_single_output_rules() -> list[str]:
         "For multi-rest: if readable count 2 or higher plus rest-like multi-rest symbol, output multi_measure_rest.",
         "For multi-rest: use uncertain only when the number is hard to read or might not be a rest count.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
+        "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
+        "Do not output ending finish/end measures.",
         "If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable, include maybe_rest_count.",
         "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
@@ -4035,7 +4075,7 @@ def _ai_prompt_single_output_rules() -> list[str]:
 
 def _ai_prompt_grand_output_rules() -> list[str]:
     return [
-        "Allowed labels: normal, pickup, multi_measure_rest, uncertain.",
+        "Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2, uncertain.",
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
         "Overusing uncertain is worse than a reasonable confident suggestion.",
@@ -4043,6 +4083,8 @@ def _ai_prompt_grand_output_rules() -> list[str]:
         "For multi-rest: if the top staff has readable count 2 or higher plus rest-like multi-rest symbol, output multi_measure_rest.",
         "For multi-rest: use uncertain only when the top-staff number is hard to read or might not be a rest count.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
+        "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
+        "Do not output ending finish/end measures.",
         "If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable, include maybe_rest_count.",
         "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
@@ -4051,10 +4093,12 @@ def _ai_prompt_grand_output_rules() -> list[str]:
 
 def _ai_prompt_score_output_rules() -> list[str]:
     return [
-        "Allowed labels: normal, pickup, uncertain.",
+        "Allowed labels: normal, pickup, ending_1, ending_2, uncertain.",
         "For pickup, overusing uncertain is worse than a reasonable pickup suggestion. For all other cases, use uncertain when evidence is truly unreadable.",
         "Do not skip any measure_id. Every input measure_id must appear exactly once.",
         "For full score V1, never output multi_measure_rest, and rest_count must always be null.",
+        "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
+        "Do not output ending finish/end measures.",
         "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
@@ -4076,6 +4120,7 @@ def _ai_prompt_legacy_rules() -> list[str]:
         "If label is multi_measure_rest, include integer rest_count of 2 or more. A visible count of 1 means the measure is normal, not multi_measure_rest.",
         "A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.",
         "For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count. If one staff has music, no count, or a different count, do not return multi_measure_rest.",
+        *_ai_prompt_ending_rules("legacy"),
         *_ai_prompt_output_rules(),
     ]
 
@@ -4109,8 +4154,8 @@ def _build_system_measure_request(
     system_id = str(system_row.get("system_id") or "").strip()
     page_number = _safe_int(system_row.get("page"), _safe_int((measure_rows[0] if measure_rows else {}).get("page"), 1))
     normalized_score_type = _normalize_ai_score_type(score_type)
-    score_allowed_labels = ["normal", "pickup", "uncertain"] if normalized_score_type == "score" else ["normal", "pickup", "multi_measure_rest", "uncertain"]
-    score_label_shape = "normal|pickup|uncertain" if normalized_score_type == "score" else "normal|pickup|multi_measure_rest|uncertain"
+    score_allowed_labels = ["normal", "pickup", "ending_1", "ending_2", "uncertain"] if normalized_score_type == "score" else ["normal", "pickup", "multi_measure_rest", "ending_1", "ending_2", "uncertain"]
+    score_label_shape = "normal|pickup|ending_1|ending_2|uncertain" if normalized_score_type == "score" else "normal|pickup|multi_measure_rest|ending_1|ending_2|uncertain"
     score_maybe_label_shape = "pickup|null" if normalized_score_type == "score" else "pickup|multi_measure_rest|null"
     intro = {
         "job_id": str(job_id),
