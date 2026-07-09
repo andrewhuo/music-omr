@@ -577,6 +577,7 @@ def _artifact_uris_for_run(run_id: int, artifact_key: str | None = None) -> dict
         "audiveris_out_corrected_pdf": f"{out}/audiveris_out_corrected.pdf",
         "run_info": f"{out}/artifacts/run_info.json",
         "mapping_summary": f"{out}/artifacts/mapping_summary.json",
+        "page_omr_report": f"{out}/artifacts/page_omr_report.json",
     }
 
 
@@ -587,6 +588,7 @@ def _legacy_artifact_uris_for_run(run_id: int) -> dict[str, str]:
         "audiveris_out_corrected_pdf": f"{out}/audiveris_out_corrected.pdf",
         "run_info": f"{out}/artifacts/run_info.json",
         "mapping_summary": f"{out}/artifacts/mapping_summary.json",
+        "page_omr_report": f"{out}/artifacts/page_omr_report.json",
     }
 
 

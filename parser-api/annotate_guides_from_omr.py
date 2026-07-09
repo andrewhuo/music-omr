@@ -342,6 +342,10 @@ def _load_mxl_page_manifest(path: str) -> tuple[dict[int, dict], dict]:
     return by_page, summary
 
 
+def _manifest_page_failed(manifest_active: bool, entry: dict | None) -> bool:
+    return bool(manifest_active and (not entry or entry.get("status") != "ok"))
+
+
 def _iter_named(root: ET.Element, name: str) -> list[ET.Element]:
     out: list[ET.Element] = []
     for el in root.iter():
@@ -3225,6 +3229,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             ending_anchor_preview: list[dict] = []
             ending_anchor_count = 0
             ending_labels_drawn = 0
+            page_recovery_failed = False
 
             if measure_label_mode == "staff_start":
                 if mxl_manifest_active:
@@ -3277,6 +3282,10 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         mapping_mode = "missing"
                         xml_selection_source = "none"
                         xml_selection_reason = "manifest_page_missing"
+                    page_recovery_failed = _manifest_page_failed(
+                        mxl_manifest_active,
+                        manifest_entry,
+                    )
                 else:
                     if mxl_any_ok:
                         page_mxl_starts, mxl_page_candidate_source, mxl_page_candidate_path = _select_mxl_page_starts(
@@ -3471,6 +3480,18 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         )
                     trace["pdf_final_right_edge"] = round(float(x_right_pdf), 3)
 
+            if page_recovery_failed:
+                staff_start_labels_pdf = []
+                ending_anchor_labels_pdf = []
+                system_labels_assigned_count = 0
+                system_label_rows = []
+                measure_box_rows = []
+                coordinate_trace_by_system = {}
+                mapping_status = "error"
+                mapping_mode = "missing"
+                if not str(mapping_reason).startswith("manifest_"):
+                    mapping_reason = f"manifest_{mapping_reason}"
+
             coordinate_trace = [
                 {
                     "system_index": int(system_index),
@@ -3481,7 +3502,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             coordinate_debug_images: list[dict] = []
             debug_dir = os.getenv("COORDINATE_DEBUG_DIR", "").strip()
             debug_image_path = None
-            if debug_dir:
+            if debug_dir and not page_recovery_failed:
                 os.makedirs(debug_dir, exist_ok=True)
                 debug_image_path = os.path.join(debug_dir, f"coordinate_debug_page_{page_index + 1}.png")
                 debug_image_written = _draw_coordinate_debug_image(
@@ -3506,7 +3527,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 pic_h,
                 scale_x,
                 scale_y,
-                measure_box_rows_px,
+                [] if page_recovery_failed else measure_box_rows_px,
                 debug_image_path,
             )
 

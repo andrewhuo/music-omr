@@ -55,6 +55,12 @@ def _barline_el(el_id: int, staff: str, x: float, y_top: float, y_bottom: float,
 
 
 class AnnotateGuidesFromOmrTests(unittest.TestCase):
+    def test_manifest_failed_page_is_skipped(self):
+        self.assertTrue(MOD._manifest_page_failed(True, None))
+        self.assertTrue(MOD._manifest_page_failed(True, {"status": "missing"}))
+        self.assertFalse(MOD._manifest_page_failed(True, {"status": "ok"}))
+        self.assertFalse(MOD._manifest_page_failed(False, None))
+
     def test_grand_staff_connector_suppression_detects_tiny_shared_left_box(self):
         rows = [
             {

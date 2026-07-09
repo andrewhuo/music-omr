@@ -403,12 +403,19 @@ jobs:
             echo "SMOKE_SELECTED_MEMBER=$(cat /tmp/work/selected_mxl_member_smoke.txt)"
           fi
 
-          run_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" audiveris_out_try1
+          FULL_RUN_EXIT_CODE=0
+          if run_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" audiveris_out_try1; then
+            FULL_RUN_EXIT_CODE=0
+          else
+            FULL_RUN_EXIT_CODE=$?
+          fi
           SELECTED_OUT="/tmp/work/audiveris_out_try1"
-          if ! check_mxl "$SELECTED_OUT" "full"; then
+          FULL_MXL_OK=false
+          if check_mxl "$SELECTED_OUT" "full"; then
+            FULL_MXL_OK=true
+          else
             echo "MusicXML export has no parts/measures after successful startup."
-            echo "Failing fast in xml-strict mode (no fallback image retry)."
-            exit 1
+            echo "FULL_MXL_FALLBACK page_split=true"
           fi
 
           AUDI_SELECTED_OUT="${SELECTED_OUT}"
@@ -421,16 +428,22 @@ jobs:
             OMR_PATH="$(find "${AUDI_SELECTED_OUT}" -maxdepth 3 -type f -name "*.omr" | head -n 1 || true)"
           fi
           if [[ -z "${OMR_PATH}" || ! -f "${OMR_PATH}" ]]; then
-            echo "ERROR: missing .omr output under ${AUDI_SELECTED_OUT}"
+            echo "WARN: missing .omr output under ${AUDI_SELECTED_OUT}; final PDF will remain unchanged"
             find "${AUDI_SELECTED_OUT}" -maxdepth 4 -type f -print || true
-            exit 1
+            OMR_PATH=""
           fi
-          MXL_MEMBER_OVERRIDE="$(cat /tmp/work/selected_mxl_member.txt)"
-          MXL_PATH_OVERRIDE="$(cat /tmp/work/selected_mxl_path.txt)"
+          MXL_MEMBER_OVERRIDE=""
+          MXL_PATH_OVERRIDE=""
+          if [[ "${FULL_MXL_OK}" == "true" ]]; then
+            MXL_MEMBER_OVERRIDE="$(cat /tmp/work/selected_mxl_member.txt)"
+            MXL_PATH_OVERRIDE="$(cat /tmp/work/selected_mxl_path.txt)"
+          fi
           echo "AUDI_SELECTED_OUT=${AUDI_SELECTED_OUT}" >> "$GITHUB_ENV"
           echo "AUDI_OMR_PATH=${OMR_PATH}" >> "$GITHUB_ENV"
           echo "MXL_MEMBER_OVERRIDE=${MXL_MEMBER_OVERRIDE}" >> "$GITHUB_ENV"
           echo "MXL_PATH_OVERRIDE=${MXL_PATH_OVERRIDE}" >> "$GITHUB_ENV"
+          echo "FULL_MXL_OK=${FULL_MXL_OK}" >> "$GITHUB_ENV"
+          echo "FULL_RUN_EXIT_CODE=${FULL_RUN_EXIT_CODE}" >> "$GITHUB_ENV"
           echo "AUDI_SELECTED_OUT=${AUDI_SELECTED_OUT}"
           echo "AUDI_OMR_PATH=${OMR_PATH}"
           echo "MXL_PATH_OVERRIDE=${MXL_PATH_OVERRIDE}"
@@ -480,6 +493,10 @@ jobs:
           set -euo pipefail
           OMR="${AUDI_OMR_PATH:-}"
           if [[ -z "$OMR" ]]; then
+            echo "WARN: no full-document OMR archive; page recovery report will still be generated"
+            exit 0
+          fi
+          if [[ -z "$OMR" ]]; then
             OMR="${AUDI_SELECTED_OUT}/input/input.omr"
           fi
           if [[ ! -f "$OMR" ]]; then
@@ -512,7 +529,7 @@ jobs:
       - name: Build page-split XML manifest (strict mode)
         run: |
           set -euo pipefail
-          mkdir -p /tmp/work/pages /tmp/work/audiveris_pages /tmp/work/page_logs
+          mkdir -p /tmp/work/pages /tmp/work/audiveris_pages /tmp/work/page_logs /tmp/work/page_status
           AUDIVERIS_IMAGE_EFFECTIVE="${AUDIVERIS_IMAGE}"
 
           python - << 'PY'
@@ -556,17 +573,51 @@ jobs:
             [[ -f "${page_pdf}" ]] || continue
             page_num="$(basename "${page_pdf}" | sed -E 's/^page_([0-9]{4})\.pdf$/\1/')"
             out_dir="/tmp/work/audiveris_pages/page_${page_num}"
-            log_path="/tmp/work/page_logs/page_${page_num}.log"
+            status_path="/tmp/work/page_status/page_${page_num}.json"
+            log_path="/tmp/work/page_logs/page_${page_num}_attempt1.log"
+            rm -rf "${out_dir}"
             if run_page_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" "${page_num}" >"${log_path}" 2>&1; then
               exit_code=0
             else
               exit_code=$?
             fi
-            echo "PAGE_XML_RUN page=$((10#${page_num})) image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${exit_code} log=${log_path} out_dir=${out_dir}"
+            page_ok=false
+            if python parser-api/page_omr_recovery.py validate \
+              --out-dir "${out_dir}" \
+              --status-path "${status_path}" \
+              --page "$((10#${page_num}))" \
+              --attempt 1 \
+              --log-path "${log_path}"; then
+              page_ok=true
+            fi
+            echo "PAGE_XML_RUN page=$((10#${page_num})) attempt=1 image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${exit_code} valid=${page_ok} log=${log_path} out_dir=${out_dir}"
+
+            if [[ "${page_ok}" != "true" ]]; then
+              log_path="/tmp/work/page_logs/page_${page_num}_attempt2.log"
+              rm -rf "${out_dir}"
+              if run_page_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" "${page_num}" >"${log_path}" 2>&1; then
+                exit_code=0
+              else
+                exit_code=$?
+              fi
+              if python parser-api/page_omr_recovery.py validate \
+                --out-dir "${out_dir}" \
+                --status-path "${status_path}" \
+                --page "$((10#${page_num}))" \
+                --attempt 2 \
+                --log-path "${log_path}"; then
+                page_ok=true
+              else
+                page_ok=false
+              fi
+              echo "PAGE_XML_RUN page=$((10#${page_num})) attempt=2 image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${exit_code} valid=${page_ok} log=${log_path} out_dir=${out_dir}"
+            fi
+
+            cp "${log_path}" "/tmp/work/page_logs/page_${page_num}.log"
             echo "PAGE_XML_OUTPUTS_BEGIN page=$((10#${page_num}))"
             find "${out_dir}" -maxdepth 4 -type f -print | sort || true
             echo "PAGE_XML_OUTPUTS_END page=$((10#${page_num}))"
-            if [[ "${exit_code}" -ne 0 ]]; then
+            if [[ "${page_ok}" != "true" ]]; then
               echo "PAGE_XML_LOG_TAIL_BEGIN page=$((10#${page_num}))"
               tail -n 200 "${log_path}" || true
               echo "PAGE_XML_LOG_TAIL_END page=$((10#${page_num}))"
@@ -3323,6 +3374,7 @@ jobs:
                       entry["numbering_policy"] = "baseline_continuous_v1"
 
                       if entry.get("status") != "ok":
+                          global_next_start = None
                           continue
 
                       raw_starts = list(entry.get("system_starts_normalized") or entry.get("system_starts") or [])
@@ -3376,6 +3428,7 @@ jobs:
                       entry["semantic_model"] = "semantic_continuous_v2_longest_ending"
                       entry["ending_groups"] = []
                       entry["ending_anchors"] = []
+                      global_next_start = None
                       continue
 
                   page_num = int(entry.get("page_number") or 0)
@@ -4054,6 +4107,12 @@ jobs:
           PY
 
           echo "MXL_PAGE_MANIFEST_PATH=/tmp/work/mxl_page_manifest.json" >> "$GITHUB_ENV"
+          python parser-api/page_omr_recovery.py report \
+            --manifest /tmp/work/mxl_page_manifest.json \
+            --status-dir /tmp/work/page_status \
+            --output /tmp/work/page_omr_report.json \
+            --full-document-success "$([[ "${FULL_MXL_OK:-false}" == "true" ]] && echo 1 || echo 0)" \
+            --log-output-dir /tmp/work/page_report_logs
 
       - name: Annotate PDF (guides only)
         env:
@@ -4098,10 +4157,40 @@ jobs:
           for m in markers:
               print(f"PARSER_MARKER {m} present={m in text}")
           PY
-          python -u parser-api/annotate_guides_from_omr.py \
-            /tmp/work/input.pdf \
-            "${AUDI_OMR_PATH}" \
-            /tmp/work/annotated.pdf
+          if [[ -n "${AUDI_OMR_PATH:-}" && -f "${AUDI_OMR_PATH}" ]]; then
+            python -u parser-api/annotate_guides_from_omr.py \
+              /tmp/work/input.pdf \
+              "${AUDI_OMR_PATH}" \
+              /tmp/work/annotated.pdf
+          else
+            cp /tmp/work/input.pdf /tmp/work/annotated.pdf
+            python - <<'PY'
+          import fitz
+          import json
+
+          doc = fitz.open("/tmp/work/input.pdf")
+          pages = []
+          for page_index in range(doc.page_count):
+              page = doc[page_index]
+              pages.append(
+                  {
+                      "page_index": page_index,
+                      "page_width": float(page.rect.width),
+                      "page_height": float(page.rect.height),
+                      "staff_start_source": "none",
+                      "mapping_status": "error",
+                      "mapping_reason": "full_omr_missing",
+                      "mapping_mode": "missing",
+                      "omr_system_count": 0,
+                      "system_label_rows": [],
+                      "measure_box_rows": [],
+                  }
+              )
+          doc.close()
+          with open("/tmp/work/measure_mapping_debug.json", "w", encoding="utf-8") as fh:
+              json.dump({"pages": pages}, fh, indent=2)
+          PY
+          fi
           ls -lh /tmp/work/annotated.pdf
 
       - name: Sanity-check output PDF
@@ -4319,21 +4408,24 @@ jobs:
           if system_qa_policy == "warn":
               for page_no, detail in strict_system_drift:
                   print(f"SUMMARY system_qa_warn page={page_no} detail={detail}")
-          if strict_xml_pages_ok != total_pages or (system_qa_policy == "strict" and strict_system_drift):
+          if strict_xml_pages_ok != total_pages:
               for page_no, reason, status, mode, detail in strict_xml_missing:
                   line = (
-                      "SUMMARY strict_xml_missing "
+                      "SUMMARY page_recovery_missing "
                       f"page={page_no} reason={reason} status={status} mode={mode}"
                   )
                   if detail:
                       line += f" select_error_detail={detail}"
                   print(line)
-              if system_qa_policy == "strict":
-                  for page_no, detail in strict_system_drift:
-                      print(f"SUMMARY strict_system_drift page={page_no} detail={detail}")
+              print(
+                  "SUMMARY partial_output "
+                  f"successful_pages={strict_xml_pages_ok} total_pages={total_pages}"
+              )
+          if system_qa_policy == "strict" and strict_system_drift:
+              for page_no, detail in strict_system_drift:
+                  print(f"SUMMARY strict_system_drift page={page_no} detail={detail}")
               raise SystemExit(
-                  "ERROR: strict checks failed "
-                  f"strict_xml_pages_ok={strict_xml_pages_ok}/{total_pages} "
+                  "ERROR: strict system QA failed "
                   f"system_count_drift={len(strict_system_drift)}"
               )
           PY
@@ -4377,9 +4469,12 @@ jobs:
 
           mm_path = Path("/tmp/work/measure_mapping_debug.json")
           manifest_path = Path("/tmp/work/mxl_page_manifest.json")
+          page_omr_report_path = Path("/tmp/work/page_omr_report.json")
           mm_raw = _load_json(mm_path)
           mm = mm_raw if isinstance(mm_raw, dict) else {}
           manifest = _load_json(manifest_path)
+          page_omr_report_raw = _load_json(page_omr_report_path)
+          page_omr_report = page_omr_report_raw if isinstance(page_omr_report_raw, dict) else {}
 
           pages = mm.get("pages") if isinstance(mm, dict) else None
           if not isinstance(pages, list):
@@ -4741,11 +4836,25 @@ jobs:
               if _sid:
                   _measures_per_system[_sid] = _measures_per_system.get(_sid, 0) + 1
           _running_start = 1
+          _previous_page = None
           for _sys in _sorted_sys:
               _sid = str(_sys.get("system_id") or "")
+              _page = int(_sys.get("page") or 0)
+              if (
+                  _previous_page is not None
+                  and _page > int(_previous_page) + 1
+              ):
+                  try:
+                      _running_start = int(str(_sys.get("current_value") or "").strip())
+                  except Exception:
+                      print(
+                          "SYSTEM_RECOMPUTE_GAP_WARN "
+                          f"page={_page} current_value={_sys.get('current_value')}"
+                      )
               _sys["current_value"] = str(_running_start)
               _sys["value"] = str(_running_start)
               _running_start += _measures_per_system.get(_sid, 0)
+              _previous_page = _page
           print(f"SYSTEM_RECOMPUTE total_systems={len(_sorted_sys)} total_measures={sum(_measures_per_system.values())}")
 
           editable_state = {
@@ -4787,6 +4896,17 @@ jobs:
               "coordinate_trace": coordinate_trace,
               "coordinate_debug_images": coordinate_debug_images,
               "page_box_debug": page_box_debug,
+              "page_omr_report": {
+                  "available": bool(page_omr_report),
+                  "artifact": "artifacts/page_omr_report.json" if page_omr_report else None,
+                  "full_document_success": page_omr_report.get("full_document_success"),
+                  "total_pages": int(page_omr_report.get("total_pages") or 0),
+                  "successful_pages": list(page_omr_report.get("successful_pages") or []),
+                  "failed_pages": list(page_omr_report.get("failed_pages") or []),
+                  "recovered_on_retry_pages": list(
+                      page_omr_report.get("recovered_on_retry_pages") or []
+                  ),
+              },
               "editable_state": editable_state,
           }
 
@@ -4867,6 +4987,24 @@ jobs:
             echo "WARN: /tmp/work/mapping_summary.json not found"
             missing_count=$((missing_count + 1))
           fi
+
+          if [[ -f /tmp/work/page_omr_report.json ]]; then
+            retry_cmd page_omr_report_upload gsutil cp /tmp/work/page_omr_report.json "${ARTIFACTS_PREFIX}/page_omr_report.json"
+            echo "uploaded_artifact_page_omr_report=${ARTIFACTS_PREFIX}/page_omr_report.json"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/page_omr_report.json not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          shopt -s nullglob
+          for page_log in /tmp/work/page_report_logs/page_*.log; do
+            name="$(basename "${page_log}")"
+            retry_cmd page_omr_log_upload gsutil cp "${page_log}" "${ARTIFACTS_PREFIX}/page_omr_logs/${name}"
+            echo "uploaded_artifact_page_omr_log=${ARTIFACTS_PREFIX}/page_omr_logs/${name}"
+            uploaded_count=$((uploaded_count + 1))
+          done
+          shopt -u nullglob
 
           shopt -s nullglob
           for debug_png in /tmp/work/coordinate_debug/coordinate_debug_page_*.png; do

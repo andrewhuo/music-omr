@@ -373,6 +373,13 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(body.get("artifacts_http"), artifacts_http)
 
+    def test_run_artifacts_include_page_omr_report(self):
+        artifacts = WORKER._artifact_uris_for_run(123, artifact_key="job-123")
+        self.assertEqual(
+            artifacts["page_omr_report"],
+            f"{WORKER.OUTPUT_PREFIX.rstrip('/')}/runs/job-123/artifacts/page_omr_report.json",
+        )
+
     def test_create_job_reuses_same_pdf_retry_request(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
