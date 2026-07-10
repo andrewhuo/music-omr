@@ -11,6 +11,10 @@ on:
         description: "Optional stable artifact folder key (e.g., backend job_id)"
         required: false
         type: string
+      raster_test_mode:
+        description: "Optional debug-only rasterized Audiveris test for one-page PDFs"
+        required: false
+        type: string
 
 jobs:
   pipeline:
@@ -25,6 +29,7 @@ jobs:
       SYSTEM_QA_POLICY: "warn"
       SYSTEM_GUIDE_CV_FALLBACK: "0"
       PIPELINE_LOG_MODE: "${{ vars.PIPELINE_LOG_MODE != '' && vars.PIPELINE_LOG_MODE || 'quiet' }}"
+      RASTER_TEST_MODE: "${{ inputs.raster_test_mode != '' && inputs.raster_test_mode || vars.RASTER_TEST_MODE }}"
 
     permissions:
       contents: read
@@ -81,6 +86,7 @@ jobs:
           echo "audiveris_image: ${AUDIVERIS_IMAGE}"
           echo "output_prefix: ${OUTPUT_PREFIX}"
           echo "pipeline_log_mode: ${PIPELINE_LOG_MODE}"
+          echo "raster_test_mode: ${RASTER_TEST_MODE:-0}"
 
       - name: Download input PDF
         run: |
@@ -525,6 +531,83 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0
+
+      - name: Rasterized Audiveris test mode
+        if: ${{ env.RASTER_TEST_MODE == '1' || env.RASTER_TEST_MODE == 'true' || env.RASTER_TEST_MODE == 'yes' }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/work/raster
+          AUDIVERIS_IMAGE_EFFECTIVE="${AUDIVERIS_IMAGE}"
+
+          python parser-api/raster_audiveris_lab.py build \
+            --input-pdf /tmp/work/input.pdf \
+            --output-dir /tmp/work/raster \
+            --zoom 4.0
+
+          if grep -q '"status": "skipped"' /tmp/work/raster/raster_report.json; then
+            echo "RASTER_TEST_SKIPPED reason=one_page_only"
+            exit 0
+          fi
+
+          run_raster_omr() {
+            local variant="$1"
+            local input_pdf="/work/raster/${variant}_input.pdf"
+            local out_dir="/work/raster/${variant}_audiveris"
+            docker run --rm \
+              --entrypoint /bin/sh \
+              --user "$(id -u):$(id -g)" \
+              -v /tmp/work:/work \
+              -e AUDI_IMAGE="${AUDIVERIS_IMAGE_EFFECTIVE}" \
+              -e AUDI_OUT_DIR="${out_dir}" \
+              -e RASTER_INPUT_PDF="${input_pdf}" \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              "${AUDIVERIS_IMAGE_EFFECTIVE}" \
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; "$AUDI_BIN" -batch -export -output "${AUDI_OUT_DIR}" "${RASTER_INPUT_PDF}"'
+          }
+
+          find_omr() {
+            local variant="$1"
+            find "/tmp/work/raster/${variant}_audiveris" -type f -name '*.omr' | sort | head -n 1 || true
+          }
+
+          for variant in gentle strong; do
+            log_path="/tmp/work/raster/${variant}_audiveris.log"
+            if run_raster_omr "${variant}" >"${log_path}" 2>&1; then
+              echo "RASTER_AUDIVERIS_RUN variant=${variant} exit_code=0"
+            else
+              exit_code=$?
+              echo "RASTER_AUDIVERIS_RUN variant=${variant} exit_code=${exit_code}"
+            fi
+
+            omr_path="$(find_omr "${variant}")"
+            if [[ -n "${omr_path}" && -f "${omr_path}" ]]; then
+              mkdir -p "/tmp/work/raster/${variant}_coordinate_debug"
+              if COORDINATE_DEBUG_DIR="/tmp/work/raster/${variant}_coordinate_debug" \
+                python -u parser-api/annotate_guides_from_omr.py \
+                  "/tmp/work/raster/${variant}_input.pdf" \
+                  "${omr_path}" \
+                  "/tmp/work/raster/${variant}_boxed.pdf" >"/tmp/work/raster/${variant}_annotate.log" 2>&1; then
+                python parser-api/raster_audiveris_lab.py copy-boxed \
+                  --raster-dir /tmp/work/raster \
+                  --variant "${variant}"
+                echo "RASTER_BOXED_OUTPUT variant=${variant} status=ok"
+              else
+                echo "RASTER_BOXED_OUTPUT variant=${variant} status=failed"
+                tail -n 120 "/tmp/work/raster/${variant}_annotate.log" || true
+              fi
+            else
+              echo "RASTER_BOXED_OUTPUT variant=${variant} status=skipped_no_omr"
+            fi
+          done
+
+          python parser-api/raster_audiveris_lab.py finalize \
+            --raster-dir /tmp/work/raster
+          echo "RASTER_REPORT_BEGIN"
+          cat /tmp/work/raster/raster_report.json
+          echo "RASTER_REPORT_END"
 
       - name: Build page-split XML manifest (strict mode)
         run: |
@@ -5014,5 +5097,15 @@ jobs:
             uploaded_count=$((uploaded_count + 1))
           done
           shopt -u nullglob
+
+          shopt -s globstar nullglob
+          for raster_file in /tmp/work/raster/**/* /tmp/work/raster/*; do
+            [[ -f "${raster_file}" ]] || continue
+            rel="${raster_file#/tmp/work/raster/}"
+            retry_cmd raster_artifact_upload gsutil cp "${raster_file}" "${ARTIFACTS_PREFIX}/raster/${rel}"
+            echo "uploaded_artifact_raster=${ARTIFACTS_PREFIX}/raster/${rel}"
+            uploaded_count=$((uploaded_count + 1))
+          done
+          shopt -u globstar nullglob
 
           echo "OUTPUT_LAYOUT_OK top_level=audiveris_out.pdf,artifacts/ uploaded=${uploaded_count} missing=${missing_count}"
