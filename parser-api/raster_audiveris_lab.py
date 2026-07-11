@@ -108,8 +108,136 @@ def _render_page(input_pdf, page_number, output_dir, zoom=4.0):
         doc.close()
 
 
-def _estimate_skew(gray):
+def _line_segments(gray):
     cv2, _, np = _image_libs()
+    h, w = gray.shape[:2]
+    normalized = _normalize_background(gray)
+    binary = cv2.adaptiveThreshold(
+        normalized,
+        255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        10,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(24, w // 90), 1))
+    horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    segments = []
+
+    def segment_angle(x, y, width, height):
+        crop = normalized[max(0, y - 4):min(h, y + height + 4), x:min(w, x + width)]
+        edges = cv2.Canny(crop, 50, 150)
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180,
+            threshold=max(6, width // 20),
+            minLineLength=max(12, width // 5),
+            maxLineGap=max(3, width // 40),
+        )
+        candidates = []
+        for x1, y1, x2, y2 in lines[:, 0, :] if lines is not None else []:
+            dx = float(x2) - float(x1)
+            if abs(dx) < 1:
+                continue
+            angle = float(np.degrees(np.arctan2(float(y2) - float(y1), dx)))
+            length = float((dx * dx + (float(y2) - float(y1)) ** 2) ** 0.5)
+            if abs(angle) <= 6:
+                candidates.append((length, angle))
+        return max(candidates, default=(0.0, 0.0))[1]
+
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        if width < max(30, int(w * 0.08)) or height > 8:
+            continue
+        crop = normalized[y:min(h, y + height), x:min(w, x + width)]
+        segments.append(
+            {
+                "left": int(x),
+                "right": int(x + width - 1),
+                "y": float(y + (height - 1) / 2.0),
+                "height": int(height),
+                "thickness": float(height),
+                "angle": round(float(segment_angle(x, y, width, height)), 3),
+                "darkness": round(float(np.mean(crop < 180)), 4),
+                "length": int(width),
+            }
+        )
+    return segments, binary, horizontal
+
+
+def _group_staff_segments(segments, image_width, image_height):
+    rows = []
+    for segment in sorted(segments, key=lambda item: item["y"]):
+        if rows and abs(segment["y"] - rows[-1]["y"]) <= 4:
+            row = rows[-1]
+            row["segments"].append(segment)
+            row["left"] = min(row["left"], segment["left"])
+            row["right"] = max(row["right"], segment["right"])
+            row["angles"].append(segment["angle"])
+            row["y"] = (row["y"] * (len(row["segments"]) - 1) + segment["y"]) / len(row["segments"])
+        else:
+            rows.append(
+                {
+                    "y": float(segment["y"]),
+                    "left": int(segment["left"]),
+                    "right": int(segment["right"]),
+                    "angles": [segment["angle"]],
+                    "segments": [segment],
+                }
+            )
+
+    groups = []
+    used_rows = set()
+    max_spacing = max(100, image_height // 20)
+    for index in range(max(0, len(rows) - 4)):
+        candidate = rows[index:index + 5]
+        distances = [candidate[i + 1]["y"] - candidate[i]["y"] for i in range(4)]
+        spacing = sum(distances) / 4.0
+        if not 5 <= spacing <= max_spacing:
+            continue
+        if max(distances) - min(distances) > max(3.0, spacing * 0.25):
+            continue
+        left = max(row["left"] for row in candidate)
+        right = min(row["right"] for row in candidate)
+        overlap = max(0, right - left + 1) / max(1, min(image_width, max(row["right"] for row in candidate) - min(row["left"] for row in candidate) + 1))
+        if overlap < 0.20:
+            continue
+        thicknesses = [segment["thickness"] for row in candidate for segment in row["segments"]]
+        angles = [segment["angle"] for row in candidate for segment in row["segments"]]
+        thickness = sum(thicknesses) / max(1, len(thicknesses))
+        if max(thicknesses) - min(thicknesses) > max(2.0, thickness):
+            continue
+        if max(angles) - min(angles) > 0.5:
+            continue
+        lengths = [segment["length"] for row in candidate for segment in row["segments"]]
+        if min(lengths) / max(1.0, max(lengths)) < 0.35:
+            continue
+        row_ids = tuple(index + offset for offset in range(5))
+        if any(row_id in used_rows for row_id in row_ids):
+            continue
+        used_rows.update(row_ids)
+        groups.append(
+            {
+                "rows": [int(round(row["y"])) for row in candidate],
+                "spacing": round(float(spacing), 3),
+                "left": int(min(row["left"] for row in candidate)),
+                "right": int(max(row["right"] for row in candidate)),
+                "overlap": round(float(overlap), 3),
+                "thickness": round(float(thickness), 3),
+                "angle": round(float(sum(angles) / max(1, len(angles))), 3),
+                "length_ratio": round(float(min(lengths) / max(1.0, max(lengths))), 3),
+            }
+        )
+    accepted_rows = sorted({row for group in groups for row in group["rows"]})
+    return groups, accepted_rows, rows
+
+
+def _estimate_skew(gray, staff_groups):
+    cv2, _, np = _image_libs()
+    if len(staff_groups) < 2:
+        return 0.0, "insufficient_staff_groups", 0
     h, w = gray.shape[:2]
     edges = cv2.Canny(gray, 50, 150)
     lines = cv2.HoughLinesP(
@@ -120,15 +248,24 @@ def _estimate_skew(gray):
         minLineLength=max(60, w // 10),
         maxLineGap=max(8, w // 300),
     )
+    staff_rows = [row for group in staff_groups for row in group["rows"]]
     angles = []
-    if lines is not None:
-        for x1, y1, x2, y2 in lines[:, 0, :]:
-            if abs(float(x2) - float(x1)) < 1:
-                continue
-            angle = float(np.degrees(np.arctan2(float(y2) - float(y1), float(x2) - float(x1))))
-            if abs(angle) <= 6:
-                angles.append(angle)
-    return float(np.median(angles)) if angles else 0.0
+    for x1, y1, x2, y2 in lines[:, 0, :] if lines is not None else []:
+        if abs(float(x2) - float(x1)) < 1:
+            continue
+        midpoint = (float(y1) + float(y2)) / 2.0
+        if min(abs(midpoint - row) for row in staff_rows) > 10:
+            continue
+        angle = float(np.degrees(np.arctan2(float(y2) - float(y1), float(x2) - float(x1))))
+        if abs(angle) <= 4:
+            angles.append(angle)
+    if len(angles) < 6:
+        return 0.0, "insufficient_staff_line_angles", len(angles)
+    median = float(np.median(angles))
+    deviation = float(np.median(np.abs(np.asarray(angles) - median)))
+    if deviation > 0.25 or abs(median) > 2.0:
+        return 0.0, "conflicting_or_large_angle", len(angles)
+    return median, "staff_group_consensus", len(angles)
 
 
 def _rotate(gray, angle):
@@ -142,48 +279,18 @@ def _rotate(gray, angle):
 
 def _staff_rows(gray):
     """Return rows belonging to likely five-line staff groups."""
-    cv2, _, np = _image_libs()
-    h, w = gray.shape[:2]
-    normalized = _normalize_background(gray)
-    binary = cv2.adaptiveThreshold(
-        normalized,
-        255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY_INV,
-        31,
-        10,
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(24, w // 70), 1))
-    horizontal = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    projection = (horizontal > 0).sum(axis=1)
-    threshold = max(8, int(w * 0.018))
-    active = projection >= threshold
-    runs = []
-    start = None
-    for index, value in enumerate(active):
-        if value and start is None:
-            start = index
-        elif not value and start is not None:
-            runs.append((start, index - 1))
-            start = None
-    if start is not None:
-        runs.append((start, h - 1))
-    centers = [int(round((a + b) / 2.0)) for a, b in runs if b - a <= 8]
-    rows = set()
-    for index in range(max(0, len(centers) - 4)):
-        group = centers[index:index + 5]
-        distances = [group[i + 1] - group[i] for i in range(4)]
-        spacing = float(np.median(distances))
-        if 5 <= spacing <= max(100, h // 20) and max(distances) - min(distances) <= max(3.0, spacing * 0.35):
-            rows.update(group)
-    return sorted(rows), binary, horizontal
+    segments, binary, horizontal = _line_segments(gray)
+    _, rows, _ = _group_staff_segments(segments, gray.shape[1], gray.shape[0])
+    return rows, binary, horizontal
 
 
 def _repair_staff_rows(normalized, binary, rows):
-    cv2, _, np = _image_libs()
+    _, _, np = _image_libs()
     h, w = normalized.shape[:2]
     cleaned = normalized.copy()
     repaired_pixels = 0
+    repaired_gaps = 0
+    repaired_spans = []
     max_gap = max(5, min(18, w // 240))
     for row in rows:
         top = max(0, row - 1)
@@ -198,10 +305,18 @@ def _repair_staff_rows(normalized, binary, rows):
             while index < w and not line[index]:
                 index += 1
             length = index - start
-            if start > 0 and index < w and length <= max_gap:
+            left_support = max(0, start - 16) < start and line[max(0, start - 16):start].any()
+            right_support = index < w and line[index:min(w, index + 16)].any()
+            if start > 0 and index < w and length <= max_gap and left_support and right_support:
                 cleaned[top:bottom, start:index] = np.minimum(cleaned[top:bottom, start:index], 55)
                 repaired_pixels += length * (bottom - top)
-    return cleaned, repaired_pixels
+                repaired_gaps += 1
+                repaired_spans.append((int(row), int(start), int(index)))
+    return cleaned, {
+        "repaired_gap_count": repaired_gaps,
+        "repaired_length": repaired_pixels,
+        "repaired_spans": repaired_spans,
+    }
 
 
 def build_page_fallback(input_pdf, page_number, output_dir, zoom=4.0):
@@ -214,15 +329,26 @@ def build_page_fallback(input_pdf, page_number, output_dir, zoom=4.0):
     gray = render["gray"]
     normalized = _normalize_background(gray)
     cv2.imwrite(str(out / "grayscale_normalized.png"), normalized)
-    skew = _estimate_skew(normalized)
+    segments, _, _ = _line_segments(normalized)
+    staff_groups, rows, candidate_rows = _group_staff_segments(
+        segments, normalized.shape[1], normalized.shape[0]
+    )
+    skew, skew_confidence, skew_samples = _estimate_skew(normalized, staff_groups)
     deskewed = _rotate(normalized, -skew)
-    rows, binary, horizontal = _staff_rows(deskewed)
-    cleaned, repaired_pixels = _repair_staff_rows(deskewed, binary, rows)
+    segments, binary, _ = _line_segments(deskewed)
+    staff_groups, rows, candidate_rows = _group_staff_segments(
+        segments, deskewed.shape[1], deskewed.shape[0]
+    )
+    cleaned, repair_info = _repair_staff_rows(deskewed, binary, rows)
     cv2.imwrite(str(out / "medium_cleaned.png"), cleaned)
 
     debug = cv2.cvtColor(deskewed, cv2.COLOR_GRAY2BGR)
-    for row in rows:
-        cv2.line(debug, (0, row), (debug.shape[1] - 1, row), (0, 180, 0), 2)
+    accepted_rows = set(rows)
+    for row in candidate_rows:
+        color = (0, 180, 0) if int(round(row["y"])) in accepted_rows else (0, 220, 220)
+        cv2.line(debug, (int(row["left"]), int(round(row["y"]))), (int(row["right"]), int(round(row["y"]))), color, 2)
+    for row, start, end in repair_info["repaired_spans"]:
+        cv2.line(debug, (start, row), (end, row), (0, 0, 255), 3)
     cv2.imwrite(str(out / "staff_candidates.png"), debug)
     _image_to_pdf(out / "medium_cleaned.png", out / "medium_input.pdf", render["page_width"], render["page_height"])
     report = {
@@ -235,8 +361,29 @@ def build_page_fallback(input_pdf, page_number, output_dir, zoom=4.0):
         "pixel_width": render["pixel_width"],
         "pixel_height": render["pixel_height"],
         "estimated_skew_degrees": round(float(skew), 3),
+        "skew_confidence": skew_confidence,
+        "skew_angle_samples": int(skew_samples),
+        "coordinate_transform": {
+            "type": "rotation_about_page_center",
+            "angle_degrees_applied_to_clean_copy": round(float(-skew), 3),
+            "center_pixels": [
+                int(render["pixel_width"] // 2),
+                int(render["pixel_height"] // 2),
+            ],
+            "mapping_inverse_applied": False,
+        },
+        "candidate_segment_count": int(len(segments)),
+        "accepted_candidate_count": int(len(rows)),
+        "rejected_candidate_count": int(max(0, len(candidate_rows) - len(rows))),
+        "staff_groups": staff_groups,
         "staff_line_rows": len(rows),
-        "repaired_pixels": int(repaired_pixels),
+        "repaired_gap_count": int(repair_info["repaired_gap_count"]),
+        "repaired_length": int(repair_info["repaired_length"]),
+        "rejection_reasons": [
+            "not_in_five_line_group",
+            "uneven_spacing_or_low_overlap",
+            "large_or_unsupported_gap_left_unchanged",
+        ],
         "files": {
             "original": "original.png",
             "grayscale_normalized": "grayscale_normalized.png",
