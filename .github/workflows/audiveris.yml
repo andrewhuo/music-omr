@@ -4195,7 +4195,9 @@ jobs:
             --status-dir /tmp/work/page_status \
             --output /tmp/work/page_omr_report.json \
             --full-document-success "$([[ "${FULL_MXL_OK:-false}" == "true" ]] && echo 1 || echo 0)" \
-            --log-output-dir /tmp/work/page_report_logs
+            --log-output-dir /tmp/work/page_report_logs \
+            --page-pdf-dir /tmp/work/pages \
+            --diagnostic-output-dir /tmp/work/page_failure_debug
 
       - name: Annotate PDF (guides only)
         env:
@@ -5085,6 +5087,15 @@ jobs:
             name="$(basename "${page_log}")"
             retry_cmd page_omr_log_upload gsutil cp "${page_log}" "${ARTIFACTS_PREFIX}/page_omr_logs/${name}"
             echo "uploaded_artifact_page_omr_log=${ARTIFACTS_PREFIX}/page_omr_logs/${name}"
+            uploaded_count=$((uploaded_count + 1))
+          done
+          shopt -u nullglob
+
+          shopt -s nullglob
+          for failure_png in /tmp/work/page_failure_debug/*.png; do
+            name="$(basename "${failure_png}")"
+            retry_cmd page_failure_debug_upload gsutil cp "${failure_png}" "${ARTIFACTS_PREFIX}/page_failure_debug/${name}"
+            echo "uploaded_artifact_page_failure_debug=${ARTIFACTS_PREFIX}/page_failure_debug/${name}"
             uploaded_count=$((uploaded_count + 1))
           done
           shopt -u nullglob

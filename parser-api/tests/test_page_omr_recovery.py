@@ -41,6 +41,32 @@ class PageOmrRecoveryTests(unittest.TestCase):
             self.assertTrue(result["success"])
             self.assertTrue(result["recovered_on_retry"])
             self.assertEqual(result["attempts"], 2)
+            self.assertEqual(len(result["attempt_results"]), 2)
+
+    def test_attempt_status_records_failure_stage_and_log_clues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "out"
+            out.mkdir()
+            (out / "page.omr").write_text("placeholder", encoding="utf-8")
+            log_path = root / "attempt.log"
+            log_path.write_text(
+                "Could not export since transcription did not complete successfully\n",
+                encoding="utf-8",
+            )
+            result = MODULE.write_attempt_status(
+                str(out),
+                str(root / "status.json"),
+                3,
+                1,
+                str(log_path),
+            )
+            self.assertFalse(result["success"])
+            self.assertTrue(result["omr_created"])
+            self.assertFalse(result["mxl_created"])
+            self.assertEqual(result["final_failure_stage"], "mxl_missing_after_omr_created")
+            self.assertIn("transcription_did_not_complete", result["log_clues"])
+            self.assertIn("export_failed", result["log_clues"])
 
     def test_report_separates_success_failed_and_recovered(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,6 +128,11 @@ class PageOmrRecoveryTests(unittest.TestCase):
                 report["page_results"][1]["log_artifact"],
                 "artifacts/page_omr_logs/page_0002.log",
             )
+            failed_page = report["page_results"][1]
+            self.assertEqual(failed_page["final_failure_stage"], "unknown_failure")
+            self.assertEqual(failed_page["recommended_next_try"], "inspect_page_manually")
+            self.assertIn("log_clues", failed_page)
+            self.assertIn("image_clues", failed_page)
 
     def test_report_can_return_all_pages_failed(self):
         with tempfile.TemporaryDirectory() as tmp:
