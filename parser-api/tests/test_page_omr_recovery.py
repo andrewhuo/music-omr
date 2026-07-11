@@ -43,6 +43,36 @@ class PageOmrRecoveryTests(unittest.TestCase):
             self.assertEqual(result["attempts"], 2)
             self.assertEqual(len(result["attempt_results"]), 2)
 
+    def test_medium_fallback_status_is_distinguished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "out"
+            out.mkdir()
+            status = root / "status.json"
+            MODULE.write_attempt_status(str(out), str(status), 2, 1, "/tmp/attempt1.log")
+            MODULE.write_attempt_status(str(out), str(status), 2, 2, "/tmp/attempt2.log")
+            _write_mxl(out / "page.mxl")
+            artifacts = root / "fallback"
+            artifacts.mkdir()
+            (artifacts / "medium_input.pdf").write_bytes(b"pdf")
+            result = MODULE.write_attempt_status(
+                str(out),
+                str(status),
+                2,
+                3,
+                "/tmp/attempt3_medium.log",
+                "medium_raster_cleanup",
+                str(artifacts),
+            )
+            self.assertTrue(result["success"])
+            self.assertTrue(result["recovered_on_raster_fallback"])
+            self.assertEqual(result["attempts"], 3)
+            self.assertEqual(result["attempt_results"][-1]["attempt_kind"], "medium_raster_cleanup")
+            self.assertEqual(
+                result["fallback_artifacts"],
+                ["artifacts/page_raster_fallback/page_0002/medium_input.pdf"],
+            )
+
     def test_attempt_status_records_failure_stage_and_log_clues(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -133,6 +163,36 @@ class PageOmrRecoveryTests(unittest.TestCase):
             self.assertEqual(failed_page["recommended_next_try"], "inspect_page_manually")
             self.assertIn("log_clues", failed_page)
             self.assertIn("image_clues", failed_page)
+
+    def test_report_lists_raster_fallback_recovery_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(
+                json.dumps({"entries": [{"page_number": 2, "status": "ok", "parts_count": 1, "measures_count": 3}]}),
+                encoding="utf-8",
+            )
+            status_dir = root / "status"
+            status_dir.mkdir()
+            (status_dir / "page_0002.json").write_text(
+                json.dumps({
+                    "page": 2,
+                    "attempts": 3,
+                    "success": True,
+                    "recovered_on_retry": True,
+                    "recovered_on_raster_fallback": True,
+                    "fallback_artifacts": ["artifacts/page_raster_fallback/page_0002/medium_input.pdf"],
+                    "log_paths": [],
+                }),
+                encoding="utf-8",
+            )
+            report = MODULE.build_report(str(manifest_path), str(status_dir), str(root / "report.json"), False)
+            self.assertEqual(report["recovered_on_raster_fallback_pages"], [2])
+            self.assertTrue(report["page_results"][0]["recovered_on_raster_fallback"])
+            self.assertEqual(
+                report["page_results"][0]["fallback_artifacts"],
+                ["artifacts/page_raster_fallback/page_0002/medium_input.pdf"],
+            )
 
     def test_report_can_return_all_pages_failed(self):
         with tempfile.TemporaryDirectory() as tmp:

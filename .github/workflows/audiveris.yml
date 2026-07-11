@@ -718,6 +718,78 @@ jobs:
             fi
           done
 
+          failed_pages="$(python - <<'PY'
+          import glob
+          import json
+
+          pages = []
+          for path in sorted(glob.glob('/tmp/work/page_status/page_*.json')):
+              try:
+                  row = json.load(open(path, encoding='utf-8'))
+              except Exception:
+                  continue
+              if not row.get('success'):
+                  pages.append(f"{int(row.get('page') or 0):04d}")
+          print(' '.join(page for page in pages if page != '0000'))
+          PY
+          )"
+
+          for page_num in ${failed_pages}; do
+            fallback_dir="/tmp/work/page_raster_fallback/page_${page_num}"
+            out_dir="/tmp/work/audiveris_pages/page_${page_num}"
+            status_path="/tmp/work/page_status/page_${page_num}.json"
+            log_path="/tmp/work/page_logs/page_${page_num}_attempt3_medium.log"
+            mkdir -p "${fallback_dir}"
+            if python parser-api/raster_audiveris_lab.py fallback-page \
+              --input-pdf /tmp/work/input.pdf \
+              --page "$((10#${page_num}))" \
+              --output-dir "${fallback_dir}" \
+              --zoom 4.0 >"${fallback_dir}/build.log" 2>&1; then
+              echo "PAGE_RASTER_FALLBACK_BUILD page=$((10#${page_num})) status=ok"
+            else
+              echo "PAGE_RASTER_FALLBACK_BUILD page=$((10#${page_num})) status=failed"
+            fi
+
+            rm -rf "${out_dir}"
+            if [[ -f "${fallback_dir}/medium_input.pdf" ]]; then
+              if docker run --rm \
+                --entrypoint /bin/sh \
+                --user "$(id -u):$(id -g)" \
+                -v /tmp/work:/work \
+                -e PAGE_NUM="${page_num}" \
+                -e AUDI_IMAGE="${AUDIVERIS_IMAGE_EFFECTIVE}" \
+                -e AUDI_OUT_DIR="/work/audiveris_pages/page_${page_num}" \
+                -e HOME="/work" \
+                -e XDG_CACHE_HOME="/work/.cache" \
+                -e XDG_CONFIG_HOME="/work/.config" \
+                -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+                "${AUDIVERIS_IMAGE_EFFECTIVE}" \
+                -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; "$AUDI_BIN" -batch -export -output "${AUDI_OUT_DIR}" "/work/page_raster_fallback/page_${PAGE_NUM}/medium_input.pdf"' \
+                >"${log_path}" 2>&1; then
+                exit_code=0
+              else
+                exit_code=$?
+              fi
+            else
+              echo "medium_input.pdf was not created" >"${log_path}"
+              exit_code=1
+            fi
+
+            if python parser-api/page_omr_recovery.py validate \
+              --out-dir "${out_dir}" \
+              --status-path "${status_path}" \
+              --page "$((10#${page_num}))" \
+              --attempt 3 \
+              --attempt-kind medium_raster_cleanup \
+              --artifact-dir "${fallback_dir}" \
+              --log-path "${log_path}"; then
+              fallback_ok=true
+            else
+              fallback_ok=false
+            fi
+            echo "PAGE_RASTER_FALLBACK page=$((10#${page_num})) exit_code=${exit_code} valid=${fallback_ok} log=${log_path} out_dir=${out_dir}"
+          done
+
           python - << 'PY'
           import cv2
           import fitz
@@ -5003,6 +5075,9 @@ jobs:
                   "recovered_on_retry_pages": list(
                       page_omr_report.get("recovered_on_retry_pages") or []
                   ),
+                  "recovered_on_raster_fallback_pages": list(
+                      page_omr_report.get("recovered_on_raster_fallback_pages") or []
+                  ),
               },
               "editable_state": editable_state,
           }
@@ -5120,6 +5195,13 @@ jobs:
             uploaded_count=$((uploaded_count + 1))
           done
           shopt -u nullglob
+
+          while IFS= read -r -d '' fallback_file; do
+            rel="${fallback_file#/tmp/work/page_raster_fallback/}"
+            retry_cmd page_raster_fallback_upload gsutil cp "${fallback_file}" "${ARTIFACTS_PREFIX}/page_raster_fallback/${rel}"
+            echo "uploaded_artifact_page_raster_fallback=${ARTIFACTS_PREFIX}/page_raster_fallback/${rel}"
+            uploaded_count=$((uploaded_count + 1))
+          done < <(find /tmp/work/page_raster_fallback -type f -print0 2>/dev/null || true)
 
           shopt -s globstar nullglob
           for raster_file in /tmp/work/raster/**/* /tmp/work/raster/*; do

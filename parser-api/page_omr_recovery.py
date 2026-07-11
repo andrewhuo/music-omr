@@ -126,7 +126,15 @@ def _recommended_next_try(final_stage, log_clues, image_clues):
     return "inspect_page_manually"
 
 
-def write_attempt_status(out_dir, status_path, page, attempt, log_path):
+def write_attempt_status(
+    out_dir,
+    status_path,
+    page,
+    attempt,
+    log_path,
+    attempt_kind="normal",
+    artifact_dir=None,
+):
     result = inspect_page_output(out_dir)
     previous = {}
     path = Path(status_path)
@@ -139,8 +147,12 @@ def write_attempt_status(out_dir, status_path, page, attempt, log_path):
     payload = {
         "page": int(page),
         "attempts": int(attempt),
+        "attempt_kind": str(attempt_kind),
         "success": bool(result["success"]),
         "recovered_on_retry": bool(int(attempt) > 1 and first_failed and result["success"]),
+        "recovered_on_raster_fallback": bool(
+            str(attempt_kind) == "medium_raster_cleanup" and result["success"]
+        ),
         "reason": str(result["reason"]),
         "final_failure_stage": _final_failure_stage(result),
         "omr_created": bool(result.get("omr_created")),
@@ -155,6 +167,7 @@ def write_attempt_status(out_dir, status_path, page, attempt, log_path):
     attempt_rows.append(
         {
             "attempt": int(attempt),
+            "attempt_kind": str(attempt_kind),
             "success": bool(result["success"]),
             "reason": str(result["reason"]),
             "final_failure_stage": _final_failure_stage(result),
@@ -167,6 +180,13 @@ def write_attempt_status(out_dir, status_path, page, attempt, log_path):
         }
     )
     payload["attempt_results"] = attempt_rows
+    if artifact_dir:
+        artifact_root = Path(artifact_dir)
+        payload["fallback_artifacts"] = [
+            f"artifacts/page_raster_fallback/page_{int(page):04d}/{path.relative_to(artifact_root)}"
+            for path in sorted(artifact_root.rglob("*"))
+            if path.is_file()
+        ]
     payload["log_clues"] = _log_clues(payload["log_paths"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -303,6 +323,7 @@ def build_report(
     successful = []
     failed = []
     recovered = []
+    recovered_on_raster_fallback = []
     for page in page_numbers:
         status = dict(statuses.get(page) or {})
         entry = dict(entries.get(page) or {})
@@ -328,6 +349,8 @@ def build_report(
             failed.append(page)
         if success and status.get("recovered_on_retry"):
             recovered.append(page)
+        if success and status.get("recovered_on_raster_fallback"):
+            recovered_on_raster_fallback.append(page)
         page_results.append(
             {
                 "page": page,
@@ -336,6 +359,9 @@ def build_report(
                 "attempts": int(status.get("attempts") or 0),
                 "attempt_results": list(status.get("attempt_results") or []),
                 "recovered_on_retry": bool(success and status.get("recovered_on_retry")),
+                "recovered_on_raster_fallback": bool(
+                    success and status.get("recovered_on_raster_fallback")
+                ),
                 "final_failure_stage": final_stage,
                 "omr_created": bool(entry.get("omr_created") or status.get("omr_created")),
                 "mxl_created": bool(entry.get("mxl_created") or status.get("mxl_created")),
@@ -353,6 +379,7 @@ def build_report(
                 ),
                 "log_paths": list(status.get("log_paths") or []),
                 "log_artifact": f"artifacts/page_omr_logs/page_{page:04d}.log",
+                "fallback_artifacts": list(status.get("fallback_artifacts") or []),
             }
         )
 
@@ -363,6 +390,7 @@ def build_report(
         "successful_pages": successful,
         "failed_pages": failed,
         "recovered_on_retry_pages": recovered,
+        "recovered_on_raster_fallback_pages": recovered_on_raster_fallback,
         "page_results": page_results,
     }
     Path(output_path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -398,6 +426,8 @@ def main():
     validate.add_argument("--page", required=True, type=int)
     validate.add_argument("--attempt", required=True, type=int)
     validate.add_argument("--log-path", required=True)
+    validate.add_argument("--attempt-kind", default="normal")
+    validate.add_argument("--artifact-dir", required=False)
 
     report = sub.add_parser("report")
     report.add_argument("--manifest", required=True)
@@ -416,6 +446,8 @@ def main():
             args.page,
             args.attempt,
             args.log_path,
+            args.attempt_kind,
+            args.artifact_dir,
         )
         print(json.dumps(payload, sort_keys=True))
         raise SystemExit(0 if payload["success"] else 1)
