@@ -93,7 +93,8 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/work
           python -m pip install --upgrade pip
-          pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0
+          pip install opencv-python==4.12.0.88 numpy lxml==5.3.0
+          pip install --only-binary=:all: pymupdf==1.24.14
 
       - name: Download input PDF
         run: |
@@ -563,7 +564,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0
+          pip install opencv-python==4.12.0.88 numpy lxml==5.3.0
+          pip install --only-binary=:all: pymupdf==1.24.14
 
       - name: Rasterized Audiveris test mode
         if: ${{ env.RASTER_TEST_MODE == '1' || env.RASTER_TEST_MODE == 'true' || env.RASTER_TEST_MODE == 'yes' }}
