@@ -88,6 +88,12 @@ jobs:
           echo "pipeline_log_mode: ${PIPELINE_LOG_MODE}"
           echo "raster_test_mode: ${RASTER_TEST_MODE:-0}"
 
+      - name: Install parser Python dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install opencv-python==4.12.0.88 pymupdf==1.20.0 numpy lxml==5.3.0
+
       - name: Download input PDF
         run: |
           set -euo pipefail
@@ -113,6 +119,30 @@ jobs:
           mkdir -p /tmp/work
           retry_cmd input_pdf_download gsutil cp "${{ inputs.pdf_gcs_uri }}" /tmp/work/input.pdf
           ls -lh /tmp/work/input.pdf
+
+      - name: Remove PDF annotations for OMR copy
+        run: |
+          set -euo pipefail
+          python parser-api/remove_pdf_annotations.py \
+            --input-pdf /tmp/work/input.pdf \
+            --output-pdf /tmp/work/input_omr_clean.pdf \
+            --report /tmp/work/annotation_cleanup_report.json
+          annotations_removed="$(python - <<'PY'
+          import json
+          with open("/tmp/work/annotation_cleanup_report.json", "r", encoding="utf-8") as f:
+              print(int((json.load(f) or {}).get("annotations_removed") or 0))
+          PY
+          )"
+          if [[ "${annotations_removed}" -gt 0 ]]; then
+            echo "OMR_INPUT_PDF=/tmp/work/input_omr_clean.pdf" >> "$GITHUB_ENV"
+            echo "ANNOTATION_CLEAN_PDF_USED=true" >> "$GITHUB_ENV"
+          else
+            echo "OMR_INPUT_PDF=/tmp/work/input.pdf" >> "$GITHUB_ENV"
+            echo "ANNOTATION_CLEAN_PDF_USED=false" >> "$GITHUB_ENV"
+          fi
+          echo "ANNOTATIONS_REMOVED=${annotations_removed}" >> "$GITHUB_ENV"
+          echo "ANNOTATION_CLEANUP_REPORT=/tmp/work/annotation_cleanup_report.json" >> "$GITHUB_ENV"
+          echo "ANNOTATION_CLEANUP annotations_removed=${annotations_removed}"
 
       - name: Run Audiveris OMR
         run: |
@@ -197,8 +227,9 @@ jobs:
               -e XDG_CACHE_HOME="/work/.cache" \
               -e XDG_CONFIG_HOME="/work/.config" \
               -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              -e OMR_INPUT_PDF="/work/$(basename "${OMR_INPUT_PDF:-/tmp/work/input.pdf}")" \
               "$image" \
-              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN} HOME=${HOME} XDG_CACHE_HOME=${XDG_CACHE_HOME}"; "$AUDI_BIN" -help >/work/audi_help.txt 2>&1 || true; if grep -Eq "AccessDeniedException: /\\.cache|Loader\\.getCacheDir\\(\\).*null|ExceptionInInitializerError" /work/audi_help.txt; then echo "AUDIVERIS_PREFLIGHT_ERROR"; tail -n 120 /work/audi_help.txt || true; exit 86; fi; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" /work/input.pdf'
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_ATTEMPT image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN} input=${OMR_INPUT_PDF} HOME=${HOME} XDG_CACHE_HOME=${XDG_CACHE_HOME}"; "$AUDI_BIN" -help >/work/audi_help.txt 2>&1 || true; if grep -Eq "AccessDeniedException: /\\.cache|Loader\\.getCacheDir\\(\\).*null|ExceptionInInitializerError" /work/audi_help.txt; then echo "AUDIVERIS_PREFLIGHT_ERROR"; tail -n 120 /work/audi_help.txt || true; exit 86; fi; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" "$OMR_INPUT_PDF"'
           }
 
           run_omr_smoke() {
@@ -214,8 +245,9 @@ jobs:
               -e XDG_CACHE_HOME="/work/.cache" \
               -e XDG_CONFIG_HOME="/work/.config" \
               -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              -e OMR_INPUT_PDF="/work/$(basename "${OMR_INPUT_PDF:-/tmp/work/input.pdf}")" \
               "$image" \
-              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_SMOKE image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN}"; echo "AUDIVERIS_SMOKE_CMD=\"${AUDI_BIN}\" -batch -export -output \"${AUDI_OUT_DIR}\" -sheets 1 -- /work/input.pdf"; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" -sheets 1 -- /work/input.pdf'
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp; echo "AUDIVERIS_SMOKE image=${AUDI_IMAGE} out_dir=${AUDI_OUT_DIR} bin=${AUDI_BIN} input=${OMR_INPUT_PDF}"; echo "AUDIVERIS_SMOKE_CMD=\"${AUDI_BIN}\" -batch -export -output \"${AUDI_OUT_DIR}\" -sheets 1 -- \"${OMR_INPUT_PDF}\""; "$AUDI_BIN" -batch -export -output "$AUDI_OUT_DIR" -sheets 1 -- "$OMR_INPUT_PDF"'
           }
 
           check_mxl() {
@@ -619,7 +651,7 @@ jobs:
           import fitz
           import os
 
-          src = "/tmp/work/input.pdf"
+          src = os.environ.get("OMR_INPUT_PDF") or "/tmp/work/input.pdf"
           out_dir = "/tmp/work/pages"
           os.makedirs(out_dir, exist_ok=True)
 
@@ -4555,11 +4587,16 @@ jobs:
           mm_path = Path("/tmp/work/measure_mapping_debug.json")
           manifest_path = Path("/tmp/work/mxl_page_manifest.json")
           page_omr_report_path = Path("/tmp/work/page_omr_report.json")
+          annotation_cleanup_report_path = Path("/tmp/work/annotation_cleanup_report.json")
           mm_raw = _load_json(mm_path)
           mm = mm_raw if isinstance(mm_raw, dict) else {}
           manifest = _load_json(manifest_path)
           page_omr_report_raw = _load_json(page_omr_report_path)
           page_omr_report = page_omr_report_raw if isinstance(page_omr_report_raw, dict) else {}
+          annotation_cleanup_report_raw = _load_json(annotation_cleanup_report_path)
+          annotation_cleanup_report = (
+              annotation_cleanup_report_raw if isinstance(annotation_cleanup_report_raw, dict) else {}
+          )
 
           pages = mm.get("pages") if isinstance(mm, dict) else None
           if not isinstance(pages, list):
@@ -4992,6 +5029,19 @@ jobs:
                       page_omr_report.get("recovered_on_retry_pages") or []
                   ),
               },
+              "annotation_cleanup": {
+                  "available": bool(annotation_cleanup_report),
+                  "artifact": "artifacts/annotation_cleanup_report.json"
+                  if annotation_cleanup_report
+                  else None,
+                  "annotations_removed": int(annotation_cleanup_report.get("annotations_removed") or 0),
+                  "clean_pdf_used_for_omr": bool(
+                      annotation_cleanup_report.get("clean_pdf_used_for_omr")
+                  ),
+                  "final_pdf_uses_original": bool(
+                      annotation_cleanup_report.get("final_pdf_uses_original", True)
+                  ),
+              },
               "editable_state": editable_state,
           }
 
@@ -5079,6 +5129,15 @@ jobs:
             uploaded_count=$((uploaded_count + 1))
           else
             echo "WARN: /tmp/work/page_omr_report.json not found"
+            missing_count=$((missing_count + 1))
+          fi
+
+          if [[ -f /tmp/work/annotation_cleanup_report.json ]]; then
+            retry_cmd annotation_cleanup_report_upload gsutil cp /tmp/work/annotation_cleanup_report.json "${ARTIFACTS_PREFIX}/annotation_cleanup_report.json"
+            echo "uploaded_artifact_annotation_cleanup_report=${ARTIFACTS_PREFIX}/annotation_cleanup_report.json"
+            uploaded_count=$((uploaded_count + 1))
+          else
+            echo "WARN: /tmp/work/annotation_cleanup_report.json not found"
             missing_count=$((missing_count + 1))
           fi
 
