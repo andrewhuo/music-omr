@@ -197,22 +197,22 @@ def _group_staff_segments(segments, image_width, image_height):
         spacing = sum(distances) / 4.0
         if not 5 <= spacing <= max_spacing:
             continue
-        if max(distances) - min(distances) > max(3.0, spacing * 0.25):
+        if max(distances) - min(distances) > max(3.0, spacing * 0.35):
             continue
         left = max(row["left"] for row in candidate)
         right = min(row["right"] for row in candidate)
         overlap = max(0, right - left + 1) / max(1, min(image_width, max(row["right"] for row in candidate) - min(row["left"] for row in candidate) + 1))
-        if overlap < 0.20:
+        if overlap < 0.10:
             continue
         thicknesses = [segment["thickness"] for row in candidate for segment in row["segments"]]
         angles = [segment["angle"] for row in candidate for segment in row["segments"]]
         thickness = sum(thicknesses) / max(1, len(thicknesses))
-        if max(thicknesses) - min(thicknesses) > max(2.0, thickness):
+        if max(thicknesses) - min(thicknesses) > max(3.0, thickness * 1.5):
             continue
-        if max(angles) - min(angles) > 0.5:
+        if max(angles) - min(angles) > 1.0:
             continue
         lengths = [segment["length"] for row in candidate for segment in row["segments"]]
-        if min(lengths) / max(1.0, max(lengths)) < 0.35:
+        if min(lengths) / max(1.0, max(lengths)) < 0.20:
             continue
         row_ids = tuple(index + offset for offset in range(5))
         if any(row_id in used_rows for row_id in row_ids):
@@ -355,6 +355,7 @@ def build_page_fallback(input_pdf, page_number, output_dir, zoom=4.0):
         "status": "input_ready",
         "page": int(page_number),
         "cleanup": "medium_staff_line_repair",
+        "cleanup_profile": "medium",
         "zoom": float(zoom),
         "page_width": render["page_width"],
         "page_height": render["page_height"],

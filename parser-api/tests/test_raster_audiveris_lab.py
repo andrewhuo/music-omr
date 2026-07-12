@@ -60,6 +60,21 @@ class RasterFallbackTests(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual(len(rows), 5)
 
+    def test_relaxed_medium_limits_accept_reasonable_scan_variation(self):
+        segments = []
+        for index, y in enumerate((60, 72, 84, 96, 110)):
+            segments.append({
+                "left": 40 if index < 4 else 700,
+                "right": 960 if index < 4 else 900,
+                "y": y,
+                "thickness": 2.0 if index < 4 else 4.0,
+                "length": 921 if index < 4 else 201,
+                "angle": 1.0 if index == 2 else 0.0,
+            })
+        groups, rows, _ = MODULE._group_staff_segments(segments, 1000, 360)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(rows), 5)
+
     def test_mismatched_endpoints_are_rejected(self):
         segments = []
         for index, y in enumerate((60, 72, 84, 96, 108)):
