@@ -1,9 +1,11 @@
 import importlib.util
 import os
 import sys
+import tempfile
 import types
 import unittest
 import xml.etree.ElementTree as ET
+import zipfile
 
 
 def _install_import_stubs():
@@ -55,6 +57,25 @@ def _barline_el(el_id: int, staff: str, x: float, y_top: float, y_bottom: float,
 
 
 class AnnotateGuidesFromOmrTests(unittest.TestCase):
+    def test_manifest_structural_omr_is_selected_for_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            structural = os.path.join(tmp, "page_grid.omr")
+            with zipfile.ZipFile(structural, "w") as archive:
+                archive.writestr("sheet#1/sheet#1.xml", "<sheet/>")
+            original_parse = MOD._parse_sheet
+            MOD._parse_sheet = lambda z, path: (z.filename, path)
+            try:
+                with zipfile.ZipFile(structural, "r") as default_zip:
+                    result = MOD._parse_page_sheet_from_manifest(
+                        default_zip,
+                        "sheet#1/sheet#1.xml",
+                        {"structural_omr_path": structural},
+                    )
+            finally:
+                MOD._parse_sheet = original_parse
+            self.assertEqual(os.path.abspath(result[0]), os.path.abspath(structural))
+            self.assertEqual(result[1], "sheet#1/sheet#1.xml")
+
     def test_manifest_failed_page_is_skipped(self):
         self.assertTrue(MOD._manifest_page_failed(True, None))
         self.assertTrue(MOD._manifest_page_failed(True, {"status": "missing"}))

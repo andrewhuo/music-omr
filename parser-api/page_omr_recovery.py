@@ -46,9 +46,81 @@ def inspect_mxl(path):
     return best
 
 
-def inspect_page_output(out_dir):
+def inspect_omr_structure(path):
+    result = {
+        "structural_success": False,
+        "omr_created": False,
+        "omr_path": str(path) if path else None,
+        "system_count": 0,
+        "staff_count": 0,
+        "barline_count": 0,
+        "error": None,
+    }
+    if not path or not os.path.isfile(path):
+        result["error"] = "omr_missing"
+        return result
+    result["omr_created"] = True
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            sheets = sorted(
+                name
+                for name in archive.namelist()
+                if re.search(r"sheet#\d+/sheet#\d+\.xml$", name)
+            )
+            if not sheets:
+                result["error"] = "sheet_xml_missing"
+                return result
+            for member in sheets:
+                try:
+                    root = ET.fromstring(archive.read(member))
+                except Exception:
+                    continue
+                systems = [node for node in root.iter() if _local(node.tag) == "system"]
+                result["system_count"] += len(systems)
+                for system in systems:
+                    result["staff_count"] += sum(
+                        1 for node in system.iter() if _local(node.tag) == "staff"
+                    )
+                    result["barline_count"] += sum(
+                        1 for node in system.iter() if _local(node.tag) == "barline"
+                    )
+    except zipfile.BadZipFile:
+        result["error"] = "omr_not_zip"
+        return result
+    except Exception as exc:
+        result["error"] = f"omr_open_failed:{type(exc).__name__}"
+        return result
+
+    if result["system_count"] <= 0:
+        result["error"] = "systems_missing"
+    elif result["staff_count"] <= 0:
+        result["error"] = "staffs_missing"
+    elif result["barline_count"] < 2:
+        result["error"] = "barlines_insufficient"
+    else:
+        result["structural_success"] = True
+        result["error"] = None
+    return result
+
+
+def inspect_page_output(out_dir, attempt_kind="normal"):
     candidates = sorted(glob.glob(os.path.join(out_dir, "**", "*.mxl"), recursive=True))
     omr_candidates = sorted(glob.glob(os.path.join(out_dir, "**", "*.omr"), recursive=True))
+    if str(attempt_kind) == "grid_structural_fallback":
+        omr_result = inspect_omr_structure(omr_candidates[0] if omr_candidates else None)
+        return {
+            "success": bool(omr_result["structural_success"]),
+            "reason": "ok" if omr_result["structural_success"] else str(omr_result["error"] or "omr_structure_invalid"),
+            "omr_created": bool(omr_result["omr_created"]),
+            "omr_path": omr_result["omr_path"],
+            "mxl_created": False,
+            "parts_count": 0,
+            "measures_count": 0,
+            "system_count": int(omr_result["system_count"]),
+            "staff_count": int(omr_result["staff_count"]),
+            "barline_count": int(omr_result["barline_count"]),
+            "structural_success": bool(omr_result["structural_success"]),
+        }
     if not candidates:
         return {
             "success": False,
@@ -59,6 +131,10 @@ def inspect_page_output(out_dir):
             "parts_count": 0,
             "measures_count": 0,
             "mxl_path": None,
+            "system_count": 0,
+            "staff_count": 0,
+            "barline_count": 0,
+            "structural_success": False,
         }
     rows = [(path, inspect_mxl(path)) for path in candidates]
     path, best = max(rows, key=lambda row: (row[1]["measures"], row[1]["parts"]))
@@ -71,6 +147,10 @@ def inspect_page_output(out_dir):
         "parts_count": int(best["parts"]),
         "measures_count": int(best["measures"]),
         "mxl_path": path,
+        "system_count": 0,
+        "staff_count": 0,
+        "barline_count": 0,
+        "structural_success": False,
     }
 
 
@@ -100,7 +180,25 @@ def _log_clues(log_paths):
     return sorted(set(clues))
 
 
+def should_use_grid(status_path, log_path):
+    try:
+        status = json.loads(Path(status_path).read_text(encoding="utf-8"))
+    except Exception:
+        status = {}
+    if not status.get("omr_created"):
+        return False
+    text = _read_log(log_path).lower()
+    return bool(
+        re.search(
+            r"metronomeinter|textbuilder|texts step|transcription did not complete|could not export",
+            text,
+        )
+    )
+
+
 def _final_failure_stage(result):
+    if result.get("structural_success"):
+        return "grid_structural_ok"
     if not result.get("omr_created"):
         return "omr_missing"
     if not result.get("mxl_created"):
@@ -135,7 +233,7 @@ def write_attempt_status(
     attempt_kind="normal",
     artifact_dir=None,
 ):
-    result = inspect_page_output(out_dir)
+    result = inspect_page_output(out_dir, attempt_kind=attempt_kind)
     previous = {}
     path = Path(status_path)
     if path.exists():
@@ -149,9 +247,17 @@ def write_attempt_status(
         "attempts": int(attempt),
         "attempt_kind": str(attempt_kind),
         "success": bool(result["success"]),
-        "recovered_on_retry": bool(int(attempt) > 1 and first_failed and result["success"]),
+        "recovered_on_retry": bool(
+            str(attempt_kind) == "normal"
+            and int(attempt) > 1
+            and first_failed
+            and result["success"]
+        ),
         "recovered_on_raster_fallback": bool(
             str(attempt_kind) == "medium_raster_cleanup" and result["success"]
+        ),
+        "recovered_on_grid_fallback": bool(
+            str(attempt_kind) == "grid_structural_fallback" and result["success"]
         ),
         "reason": str(result["reason"]),
         "final_failure_stage": _final_failure_stage(result),
@@ -161,6 +267,10 @@ def write_attempt_status(
         "parts_count": int(result["parts_count"]),
         "measures_count": int(result["measures_count"]),
         "mxl_path": result.get("mxl_path"),
+        "system_count": int(result.get("system_count") or 0),
+        "staff_count": int(result.get("staff_count") or 0),
+        "barline_count": int(result.get("barline_count") or 0),
+        "structural_success": bool(result.get("structural_success")),
         "log_paths": list(previous.get("log_paths") or []) + [str(log_path)],
     }
     attempt_rows = list(previous.get("attempt_results") or [])
@@ -176,6 +286,10 @@ def write_attempt_status(
             "parts_count": int(result["parts_count"]),
             "measures_count": int(result["measures_count"]),
             "mxl_path": result.get("mxl_path"),
+            "system_count": int(result.get("system_count") or 0),
+            "staff_count": int(result.get("staff_count") or 0),
+            "barline_count": int(result.get("barline_count") or 0),
+            "structural_success": bool(result.get("structural_success")),
             "log_path": str(log_path),
         }
     )
@@ -324,6 +438,7 @@ def build_report(
     failed = []
     recovered = []
     recovered_on_raster_fallback = []
+    recovered_on_grid_fallback = []
     for page in page_numbers:
         status = dict(statuses.get(page) or {})
         entry = dict(entries.get(page) or {})
@@ -351,6 +466,8 @@ def build_report(
             recovered.append(page)
         if success and status.get("recovered_on_raster_fallback"):
             recovered_on_raster_fallback.append(page)
+        if success and status.get("recovered_on_grid_fallback"):
+            recovered_on_grid_fallback.append(page)
         page_results.append(
             {
                 "page": page,
@@ -362,12 +479,35 @@ def build_report(
                 "recovered_on_raster_fallback": bool(
                     success and status.get("recovered_on_raster_fallback")
                 ),
+                "recovered_on_grid_fallback": bool(
+                    success and status.get("recovered_on_grid_fallback")
+                ),
                 "final_failure_stage": final_stage,
                 "omr_created": bool(entry.get("omr_created") or status.get("omr_created")),
                 "mxl_created": bool(entry.get("mxl_created") or status.get("mxl_created")),
                 "parts_count": int(entry.get("parts_count") or status.get("parts_count") or 0),
                 "measures_count": int(entry.get("measures_count") or status.get("measures_count") or 0),
-                "system_count": len(entry.get("system_starts") or []),
+                "system_count": int(
+                    len(entry.get("system_starts") or [])
+                    or entry.get("structural_system_count")
+                    or status.get("system_count")
+                    or 0
+                ),
+                "structural_system_count": int(
+                    entry.get("structural_system_count")
+                    or status.get("system_count")
+                    or 0
+                ),
+                "structural_staff_count": int(
+                    entry.get("structural_staff_count")
+                    or status.get("staff_count")
+                    or 0
+                ),
+                "structural_barline_count": int(
+                    entry.get("structural_barline_count")
+                    or status.get("barline_count")
+                    or 0
+                ),
                 "log_clues": log_clues,
                 "image_clues": image_clues,
                 "image_metrics": dict(image_diag.get("image_metrics") or {}),
@@ -391,6 +531,7 @@ def build_report(
         "failed_pages": failed,
         "recovered_on_retry_pages": recovered,
         "recovered_on_raster_fallback_pages": recovered_on_raster_fallback,
+        "recovered_on_grid_fallback_pages": recovered_on_grid_fallback,
         "page_results": page_results,
     }
     Path(output_path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -429,6 +570,10 @@ def main():
     validate.add_argument("--attempt-kind", default="normal")
     validate.add_argument("--artifact-dir", required=False)
 
+    should_grid = sub.add_parser("should-grid")
+    should_grid.add_argument("--status-path", required=True)
+    should_grid.add_argument("--log-path", required=True)
+
     report = sub.add_parser("report")
     report.add_argument("--manifest", required=True)
     report.add_argument("--status-dir", required=True)
@@ -439,6 +584,8 @@ def main():
     report.add_argument("--diagnostic-output-dir", required=False)
 
     args = parser.parse_args()
+    if args.command == "should-grid":
+        raise SystemExit(0 if should_use_grid(args.status_path, args.log_path) else 1)
     if args.command == "validate":
         payload = write_attempt_status(
             args.out_dir,

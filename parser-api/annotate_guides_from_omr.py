@@ -2755,6 +2755,21 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
     )
 
 
+def _parse_page_sheet_from_manifest(
+    default_zip: zipfile.ZipFile,
+    default_sheet_path: str,
+    manifest_entry: dict | None,
+):
+    structural_path = str((manifest_entry or {}).get("structural_omr_path") or "").strip()
+    if not structural_path:
+        return _parse_sheet(default_zip, default_sheet_path)
+    with zipfile.ZipFile(structural_path, "r") as structural_zip:
+        structural_sheets = _sorted_sheet_xml_paths(structural_zip)
+        if not structural_sheets:
+            raise RuntimeError(f"No sheet XML in structural OMR: {structural_path}")
+        return _parse_sheet(structural_zip, structural_sheets[0])
+
+
 def _render_page_gray(page: fitz.Page, zoom: float = 2.0) -> np.ndarray:
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -3105,6 +3120,11 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
 
             page = doc[page_index]
             sheet_xml_path = sheet_paths[page_index]
+            source_manifest_entry = (
+                mxl_page_manifest_by_page.get(page_index)
+                if mxl_manifest_active
+                else None
+            )
 
             (
                 pic_w,
@@ -3119,7 +3139,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                 omr_fallback_rows,
                 omr_system_recovery_rows,
                 measure_box_filter_reason_counts,
-            ) = _parse_sheet(z, sheet_xml_path)
+            ) = _parse_page_sheet_from_manifest(z, sheet_xml_path, source_manifest_entry)
             if pic_w <= 0 or pic_h <= 0:
                 continue
 
@@ -3215,6 +3235,7 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
             mapping_mode = "-"
             mxl_page_candidate_source = "-"
             mxl_page_candidate_path = None
+            manifest_source_kind = "mxl"
             page_mxl_starts: list[str] = []
             manifest_entry: dict | None = None
             xml_selection_source = "none"
@@ -3238,13 +3259,24 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         manifest_ending_anchors = list(manifest_entry.get("ending_anchors") or [])
                         page_mxl_starts = list(manifest_entry.get("system_starts") or [])
                         mxl_system_count = len(page_mxl_starts)
-                        mxl_page_candidate_source = "manifest"
+                        source_kind = str(manifest_entry.get("source_kind") or "mxl")
+                        manifest_source_kind = source_kind
+                        mxl_page_candidate_source = source_kind
                         mxl_page_candidate_path = manifest_entry.get("mxl_path")
                         xml_selection_source = str(manifest_entry.get("selection_source") or "none")
                         xml_selection_reason = str(manifest_entry.get("selection_reason") or "manifest_entry")
                         xml_confidence_tier = str(manifest_entry.get("confidence_tier") or "none")
                         xml_low_confidence_used = bool(manifest_entry.get("low_confidence_used"))
-                        if manifest_entry.get("status") != "ok":
+                        if source_kind == "grid_structural_fallback" and manifest_entry.get("status") == "ok":
+                            staff_start_source = "omr_fallback"
+                            mapping_status = "fallback"
+                            mapping_mode = "grid_structural_fallback"
+                            mapping_reason = "grid_structural_fallback_no_musicxml"
+                            xml_selection_source = "none"
+                            xml_selection_reason = "musicxml_unavailable"
+                            xml_confidence_tier = "structural"
+                            xml_low_confidence_used = True
+                        elif manifest_entry.get("status") != "ok":
                             mapping_status = "error"
                             mapping_reason = f"manifest_{manifest_entry.get('error') or 'entry_not_ok'}"
                             mapping_mode = "missing"
@@ -3346,7 +3378,13 @@ def annotate_guides_from_omr(input_pdf: str, omr_path: str, output_pdf: str) -> 
                         mapping_mode = "parse_error"
 
                 if staff_start_source != "mxl":
-                    if measure_source_policy == "mxl_with_omr_fallback" and staff_start_labels_pdf:
+                    if (
+                        (
+                            measure_source_policy == "mxl_with_omr_fallback"
+                            or manifest_source_kind == "grid_structural_fallback"
+                        )
+                        and staff_start_labels_pdf
+                    ):
                         staff_start_source = "omr_fallback"
                         mapping_status = "fallback"
                         mapping_reason = f"{mapping_reason}|fallback_to_omr"

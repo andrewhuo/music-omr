@@ -19,6 +19,16 @@ def _write_mxl(path, parts=1, measures=2):
         archive.writestr("score.xml", f"<score-partwise>{part_xml}</score-partwise>")
 
 
+def _write_omr(path, systems=1, staffs=4, barlines=3):
+    systems_xml = []
+    for _ in range(systems):
+        staff_xml = "".join("<staff/>" for _ in range(staffs))
+        barline_xml = "".join("<barline><bounds x='10' y='10' h='40'/></barline>" for _ in range(barlines))
+        systems_xml.append(f"<system>{staff_xml}{barline_xml}</system>")
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("sheet#1/sheet#1.xml", f"<sheet><page>{''.join(systems_xml)}</page></sheet>")
+
+
 class PageOmrRecoveryTests(unittest.TestCase):
     def test_page_output_requires_parts_and_measures(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -28,6 +38,54 @@ class PageOmrRecoveryTests(unittest.TestCase):
             result = MODULE.inspect_page_output(str(out))
             self.assertTrue(result["success"])
             self.assertEqual(result["measures_count"], 3)
+
+    def test_grid_structural_output_requires_systems_and_barlines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "grid"
+            out.mkdir()
+            _write_omr(out / "page.omr", systems=2, staffs=4, barlines=3)
+            result = MODULE.inspect_page_output(str(out), "grid_structural_fallback")
+            self.assertTrue(result["success"])
+            self.assertEqual(result["system_count"], 2)
+            self.assertEqual(result["staff_count"], 8)
+            self.assertEqual(result["barline_count"], 6)
+
+    def test_grid_structural_output_rejects_missing_barlines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "grid"
+            out.mkdir()
+            _write_omr(out / "page.omr", systems=1, staffs=4, barlines=1)
+            result = MODULE.inspect_page_output(str(out), "grid_structural_fallback")
+            self.assertFalse(result["success"])
+            self.assertEqual(result["reason"], "barlines_insufficient")
+
+    def test_text_crash_with_omr_selects_grid_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "out"
+            out.mkdir()
+            status = root / "status.json"
+            log = root / "attempt.log"
+            (out / "page.omr").write_text("placeholder", encoding="utf-8")
+            log.write_text(
+                "GRID completed\n"
+                "at org.audiveris.omr.sig.inter.MetronomeInter.create\n"
+                "Could not export since transcription did not complete successfully\n",
+                encoding="utf-8",
+            )
+            MODULE.write_attempt_status(str(out), str(status), 8, 1, str(log))
+            self.assertTrue(MODULE.should_use_grid(str(status), str(log)))
+
+    def test_missing_omr_does_not_select_grid_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            status = root / "status.json"
+            log = root / "attempt.log"
+            log.write_text("Could not export\n", encoding="utf-8")
+            status.write_text(json.dumps({"omr_created": False}), encoding="utf-8")
+            self.assertFalse(MODULE.should_use_grid(str(status), str(log)))
 
     def test_retry_status_marks_recovered_page(self):
         with tempfile.TemporaryDirectory() as tmp:

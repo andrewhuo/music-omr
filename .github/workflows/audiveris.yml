@@ -623,7 +623,7 @@ jobs:
       - name: Build page-split XML manifest (strict mode)
         run: |
           set -euo pipefail
-          mkdir -p /tmp/work/pages /tmp/work/audiveris_pages /tmp/work/page_logs /tmp/work/page_status
+          mkdir -p /tmp/work/pages /tmp/work/audiveris_pages /tmp/work/audiveris_grid_pages /tmp/work/page_logs /tmp/work/page_status
           AUDIVERIS_IMAGE_EFFECTIVE="${AUDIVERIS_IMAGE}"
 
           python - << 'PY'
@@ -663,6 +663,24 @@ jobs:
               -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; "$AUDI_BIN" -batch -export -output "${AUDI_OUT_DIR}" "/work/pages/page_${PAGE_NUM}.pdf"'
           }
 
+          run_page_grid() {
+            local image="$1"
+            local page_num="$2"
+            docker run --rm \
+              --entrypoint /bin/sh \
+              --user "$(id -u):$(id -g)" \
+              -v /tmp/work:/work \
+              -e PAGE_NUM="${page_num}" \
+              -e AUDI_IMAGE="${image}" \
+              -e AUDI_OUT_DIR="/work/audiveris_grid_pages/page_${page_num}" \
+              -e HOME="/work" \
+              -e XDG_CACHE_HOME="/work/.cache" \
+              -e XDG_CONFIG_HOME="/work/.config" \
+              -e JAVA_TOOL_OPTIONS="-Duser.home=/work -Djava.io.tmpdir=/work/tmp" \
+              "${image}" \
+              -c 'set -e; AUDI_BIN="/audiveris-extract/bin/Audiveris"; if [ -x /audiveris/bin/Audiveris ]; then AUDI_BIN="/audiveris/bin/Audiveris"; fi; if [ -x /opt/audiveris/bin/Audiveris ]; then AUDI_BIN="/opt/audiveris/bin/Audiveris"; fi; mkdir -p /work/.cache /work/.config /work/tmp "${AUDI_OUT_DIR}"; "$AUDI_BIN" -batch -step GRID -save -output "${AUDI_OUT_DIR}" "/work/pages/page_${PAGE_NUM}.pdf"'
+          }
+
           for page_pdf in /tmp/work/pages/page_*.pdf; do
             [[ -f "${page_pdf}" ]] || continue
             page_num="$(basename "${page_pdf}" | sed -E 's/^page_([0-9]{4})\.pdf$/\1/')"
@@ -686,7 +704,31 @@ jobs:
             fi
             echo "PAGE_XML_RUN page=$((10#${page_num})) attempt=1 image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${exit_code} valid=${page_ok} log=${log_path} out_dir=${out_dir}"
 
-            if [[ "${page_ok}" != "true" ]]; then
+            if [[ "${page_ok}" != "true" ]] && python parser-api/page_omr_recovery.py should-grid \
+              --status-path "${status_path}" --log-path "${log_path}"; then
+              grid_dir="/tmp/work/audiveris_grid_pages/page_${page_num}"
+              grid_log="/tmp/work/page_logs/page_${page_num}_grid.log"
+              grid_status_path="${status_path}"
+              rm -rf "${grid_dir}"
+              if run_page_grid "${AUDIVERIS_IMAGE_EFFECTIVE}" "${page_num}" >"${grid_log}" 2>&1; then
+                grid_exit_code=0
+              else
+                grid_exit_code=$?
+              fi
+              if python parser-api/page_omr_recovery.py validate \
+                --out-dir "${grid_dir}" \
+                --status-path "${grid_status_path}" \
+                --page "$((10#${page_num}))" \
+                --attempt 2 \
+                --attempt-kind grid_structural_fallback \
+                --log-path "${grid_log}"; then
+                page_ok=true
+              else
+                page_ok=false
+              fi
+              echo "PAGE_GRID_RUN page=$((10#${page_num})) attempt=2 image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${grid_exit_code} valid=${page_ok} log=${grid_log} out_dir=${grid_dir}"
+              log_path="${grid_log}"
+            elif [[ "${page_ok}" != "true" ]]; then
               log_path="/tmp/work/page_logs/page_${page_num}_attempt2.log"
               rm -rf "${out_dir}"
               if run_page_omr "${AUDIVERIS_IMAGE_EFFECTIVE}" "${page_num}" >"${log_path}" 2>&1; then
@@ -705,6 +747,31 @@ jobs:
                 page_ok=false
               fi
               echo "PAGE_XML_RUN page=$((10#${page_num})) attempt=2 image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${exit_code} valid=${page_ok} log=${log_path} out_dir=${out_dir}"
+            fi
+
+            if [[ "${page_ok}" != "true" ]] && python parser-api/page_omr_recovery.py should-grid \
+              --status-path "${status_path}" --log-path "${log_path}"; then
+              grid_dir="/tmp/work/audiveris_grid_pages/page_${page_num}"
+              grid_log="/tmp/work/page_logs/page_${page_num}_grid.log"
+              rm -rf "${grid_dir}"
+              if run_page_grid "${AUDIVERIS_IMAGE_EFFECTIVE}" "${page_num}" >"${grid_log}" 2>&1; then
+                grid_exit_code=0
+              else
+                grid_exit_code=$?
+              fi
+              if python parser-api/page_omr_recovery.py validate \
+                --out-dir "${grid_dir}" \
+                --status-path "${status_path}" \
+                --page "$((10#${page_num}))" \
+                --attempt 3 \
+                --attempt-kind grid_structural_fallback \
+                --log-path "${grid_log}"; then
+                page_ok=true
+              else
+                page_ok=false
+              fi
+              echo "PAGE_GRID_RUN page=$((10#${page_num})) attempt=3 image=${AUDIVERIS_IMAGE_EFFECTIVE} exit_code=${grid_exit_code} valid=${page_ok} log=${grid_log} out_dir=${grid_dir}"
+              log_path="${grid_log}"
             fi
 
             cp "${log_path}" "/tmp/work/page_logs/page_${page_num}.log"
@@ -1092,6 +1159,9 @@ jobs:
           def find_page_split_omr_path(page_num, entry):
               page_prefix = f"page_{int(page_num):04d}"
               candidates = []
+              structural_path = str((entry or {}).get("structural_omr_path") or "").strip()
+              if structural_path:
+                  candidates.append(structural_path)
               for mxl_path in sorted(set(str(p) for p in (entry.get("mxl_paths") or []) if p)):
                   parent = os.path.dirname(mxl_path)
                   candidates.extend(sorted(glob.glob(os.path.join(parent, "*.omr"))))
@@ -3885,6 +3955,65 @@ jobs:
               page_num = int(re.search(r"page_(\d{4})\.pdf$", page_pdf).group(1))
               page_idx = page_num - 1
               out_dir = f"/tmp/work/audiveris_pages/page_{page_num:04d}"
+              status_path = f"/tmp/work/page_status/page_{page_num:04d}.json"
+              structural_status = {}
+              try:
+                  with open(status_path, "r", encoding="utf-8") as fh:
+                      structural_status = json.load(fh)
+              except Exception:
+                  structural_status = {}
+              if (
+                  structural_status.get("success")
+                  and structural_status.get("recovered_on_grid_fallback")
+                  and structural_status.get("structural_success")
+                  and structural_status.get("omr_path")
+              ):
+                  structural_omr_path = str(structural_status["omr_path"])
+                  structural_entry = {
+                      "page_index": page_idx,
+                      "page_number": page_num,
+                      "status": "ok",
+                      "source_kind": "grid_structural_fallback",
+                      "error": None,
+                      "mxl_path": None,
+                      "mxl_paths": [],
+                      "structural_omr_path": structural_omr_path,
+                      "structural_system_count": int(structural_status.get("system_count") or 0),
+                      "structural_staff_count": int(structural_status.get("staff_count") or 0),
+                      "structural_barline_count": int(structural_status.get("barline_count") or 0),
+                      "parts_count": 0,
+                      "measures_count": 0,
+                      "system_count_target": int(omr_targets.get(page_num) or 0),
+                      "system_starts_raw": [],
+                      "system_starts_normalized": [],
+                      "system_starts_semantic": [],
+                      "system_starts": [],
+                      "merge_offsets": [],
+                      "system_starts_raw_segments": [],
+                      "numbering_policy": NUMBERING_POLICY,
+                      "semantic_events": {},
+                      "semantic_warnings": ["musicxml_unavailable_structural_fallback"],
+                      "normalization_warnings": [],
+                      "ending_anchors": [],
+                      "_semantic_measure_events": [],
+                      "selection_source": "grid_structural_fallback",
+                      "selection_reason": "audiveris_grid_reached_without_musicxml",
+                      "confidence_tier": "structural",
+                      "low_confidence_used": True,
+                      "retry_attempted": True,
+                      "retry_profile": "grid",
+                      "candidate_summary": [],
+                      "merge_debug": {},
+                  }
+                  entries.append(structural_entry)
+                  print(
+                      "PAGE_GRID_SELECTED "
+                      f"page={page_num} omr={structural_omr_path} "
+                      f"systems={int(structural_status.get('system_count') or 0)} "
+                      f"staffs={int(structural_status.get('staff_count') or 0)} "
+                      f"barlines={int(structural_status.get('barline_count') or 0)}"
+                  )
+                  continue
               candidates = sorted(glob.glob(os.path.join(out_dir, "**", "*.mxl"), recursive=True))
               scored = [score_mxl(path) for path in candidates]
               candidate_summary = []
@@ -5078,6 +5207,9 @@ jobs:
                   "recovered_on_raster_fallback_pages": list(
                       page_omr_report.get("recovered_on_raster_fallback_pages") or []
                   ),
+                  "recovered_on_grid_fallback_pages": list(
+                      page_omr_report.get("recovered_on_grid_fallback_pages") or []
+                  ),
               },
               "editable_state": editable_state,
           }
@@ -5202,6 +5334,13 @@ jobs:
             echo "uploaded_artifact_page_raster_fallback=${ARTIFACTS_PREFIX}/page_raster_fallback/${rel}"
             uploaded_count=$((uploaded_count + 1))
           done < <(find /tmp/work/page_raster_fallback -type f -print0 2>/dev/null || true)
+
+          while IFS= read -r -d '' grid_file; do
+            rel="${grid_file#/tmp/work/audiveris_grid_pages/}"
+            retry_cmd page_grid_omr_upload gsutil cp "${grid_file}" "${ARTIFACTS_PREFIX}/page_grid_omr/${rel}"
+            echo "uploaded_artifact_page_grid_omr=${ARTIFACTS_PREFIX}/page_grid_omr/${rel}"
+            uploaded_count=$((uploaded_count + 1))
+          done < <(find /tmp/work/audiveris_grid_pages -type f -print0 2>/dev/null || true)
 
           shopt -s globstar nullglob
           for raster_file in /tmp/work/raster/**/* /tmp/work/raster/*; do
