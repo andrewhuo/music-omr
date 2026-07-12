@@ -56,7 +56,52 @@ def _barline_el(el_id: int, staff: str, x: float, y_top: float, y_bottom: float,
     return el
 
 
+def _two_group_sheet_xml() -> bytes:
+    root = ET.Element("sheet")
+    ET.SubElement(root, "picture", {"width": "240", "height": "220"})
+    scale = ET.SubElement(root, "scale")
+    ET.SubElement(scale, "interline", {"main": "10"})
+
+    for group_index, y_top in enumerate((20.0, 130.0), start=1):
+        page = ET.SubElement(root, "page", {"id": "1"})
+        system = ET.SubElement(page, "system", {"id": "1"})
+        staff = ET.SubElement(system, "staff", {"id": "1", "left": "20", "right": "220"})
+        ET.SubElement(staff, "header", {"start": "20"})
+        lines = ET.SubElement(staff, "lines")
+        for offset in range(5):
+            line = ET.SubElement(lines, "line")
+            ET.SubElement(line, "point", {"x": "20", "y": str(y_top + (10.0 * offset))})
+            ET.SubElement(line, "point", {"x": "220", "y": str(y_top + (10.0 * offset))})
+        ET.SubElement(staff, "barlines").text = "1 2"
+        inters = ET.SubElement(ET.SubElement(system, "sig"), "inters")
+        inters.append(_barline_el(1, "1", 90.0, y_top, y_top + 40.0))
+        inters.append(_barline_el(2, "1", 160.0, y_top, y_top + 40.0))
+
+    return ET.tostring(root, encoding="utf-8")
+
+
 class AnnotateGuidesFromOmrTests(unittest.TestCase):
+    def test_parse_sheet_keeps_internal_groups_on_unique_system_indexes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            omr_path = os.path.join(tmp, "two_groups.omr")
+            with zipfile.ZipFile(omr_path, "w") as archive:
+                archive.writestr("sheet#1/sheet#1.xml", _two_group_sheet_xml())
+            with zipfile.ZipFile(omr_path, "r") as archive:
+                parsed = MOD._parse_sheet(archive, "sheet#1/sheet#1.xml")
+
+        measure_rows = parsed[8]
+        recovery_rows = parsed[10]
+
+        self.assertEqual(parsed[6], [1, 1])
+        self.assertEqual([row["system_index"] for row in recovery_rows], [0, 1])
+        self.assertEqual([row["source_group_index"] for row in recovery_rows], [1, 2])
+        self.assertEqual({row["system_index"] for row in measure_rows}, {0, 1})
+        self.assertEqual({row["source_group_index"] for row in recovery_rows}, {1, 2})
+
+        first_group_bottom = max(row["y_bottom"] for row in measure_rows if row["system_index"] == 0)
+        second_group_top = min(row["y_top"] for row in measure_rows if row["system_index"] == 1)
+        self.assertLess(first_group_bottom, second_group_top)
+
     def test_manifest_structural_omr_is_selected_for_page(self):
         with tempfile.TemporaryDirectory() as tmp:
             structural = os.path.join(tmp, "page_grid.omr")

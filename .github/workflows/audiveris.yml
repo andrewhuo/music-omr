@@ -4878,6 +4878,16 @@ jobs:
                                   if recovery_row.get("system_index") is not None
                                   else 0
                               ),
+                              "source_group_index": int(
+                                  recovery_row.get("source_group_index")
+                                  if recovery_row.get("source_group_index") is not None
+                                  else 0
+                              ),
+                              "source_system_index": int(
+                                  recovery_row.get("source_system_index")
+                                  if recovery_row.get("source_system_index") is not None
+                                  else 0
+                              ),
                               "recovery_result": str(recovery_row.get("recovery_result") or ""),
                               "under_split_suspect": bool(recovery_row.get("under_split_suspect")),
                               "grand_staff_connector_suppressed": bool(

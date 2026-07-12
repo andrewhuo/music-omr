@@ -2172,13 +2172,15 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
 
     measure_counter = 1
 
-    for page in pages:
+    for source_page_index, page in enumerate(pages):
         systems = page.findall(".//system")
         if not systems:
             systems = page.findall("system")
         page_system_entries: list[dict] = []
+        system_index_offset = len(system_staff_counts)
 
-        for sys_index, system in enumerate(systems):
+        for source_system_index, system in enumerate(systems):
+            system_index = system_index_offset + source_system_index
             page_id = page.get("id") or "?"
             system_id = system.get("id") or "?"
             staff_nodes = system.findall(".//staff")
@@ -2464,7 +2466,7 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                         if cand is not None:
                             left_ref = float(cand)
                             break
-                    if left_ref is not None and sys_index > 0 and increment_bars > 1:
+                    if left_ref is not None and source_system_index > 0 and increment_bars > 1:
                         first_bar_x = float(min(staff_barline_xs))
                         if abs(first_bar_x - left_ref) <= carry_tol:
                             left_carryover_detected = True
@@ -2517,7 +2519,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     {
                         "page_id": page_id,
                         "system_id": system_id,
-                        "system_index": int(sys_index),
+                        "system_index": int(system_index),
+                        "source_group_index": int(source_page_index + 1),
+                        "source_system_index": int(source_system_index),
                         "x_start": float(x_postpad),
                         "y_top": float(y_top),
                         "y_bottom": float(y_bot),
@@ -2571,7 +2575,9 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                 {
                     "page_id": page_id,
                     "system_id": system_id,
-                    "system_index": int(sys_index),
+                    "system_index": int(system_index),
+                    "source_group_index": int(source_page_index + 1),
+                    "source_system_index": int(source_system_index),
                     "staff_contexts": staff_contexts,
                     "system_measure_rows_px": system_measure_rows_px,
                     "selected_measure_rows": selected_measure_rows,
@@ -2703,6 +2709,8 @@ def _parse_sheet(z: zipfile.ZipFile, sheet_xml_path: str):
                     "page_id": page_id,
                     "system_id": system_id,
                     "system_index": system_index,
+                    "source_group_index": int(entry.get("source_group_index") or 0),
+                    "source_system_index": int(entry.get("source_system_index") or 0),
                     "system_width": float(entry.get("system_width") or 0.0),
                     "first_pass_measure_count": int(first_pass_measure_count),
                     "neighbor_median_measure_count": float(neighbor_median_count) if neighbor_median_count is not None else None,
