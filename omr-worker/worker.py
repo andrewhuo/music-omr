@@ -5407,17 +5407,6 @@ def _system_start_anchor_measures(
     ]
 
 
-def _apply_pickup_measure_rest(
-    current_value: int,
-    measure_id: str,
-    rest_measures: dict[str, int],
-) -> int:
-    exact_rest_count = _safe_int(rest_measures.get(measure_id), 0) if measure_id else 0
-    if exact_rest_count > 0:
-        return int(current_value) + exact_rest_count
-    return int(current_value)
-
-
 def _recompute_measure_numbering(
     systems: list[dict] | None,
     measures: list[dict] | None,
@@ -5480,6 +5469,15 @@ def _recompute_measure_numbering(
     result_labels: dict[str, str] = {}
     seq_starts_by_system: dict[str, int] = {}
     current_value = int(first_start)
+    first_counted_measure_id = next(
+        (
+            str(measure.get("measure_id") or "").strip()
+            for measure in ordered_measures
+            if not _is_excluded_from_counting(measure)
+            and str(measure.get("measure_id") or "").strip()
+        ),
+        "",
+    )
     active_ending_group_id: int | None = None
     active_ending_group_state: dict | None = None
     current_sid: str | None = None
@@ -5539,16 +5537,20 @@ def _recompute_measure_numbering(
 
         # Stage 3: pickup wins over same-measure numbering anchors.
         if pickup_active:
+            is_opening_pickup = measure_id == first_counted_measure_id
+            label_value = 0 if is_opening_pickup else int(current_value)
             _apply_measure_label(
                 measure,
                 measure_id,
                 system_id,
-                "",
+                str(label_value),
                 result_labels,
                 seq_starts_by_system,
             )
-            current_value = _apply_pickup_measure_rest(
-                current_value,
+            next_value = 1 if is_opening_pickup else int(label_value) + 1
+            current_value = _apply_post_measure_rest(
+                next_value,
+                label_value,
                 measure_id,
                 rest_measures,
             )
