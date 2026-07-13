@@ -704,43 +704,43 @@ class RelabelLogicTests(unittest.TestCase):
                 self.assertEqual(rejected[0]["reason"], "invalid_value")
                 self.assertEqual(state.get("pickup_measures"), {})
 
-    def test_pickup_measure_in_middle_of_system_uses_the_next_number(self):
+    def test_pickup_measure_in_middle_of_system_repeats_the_previous_number(self):
         state = self._sample_state()
         state["pickup_measures"] = {"p1_s1_m1": True}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "7", "10"])
+        self.assertEqual(values, ["1", "4", "6", "9"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s1_m0"], "4")
-        self.assertEqual(measure_values["p1_s1_m1"], "5")
-        self.assertEqual(measure_values["p1_s1_m2"], "6")
-        self.assertEqual(measure_values["p1_s2_m0"], "7")
-        self.assertEqual(measure_values["p2_s0_m0"], "10")
+        self.assertEqual(measure_values["p1_s1_m1"], "4")
+        self.assertEqual(measure_values["p1_s1_m2"], "5")
+        self.assertEqual(measure_values["p1_s2_m0"], "6")
+        self.assertEqual(measure_values["p2_s0_m0"], "9")
 
-    def test_pickup_measure_at_end_of_system_uses_the_next_number(self):
+    def test_pickup_measure_at_end_of_system_repeats_the_previous_number(self):
         state = self._sample_state()
         state["pickup_measures"] = {"p1_s1_m2": True}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "7", "10"])
+        self.assertEqual(values, ["1", "4", "6", "9"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s1_m1"], "5")
-        self.assertEqual(measure_values["p1_s1_m2"], "6")
-        self.assertEqual(measure_values["p1_s2_m0"], "7")
-        self.assertEqual(measure_values["p2_s0_m0"], "10")
+        self.assertEqual(measure_values["p1_s1_m2"], "5")
+        self.assertEqual(measure_values["p1_s2_m0"], "6")
+        self.assertEqual(measure_values["p2_s0_m0"], "9")
 
-    def test_pickup_measure_at_start_of_system_uses_the_next_number(self):
+    def test_pickup_measure_at_start_of_system_repeats_the_previous_number(self):
         state = self._sample_state()
         state["pickup_measures"] = {"p1_s1_m0": True}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "7", "10"])
+        self.assertEqual(values, ["1", "3", "6", "9"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
-        self.assertEqual(measure_values["p1_s1_m0"], "4")
-        self.assertEqual(measure_values["p1_s1_m1"], "5")
-        self.assertEqual(measure_values["p1_s1_m2"], "6")
-        self.assertEqual(measure_values["p1_s2_m0"], "7")
-        self.assertEqual(measure_values["p2_s0_m0"], "10")
+        self.assertEqual(measure_values["p1_s1_m0"], "3")
+        self.assertEqual(measure_values["p1_s1_m1"], "4")
+        self.assertEqual(measure_values["p1_s1_m2"], "5")
+        self.assertEqual(measure_values["p1_s2_m0"], "6")
+        self.assertEqual(measure_values["p2_s0_m0"], "9")
 
     def test_opening_pickup_is_zero_and_the_next_measure_is_one(self):
         state = self._sample_state()
@@ -786,9 +786,9 @@ class RelabelLogicTests(unittest.TestCase):
             [(row["measure_id"], label) for row, label in anchors],
             [
                 ("p1_s0_m0", "1"),
-                ("p1_s1_m0", "4"),
-                ("p1_s2_m0", "7"),
-                ("p2_s0_m0", "10"),
+                ("p1_s1_m0", "3"),
+                ("p1_s2_m0", "6"),
+                ("p2_s0_m0", "9"),
             ],
         )
 
@@ -807,9 +807,9 @@ class RelabelLogicTests(unittest.TestCase):
             [(row["measure_id"], label) for row, label in anchors],
             [
                 ("p1_s0_m0", "1"),
-                ("p1_s1_m0", "4"),
-                ("p1_s2_m0", "8"),
-                ("p2_s0_m0", "11"),
+                ("p1_s1_m0", "3"),
+                ("p1_s2_m0", "7"),
+                ("p2_s0_m0", "10"),
             ],
         )
 
@@ -831,9 +831,9 @@ class RelabelLogicTests(unittest.TestCase):
             [(row["measure_id"], label) for row, label in anchors],
             [
                 ("p1_s0_m0", "1"),
-                ("p1_s1_m0", "4"),
-                ("p1_s2_m0", "7"),
-                ("p2_s0_m0", "10"),
+                ("p1_s1_m0", "3"),
+                ("p1_s2_m0", "4"),
+                ("p2_s0_m0", "7"),
             ],
         )
 
@@ -1026,12 +1026,12 @@ class RelabelLogicTests(unittest.TestCase):
         state["pickup_measures"] = {"p1_s1_m1": True}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "7", "10"])
+        self.assertEqual(values, ["1", "4", "6", "9"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s1_m0"], "4")
-        self.assertEqual(measure_values["p1_s1_m1"], "5")
-        self.assertEqual(measure_values["p1_s1_m2"], "6")
-        self.assertEqual(measure_values["p1_s2_m0"], "7")
+        self.assertEqual(measure_values["p1_s1_m1"], "4")
+        self.assertEqual(measure_values["p1_s1_m2"], "5")
+        self.assertEqual(measure_values["p1_s2_m0"], "6")
 
     def test_pickup_and_rest_on_same_middle_measure_shift_following_count(self):
         state = self._sample_state()
@@ -1039,12 +1039,12 @@ class RelabelLogicTests(unittest.TestCase):
         state["rest_measures"] = {"p1_s1_m1": 2}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "8", "11"])
+        self.assertEqual(values, ["1", "4", "7", "10"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s1_m0"], "4")
-        self.assertEqual(measure_values["p1_s1_m1"], "5")
-        self.assertEqual(measure_values["p1_s1_m2"], "7")
-        self.assertEqual(measure_values["p1_s2_m0"], "8")
+        self.assertEqual(measure_values["p1_s1_m1"], "4")
+        self.assertEqual(measure_values["p1_s1_m2"], "6")
+        self.assertEqual(measure_values["p1_s2_m0"], "7")
 
     def test_pickup_and_rest_at_start_of_system_shift_following_count(self):
         state = self._sample_state()
@@ -1052,12 +1052,12 @@ class RelabelLogicTests(unittest.TestCase):
         state["rest_measures"] = {"p1_s1_m0": 2}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "8", "11"])
+        self.assertEqual(values, ["1", "3", "7", "10"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
-        self.assertEqual(measure_values["p1_s1_m0"], "4")
-        self.assertEqual(measure_values["p1_s1_m1"], "6")
-        self.assertEqual(measure_values["p1_s1_m2"], "7")
-        self.assertEqual(measure_values["p1_s2_m0"], "8")
+        self.assertEqual(measure_values["p1_s1_m0"], "3")
+        self.assertEqual(measure_values["p1_s1_m1"], "5")
+        self.assertEqual(measure_values["p1_s1_m2"], "6")
+        self.assertEqual(measure_values["p1_s2_m0"], "7")
 
     def test_pickup_and_rest_near_system_boundary_shift_later_systems(self):
         state = self._sample_state()
@@ -1065,11 +1065,11 @@ class RelabelLogicTests(unittest.TestCase):
         state["rest_measures"] = {"p1_s2_m2": 2}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "7", "11"])
+        self.assertEqual(values, ["1", "4", "7", "10"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s2_m1"], "8")
-        self.assertEqual(measure_values["p1_s2_m2"], "9")
-        self.assertEqual(measure_values["p2_s0_m0"], "11")
+        self.assertEqual(measure_values["p1_s2_m2"], "8")
+        self.assertEqual(measure_values["p2_s0_m0"], "10")
 
     def test_pickup_set_measure_number_and_rest_same_measure_follow_pickup_then_rest(self):
         state = self._sample_state()
@@ -1078,13 +1078,13 @@ class RelabelLogicTests(unittest.TestCase):
         state["rest_measures"] = {"p1_s1_m1": 2}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "8", "11"])
+        self.assertEqual(values, ["1", "4", "7", "10"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s1_m0"], "4")
-        self.assertEqual(measure_values["p1_s1_m1"], "5")
-        self.assertEqual(measure_values["p1_s1_m2"], "7")
-        self.assertEqual(measure_values["p1_s2_m0"], "8")
-        self.assertEqual(measure_values["p2_s0_m0"], "11")
+        self.assertEqual(measure_values["p1_s1_m1"], "4")
+        self.assertEqual(measure_values["p1_s1_m2"], "6")
+        self.assertEqual(measure_values["p1_s2_m0"], "7")
+        self.assertEqual(measure_values["p2_s0_m0"], "10")
 
     def test_pickup_set_measure_number_ending_and_rest_same_measure_ignore_set_and_ending_but_keep_rest(self):
         state = self._sample_state()
@@ -1094,12 +1094,12 @@ class RelabelLogicTests(unittest.TestCase):
         state["rest_measures"] = {"p1_s2_m2": 2}
         systems, _, _, _ = WORKER._apply_relabel_edits(state, [])
         values = [str(row["current_value"]) for row in systems]
-        self.assertEqual(values, ["1", "4", "7", "11"])
+        self.assertEqual(values, ["1", "4", "7", "10"])
         measure_values = {row["measure_id"]: str(row.get("current_value") or "") for row in state.get("measures") or []}
         self.assertEqual(measure_values["p1_s2_m1"], "8")
-        self.assertEqual(measure_values["p1_s2_m2"], "9")
-        self.assertEqual(measure_values["p2_s0_m0"], "11")
-        self.assertEqual(measure_values["p2_s0_m1"], "12")
+        self.assertEqual(measure_values["p1_s2_m2"], "8")
+        self.assertEqual(measure_values["p2_s0_m0"], "10")
+        self.assertEqual(measure_values["p2_s0_m1"], "11")
 
     def test_set_measure_number_and_rest_measure_compose_from_anchor_label(self):
         state = self._sample_state()
@@ -1362,15 +1362,15 @@ class RelabelLogicTests(unittest.TestCase):
             ],
         )
         values = [int(row["current_value"]) for row in systems]
-        self.assertEqual(values, [1, 4, 7, 10])
+        self.assertEqual(values, [1, 4, 6, 9])
         measure_values = {
             row["measure_id"]: str(row.get("current_value") or "")
             for row in state.get("measures") or []
         }
         self.assertEqual(measure_values["p1_s1_m1"], "5")
-        self.assertEqual(measure_values["p1_s1_m2"], "6")
-        self.assertEqual(measure_values["p1_s2_m0"], "7")
-        self.assertEqual(measure_values["p2_s0_m0"], "10")
+        self.assertEqual(measure_values["p1_s1_m2"], "5")
+        self.assertEqual(measure_values["p1_s2_m0"], "6")
+        self.assertEqual(measure_values["p2_s0_m0"], "9")
 
     def test_malformed_saved_ending_fragments_are_ignored_for_numbering(self):
         state = self._sample_state()
@@ -1570,8 +1570,8 @@ class RelabelLogicTests(unittest.TestCase):
             (
                 "one pickup",
                 {"pickup_measures": {"p1_s1_m1": True}},
-                ["1", "4", "7", "10"],
-                {"p1_s1_m1": "5", "p1_s1_m2": "6"},
+                ["1", "4", "6", "9"],
+                {"p1_s1_m1": "4", "p1_s1_m2": "5"},
             ),
             (
                 "one exact rest",

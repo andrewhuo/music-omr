@@ -5538,7 +5538,7 @@ def _recompute_measure_numbering(
         # Stage 3: pickup wins over same-measure numbering anchors.
         if pickup_active:
             is_opening_pickup = measure_id == first_counted_measure_id
-            label_value = 0 if is_opening_pickup else int(current_value)
+            label_value = 0 if is_opening_pickup else int(current_value) - 1
             _apply_measure_label(
                 measure,
                 measure_id,
@@ -5547,7 +5547,7 @@ def _recompute_measure_numbering(
                 result_labels,
                 seq_starts_by_system,
             )
-            next_value = 1 if is_opening_pickup else int(label_value) + 1
+            next_value = 1 if is_opening_pickup else int(current_value)
             current_value = _apply_post_measure_rest(
                 next_value,
                 label_value,
