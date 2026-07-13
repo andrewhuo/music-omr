@@ -8,6 +8,7 @@ import threading
 import uuid
 import hashlib
 import base64
+from decimal import Decimal, InvalidOperation
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -107,6 +108,8 @@ STAFF_START_SAME_ROW_CENTER_TOLERANCE_RATIO = 0.45
 STAFF_START_SAME_ROW_MIN_HEIGHT_RATIO = 0.55
 STAFF_START_SAME_ROW_MAX_HEIGHT_RATIO = 1.80
 AI_SUGGESTIONS_VERSION = "ai_suggestions_v1"
+AI_COST_SUMMARY_VERSION = "ai_cost_summary_v1"
+AI_COST_SUMMARY_KEY = "internal_ai_cost_summary"
 AI_SUGGEST_RUN_STATUS_IDLE = "idle"
 AI_SUGGEST_RUN_STATUS_RUNNING = "running"
 AI_SUGGEST_RUN_STATUS_COMPLETED = "completed"
@@ -2240,6 +2243,131 @@ def _requested_ai_model_name() -> str:
     return "unknown"
 
 
+def _ai_cost_rate_snapshot() -> dict:
+    def _rate_value(name: str) -> Decimal | None:
+        raw = str(os.environ.get(name, "") or "").strip()
+        if not raw:
+            return None
+        try:
+            value = Decimal(raw)
+        except (InvalidOperation, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    input_rate = _rate_value("BEDROCK_COST_INPUT_USD_PER_MILLION")
+    output_rate = _rate_value("BEDROCK_COST_OUTPUT_USD_PER_MILLION")
+    rate_version = str(os.environ.get("BEDROCK_COST_RATE_VERSION", "") or "").strip() or None
+    return {
+        "rate_version": rate_version,
+        "input_usd_per_million": str(input_rate) if input_rate is not None else None,
+        "output_usd_per_million": str(output_rate) if output_rate is not None else None,
+        "available": input_rate is not None and output_rate is not None and rate_version is not None,
+    }
+
+
+def _safe_ai_usage_tokens(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _ai_usage_from_message(message: dict | None) -> dict | None:
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = _safe_ai_usage_tokens(usage.get("input_tokens"))
+    output_tokens = _safe_ai_usage_tokens(usage.get("output_tokens"))
+    if input_tokens is None or output_tokens is None:
+        return None
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "retry_attempts": max(1, _safe_int(message.get("_internal_bedrock_attempts"), 1)),
+    }
+
+
+def _ai_cost_decimal(summary: dict) -> Decimal | None:
+    rate = summary.get("rate") if isinstance(summary.get("rate"), dict) else {}
+    if not rate.get("available"):
+        return None
+    try:
+        input_rate = Decimal(str(rate.get("input_usd_per_million")))
+        output_rate = Decimal(str(rate.get("output_usd_per_million")))
+    except (InvalidOperation, ValueError):
+        return None
+    input_tokens = max(0, _safe_int(summary.get("input_tokens_total"), 0))
+    output_tokens = max(0, _safe_int(summary.get("output_tokens_total"), 0))
+    return (
+        (Decimal(input_tokens) * input_rate + Decimal(output_tokens) * output_rate)
+        / Decimal(1_000_000)
+    )
+
+
+def _append_internal_ai_cost_usage(
+    mapping_summary: dict,
+    *,
+    job_id: str,
+    run_id: int,
+    system_row: dict,
+    model: str,
+    usage: dict | None,
+) -> dict:
+    existing = mapping_summary.get(AI_COST_SUMMARY_KEY)
+    summary = dict(existing) if isinstance(existing, dict) else {}
+    history = [dict(row) for row in (summary.get("invocations") or []) if isinstance(row, dict)]
+    rate = summary.get("rate") if isinstance(summary.get("rate"), dict) else _ai_cost_rate_snapshot()
+    now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+    system_id = str(system_row.get("system_id") or "").strip() or None
+    page = _safe_int(system_row.get("page"), 0) or None
+    retry_attempts = max(1, _safe_int((usage or {}).get("retry_attempts"), 1))
+    input_tokens = _safe_ai_usage_tokens((usage or {}).get("input_tokens"))
+    output_tokens = _safe_ai_usage_tokens((usage or {}).get("output_tokens"))
+    usage_available = input_tokens is not None and output_tokens is not None
+    history.append(
+        {
+            "job_id": str(job_id),
+            "run_id": int(run_id),
+            "page": page,
+            "system_id": system_id,
+            "model": str(model or _requested_ai_model_name()).strip() or "unknown",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "retry_attempts": retry_attempts,
+            "usage_available": usage_available,
+            "completed_at_utc": now_txt,
+        }
+    )
+    usable_history = [row for row in history if row.get("usage_available")]
+    complete_usage = len(usable_history) == len(history)
+    summary = {
+        "version": AI_COST_SUMMARY_VERSION,
+        "currency": "USD",
+        "job_id": str(job_id),
+        "run_id": int(run_id),
+        "provider": _requested_ai_provider_name(),
+        "model": str(model or _requested_ai_model_name()).strip() or "unknown",
+        "rate": rate,
+        "successful_invocations": len(history),
+        "usage_available_invocations": len(usable_history),
+        "input_tokens_total": sum(max(0, _safe_int(row.get("input_tokens"), 0)) for row in usable_history),
+        "output_tokens_total": sum(max(0, _safe_int(row.get("output_tokens"), 0)) for row in usable_history),
+        "estimated_ai_cost_usd": None,
+        "cost_status": "usage_missing" if not complete_usage else "rate_unavailable",
+        "updated_at_utc": now_txt,
+        "invocations": history,
+    }
+    estimated_cost = _ai_cost_decimal(summary) if complete_usage else None
+    if estimated_cost is not None:
+        summary["estimated_ai_cost_usd"] = format(estimated_cost, "f")
+        summary["cost_status"] = "estimated"
+    mapping_summary[AI_COST_SUMMARY_KEY] = summary
+    return summary
+
+
 def _requested_anthropic_model_name() -> str:
     return _configured_anthropic_model_name() or "unknown"
 
@@ -3258,7 +3386,11 @@ def _bedrock_messages_create(payload: dict) -> dict:
     while True:
         attempt += 1
         try:
-            return _bedrock_messages_create_once(payload)
+            response = _bedrock_messages_create_once(payload)
+            if isinstance(response, dict):
+                response = dict(response)
+                response["_internal_bedrock_attempts"] = attempt
+            return response
         except AiSuggestError as exc:
             if not _is_bedrock_retryable_error(exc):
                 raise
@@ -4364,6 +4496,7 @@ def _generate_ai_suggestions_for_system_batch(
             )
             normalized["pdf_source"] = pdf_source
             normalized["reference_examples_attached"] = int(reference_examples_attached)
+            normalized["_internal_ai_usage"] = _ai_usage_from_message(message)
             debug_crops = _finalize_debug_crops()
             if debug_crops is not None:
                 normalized["debug_crops"] = debug_crops
@@ -7232,6 +7365,7 @@ def ai_suggest_job_step(job_id: str):
     system_row, system_measures = system_batches[next_system_index]
     debug_crops = None
     reference_examples_attached = 0
+    internal_ai_usage = None
     remembered_time_signature_in = _normalize_ai_time_signature_value(ai_suggest_run.get("remembered_time_signature"))
     score_type = _normalize_ai_score_type(ai_suggest_run.get("score_type"))
     try:
@@ -7249,6 +7383,7 @@ def ai_suggest_job_step(job_id: str):
         if isinstance(system_result, dict):
             debug_crops = system_result.pop("debug_crops", None)
             reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
+            internal_ai_usage = system_result.pop("_internal_ai_usage", None)
             current_system_id = str(system_row.get("system_id") or "").strip() or None
             system_result.pop("remembered_time_signature_out", None)
             ai_suggest_run["remembered_time_signature"] = None
@@ -7274,6 +7409,26 @@ def ai_suggest_job_step(job_id: str):
             ai_suggest_run["last_time_signature_update"] = previous_last_time_signature_update
             ai_suggest_run["time_signature_updates"] = current_time_signature_updates
         ai_suggestions = _merge_ai_suggestions_state(ai_suggestions, system_result, int(artifact_run_id), source_state_version)
+        cost_summary = _append_internal_ai_cost_usage(
+            mapping_summary,
+            job_id=job_id,
+            run_id=int(artifact_run_id),
+            system_row=system_row,
+            model=str(system_result.get("model") or _requested_ai_model_name()),
+            usage=internal_ai_usage if isinstance(internal_ai_usage, dict) else None,
+        )
+        latest_cost = (cost_summary.get("invocations") or [])[-1] if isinstance(cost_summary, dict) else {}
+        logger.info(
+            "AI_COST_USAGE job_id=%s run_id=%s system_id=%s page=%s input_tokens=%s output_tokens=%s retry_attempts=%s usage_available=%s",
+            job_id,
+            int(artifact_run_id),
+            latest_cost.get("system_id"),
+            latest_cost.get("page"),
+            latest_cost.get("input_tokens"),
+            latest_cost.get("output_tokens"),
+            latest_cost.get("retry_attempts"),
+            latest_cost.get("usage_available"),
+        )
         if isinstance(debug_batch_trace_payload, dict):
             try:
                 debug_batch_trace_payload = _mark_ai_batch_trace_processed(

@@ -444,6 +444,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                 return_value=(
                     artifacts,
                     {
+                        WORKER.AI_COST_SUMMARY_KEY: {"estimated_ai_cost_usd": "0.001", "invocations": [{"input_tokens": 1}]},
                         "editable_state": {
                             "version": "system_state_v1",
                             "qa": {"ok": True},
@@ -476,6 +477,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("editable_state") or {}).get("staff_boxes"), [])
         self.assertIsNone(body.get("ai_suggestions"))
         self.assertEqual(((body.get("ai_suggest_run") or {}).get("status")), "idle")
+        self.assertNotIn(WORKER.AI_COST_SUMMARY_KEY, body)
 
     def test_list_jobs_endpoint_returns_simple_rows(self):
         now = WORKER._utc_now()
@@ -1012,6 +1014,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     "remembered_time_signature_out": "3/4",
                     "time_signature_updates": [{"measure_id": "p1_s0_m0", "new_time_signature": "3/4"}],
                     "last_time_signature_update": {"measure_id": "p1_s0_m0", "new_time_signature": "3/4"},
+                    "_internal_ai_usage": {"input_tokens": 1200, "output_tokens": 300, "retry_attempts": 2},
                 },
             ),
             patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
@@ -1033,6 +1036,108 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
+        cost_summary = mapping_summary.get(WORKER.AI_COST_SUMMARY_KEY) or {}
+        self.assertEqual(cost_summary.get("successful_invocations"), 1)
+        self.assertEqual(cost_summary.get("input_tokens_total"), 1200)
+        self.assertEqual(cost_summary.get("output_tokens_total"), 300)
+        self.assertEqual(((cost_summary.get("invocations") or [{}])[-1]).get("retry_attempts"), 2)
+        self.assertNotIn(WORKER.AI_COST_SUMMARY_KEY, body)
+
+    def test_internal_ai_cost_usage_adds_rows_and_keeps_original_rate_snapshot(self):
+        mapping_summary = {}
+        first_system = {"system_id": "p1_s0", "page": 1}
+        second_system = {"system_id": "p1_s1", "page": 1}
+        with patch.dict(
+            os.environ,
+            {
+                "BEDROCK_COST_INPUT_USD_PER_MILLION": "1",
+                "BEDROCK_COST_OUTPUT_USD_PER_MILLION": "5",
+                "BEDROCK_COST_RATE_VERSION": "2026-07-13",
+            },
+        ):
+            WORKER._append_internal_ai_cost_usage(
+                mapping_summary,
+                job_id="job-1",
+                run_id=111,
+                system_row=first_system,
+                model="haiku-test",
+                usage={"input_tokens": 1_000_000, "output_tokens": 100_000, "retry_attempts": 3},
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "BEDROCK_COST_INPUT_USD_PER_MILLION": "999",
+                "BEDROCK_COST_OUTPUT_USD_PER_MILLION": "999",
+                "BEDROCK_COST_RATE_VERSION": "later-rate",
+            },
+        ):
+            summary = WORKER._append_internal_ai_cost_usage(
+                mapping_summary,
+                job_id="job-1",
+                run_id=111,
+                system_row=second_system,
+                model="haiku-test",
+                usage={"input_tokens": 1_000_000, "output_tokens": 100_000, "retry_attempts": 1},
+            )
+
+        self.assertEqual(summary.get("successful_invocations"), 2)
+        self.assertEqual(summary.get("input_tokens_total"), 2_000_000)
+        self.assertEqual(summary.get("output_tokens_total"), 200_000)
+        self.assertEqual((summary.get("rate") or {}).get("rate_version"), "2026-07-13")
+        self.assertEqual(summary.get("estimated_ai_cost_usd"), "3")
+        self.assertEqual(((summary.get("invocations") or [{}])[0]).get("retry_attempts"), 3)
+
+    def test_internal_ai_cost_usage_keeps_partial_progress_when_usage_is_missing(self):
+        mapping_summary = {}
+        with patch.dict(os.environ, {}, clear=False):
+            first = WORKER._append_internal_ai_cost_usage(
+                mapping_summary,
+                job_id="job-1",
+                run_id=111,
+                system_row={"system_id": "p1_s0", "page": 1},
+                model="haiku-test",
+                usage={"input_tokens": 100, "output_tokens": 20, "retry_attempts": 1},
+            )
+            second = WORKER._append_internal_ai_cost_usage(
+                mapping_summary,
+                job_id="job-1",
+                run_id=111,
+                system_row={"system_id": "p1_s1", "page": 1},
+                model="haiku-test",
+                usage=None,
+            )
+
+        self.assertEqual(first.get("successful_invocations"), 1)
+        self.assertEqual(second.get("successful_invocations"), 2)
+        self.assertEqual(second.get("usage_available_invocations"), 1)
+        self.assertEqual(second.get("input_tokens_total"), 100)
+        self.assertEqual(second.get("output_tokens_total"), 20)
+        self.assertEqual(second.get("estimated_ai_cost_usd"), None)
+        self.assertEqual(second.get("cost_status"), "usage_missing")
+
+    def test_internal_ai_cost_usage_preserves_usage_when_price_settings_are_missing(self):
+        mapping_summary = {}
+        with patch.dict(
+            os.environ,
+            {
+                "BEDROCK_COST_INPUT_USD_PER_MILLION": "",
+                "BEDROCK_COST_OUTPUT_USD_PER_MILLION": "",
+                "BEDROCK_COST_RATE_VERSION": "",
+            },
+        ):
+            summary = WORKER._append_internal_ai_cost_usage(
+                mapping_summary,
+                job_id="job-1",
+                run_id=111,
+                system_row={"system_id": "p1_s0", "page": 1},
+                model="haiku-test",
+                usage={"input_tokens": 100, "output_tokens": 20, "retry_attempts": 1},
+            )
+
+        self.assertEqual(summary.get("input_tokens_total"), 100)
+        self.assertEqual(summary.get("output_tokens_total"), 20)
+        self.assertEqual(summary.get("estimated_ai_cost_usd"), None)
+        self.assertEqual(summary.get("cost_status"), "rate_unavailable")
 
     def test_ai_suggest_step_partial_failed_keeps_completed_suggestions(self):
         artifacts = self._sample_artifacts()
@@ -1350,7 +1455,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                 {"measure_id": "p1_s0_m1", "new_time_signature": "still_bad"},
             ],
         }
-        message = {"content": [{"type": "text", "text": json.dumps(provider_payload)}]}
+        message = {
+            "content": [{"type": "text", "text": json.dumps(provider_payload)}],
+            "usage": {"input_tokens": 700, "output_tokens": 80},
+            "_internal_bedrock_attempts": 2,
+        }
 
         with (
             patch.object(WORKER, "_resolve_ai_crop_pdf_source", return_value=(Path("/tmp/audiveris_out_corrected.pdf"), "corrected")),
@@ -1374,6 +1483,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "pickup")
         self.assertEqual((result.get("model") or ""), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((result.get("pdf_source") or ""), "corrected")
+        self.assertEqual(result.get("_internal_ai_usage"), {"input_tokens": 700, "output_tokens": 80, "retry_attempts": 2})
 
     def test_ai_suggest_system_batches_skip_excluded_measures_and_empty_systems(self):
         editable_state = deepcopy(self._sample_mapping_summary().get("editable_state") or {})
@@ -1786,7 +1896,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         ):
             result = WORKER._bedrock_messages_create({"model": "global.anthropic.claude-haiku-4-5-20251001-v1:0"})
 
-        self.assertEqual(result, success)
+        self.assertEqual(result.get("content"), success.get("content"))
+        self.assertEqual(result.get("_internal_bedrock_attempts"), 3)
         self.assertEqual(create_once.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [0.7, 1.5])
 
