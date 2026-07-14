@@ -199,6 +199,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         os.environ["BEDROCK_MODEL_ID"] = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
         os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-6"
         os.environ["ANTHROPIC_API_KEY"] = "test-key"
+        os.environ["FRIEND_ACCESS_ENFORCED"] = "0"
         WORKER.request = SimpleNamespace(path="", method="GET", headers={}, files={}, json={})
         WORKER._PENDING_DISPATCHES.clear()
 
@@ -255,6 +256,86 @@ class BrowserReadyApiTests(unittest.TestCase):
                 ],
             }
         }
+
+    def test_friend_activation_returns_token_and_public_status_only(self):
+        WORKER.request = SimpleNamespace(
+            path="/api/access/friend/activate",
+            method="POST",
+            headers={},
+            get_json=lambda silent=True: {"device_id": "device-identifier-1234", "code": "private-code"},
+        )
+        with patch.object(
+            WORKER,
+            "_friend_activate_device",
+            return_value={"active": True, "friend_id": "A1B2C3", "access_token": "private-token"},
+        ):
+            body, status = _unpack(WORKER.activate_friend_access())
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("access_token"), "private-token")
+        self.assertEqual(body.get("friend_access"), {"active": True, "friend_id": "A1B2C3"})
+        self.assertNotIn("credits_remaining", body)
+
+    def test_friend_status_does_not_expose_credit_balance(self):
+        WORKER.request = SimpleNamespace(
+            path="/api/access/status",
+            method="GET",
+            headers={"Authorization": "Bearer token"},
+        )
+        with patch.object(WORKER, "_friend_verify_token", return_value={"active": True, "friend_id": "A1B2C3"}):
+            body, status = _unpack(WORKER.get_access_status())
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"friend_access": {"active": True, "friend_id": "A1B2C3"}})
+
+    def test_friend_month_reset_is_exactly_500_without_rollover(self):
+        result = WORKER._friend_reset_month(
+            {"credit_month": "2026-06", "credits_remaining": 900, "credits_used": 2},
+            {"default_monthly_credits": 500},
+            WORKER.datetime(2026, 7, 1, tzinfo=WORKER.timezone.utc),
+        )
+        self.assertEqual(result.get("credit_month"), "2026-07")
+        self.assertEqual(result.get("credits_remaining"), 500)
+        self.assertEqual(result.get("credits_used"), 0)
+
+    def test_disabled_friend_code_rejects_activation(self):
+        with (
+            patch.object(WORKER, "_friend_store_client", return_value=object()),
+            patch.object(WORKER, "_friend_config", return_value={"enabled": False}),
+        ):
+            with self.assertRaises(WORKER.FriendAccessError) as raised:
+                WORKER._friend_activate_device("device-identifier-1234", "private-code")
+        self.assertEqual(raised.exception.code, "friend_code_disabled")
+
+    def test_wrong_friend_code_is_recorded_and_rejected(self):
+        config = {"enabled": True, "device_pepper": "cHJpdmF0ZS1wZXBwZXI"}
+        with (
+            patch.object(WORKER, "_friend_store_client", return_value=object()),
+            patch.object(WORKER, "_friend_config", return_value=config),
+            patch.object(WORKER, "_friend_check_activation_rate"),
+            patch.object(WORKER, "_friend_code_matches", return_value=False),
+            patch.object(WORKER, "_friend_record_bad_activation") as bad_attempt,
+        ):
+            with self.assertRaises(WORKER.FriendAccessError) as raised:
+                WORKER._friend_activate_device("device-identifier-1234", "wrong-code")
+        self.assertEqual(raised.exception.code, "friend_code_invalid")
+        bad_attempt.assert_called_once()
+
+    def test_stale_credit_reservation_is_released(self):
+        result = WORKER._friend_release_stale_reservations(
+            {
+                "credits_remaining": 120,
+                "reservations": {"old": {"created_at_utc": "2026-07-01T00:00:00Z"}},
+            },
+            WORKER.datetime(2026, 7, 2, tzinfo=WORKER.timezone.utc),
+        )
+        self.assertEqual(result.get("credits_remaining"), 121)
+        self.assertEqual(result.get("reservations"), {})
+
+    def test_ai_access_is_required_when_enforcement_is_on(self):
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest", method="POST", headers={})
+        with patch.dict(os.environ, {"FRIEND_ACCESS_ENFORCED": "1"}):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+        self.assertEqual(status, 403)
+        self.assertEqual((body.get("error") or {}).get("code"), "ai_access_required")
 
     def test_cors_allowed_and_disallowed(self):
         self.assertTrue(WORKER._origin_allowed("http://localhost:5173"))
@@ -1019,6 +1100,12 @@ class BrowserReadyApiTests(unittest.TestCase):
             ),
             patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
             patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(
+                WORKER,
+                "_friend_ai_access",
+                return_value={"device_key": "device", "reservation_id": "reservation"},
+            ),
+            patch.object(WORKER, "_friend_finish_reservation") as finish_reservation,
         ):
             body, status = _unpack(WORKER.ai_suggest_job_step("111"))
 
@@ -1038,6 +1125,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
         cost_summary = mapping_summary.get(WORKER.AI_COST_SUMMARY_KEY) or {}
         self.assertEqual(cost_summary.get("successful_invocations"), 1)
+        finish_reservation.assert_called_once_with(
+            {"device_key": "device", "reservation_id": "reservation"},
+            spent=True,
+        )
         self.assertEqual(cost_summary.get("input_tokens_total"), 1200)
         self.assertEqual(cost_summary.get("output_tokens_total"), 300)
         self.assertEqual(((cost_summary.get("invocations") or [{}])[-1]).get("retry_attempts"), 2)
@@ -1169,6 +1260,12 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_generate_ai_suggestions_for_system_batch", side_effect=WORKER.AiSuggestError(provider_status=503, detail="temporary")),
             patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
             patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(
+                WORKER,
+                "_friend_ai_access",
+                return_value={"device_key": "device", "reservation_id": "reservation"},
+            ),
+            patch.object(WORKER, "_friend_finish_reservation") as finish_reservation,
         ):
             body, status = _unpack(WORKER.ai_suggest_job_step("111"))
 
@@ -1179,6 +1276,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(run.get("next_system_index"), 1)
         self.assertEqual((run.get("last_error") or {}).get("provider_status"), 503)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
+        finish_reservation.assert_called_once_with(
+            {"device_key": "device", "reservation_id": "reservation"},
+            spent=False,
+        )
 
     def test_ai_suggest_step_first_system_failure_stays_failed(self):
         artifacts = self._sample_artifacts()

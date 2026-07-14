@@ -1,8 +1,10 @@
 import json
+import hmac
 import logging
 import math
 import os
 import re
+import secrets
 import time
 import threading
 import uuid
@@ -53,6 +55,13 @@ CORS_ALLOW_ORIGINS_DEFAULT = "http://localhost:5173,http://localhost:3000"
 RUNS_PREFIX = str(os.environ.get("RUNS_PREFIX", "runs") or "runs").strip().strip("/") or "runs"
 ENABLE_JOB_STORE = str(os.environ.get("ENABLE_JOB_STORE", "1")).strip().lower() not in ("0", "false", "no")
 JOB_STORE_COLLECTION = str(os.environ.get("JOB_STORE_COLLECTION", "omr_jobs") or "omr_jobs").strip() or "omr_jobs"
+FRIEND_ACCESS_COLLECTION = str(os.environ.get("FRIEND_ACCESS_COLLECTION", "omr_friend_devices") or "omr_friend_devices").strip() or "omr_friend_devices"
+FRIEND_ACCESS_CONFIG_COLLECTION = str(os.environ.get("FRIEND_ACCESS_CONFIG_COLLECTION", "omr_access_config") or "omr_access_config").strip() or "omr_access_config"
+FRIEND_ACCESS_CONFIG_DOCUMENT = "friend"
+FRIEND_ACCESS_ATTEMPT_COLLECTION = str(os.environ.get("FRIEND_ACCESS_ATTEMPT_COLLECTION", "omr_friend_activation_attempts") or "omr_friend_activation_attempts").strip() or "omr_friend_activation_attempts"
+FRIEND_ACCESS_DEFAULT_CREDITS = 500
+FRIEND_ACCESS_RESERVATION_TTL_SEC = 15 * 60
+FRIEND_ACCESS_HISTORY_MAX = 40
 ALLOW_LEGACY_ARTIFACT_FALLBACK = (
     str(os.environ.get("ALLOW_LEGACY_ARTIFACT_FALLBACK", "1")).strip().lower() not in ("0", "false", "no")
 )
@@ -171,6 +180,7 @@ _PENDING_DISPATCHES_LOCK = threading.RLock()
 _GCS_CLIENT: storage.Client | None = None
 _GOOGLE_CREDENTIALS = None
 _JOB_STORE_CLIENT = None
+_FRIEND_STORE_CLIENT = None
 
 
 class GitHubAPIError(RuntimeError):
@@ -210,6 +220,15 @@ class AiSuggestError(RuntimeError):
         self.debug_crops = dict(debug_crops) if isinstance(debug_crops, dict) else None
 
 
+class FriendAccessError(RuntimeError):
+    def __init__(self, code: str, message: str, status_code: int, *, retryable: bool = False):
+        super().__init__(message)
+        self.code = str(code)
+        self.message = str(message)
+        self.status_code = int(status_code)
+        self.retryable = bool(retryable)
+
+
 def _storage_mode_for_artifacts(artifacts: dict[str, str] | None) -> str:
     path = str((artifacts or {}).get("run_info") or "")
     marker = f"/{RUNS_PREFIX}/"
@@ -220,7 +239,7 @@ def _storage_mode_for_artifacts(artifacts: dict[str, str] | None) -> str:
 
 def _api_path(path: str | None = None) -> bool:
     txt = str(path or request.path or "").strip()
-    return txt.startswith("/api/omr/")
+    return txt.startswith("/api/omr/") or txt.startswith("/api/access/")
 
 
 def _allowed_origins() -> set[str]:
@@ -242,7 +261,7 @@ def _apply_cors_headers(resp, origin: str | None):
     resp.headers["Access-Control-Allow-Origin"] = allow_origin
     resp.headers["Access-Control-Allow-Credentials"] = "true"
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     vary = str(resp.headers.get("Vary") or "").strip()
     if vary:
         if "Origin" not in [v.strip() for v in vary.split(",")]:
@@ -816,6 +835,408 @@ def _job_store_get(job_id: str) -> dict | None:
     if _with_job_store_retry("GET", str(job_id), _read):
         return holder["value"]
     return None
+
+
+def _friend_access_enforced() -> bool:
+    return str(os.environ.get("FRIEND_ACCESS_ENFORCED", "0") or "0").strip().lower() in {"1", "true", "yes"}
+
+
+def _friend_store_client():
+    global _FRIEND_STORE_CLIENT
+    if firestore is None:
+        return None
+    if _FRIEND_STORE_CLIENT is None:
+        try:
+            _FRIEND_STORE_CLIENT = firestore.Client()
+        except Exception as exc:
+            logger.warning("FRIEND_ACCESS_STORE_WARN detail=%s", _safe_error_text(exc))
+            return None
+    return _FRIEND_STORE_CLIENT
+
+
+def _friend_month_key(now: datetime | None = None) -> str:
+    row = now if isinstance(now, datetime) else _utc_now()
+    return row.astimezone(timezone.utc).strftime("%Y-%m")
+
+
+def _friend_parse_time(value) -> datetime | None:
+    txt = str(value or "").strip()
+    if not txt:
+        return None
+    try:
+        parsed = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _friend_history_append(data: dict, action: str, **details) -> list[dict]:
+    history = [dict(row) for row in (data.get("admin_history") or []) if isinstance(row, dict)]
+    row = {"action": str(action), "at_utc": _to_utc_z(_utc_now())}
+    for key, value in details.items():
+        if value is not None:
+            row[str(key)] = value
+    history.append(row)
+    return history[-FRIEND_ACCESS_HISTORY_MAX:]
+
+
+def _friend_run_transaction(client, callback):
+    transaction = client.transaction()
+    decorator = getattr(firestore, "transactional", None) if firestore is not None else None
+    if callable(decorator):
+        return decorator(callback)(transaction)
+    return callback(transaction)
+
+
+def _friend_config(client=None) -> dict:
+    store = client or _friend_store_client()
+    if store is None:
+        raise FriendAccessError(
+            "friend_access_unavailable",
+            "Friend Access is temporarily unavailable. Try again.",
+            503,
+            retryable=True,
+        )
+    try:
+        snap = store.collection(FRIEND_ACCESS_CONFIG_COLLECTION).document(FRIEND_ACCESS_CONFIG_DOCUMENT).get()
+        data = snap.to_dict() if bool(getattr(snap, "exists", False)) else None
+    except Exception as exc:
+        logger.warning("FRIEND_ACCESS_CONFIG_WARN detail=%s", _safe_error_text(exc))
+        raise FriendAccessError(
+            "friend_access_unavailable",
+            "Friend Access is temporarily unavailable. Try again.",
+            503,
+            retryable=True,
+        ) from exc
+    if not isinstance(data, dict):
+        raise FriendAccessError("friend_code_not_configured", "Friend Access is not configured yet.", 503, retryable=False)
+    return data
+
+
+def _friend_b64decode(value: str) -> bytes:
+    txt = str(value or "").strip()
+    if not txt:
+        return b""
+    padding = "=" * ((4 - len(txt) % 4) % 4)
+    try:
+        return base64.urlsafe_b64decode((txt + padding).encode("ascii"))
+    except Exception:
+        return b""
+
+
+def _friend_code_digest(code: str, salt: bytes, iterations: int) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", str(code).encode("utf-8"), salt, max(100_000, int(iterations)))
+
+
+def _friend_code_matches(code: str, config: dict) -> bool:
+    salt = _friend_b64decode(config.get("code_salt"))
+    expected = _friend_b64decode(config.get("code_hash"))
+    iterations = max(100_000, _safe_int(config.get("code_iterations"), 210_000))
+    if not salt or not expected or not str(code or "").strip():
+        return False
+    actual = _friend_code_digest(str(code).strip(), salt, iterations)
+    return hmac.compare_digest(actual, expected)
+
+
+def _friend_device_key(device_id: str, config: dict) -> str:
+    pepper = _friend_b64decode(config.get("device_pepper"))
+    if not pepper:
+        raise FriendAccessError("friend_code_not_configured", "Friend Access is not configured yet.", 503)
+    return hmac.new(pepper, str(device_id).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _friend_validate_device_id(device_id: str) -> str:
+    txt = str(device_id or "").strip()
+    if len(txt) < 16 or len(txt) > 128 or not re.fullmatch(r"[A-Za-z0-9._:\-]+", txt):
+        raise FriendAccessError("friend_device_invalid", "This device could not be identified.", 400)
+    return txt
+
+
+def _friend_record_bad_activation(client, device_key: str) -> None:
+    ref = client.collection(FRIEND_ACCESS_ATTEMPT_COLLECTION).document(device_key)
+    now = _utc_now()
+
+    def _update(transaction):
+        snap = ref.get(transaction=transaction)
+        data = snap.to_dict() if bool(getattr(snap, "exists", False)) else {}
+        data = dict(data) if isinstance(data, dict) else {}
+        window_start = _friend_parse_time(data.get("window_started_at_utc"))
+        if window_start is None or (now - window_start).total_seconds() >= 15 * 60:
+            count = 1
+            window_start = now
+        else:
+            count = max(0, _safe_int(data.get("failed_count"), 0)) + 1
+        transaction.set(
+            ref,
+            {
+                "failed_count": count,
+                "window_started_at_utc": _to_utc_z(window_start),
+                "last_failed_at_utc": _to_utc_z(now),
+            },
+            merge=True,
+        )
+        return count
+
+    try:
+        count = _friend_run_transaction(client, _update)
+    except Exception as exc:
+        if isinstance(exc, FriendAccessError):
+            raise
+        logger.warning("FRIEND_ACCESS_ATTEMPT_WARN detail=%s", _safe_error_text(exc))
+        raise FriendAccessError("friend_access_unavailable", "Friend Access is temporarily unavailable. Try again.", 503, retryable=True) from exc
+    if int(count) >= 5:
+        raise FriendAccessError("friend_code_rate_limited", "Too many code attempts. Wait 15 minutes and try again.", 429, retryable=True)
+
+
+def _friend_check_activation_rate(client, device_key: str) -> None:
+    ref = client.collection(FRIEND_ACCESS_ATTEMPT_COLLECTION).document(device_key)
+    try:
+        snap = ref.get()
+        data = snap.to_dict() if bool(getattr(snap, "exists", False)) else {}
+    except Exception as exc:
+        raise FriendAccessError("friend_access_unavailable", "Friend Access is temporarily unavailable. Try again.", 503, retryable=True) from exc
+    if not isinstance(data, dict):
+        return
+    started = _friend_parse_time(data.get("window_started_at_utc"))
+    if started is None or (_utc_now() - started).total_seconds() >= 15 * 60:
+        return
+    if _safe_int(data.get("failed_count"), 0) >= 5:
+        raise FriendAccessError("friend_code_rate_limited", "Too many code attempts. Wait 15 minutes and try again.", 429, retryable=True)
+
+
+def _friend_clear_activation_attempts(client, device_key: str) -> None:
+    try:
+        client.collection(FRIEND_ACCESS_ATTEMPT_COLLECTION).document(device_key).delete()
+    except Exception as exc:
+        logger.warning("FRIEND_ACCESS_ATTEMPT_CLEAR_WARN detail=%s", _safe_error_text(exc))
+
+
+def _friend_default_credits(config: dict) -> int:
+    return max(1, _safe_int(config.get("default_monthly_credits"), FRIEND_ACCESS_DEFAULT_CREDITS))
+
+
+def _friend_reset_month(data: dict, config: dict, now: datetime | None = None) -> dict:
+    result = dict(data or {})
+    current_month = _friend_month_key(now)
+    if str(result.get("credit_month") or "") != current_month:
+        result["credit_month"] = current_month
+        result["credits_remaining"] = _friend_default_credits(config)
+        result["credits_used"] = 0
+        result["reservations"] = {}
+        result["admin_history"] = _friend_history_append(result, "monthly_reset", new_balance=result["credits_remaining"])
+    return result
+
+
+def _friend_release_stale_reservations(data: dict, now: datetime | None = None) -> dict:
+    result = dict(data or {})
+    current = now if isinstance(now, datetime) else _utc_now()
+    reservations = dict(result.get("reservations") or {})
+    kept: dict[str, dict] = {}
+    released = 0
+    for reservation_id, row in reservations.items():
+        created = _friend_parse_time((row or {}).get("created_at_utc") if isinstance(row, dict) else None)
+        if created is None or (current - created).total_seconds() >= FRIEND_ACCESS_RESERVATION_TTL_SEC:
+            released += 1
+            continue
+        kept[str(reservation_id)] = dict(row)
+    if released:
+        result["credits_remaining"] = max(0, _safe_int(result.get("credits_remaining"), 0)) + released
+        result["admin_history"] = _friend_history_append(result, "stale_reservations_released", amount=released)
+    result["reservations"] = kept
+    return result
+
+
+def _friend_activate_device(device_id: str, code: str) -> dict:
+    device_id = _friend_validate_device_id(device_id)
+    client = _friend_store_client()
+    config = _friend_config(client)
+    if not bool(config.get("enabled")):
+        raise FriendAccessError("friend_code_disabled", "This Friend Code is not currently available.", 403)
+    device_key = _friend_device_key(device_id, config)
+    _friend_check_activation_rate(client, device_key)
+    if not _friend_code_matches(code, config):
+        _friend_record_bad_activation(client, device_key)
+        raise FriendAccessError("friend_code_invalid", "That Friend Code is not valid.", 403)
+
+    ref = client.collection(FRIEND_ACCESS_COLLECTION).document(device_key)
+    token_secret = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token_secret.encode("utf-8")).hexdigest()
+    now = _utc_now()
+
+    def _activate(transaction):
+        snap = ref.get(transaction=transaction)
+        existing = snap.to_dict() if bool(getattr(snap, "exists", False)) else {}
+        data = dict(existing) if isinstance(existing, dict) else {}
+        if str(data.get("status") or "active").lower() == "banned":
+            raise FriendAccessError("friend_access_banned", "Friend Access is unavailable for this device.", 403)
+        data = _friend_reset_month(data, config, now)
+        data = _friend_release_stale_reservations(data, now)
+        friend_id = str(data.get("friend_id") or "").strip() or secrets.token_hex(5).upper()
+        joined_at = str(data.get("joined_at_utc") or "").strip() or _to_utc_z(now)
+        new_data = {
+            **data,
+            "friend_id": friend_id,
+            "device_key": device_key,
+            "token_hash": token_hash,
+            "status": "active",
+            "joined_at_utc": joined_at,
+            "last_seen_at_utc": _to_utc_z(now),
+            "updated_at_utc": _to_utc_z(now),
+        }
+        new_data["admin_history"] = _friend_history_append(new_data, "activated")
+        transaction.set(ref, new_data, merge=False)
+        return friend_id
+
+    try:
+        friend_id = _friend_run_transaction(client, _activate)
+    except FriendAccessError:
+        raise
+    except Exception as exc:
+        logger.warning("FRIEND_ACCESS_ACTIVATE_WARN detail=%s", _safe_error_text(exc))
+        raise FriendAccessError("friend_access_unavailable", "Friend Access is temporarily unavailable. Try again.", 503, retryable=True) from exc
+    _friend_clear_activation_attempts(client, device_key)
+    return {"active": True, "friend_id": str(friend_id), "access_token": f"{device_key}.{token_secret}"}
+
+
+def _friend_bearer_token() -> str:
+    try:
+        raw = str(request.headers.get("Authorization") or "").strip()
+    except Exception:
+        raw = ""
+    if raw.lower().startswith("bearer "):
+        return raw[7:].strip()
+    return ""
+
+
+def _friend_parse_access_token(token: str) -> tuple[str, str]:
+    device_key, separator, secret = str(token or "").strip().partition(".")
+    if separator != "." or not re.fullmatch(r"[0-9a-f]{64}", device_key) or len(secret) < 32:
+        raise FriendAccessError("ai_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+    return device_key, secret
+
+
+def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
+    device_key, secret = _friend_parse_access_token(token)
+    client = _friend_store_client()
+    config = _friend_config(client)
+    ref = client.collection(FRIEND_ACCESS_COLLECTION).document(device_key)
+    now = _utc_now()
+    reservation_id = secrets.token_hex(16) if reserve else None
+
+    def _verify(transaction):
+        snap = ref.get(transaction=transaction)
+        data = snap.to_dict() if bool(getattr(snap, "exists", False)) else None
+        if not isinstance(data, dict):
+            raise FriendAccessError("ai_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+        expected = str(data.get("token_hash") or "")
+        actual = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        if not expected or not hmac.compare_digest(actual, expected):
+            raise FriendAccessError("ai_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+        if str(data.get("status") or "").lower() == "banned":
+            raise FriendAccessError("friend_access_banned", "Friend Access is unavailable for this device.", 403)
+        data = _friend_reset_month(data, config, now)
+        data = _friend_release_stale_reservations(data, now)
+        if reserve:
+            remaining = max(0, _safe_int(data.get("credits_remaining"), 0))
+            if remaining <= 0:
+                raise FriendAccessError("ai_credits_exhausted", "Friend AI credits are used up for this month.", 403)
+            data["credits_remaining"] = remaining - 1
+            reservations = dict(data.get("reservations") or {})
+            reservations[str(reservation_id)] = {
+                "created_at_utc": _to_utc_z(now),
+                "job_id": str(job_id or "") or None,
+                "system_id": str(system_id or "") or None,
+            }
+            data["reservations"] = reservations
+        data["last_seen_at_utc"] = _to_utc_z(now)
+        data["updated_at_utc"] = _to_utc_z(now)
+        transaction.set(ref, data, merge=False)
+        return {
+            "active": True,
+            "friend_id": str(data.get("friend_id") or ""),
+            "device_key": device_key,
+            "reservation_id": reservation_id,
+        }
+
+    try:
+        return _friend_run_transaction(client, _verify)
+    except FriendAccessError:
+        raise
+    except Exception as exc:
+        logger.warning("FRIEND_ACCESS_VERIFY_WARN detail=%s", _safe_error_text(exc))
+        raise FriendAccessError("friend_access_unavailable", "Friend Access is temporarily unavailable. Try again.", 503, retryable=True) from exc
+
+
+def _friend_finish_reservation(access: dict | None, *, spent: bool) -> None:
+    if not isinstance(access, dict) or not access.get("reservation_id") or access.get("bypass"):
+        return
+    client = _friend_store_client()
+    if client is None:
+        logger.warning("FRIEND_ACCESS_FINISH_WARN reason=store_unavailable")
+        return
+    device_key = str(access.get("device_key") or "")
+    reservation_id = str(access.get("reservation_id") or "")
+    ref = client.collection(FRIEND_ACCESS_COLLECTION).document(device_key)
+
+    def _finish(transaction):
+        snap = ref.get(transaction=transaction)
+        data = snap.to_dict() if bool(getattr(snap, "exists", False)) else None
+        if not isinstance(data, dict):
+            return False
+        reservations = dict(data.get("reservations") or {})
+        if reservation_id not in reservations:
+            return False
+        reservations.pop(reservation_id, None)
+        data["reservations"] = reservations
+        if spent:
+            data["credits_used"] = max(0, _safe_int(data.get("credits_used"), 0)) + 1
+            action = "credit_spent"
+        else:
+            data["credits_remaining"] = max(0, _safe_int(data.get("credits_remaining"), 0)) + 1
+            action = "credit_released"
+        data["updated_at_utc"] = _to_utc_z(_utc_now())
+        data["admin_history"] = _friend_history_append(data, action, reservation_id=reservation_id)
+        transaction.set(ref, data, merge=False)
+        return True
+
+    try:
+        _friend_run_transaction(client, _finish)
+    except Exception as exc:
+        logger.warning("FRIEND_ACCESS_FINISH_WARN detail=%s", _safe_error_text(exc))
+
+
+def _friend_ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
+    token = _friend_bearer_token()
+    if not token and not _friend_access_enforced():
+        return {"active": True, "bypass": True, "reservation_id": None}
+    if not token:
+        raise FriendAccessError("ai_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+    try:
+        return _friend_verify_token(token, reserve=reserve, job_id=job_id, system_id=system_id)
+    except FriendAccessError:
+        if not _friend_access_enforced():
+            return {"active": True, "bypass": True, "reservation_id": None}
+        raise
+
+
+def _friend_error_response(exc: FriendAccessError):
+    return (
+        jsonify(
+            {
+                "status": "failed",
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "retryable": exc.retryable,
+                    "provider_status": exc.status_code,
+                    "detail": exc.code,
+                },
+            }
+        ),
+        exc.status_code,
+    )
 
 
 def _derive_job_id_from_pdf_uri(pdf_gcs_uri: str) -> str:
@@ -6919,9 +7340,46 @@ def get_job_state(job_id: str):
     return jsonify(response), 200
 
 
+@app.route("/api/access/friend/activate", methods=["POST"])
+def activate_friend_access():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        result = _friend_activate_device(payload.get("device_id"), payload.get("code"))
+    except FriendAccessError as exc:
+        return _friend_error_response(exc)
+    return (
+        jsonify(
+            {
+                "friend_access": {
+                    "active": True,
+                    "friend_id": result["friend_id"],
+                },
+                "access_token": result["access_token"],
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/api/access/status", methods=["GET"])
+def get_access_status():
+    try:
+        result = _friend_verify_token(_friend_bearer_token())
+    except FriendAccessError as exc:
+        return _friend_error_response(exc)
+    return jsonify({"friend_access": {"active": True, "friend_id": result["friend_id"]}}), 200
+
+
 @app.route("/api/omr/jobs/<job_id>/ai-suggest", methods=["POST"])
 def ai_suggest_job(job_id: str):
     started = time.time()
+    try:
+        _friend_ai_access()
+    except FriendAccessError as exc:
+        return _friend_error_response(exc)
+
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     if err:
         return (
@@ -7363,6 +7821,15 @@ def ai_suggest_job_step(job_id: str):
         )
 
     system_row, system_measures = system_batches[next_system_index]
+    try:
+        friend_access = _friend_ai_access(
+            reserve=True,
+            job_id=job_id,
+            system_id=str(system_row.get("system_id") or "") or None,
+        )
+    except FriendAccessError as exc:
+        return _friend_error_response(exc)
+
     debug_crops = None
     reference_examples_attached = 0
     internal_ai_usage = None
@@ -7452,6 +7919,7 @@ def ai_suggest_job_step(job_id: str):
         mapping_summary["ai_suggestions"] = ai_suggestions
         mapping_summary["ai_suggest_run"] = ai_suggest_run
         _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        _friend_finish_reservation(friend_access, spent=True)
         response = {
             "job_id": job_id,
             "run_id": int(artifact_run_id),
@@ -7470,6 +7938,7 @@ def ai_suggest_job_step(job_id: str):
             response["debug_batch_trace"] = debug_batch_trace
         return jsonify(response), 200
     except Exception as exc:
+        _friend_finish_reservation(friend_access, spent=False)
         error_payload = _ai_suggest_error_payload(exc)
         now_txt = _utc_now().isoformat().replace("+00:00", "Z")
         saved_completed_count = max(0, _safe_int(ai_suggest_run.get("systems_completed"), 0))
