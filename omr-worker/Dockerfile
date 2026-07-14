@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY worker.py .
 COPY reference_examples ./reference_examples
+COPY apple_root_certs ./apple_root_certs
 
 ENV PORT=8080
 
