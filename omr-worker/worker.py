@@ -70,12 +70,18 @@ FRIEND_ACCESS_DEFAULT_CREDITS = 500
 FRIEND_ACCESS_RESERVATION_TTL_SEC = 15 * 60
 FRIEND_ACCESS_HISTORY_MAX = 40
 PAID_ACCESS_COLLECTION = str(os.environ.get("PAID_ACCESS_COLLECTION", "omr_paid_access") or "omr_paid_access").strip() or "omr_paid_access"
+APPLE_PURCHASE_COLLECTION = str(os.environ.get("APPLE_PURCHASE_COLLECTION", "omr_apple_purchases") or "omr_apple_purchases").strip() or "omr_apple_purchases"
 PAID_ACCESS_DEFAULT_CREDITS = 200
 PAID_ACCESS_RESERVATION_TTL_SEC = 15 * 60
 APPLE_BUNDLE_ID = str(os.environ.get("APPLE_BUNDLE_ID", "pineapple.Sheet-Music-Labeler") or "").strip()
 APPLE_MONTHLY_PRODUCT_ID = str(
     os.environ.get("APPLE_MONTHLY_PRODUCT_ID", "pineapple.sheetmusiclabeler.pro.monthly") or ""
 ).strip()
+APPLE_CREDIT_PACKS = {
+    "pineapple.sheetmusiclabeler.credits.60": 60,
+    "pineapple.sheetmusiclabeler.credits.140": 140,
+    "pineapple.sheetmusiclabeler.credits.240": 240,
+}
 ALLOW_LEGACY_ARTIFACT_FALLBACK = (
     str(os.environ.get("ALLOW_LEGACY_ARTIFACT_FALLBACK", "1")).strip().lower() not in ("0", "false", "no")
 )
@@ -1182,6 +1188,8 @@ def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | Non
             "friend_id": str(data.get("friend_id") or ""),
             "device_key": device_key,
             "reservation_id": reservation_id,
+            "credits_remaining": max(0, _safe_int(data.get("credits_remaining"), 0)),
+            "expires_at_utc": _to_utc_z(datetime(now.year + (1 if now.month == 12 else 0), 1 if now.month == 12 else now.month + 1, 1, tzinfo=timezone.utc)),
         }
 
     try:
@@ -1265,6 +1273,10 @@ def _friend_error_response(exc: FriendAccessError):
 
 def _apple_iap_enabled() -> bool:
     return str(os.environ.get("APPLE_IAP_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes"}
+
+
+def _apple_packs_enabled() -> bool:
+    return str(os.environ.get("APPLE_PACKS_ENABLED", "0") or "0").strip().lower() in {"1", "true", "yes"}
 
 
 def _apple_text(value) -> str:
@@ -1368,6 +1380,20 @@ def _apple_verify_transaction(signed_transaction: str):
     raise PaidAccessError("apple_purchase_invalid", "Apple could not verify this purchase.", 403)
 
 
+def _apple_verify_app_transaction(signed_app_transaction: str):
+    value = str(signed_app_transaction or "").strip()
+    if len(value) < 100 or value.count(".") != 2:
+        raise PaidAccessError("apple_purchase_invalid", "Apple app purchase information is invalid.", 400)
+    for environment_name in ("production", "sandbox"):
+        try:
+            return _apple_verifier(environment_name).verify_and_decode_app_transaction(value)
+        except (PaidAccessError, VerificationException):
+            continue
+        except Exception as exc:
+            logger.warning("APPLE_APP_TRANSACTION_VERIFY_WARN environment=%s detail=%s", environment_name, _safe_error_text(exc))
+    raise PaidAccessError("apple_purchase_invalid", "Apple could not verify this app purchase.", 403)
+
+
 def _apple_verify_notification(signed_payload: str):
     value = str(signed_payload or "").strip()
     if len(value) < 100 or value.count(".") != 2:
@@ -1382,16 +1408,17 @@ def _apple_verify_notification(signed_payload: str):
     raise PaidAccessError("apple_notification_invalid", "Apple notification could not be verified.", 400)
 
 
-def _paid_transaction_data(payload) -> dict:
+def _apple_transaction_data(payload, *, allowed_products: set[str]) -> dict:
     product_id = _apple_text(_apple_field(payload, "productId"))
     bundle_id = _apple_text(_apple_field(payload, "bundleId"))
     transaction_id = _apple_text(_apple_field(payload, "transactionId"))
     original_transaction_id = _apple_text(_apple_field(payload, "originalTransactionId"))
-    environment_name = _apple_text(_apple_field(payload, "environment")).lower()
+    environment_name = _apple_text(_apple_field(payload, "environment") or _apple_field(payload, "receiptType")).lower()
     expires_at = _apple_millis_time(_apple_field(payload, "expiresDate"))
     purchase_at = _apple_millis_time(_apple_field(payload, "purchaseDate"))
     revocation_at = _apple_millis_time(_apple_field(payload, "revocationDate"))
-    if product_id != APPLE_MONTHLY_PRODUCT_ID or bundle_id != APPLE_BUNDLE_ID:
+    app_transaction_id = _apple_text(_apple_field(payload, "appTransactionId"))
+    if product_id not in allowed_products or bundle_id != APPLE_BUNDLE_ID:
         raise PaidAccessError("apple_purchase_invalid", "This purchase does not belong to this app plan.", 403)
     if not transaction_id or not original_transaction_id or environment_name not in {"sandbox", "production"}:
         raise PaidAccessError("apple_purchase_invalid", "Apple purchase information is incomplete.", 400)
@@ -1400,6 +1427,7 @@ def _paid_transaction_data(payload) -> dict:
         "bundle_id": bundle_id,
         "transaction_id": transaction_id,
         "original_transaction_id": original_transaction_id,
+        "app_transaction_id": app_transaction_id,
         "environment": environment_name,
         "purchase_at": purchase_at,
         "expires_at": expires_at,
@@ -1407,8 +1435,37 @@ def _paid_transaction_data(payload) -> dict:
     }
 
 
+def _paid_transaction_data(payload) -> dict:
+    return _apple_transaction_data(payload, allowed_products={APPLE_MONTHLY_PRODUCT_ID})
+
+
+def _pack_transaction_data(payload) -> dict:
+    return _apple_transaction_data(payload, allowed_products=set(APPLE_CREDIT_PACKS))
+
+
+def _apple_app_transaction_data(payload) -> dict:
+    bundle_id = _apple_text(_apple_field(payload, "bundleId"))
+    app_transaction_id = _apple_text(_apple_field(payload, "appTransactionId"))
+    environment_name = _apple_text(_apple_field(payload, "receiptType")).lower()
+    if bundle_id != APPLE_BUNDLE_ID or not app_transaction_id or environment_name not in {"sandbox", "production"}:
+        raise PaidAccessError("apple_purchase_invalid", "Apple app purchase information is incomplete.", 400)
+    return {
+        "bundle_id": bundle_id,
+        "app_transaction_id": app_transaction_id,
+        "environment": environment_name,
+    }
+
+
 def _paid_record_key(original_transaction_id: str) -> str:
     return hashlib.sha256(str(original_transaction_id).encode("utf-8")).hexdigest()
+
+
+def _apple_wallet_key(app_transaction_id: str) -> str:
+    return hashlib.sha256(str(app_transaction_id).encode("utf-8")).hexdigest()
+
+
+def _apple_purchase_key(transaction_id: str) -> str:
+    return hashlib.sha256(str(transaction_id).encode("utf-8")).hexdigest()
 
 
 def _paid_device_key(device_id: str) -> str:
@@ -1421,15 +1478,19 @@ def _paid_release_stale_reservations(data: dict, now: datetime | None = None) ->
     current = now if isinstance(now, datetime) else _utc_now()
     reservations = dict(result.get("reservations") or {})
     kept = {}
-    released = 0
+    released = {"pro": 0, "purchased": 0}
     for reservation_id, row in reservations.items():
         created = _friend_parse_time((row or {}).get("created_at_utc") if isinstance(row, dict) else None)
         if created is None or (current - created).total_seconds() >= PAID_ACCESS_RESERVATION_TTL_SEC:
-            released += 1
+            source = str((row or {}).get("source") or "pro")
+            released[source if source in released else "pro"] += 1
         else:
             kept[str(reservation_id)] = dict(row)
-    if released:
-        result["credits_remaining"] = max(0, _safe_int(result.get("credits_remaining"), 0)) + released
+    if released["pro"]:
+        result["subscription_credits_remaining"] = max(0, _safe_int(result.get("subscription_credits_remaining", result.get("credits_remaining")), 0)) + released["pro"]
+        result["credits_remaining"] = result["subscription_credits_remaining"]
+    if released["purchased"]:
+        result["purchased_credits_remaining"] = max(0, _safe_int(result.get("purchased_credits_remaining"), 0)) + released["purchased"]
     result["reservations"] = kept
     return result
 
@@ -1446,12 +1507,13 @@ def _paid_is_active(data: dict, now: datetime | None = None) -> bool:
     return bool(status == "billing_grace" and grace_at is not None and current < grace_at)
 
 
-def _paid_apply_transaction(payload, *, device_id: str | None = None, issue_token: bool = False) -> dict:
+def _paid_apply_transaction(payload, *, app_transaction_id: str | None = None, device_id: str | None = None, issue_token: bool = False) -> dict:
     transaction_data = _paid_transaction_data(payload)
     client = _friend_store_client()
     if client is None:
         raise PaidAccessError("paid_access_unavailable", "Paid Access is temporarily unavailable.", 503, retryable=True)
-    record_key = _paid_record_key(transaction_data["original_transaction_id"])
+    wallet_identity = str(app_transaction_id or transaction_data.get("app_transaction_id") or transaction_data["original_transaction_id"])
+    record_key = _apple_wallet_key(wallet_identity)
     ref = client.collection(PAID_ACCESS_COLLECTION).document(record_key)
     now = _utc_now()
     active = transaction_data["revocation_at"] is None and (
@@ -1468,9 +1530,10 @@ def _paid_apply_transaction(payload, *, device_id: str | None = None, issue_toke
         is_new_period = transaction_data["transaction_id"] not in processed
         if is_new_period:
             processed.append(transaction_data["transaction_id"])
-            data["credits_remaining"] = PAID_ACCESS_DEFAULT_CREDITS if active else 0
+            data["subscription_credits_remaining"] = PAID_ACCESS_DEFAULT_CREDITS if active else 0
+            data["subscription_credits_used"] = 0
+            data["credits_remaining"] = data["subscription_credits_remaining"]
             data["credits_used"] = 0
-            data["reservations"] = {}
             data["credit_period_transaction_id"] = transaction_data["transaction_id"]
         data.update(
             {
@@ -1479,6 +1542,7 @@ def _paid_apply_transaction(payload, *, device_id: str | None = None, issue_toke
                 "environment": transaction_data["environment"],
                 "original_transaction_id": transaction_data["original_transaction_id"],
                 "current_transaction_id": transaction_data["transaction_id"],
+                "app_wallet_key": record_key,
                 "purchase_at_utc": _to_utc_z(transaction_data["purchase_at"]) if transaction_data["purchase_at"] else None,
                 "expires_at_utc": _to_utc_z(transaction_data["expires_at"]) if transaction_data["expires_at"] else None,
                 "status": "active" if active else ("revoked" if transaction_data["revocation_at"] else "expired"),
@@ -1511,7 +1575,8 @@ def _paid_apply_transaction(payload, *, device_id: str | None = None, issue_toke
     return {
         "active": True,
         "paid_id": record_key[:10].upper(),
-        "credits_remaining": max(0, _safe_int(saved.get("credits_remaining"), 0)),
+        "credits_remaining": max(0, _safe_int(saved.get("credits_remaining", saved.get("subscription_credits_remaining")), 0)),
+        "purchased_credits_remaining": max(0, _safe_int(saved.get("purchased_credits_remaining"), 0)),
         "expires_at_utc": saved.get("expires_at_utc"),
         "new_period": bool(is_new_period),
         "access_token": f"{record_key}.{device_key}.{token_secret}" if issue_token else None,
@@ -1525,6 +1590,126 @@ def _paid_header_token() -> str:
         return ""
 
 
+def _paid_issue_device_token(data: dict, *, record_key: str, device_id: str, now: datetime) -> tuple[dict, str]:
+    device_key = _paid_device_key(device_id)
+    token_secret = secrets.token_urlsafe(32)
+    device_tokens = dict(data.get("device_tokens") or {})
+    device_tokens[device_key] = {
+        "token_hash": hashlib.sha256(token_secret.encode("utf-8")).hexdigest(),
+        "issued_at_utc": _to_utc_z(now),
+        "last_seen_at_utc": _to_utc_z(now),
+    }
+    data["device_tokens"] = device_tokens
+    return data, f"{record_key}.{device_key}.{token_secret}"
+
+
+def _pack_apply_transaction(payload, *, app_transaction_id: str, device_id: str) -> dict:
+    purchase = _pack_transaction_data(payload)
+    if purchase.get("revocation_at") is not None:
+        raise PaidAccessError("apple_purchase_refunded", "This credit purchase was refunded.", 403)
+    client = _friend_store_client()
+    if client is None:
+        raise PaidAccessError("paid_access_unavailable", "Credit purchases are temporarily unavailable.", 503, retryable=True)
+    record_key = _apple_wallet_key(app_transaction_id)
+    purchase_key = _apple_purchase_key(purchase["transaction_id"])
+    wallet_ref = client.collection(PAID_ACCESS_COLLECTION).document(record_key)
+    purchase_ref = client.collection(APPLE_PURCHASE_COLLECTION).document(purchase_key)
+    now = _utc_now()
+    granted = int(APPLE_CREDIT_PACKS[purchase["product_id"]])
+    token_box = {"value": None}
+
+    def _apply(transaction):
+        receipt_snap = purchase_ref.get(transaction=transaction)
+        receipt = receipt_snap.to_dict() if bool(getattr(receipt_snap, "exists", False)) else None
+        wallet_snap = wallet_ref.get(transaction=transaction)
+        wallet = wallet_snap.to_dict() if bool(getattr(wallet_snap, "exists", False)) else {}
+        wallet = dict(wallet) if isinstance(wallet, dict) else {}
+        is_new = not isinstance(receipt, dict)
+        usable_added = 0
+        debt_paid = 0
+        if is_new:
+            debt = max(0, _safe_int(wallet.get("purchased_credit_debt"), 0))
+            debt_paid = min(debt, granted)
+            usable_added = granted - debt_paid
+            wallet["purchased_credit_debt"] = debt - debt_paid
+            wallet["purchased_credits_remaining"] = max(0, _safe_int(wallet.get("purchased_credits_remaining"), 0)) + usable_added
+            transaction.set(
+                purchase_ref,
+                {
+                    "wallet_key": record_key,
+                    "product_id": purchase["product_id"],
+                    "credits_granted": granted,
+                    "transaction_id_hash": purchase_key,
+                    "environment": purchase["environment"],
+                    "status": "granted",
+                    "granted_at_utc": _to_utc_z(now),
+                },
+                merge=False,
+            )
+        wallet.update({
+            "app_wallet_key": record_key,
+            "bundle_id": purchase["bundle_id"],
+            "environment": purchase["environment"],
+            "updated_at_utc": _to_utc_z(now),
+        })
+        if not wallet.get("created_at_utc"):
+            wallet["created_at_utc"] = _to_utc_z(now)
+        wallet, token_box["value"] = _paid_issue_device_token(wallet, record_key=record_key, device_id=device_id, now=now)
+        transaction.set(wallet_ref, wallet, merge=False)
+        return wallet, is_new, usable_added, debt_paid
+
+    try:
+        wallet, is_new, usable_added, debt_paid = _friend_run_transaction(client, _apply)
+    except PaidAccessError:
+        raise
+    except Exception as exc:
+        logger.warning("APPLE_PACK_SAVE_WARN detail=%s", _safe_error_text(exc))
+        raise PaidAccessError("paid_access_unavailable", "Credit purchases are temporarily unavailable.", 503, retryable=True) from exc
+    return {
+        "paid_id": record_key[:10].upper(),
+        "access_token": token_box["value"],
+        "new_purchase": bool(is_new),
+        "credits_granted": granted if is_new else 0,
+        "usable_credits_added": usable_added,
+        "debt_repaid": debt_paid,
+        "purchased_credits_remaining": max(0, _safe_int(wallet.get("purchased_credits_remaining"), 0)),
+        "purchased_credit_debt": max(0, _safe_int(wallet.get("purchased_credit_debt"), 0)),
+    }
+
+
+def _pack_refund_transaction(payload) -> dict:
+    purchase = _pack_transaction_data(payload)
+    client = _friend_store_client()
+    if client is None:
+        raise PaidAccessError("paid_access_unavailable", "Credit refunds are temporarily unavailable.", 503, retryable=True)
+    purchase_key = _apple_purchase_key(purchase["transaction_id"])
+    purchase_ref = client.collection(APPLE_PURCHASE_COLLECTION).document(purchase_key)
+    now = _utc_now()
+
+    def _refund(transaction):
+        receipt_snap = purchase_ref.get(transaction=transaction)
+        receipt = receipt_snap.to_dict() if bool(getattr(receipt_snap, "exists", False)) else None
+        if not isinstance(receipt, dict) or str(receipt.get("status")) == "refunded":
+            return {"changed": False}
+        wallet_key = str(receipt.get("wallet_key") or "")
+        wallet_ref = client.collection(PAID_ACCESS_COLLECTION).document(wallet_key)
+        wallet_snap = wallet_ref.get(transaction=transaction)
+        wallet = wallet_snap.to_dict() if bool(getattr(wallet_snap, "exists", False)) else {}
+        wallet = dict(wallet) if isinstance(wallet, dict) else {}
+        amount = max(0, _safe_int(receipt.get("credits_granted"), 0))
+        available = max(0, _safe_int(wallet.get("purchased_credits_remaining"), 0))
+        wallet["purchased_credits_remaining"] = max(0, available - amount)
+        wallet["purchased_credit_debt"] = max(0, _safe_int(wallet.get("purchased_credit_debt"), 0)) + max(0, amount - available)
+        wallet["updated_at_utc"] = _to_utc_z(now)
+        receipt["status"] = "refunded"
+        receipt["refunded_at_utc"] = _to_utc_z(now)
+        transaction.set(wallet_ref, wallet, merge=False)
+        transaction.set(purchase_ref, receipt, merge=False)
+        return {"changed": True, "wallet_key": wallet_key}
+
+    return _friend_run_transaction(client, _refund)
+
+
 def _paid_parse_access_token(token: str) -> tuple[str, str, str]:
     pieces = str(token or "").strip().split(".")
     if len(pieces) != 3 or not all(re.fullmatch(r"[0-9a-f]{64}", value or "") for value in pieces[:2]) or len(pieces[2]) < 32:
@@ -1532,7 +1717,7 @@ def _paid_parse_access_token(token: str) -> tuple[str, str, str]:
     return pieces[0], pieces[1], pieces[2]
 
 
-def _paid_verify_token(token: str, *, reserve: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
+def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None = None, allow_empty: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
     record_key, device_key, secret = _paid_parse_access_token(token)
     client = _friend_store_client()
     if client is None:
@@ -1552,18 +1737,33 @@ def _paid_verify_token(token: str, *, reserve: bool = False, job_id: str | None 
         if not expected or not hmac.compare_digest(expected, actual):
             raise PaidAccessError("paid_access_required", "AI Suggestions require Pro or Friend Access.", 403)
         data = _paid_release_stale_reservations(data, now)
-        if not _paid_is_active(data, now):
-            raise PaidAccessError("paid_subscription_inactive", "This subscription is not currently active.", 403)
-        if reserve:
-            remaining = max(0, _safe_int(data.get("credits_remaining"), 0))
-            if remaining <= 0:
+        pro_active = _paid_is_active(data, now)
+        legacy_remaining = data.get("credits_remaining")
+        pro_remaining = max(0, _safe_int(legacy_remaining if legacy_remaining is not None else data.get("subscription_credits_remaining"), 0)) if pro_active else 0
+        purchased_remaining = max(0, _safe_int(data.get("purchased_credits_remaining"), 0))
+        if pro_remaining <= 0 and purchased_remaining <= 0 and not allow_empty:
+            if pro_active:
                 raise PaidAccessError("paid_credits_exhausted", "Paid AI credits are used up for this billing period.", 403)
-            data["credits_remaining"] = remaining - 1
+            raise PaidAccessError("paid_subscription_inactive", "No paid AI credits are available.", 403)
+        selected_source = str(source or ("pro" if pro_remaining > 0 else "purchased"))
+        if reserve and selected_source == "pro" and pro_remaining <= 0:
+            raise PaidAccessError("paid_credits_exhausted", "Pro AI credits are used up for this billing period.", 403)
+        if reserve and selected_source == "purchased" and purchased_remaining <= 0:
+            raise PaidAccessError("paid_credits_exhausted", "Purchased AI credits are used up.", 403)
+        if reserve:
+            if selected_source == "pro":
+                data["subscription_credits_remaining"] = pro_remaining - 1
+                data["credits_remaining"] = pro_remaining - 1
+                pro_remaining -= 1
+            else:
+                data["purchased_credits_remaining"] = purchased_remaining - 1
+                purchased_remaining -= 1
             reservations = dict(data.get("reservations") or {})
             reservations[str(reservation_id)] = {
                 "created_at_utc": _to_utc_z(now),
                 "job_id": str(job_id or "") or None,
                 "system_id": str(system_id or "") or None,
+                "source": selected_source,
             }
             data["reservations"] = reservations
         device_tokens = dict(data.get("device_tokens") or {})
@@ -1578,7 +1778,12 @@ def _paid_verify_token(token: str, *, reserve: bool = False, job_id: str | None 
             "record_key": record_key,
             "reservation_id": reservation_id,
             "paid_id": record_key[:10].upper(),
-            "credits_remaining": max(0, _safe_int(data.get("credits_remaining"), 0)),
+            "source": selected_source,
+            "credits_remaining": pro_remaining,
+            "pro_credits_remaining": pro_remaining,
+            "purchased_credits_remaining": purchased_remaining,
+            "purchased_credit_debt": max(0, _safe_int(data.get("purchased_credit_debt"), 0)),
+            "pro_active": pro_active,
             "expires_at_utc": data.get("expires_at_utc"),
         }
 
@@ -1610,12 +1815,20 @@ def _paid_finish_reservation(access: dict | None, *, spent: bool) -> None:
         reservations = dict(data.get("reservations") or {})
         if reservation_id not in reservations:
             return False
+        reservation = dict(reservations.get(reservation_id) or {})
         reservations.pop(reservation_id, None)
         data["reservations"] = reservations
+        source = str(reservation.get("source") or access.get("source") or "pro")
         if spent:
-            data["credits_used"] = max(0, _safe_int(data.get("credits_used"), 0)) + 1
+            key = "subscription_credits_used" if source == "pro" else "purchased_credits_used"
+            data[key] = max(0, _safe_int(data.get(key), 0)) + 1
+            if source == "pro":
+                data["credits_used"] = data[key]
+        elif source == "purchased":
+            data["purchased_credits_remaining"] = max(0, _safe_int(data.get("purchased_credits_remaining"), 0)) + 1
         else:
-            data["credits_remaining"] = max(0, _safe_int(data.get("credits_remaining"), 0)) + 1
+            data["subscription_credits_remaining"] = max(0, _safe_int(data.get("subscription_credits_remaining", data.get("credits_remaining")), 0)) + 1
+            data["credits_remaining"] = data["subscription_credits_remaining"]
         data["updated_at_utc"] = _to_utc_z(_utc_now())
         transaction.set(ref, data, merge=False)
         return True
@@ -1628,12 +1841,48 @@ def _paid_finish_reservation(access: dict | None, *, spent: bool) -> None:
 
 def _ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
     paid_token = _paid_header_token()
+    friend_token = _friend_bearer_token()
+    if not paid_token and not friend_token:
+        friend = _friend_ai_access(reserve=reserve, job_id=job_id, system_id=system_id)
+        if isinstance(friend, dict):
+            friend["provider"] = "friend"
+        return friend
+
+    candidates = []
+    access_errors = []
+    if friend_token:
+        try:
+            friend = _friend_verify_token(friend_token)
+            if max(0, _safe_int(friend.get("credits_remaining"), 0)) > 0:
+                candidates.append((str(friend.get("expires_at_utc") or "9999"), 0, "friend"))
+        except FriendAccessError as exc:
+            if exc.retryable:
+                raise
+            access_errors.append(exc)
     if paid_token:
-        return _paid_verify_token(paid_token, reserve=reserve, job_id=job_id, system_id=system_id)
-    friend = _friend_ai_access(reserve=reserve, job_id=job_id, system_id=system_id)
-    if isinstance(friend, dict):
-        friend["provider"] = "friend"
-    return friend
+        try:
+            paid = _paid_verify_token(paid_token)
+            if paid.get("pro_active") and max(0, _safe_int(paid.get("pro_credits_remaining"), 0)) > 0:
+                candidates.append((str(paid.get("expires_at_utc") or "9999"), 1, "pro"))
+            if max(0, _safe_int(paid.get("purchased_credits_remaining"), 0)) > 0:
+                candidates.append(("9999", 2, "purchased"))
+        except PaidAccessError as exc:
+            if exc.retryable:
+                raise
+            access_errors.append(exc)
+    if not candidates:
+        if access_errors:
+            raise access_errors[0]
+        raise PaidAccessError("paid_credits_exhausted", "No AI credits are available.", 403)
+    candidates.sort(key=lambda row: (row[0], row[1]))
+    selected = candidates[0][2]
+    if not reserve:
+        return {"active": True, "provider": selected}
+    if selected == "friend":
+        result = _friend_verify_token(friend_token, reserve=True, job_id=job_id, system_id=system_id)
+        result["provider"] = "friend"
+        return result
+    return _paid_verify_token(paid_token, reserve=True, source=selected, job_id=job_id, system_id=system_id)
 
 
 def _finish_ai_access(access: dict | None, *, spent: bool) -> None:
@@ -1664,12 +1913,95 @@ def _paid_error_response(exc: PaidAccessError):
     )
 
 
+def _verified_apple_identity(signed_app_transaction: str, transaction_payload=None) -> dict:
+    app_data = _apple_app_transaction_data(_apple_verify_app_transaction(signed_app_transaction))
+    if transaction_payload is not None:
+        transaction_app_id = _apple_text(_apple_field(transaction_payload, "appTransactionId"))
+        transaction_environment = _apple_text(_apple_field(transaction_payload, "environment")).lower()
+        if transaction_app_id and transaction_app_id != app_data["app_transaction_id"]:
+            raise PaidAccessError("apple_purchase_invalid", "Apple purchase wallet does not match.", 403)
+        if transaction_environment and transaction_environment != app_data["environment"]:
+            raise PaidAccessError("apple_purchase_invalid", "Apple purchase environment does not match.", 403)
+    return app_data
+
+
+def _paid_restore_wallet(*, app_transaction_id: str, device_id: str) -> dict:
+    client = _friend_store_client()
+    if client is None:
+        raise PaidAccessError("paid_access_unavailable", "Paid Access is temporarily unavailable.", 503, retryable=True)
+    record_key = _apple_wallet_key(app_transaction_id)
+    ref = client.collection(PAID_ACCESS_COLLECTION).document(record_key)
+    now = _utc_now()
+    token_box = {"value": None}
+
+    def _restore(transaction):
+        snap = ref.get(transaction=transaction)
+        data = snap.to_dict() if bool(getattr(snap, "exists", False)) else None
+        if not isinstance(data, dict):
+            raise PaidAccessError("paid_access_required", "No Apple credit wallet was found.", 404)
+        data, token_box["value"] = _paid_issue_device_token(data, record_key=record_key, device_id=device_id, now=now)
+        data["updated_at_utc"] = _to_utc_z(now)
+        transaction.set(ref, data, merge=False)
+        return data
+
+    saved = _friend_run_transaction(client, _restore)
+    return {
+        "paid_id": record_key[:10].upper(),
+        "access_token": token_box["value"],
+        "pro_active": _paid_is_active(saved, now),
+        "pro_credits_remaining": max(0, _safe_int(saved.get("subscription_credits_remaining", saved.get("credits_remaining")), 0)) if _paid_is_active(saved, now) else 0,
+        "purchased_credits_remaining": max(0, _safe_int(saved.get("purchased_credits_remaining"), 0)),
+        "purchased_credit_debt": max(0, _safe_int(saved.get("purchased_credit_debt"), 0)),
+        "expires_at_utc": saved.get("expires_at_utc"),
+    }
+
+
+def _combined_credit_status() -> dict:
+    friend_result = None
+    paid_result = None
+    friend_token = _friend_bearer_token()
+    paid_token = _paid_header_token()
+    errors = []
+    if friend_token:
+        try:
+            friend_result = _friend_verify_token(friend_token)
+        except FriendAccessError as exc:
+            if exc.retryable:
+                raise
+            errors.append(exc)
+    if paid_token:
+        try:
+            paid_result = _paid_verify_token(paid_token, allow_empty=True)
+        except PaidAccessError as exc:
+            if exc.retryable:
+                raise
+            errors.append(exc)
+    if not friend_result and not paid_result and errors:
+        raise errors[0]
+    friend_credits = max(0, _safe_int((friend_result or {}).get("credits_remaining"), 0))
+    pro_credits = max(0, _safe_int((paid_result or {}).get("pro_credits_remaining"), 0))
+    purchased_credits = max(0, _safe_int((paid_result or {}).get("purchased_credits_remaining"), 0))
+    return {
+        "friend_credits": friend_credits,
+        "pro_credits": pro_credits,
+        "purchased_credits": purchased_credits,
+        "total_credits": friend_credits + pro_credits + purchased_credits,
+        "friend_active": bool(friend_result),
+        "pro_active": bool((paid_result or {}).get("pro_active")),
+        "paid_wallet_active": bool(paid_result and (pro_credits + purchased_credits) > 0),
+        "friend_id": (friend_result or {}).get("friend_id"),
+        "paid_id": (paid_result or {}).get("paid_id"),
+        "pro_expires_at_utc": (paid_result or {}).get("expires_at_utc"),
+        "purchased_credit_debt": max(0, _safe_int((paid_result or {}).get("purchased_credit_debt"), 0)),
+    }
+
+
 def _paid_update_notification_state(payload, *, notification_type: str, grace_expires_at: datetime | None = None) -> dict:
     data = _paid_transaction_data(payload)
     client = _friend_store_client()
     if client is None:
         raise PaidAccessError("paid_access_unavailable", "Paid Access is temporarily unavailable.", 503, retryable=True)
-    record_key = _paid_record_key(data["original_transaction_id"])
+    record_key = _apple_wallet_key(data.get("app_transaction_id") or data["original_transaction_id"])
     ref = client.collection(PAID_ACCESS_COLLECTION).document(record_key)
     event = str(notification_type or "").strip().upper()
     status = None
@@ -7845,7 +8177,13 @@ def verify_paid_access():
     payload = request.get_json(silent=True) or {}
     try:
         decoded = _apple_verify_transaction(payload.get("signed_transaction"))
-        result = _paid_apply_transaction(decoded, device_id=payload.get("device_id"), issue_token=True)
+        identity = _verified_apple_identity(payload.get("signed_app_transaction"), decoded)
+        result = _paid_apply_transaction(
+            decoded,
+            app_transaction_id=identity["app_transaction_id"],
+            device_id=payload.get("device_id"),
+            issue_token=True,
+        )
     except PaidAccessError as exc:
         return _paid_error_response(exc)
     return (
@@ -7855,6 +8193,7 @@ def verify_paid_access():
                     "active": True,
                     "paid_id": result["paid_id"],
                     "credits_remaining": result["credits_remaining"],
+                    "purchased_credits_remaining": result["purchased_credits_remaining"],
                     "expires_at_utc": result["expires_at_utc"],
                 },
                 "paid_access_token": result["access_token"],
@@ -7867,16 +8206,17 @@ def verify_paid_access():
 @app.route("/api/access/paid/status", methods=["GET"])
 def get_paid_access_status():
     try:
-        result = _paid_verify_token(_paid_header_token())
+        result = _paid_verify_token(_paid_header_token(), allow_empty=True)
     except PaidAccessError as exc:
         return _paid_error_response(exc)
     return (
         jsonify(
             {
                 "paid_access": {
-                    "active": True,
+                    "active": bool(result.get("pro_active")),
                     "paid_id": result["paid_id"],
-                    "credits_remaining": result["credits_remaining"],
+                    "credits_remaining": result["pro_credits_remaining"],
+                    "purchased_credits_remaining": result["purchased_credits_remaining"],
                     "expires_at_utc": result["expires_at_utc"],
                 }
             }
@@ -7885,9 +8225,52 @@ def get_paid_access_status():
     )
 
 
+@app.route("/api/access/credits/status", methods=["GET"])
+def get_combined_credit_status():
+    try:
+        result = _combined_credit_status()
+    except FriendAccessError as exc:
+        return _friend_error_response(exc)
+    except PaidAccessError as exc:
+        return _paid_error_response(exc)
+    return jsonify({"credits": result}), 200
+
+
+@app.route("/api/access/packs/verify", methods=["POST"])
+def verify_credit_pack():
+    if not _apple_packs_enabled():
+        return _paid_error_response(PaidAccessError("apple_packs_not_enabled", "Credit packs are not available yet.", 503))
+    payload = request.get_json(silent=True) or {}
+    try:
+        decoded = _apple_verify_transaction(payload.get("signed_transaction"))
+        identity = _verified_apple_identity(payload.get("signed_app_transaction"), decoded)
+        result = _pack_apply_transaction(
+            decoded,
+            app_transaction_id=identity["app_transaction_id"],
+            device_id=payload.get("device_id"),
+        )
+    except PaidAccessError as exc:
+        return _paid_error_response(exc)
+    return jsonify({"pack_purchase": result, "paid_access_token": result["access_token"]}), 200
+
+
+@app.route("/api/access/apple/restore", methods=["POST"])
+def restore_apple_wallet():
+    payload = request.get_json(silent=True) or {}
+    try:
+        identity = _verified_apple_identity(payload.get("signed_app_transaction"))
+        result = _paid_restore_wallet(
+            app_transaction_id=identity["app_transaction_id"],
+            device_id=payload.get("device_id"),
+        )
+    except PaidAccessError as exc:
+        return _paid_error_response(exc)
+    return jsonify({"paid_access": result, "paid_access_token": result["access_token"]}), 200
+
+
 @app.route("/api/apple/app-store/notifications", methods=["POST"])
 def apple_app_store_notification():
-    if not _apple_iap_enabled():
+    if not (_apple_iap_enabled() or _apple_packs_enabled()):
         return jsonify({"status": "disabled"}), 503
     payload = request.get_json(silent=True) or {}
     try:
@@ -7898,7 +8281,13 @@ def apple_app_store_notification():
         if not signed_transaction:
             return jsonify({"status": "ignored", "reason": "no_transaction"}), 200
         transaction = _apple_verify_transaction(signed_transaction)
-        if notification_type in {"SUBSCRIBED", "DID_RENEW", "OFFER_REDEEMED"}:
+        product_id = _apple_text(_apple_field(transaction, "productId"))
+        if product_id in APPLE_CREDIT_PACKS:
+            if notification_type in {"REFUND", "REVOKE"}:
+                result = _pack_refund_transaction(transaction)
+            else:
+                result = {"status": "ignored_pack_event"}
+        elif notification_type in {"SUBSCRIBED", "DID_RENEW", "OFFER_REDEEMED"}:
             result = _paid_apply_transaction(transaction)
         else:
             grace_expires_at = None
