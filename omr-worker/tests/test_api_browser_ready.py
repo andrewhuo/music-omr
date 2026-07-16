@@ -1863,6 +1863,86 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         mock_generate.assert_not_called()
 
+    def test_ai_suggest_cancel_preserves_saved_results_and_does_not_cancel_job(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {key: f"https://signed/{key}" for key in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        saved_suggestions = {
+            "version": "ai_suggestions_v1",
+            "source_run_id": 111,
+            "by_measure_id": {
+                "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "high"}
+            },
+            "warnings": [],
+            "summary": {"systems_processed": 1, "suggestions_kept": 1},
+        }
+        saved_cost = {"successful_invocations": 1, "input_tokens_total": 100}
+        mapping_summary["ai_suggestions"] = saved_suggestions
+        mapping_summary[WORKER.AI_COST_SUMMARY_KEY] = saved_cost
+        mapping_summary["ai_suggest_run"] = {
+            "status": "running",
+            "started_at_utc": "2026-07-16T00:00:00Z",
+            "updated_at_utc": "2026-07-16T00:00:10Z",
+            "systems_total": 3,
+            "systems_completed": 1,
+            "next_system_index": 1,
+            "source_run_id": 111,
+            "source_state_version": "test-state",
+        }
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/cancel", method="POST", headers={}, files={}, json={})
+
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None) as upload,
+            patch.object(WORKER, "_cancel_github_run") as cancel_github,
+        ):
+            body, status = _unpack(WORKER.cancel_ai_suggest_job("111"))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("status"), "cancelled")
+        self.assertEqual(body.get("ai_suggestions"), saved_suggestions)
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 1)
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 1)
+        self.assertTrue((body.get("ai_suggest_run") or {}).get("cancelled_at_utc"))
+        self.assertEqual(mapping_summary.get(WORKER.AI_COST_SUMMARY_KEY), saved_cost)
+        upload.assert_called_once_with(mapping_summary, artifacts["mapping_summary"])
+        cancel_github.assert_not_called()
+
+    def test_ai_suggest_cancel_is_idempotent_for_cancelled_and_completed_runs(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {key: f"https://signed/{key}" for key in artifacts}
+        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/cancel", method="POST", headers={}, files={}, json={})
+
+        for existing_status in ("cancelled", "completed"):
+            with self.subTest(existing_status=existing_status):
+                mapping_summary = self._sample_mapping_summary()
+                mapping_summary["ai_suggestions"] = {"by_measure_id": {}}
+                mapping_summary["ai_suggest_run"] = {
+                    "status": existing_status,
+                    "systems_total": 1,
+                    "systems_completed": 1,
+                    "next_system_index": 1,
+                    "source_run_id": 111,
+                    "source_state_version": "test-state",
+                    "cancelled_at_utc": "2026-07-16T00:00:20Z" if existing_status == "cancelled" else None,
+                    "completed_at_utc": "2026-07-16T00:00:20Z" if existing_status == "completed" else None,
+                }
+                with (
+                    patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+                    patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+                    patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+                    patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+                    patch.object(WORKER, "_upload_json_to_gcs", return_value=None) as upload,
+                ):
+                    body, status = _unpack(WORKER.cancel_ai_suggest_job("111"))
+
+                self.assertEqual(status, 200)
+                self.assertEqual(body.get("status"), existing_status)
+                upload.assert_not_called()
+
     def test_ai_suggest_step_failure_marks_failed_and_keeps_partial_suggestions(self):
         artifacts = self._sample_artifacts()
         mapping_summary = self._sample_mapping_summary()

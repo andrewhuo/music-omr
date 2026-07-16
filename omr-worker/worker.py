@@ -3610,6 +3610,7 @@ def _current_ai_suggest_run(
         "updated_at_utc": str(row.get("updated_at_utc") or "").strip() or None,
         "completed_at_utc": str(row.get("completed_at_utc") or "").strip() or None,
         "failed_at_utc": str(row.get("failed_at_utc") or "").strip() or None,
+        "cancelled_at_utc": str(row.get("cancelled_at_utc") or "").strip() or None,
         "systems_total": max(0, _safe_int(row.get("systems_total"), 0)),
         "systems_completed": max(0, _safe_int(row.get("systems_completed"), 0)),
         "next_system_index": max(0, _safe_int(row.get("next_system_index"), 0)),
@@ -3668,6 +3669,7 @@ def _new_ai_suggest_run_state(
         "updated_at_utc": now_txt,
         "completed_at_utc": now_txt if status == AI_SUGGEST_RUN_STATUS_COMPLETED else None,
         "failed_at_utc": now_txt if status == AI_SUGGEST_RUN_STATUS_FAILED else None,
+        "cancelled_at_utc": now_txt if status == AI_SUGGEST_RUN_STATUS_CANCELLED else None,
         "systems_total": max(0, int(systems_total)),
         "systems_completed": max(0, int(systems_total)) if status == AI_SUGGEST_RUN_STATUS_COMPLETED else 0,
         "next_system_index": max(0, int(systems_total)) if status == AI_SUGGEST_RUN_STATUS_COMPLETED else 0,
@@ -8530,6 +8532,115 @@ def ai_suggest_job(job_id: str):
         response["debug_batch_trace"] = debug_batch_trace
     if rec and isinstance(rec, dict) and rec.get("pdf_gcs_uri"):
         response["pdf_gcs_uri"] = rec.get("pdf_gcs_uri")
+    return jsonify(response), 200
+
+
+@app.route("/api/omr/jobs/<job_id>/ai-suggest/cancel", methods=["POST"])
+def cancel_ai_suggest_job(job_id: str):
+    started = time.time()
+    run_id, rec, err = _resolve_run_id_from_job_id(job_id)
+    if err:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_cancel_failed",
+                        "message": str(err),
+                        "retryable": True,
+                        "provider_status": 409,
+                        "detail": "state_load_failed",
+                    },
+                }
+            ),
+            409,
+        )
+
+    artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
+    try:
+        artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
+    except StaleArtifactsError as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(exc.requested_run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_cancel_failed",
+                        "message": "requested job_id does not match single-latest artifacts",
+                        "retryable": True,
+                        "provider_status": 409,
+                        "detail": "stale_run_mismatch",
+                    },
+                }
+            ),
+            409,
+        )
+    except Exception as exc:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "ai_suggest_cancel_failed",
+                        "message": "failed to load AI suggestion state",
+                        "retryable": True,
+                        "provider_status": 502,
+                        "detail": _safe_error_text(exc),
+                    },
+                }
+            ),
+            502,
+        )
+
+    editable_state = mapping_summary.get("editable_state") or {}
+    source_state_version = _editable_state_version(editable_state) if isinstance(editable_state, dict) else None
+    ai_suggestions = _current_ai_suggestions(mapping_summary)
+    ai_suggest_run = _current_ai_suggest_run(mapping_summary, int(artifact_run_id), source_state_version)
+    current_status = str(ai_suggest_run.get("status") or AI_SUGGEST_RUN_STATUS_IDLE)
+
+    if current_status not in {AI_SUGGEST_RUN_STATUS_COMPLETED, AI_SUGGEST_RUN_STATUS_CANCELLED}:
+        now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+        ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_CANCELLED
+        ai_suggest_run["updated_at_utc"] = now_txt
+        ai_suggest_run["cancelled_at_utc"] = now_txt
+        mapping_summary["ai_suggest_run"] = ai_suggest_run
+        try:
+            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        except Exception as exc:
+            return (
+                jsonify(
+                    {
+                        "job_id": job_id,
+                        "run_id": int(artifact_run_id),
+                        "status": "failed",
+                        "error": {
+                            "code": "ai_suggest_cancel_failed",
+                            "message": "failed to save stopped AI suggestion state",
+                            "retryable": True,
+                            "provider_status": 500,
+                            "detail": _safe_error_text(exc),
+                        },
+                    }
+                ),
+                500,
+            )
+
+    response = {
+        "job_id": job_id,
+        "run_id": int(artifact_run_id),
+        "status": str(ai_suggest_run.get("status") or AI_SUGGEST_RUN_STATUS_CANCELLED),
+        "ai_suggestions": ai_suggestions,
+        "ai_suggest_run": ai_suggest_run,
+        "storage_mode": _storage_mode_for_artifacts(artifacts),
+        "artifacts": artifacts,
+        "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+        "duration_ms": int((time.time() - started) * 1000),
+    }
     return jsonify(response), 200
 
 
