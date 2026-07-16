@@ -228,6 +228,105 @@ class RelabelLogicTests(unittest.TestCase):
         self.assertEqual([row.get("reason") for row in rejected], ["invalid_label_id", "invalid_label_id"])
         self.assertEqual(state.get("hidden_label_ids"), [])
 
+    def test_show_label_persists_and_restores_default_position(self):
+        state = self._sample_state()
+        state["hidden_label_ids"] = ["label:p1_s0_m1"]
+        state["label_positions"] = {
+            "label:p1_s0_m1": {"page": 1, "left": 42.25, "top": 13.75}
+        }
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "show_label", "measure_id": "p1_s0_m1"},
+                {"type": "show_label", "measure_id": "p1_s0_m1"},
+            ],
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(applied), 2)
+        self.assertEqual(state.get("forced_label_ids"), ["label:p1_s0_m1"])
+        self.assertEqual(state.get("hidden_label_ids"), [])
+        self.assertEqual(state.get("label_positions"), {})
+
+    def test_show_label_rejects_invalid_measure(self):
+        state = self._sample_state()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [{"type": "show_label", "measure_id": "missing"}],
+        )
+
+        self.assertEqual(applied, [])
+        self.assertEqual([row.get("reason") for row in rejected], ["invalid_measure_id"])
+        self.assertEqual(state.get("forced_label_ids"), [])
+
+    def test_forced_label_adds_middle_measure_in_system_only_mode(self):
+        state = self._sample_state()
+        systems, measures, result_labels, _ = WORKER._recompute_measure_numbering(
+            state["systems"], state["measures"], state
+        )
+        rows = WORKER._label_render_rows(
+            "system_only",
+            systems,
+            measures,
+            result_labels,
+            {"label:p1_s0_m1"},
+        )
+
+        measure_ids = [row.get("measure_id") for row, _ in rows]
+        self.assertIn("p1_s0_m0", measure_ids)
+        self.assertIn("p1_s0_m1", measure_ids)
+        self.assertEqual(measure_ids.count("p1_s0_m1"), 1)
+
+    def test_forced_label_does_not_duplicate_all_measures_label(self):
+        state = self._sample_state()
+        systems, measures, result_labels, _ = WORKER._recompute_measure_numbering(
+            state["systems"], state["measures"], state
+        )
+        rows = WORKER._label_render_rows(
+            "all_measures",
+            systems,
+            measures,
+            result_labels,
+            {"label:p1_s0_m1"},
+        )
+
+        measure_ids = [row.get("measure_id") for row, _ in rows]
+        self.assertEqual(measure_ids.count("p1_s0_m1"), 1)
+
+    def test_forced_label_uses_recomputed_number(self):
+        state = self._sample_state()
+        WORKER._apply_relabel_edits(
+            state,
+            [
+                {"type": "show_label", "measure_id": "p1_s0_m1"},
+                {"type": "set_measure_number", "measure_id": "p1_s0_m1", "value": 42},
+            ],
+        )
+        systems, measures, result_labels, _ = WORKER._recompute_measure_numbering(
+            state["systems"], state["measures"], state
+        )
+        rows = WORKER._label_render_rows(
+            "system_only",
+            systems,
+            measures,
+            result_labels,
+            set(state.get("forced_label_ids") or []),
+        )
+
+        rendered = {
+            row.get("measure_id"): label
+            for row, label in rows
+        }
+        self.assertEqual(rendered.get("p1_s0_m1"), "42")
+
+    def test_forced_label_ids_drop_deleted_measures(self):
+        state = {
+            "forced_label_ids": ["label:keep", "label:deleted", "bad"],
+        }
+        cleaned = WORKER._editable_forced_label_ids(state, {"keep"})
+
+        self.assertEqual(cleaned, ["label:keep"])
+
     def test_move_label_persists(self):
         state = self._sample_state()
         _, applied, rejected, _ = WORKER._apply_relabel_edits(
