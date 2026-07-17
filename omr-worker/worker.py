@@ -58,6 +58,7 @@ ARTIFACT_SIGNED_URL_TTL_SEC = int(os.environ.get("ARTIFACT_SIGNED_URL_TTL_SEC", 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "25"))
 RELABEL_DEBUG_HISTORY_MAX = int(os.environ.get("RELABEL_DEBUG_HISTORY_MAX", "50"))
 RELABEL_DEBUG_VERSION = "relabel_debug_v1"
+MANUAL_FIX_BATCH_HISTORY_MAX = 20
 CORS_ALLOW_ORIGINS_DEFAULT = "http://localhost:5173,http://localhost:3000"
 RUNS_PREFIX = str(os.environ.get("RUNS_PREFIX", "runs") or "runs").strip().strip("/") or "runs"
 ENABLE_JOB_STORE = str(os.environ.get("ENABLE_JOB_STORE", "1")).strip().lower() not in ("0", "false", "no")
@@ -3431,6 +3432,60 @@ def _summarize_relabel_debug(mapping_summary: dict) -> dict:
         "last_trace_id": str(last_trace.get("trace_id") or ""),
         "reason_counts": reason_counts,
     }
+
+
+def _manual_fix_batch_receipts(mapping_summary: dict) -> list[dict]:
+    rows = mapping_summary.get("manual_fix_batches")
+    if not isinstance(rows, list):
+        rows = []
+    cleaned = [row for row in rows if isinstance(row, dict) and str(row.get("request_id") or "").strip()]
+    mapping_summary["manual_fix_batches"] = cleaned[-MANUAL_FIX_BATCH_HISTORY_MAX:]
+    return mapping_summary["manual_fix_batches"]
+
+
+def _find_manual_fix_batch_receipt(mapping_summary: dict, request_id: str) -> dict | None:
+    clean_id = str(request_id or "").strip()
+    if not clean_id:
+        return None
+    for row in reversed(_manual_fix_batch_receipts(mapping_summary)):
+        if str(row.get("request_id") or "").strip() == clean_id:
+            return row
+    return None
+
+
+def _append_manual_fix_batch_receipt(mapping_summary: dict, receipt: dict) -> None:
+    request_id = str(receipt.get("request_id") or "").strip()
+    if not request_id:
+        return
+    rows = [
+        row
+        for row in _manual_fix_batch_receipts(mapping_summary)
+        if str(row.get("request_id") or "").strip() != request_id
+    ]
+    rows.append(deepcopy(receipt))
+    mapping_summary["manual_fix_batches"] = rows[-MANUAL_FIX_BATCH_HISTORY_MAX:]
+
+
+def _atomic_relabel_rejections(rejected: list[dict], editable_state: dict) -> list[dict]:
+    measure_pages = {
+        str(row.get("measure_id") or "").strip(): _safe_int(row.get("page"), 0)
+        for row in (editable_state.get("measures") or [])
+        if isinstance(row, dict) and str(row.get("measure_id") or "").strip()
+    }
+    output: list[dict] = []
+    for row in rejected:
+        if not isinstance(row, dict):
+            continue
+        raw_edit = row.get("edit") if isinstance(row.get("edit"), dict) else {}
+        page = _safe_int(raw_edit.get("page"), 0)
+        if page <= 0:
+            measure_id = str(raw_edit.get("measure_id") or "").strip()
+            page = measure_pages.get(measure_id, 0)
+        item = {"reason": str(row.get("reason") or "edit_rejected").strip() or "edit_rejected"}
+        if page > 0:
+            item["page"] = page
+        output.append(item)
+    return output
 
 
 def _persist_relabel_trace(mapping_summary: dict, mapping_uri: str, trace: dict, trace_id: str) -> bool:
@@ -9121,7 +9176,23 @@ def relabel_job(job_id: str):
     started = time.time()
     payload = request.json or {}
     edits = payload.get("edits")
+    atomic = payload.get("atomic") is True
+    request_id = str(payload.get("request_id") or "").strip()
+    requested_state_version = str(payload.get("state_version") or "").strip()
     edits_requested_count = len(edits) if isinstance(edits, list) else 0
+
+    if atomic and not re.fullmatch(r"[A-Za-z0-9-]{16,128}", request_id):
+        return (
+            jsonify(
+                {
+                    "error": "atomic relabel requires a valid request_id",
+                    "code": "invalid_request_id",
+                    "job_id": job_id,
+                    "trace_id": trace_id,
+                }
+            ),
+            400,
+        )
 
     run_id, rec, err = _resolve_run_id_from_job_id(job_id)
     requested_run_id = int(run_id) if isinstance(run_id, int) else 0
@@ -9207,6 +9278,42 @@ def relabel_job(job_id: str):
     mapping_uri = artifacts["mapping_summary"]
     baseline_pdf_uri = artifacts["audiveris_out_pdf"]
     corrected_pdf_uri = artifacts["audiveris_out_corrected_pdf"]
+
+    if atomic:
+        duplicate_receipt = _find_manual_fix_batch_receipt(mapping_summary, request_id)
+        if isinstance(duplicate_receipt, dict):
+            duplicate_relabel = {
+                "applied_edits": deepcopy(duplicate_receipt.get("applied_edits") or []),
+                "rejected_edits": [],
+                "labels_mode": str(duplicate_receipt.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
+                "state_version_before": duplicate_receipt.get("state_version_before"),
+                "state_version_after": duplicate_receipt.get("state_version_after"),
+                "updated_system_ids": deepcopy(duplicate_receipt.get("updated_system_ids") or []),
+                "systems_updated_count": _safe_int(duplicate_receipt.get("systems_updated_count"), 0),
+                "labels_redrawn_count": _safe_int(duplicate_receipt.get("labels_redrawn_count"), 0),
+                "duration_ms": 0,
+                "redraw_duration_ms": 0,
+                "duplicate_request": True,
+                "request_id": request_id,
+            }
+            response = {
+                "job_id": job_id,
+                "run_id": int(run_id),
+                "status": "succeeded",
+                "trace_id": trace_id,
+                "debug_result": "duplicate_request",
+                "artifacts": artifacts,
+                "artifacts_http": _artifact_http_uris_for_run(int(run_id), artifacts),
+                "storage_mode": _storage_mode_for_artifacts(artifacts),
+                "relabel": duplicate_relabel,
+            }
+            if rec and isinstance(rec, dict) and rec.get("pdf_gcs_uri"):
+                response["pdf_gcs_uri"] = rec.get("pdf_gcs_uri")
+            print(
+                f"RELABEL_TRACE_RESULT trace_id={trace_id} result=duplicate_request "
+                f"request_id={request_id}"
+            )
+            return jsonify(response), 200
 
     def _persist_error_trace(trace_payload: dict) -> bool:
         return _persist_relabel_trace(deepcopy(persisted_mapping_summary), mapping_uri, trace_payload, trace_id)
@@ -9298,6 +9405,49 @@ def relabel_job(job_id: str):
         )
 
     state_version_before = _editable_state_version(editable_state)
+    if atomic and (not requested_state_version or requested_state_version != state_version_before):
+        first_page = 0
+        version_edits = edits if isinstance(edits, list) else []
+        for raw_edit in version_edits:
+            if isinstance(raw_edit, dict):
+                first_page = _safe_int(raw_edit.get("page"), 0)
+                if first_page > 0:
+                    break
+        rejection = {"reason": "state_version_conflict"}
+        if first_page > 0:
+            rejection["page"] = first_page
+        trace = {
+            "trace_id": trace_id,
+            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "requested_run_id": int(run_id),
+            "artifact_run_id": int(artifact_run_id),
+            "state_version_before": state_version_before,
+            "edits_requested_count": edits_requested_count,
+            "applied_count": 0,
+            "rejected_count": 1,
+            "rejected_reason_counts": {"state_version_conflict": 1},
+            "updated_system_ids_count": 0,
+            "labels_redrawn_count": 0,
+            "duration_ms": int((time.time() - started) * 1000),
+            "redraw_duration_ms": 0,
+            "result": "validation_error",
+            "reason": "state_version_conflict",
+        }
+        _persist_error_trace(trace)
+        return (
+            jsonify(
+                {
+                    "error": "state version changed before manual fixes could save",
+                    "code": "state_version_conflict",
+                    "job_id": job_id,
+                    "trace_id": trace_id,
+                    "page": first_page if first_page > 0 else None,
+                    "rejected_edits": [rejection],
+                }
+            ),
+            409,
+        )
     ending_debug_ctx: dict | None = None
     if _relabel_has_ending_debug(editable_state, edits if isinstance(edits, list) else []):
         ending_debug_ctx = {
@@ -9416,6 +9566,46 @@ def relabel_job(job_id: str):
                 }
             ),
             500,
+        )
+
+    if atomic and rejected:
+        rejection_rows = _atomic_relabel_rejections(rejected, editable_state)
+        first_page = next(
+            (_safe_int(row.get("page"), 0) for row in rejection_rows if _safe_int(row.get("page"), 0) > 0),
+            0,
+        )
+        trace = {
+            "trace_id": trace_id,
+            "timestamp_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "requested_run_id": int(run_id),
+            "artifact_run_id": int(artifact_run_id),
+            "state_version_before": state_version_before,
+            "edits_requested_count": edits_requested_count,
+            "applied_count": 0,
+            "rejected_count": len(rejection_rows),
+            "rejected_reason_counts": _rejected_reason_counts(rejected),
+            "updated_system_ids_count": 0,
+            "labels_redrawn_count": 0,
+            "duration_ms": int((time.time() - started) * 1000),
+            "redraw_duration_ms": 0,
+            "result": "validation_error",
+            "reason": "atomic_relabel_rejected",
+            "request_id": request_id,
+        }
+        _persist_error_trace(trace)
+        return (
+            jsonify(
+                {
+                    "error": "Manual Fix batch was rejected",
+                    "code": "atomic_relabel_rejected",
+                    "job_id": job_id,
+                    "trace_id": trace_id,
+                    "page": first_page if first_page > 0 else None,
+                    "rejected_edits": rejection_rows,
+                }
+            ),
+            409,
         )
 
     redraw_ms = 0
@@ -9571,6 +9761,21 @@ def relabel_job(job_id: str):
     }
     mapping_summary["editable_state"] = editable_state
     mapping_summary["relabel"] = relabel_info
+    if atomic:
+        _append_manual_fix_batch_receipt(
+            mapping_summary,
+            {
+                "request_id": request_id,
+                "saved_at_utc": relabel_info["updated_at_utc"],
+                "state_version_before": state_version_before,
+                "state_version_after": state_version_after,
+                "applied_edits": deepcopy(applied),
+                "labels_mode": relabel_info["labels_mode"],
+                "updated_system_ids": deepcopy(updated_system_ids),
+                "systems_updated_count": total_systems,
+                "labels_redrawn_count": labels_drawn,
+            },
+        )
 
     trace = {
         "trace_id": trace_id,
@@ -9648,6 +9853,8 @@ def relabel_job(job_id: str):
             "labels_redrawn_count": labels_drawn,
             "duration_ms": relabel_info["duration_ms"],
             "redraw_duration_ms": relabel_info["redraw_duration_ms"],
+            "request_id": request_id if atomic else None,
+            "duplicate_request": False,
         },
     }
     if response["storage_mode"] == "legacy_single_latest":

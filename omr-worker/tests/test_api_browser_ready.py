@@ -647,6 +647,212 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(relabel.get("labels_mode"), "all_measures")
         self.assertEqual(relabel.get("labels_redrawn_count"), 2)
 
+    def test_atomic_manual_fix_rejects_entire_multi_page_batch_before_render(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        original_editable = deepcopy(mapping_summary["editable_state"])
+        version_state = deepcopy(original_editable)
+        WORKER._refresh_editable_state_systems_and_measures(version_state)
+        state_version = WORKER._editable_state_version(version_state)
+        request_id = "11111111-1111-1111-1111-111111111111"
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={
+                "atomic": True,
+                "request_id": request_id,
+                "state_version": state_version,
+                "edits": [
+                    {
+                        "type": "replace_manual_rows_for_page",
+                        "page": 1,
+                        "rows": [
+                            {
+                                "manual_row_id": "manual_page_1",
+                                "page": 1,
+                                "staff_kind": "single",
+                                "rect": {"left": 10, "right": 110, "top": 150, "bottom": 170},
+                                "cut_xs": [60],
+                            }
+                        ],
+                    },
+                    {
+                        "type": "replace_manual_rows_for_page",
+                        "page": 2,
+                        "rows": [
+                            {
+                                "manual_row_id": "manual_page_2",
+                                "page": 2,
+                                "staff_kind": "invalid",
+                                "rect": {"left": 10, "right": 110, "top": 20, "bottom": 40},
+                                "cut_xs": [60],
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+        uploaded_json = []
+
+        def fake_upload_json(data, _uri):
+            uploaded_json.append(deepcopy(data))
+
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=fake_upload_json),
+            patch.object(WORKER, "_render_corrected_pdf") as render_pdf,
+            patch.object(WORKER, "_upload_file_to_gcs") as upload_pdf,
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 409)
+        self.assertEqual(body.get("code"), "atomic_relabel_rejected")
+        self.assertEqual(body.get("page"), 2)
+        self.assertEqual((body.get("rejected_edits") or [{}])[0].get("reason"), "invalid_staff_kind")
+        render_pdf.assert_not_called()
+        upload_pdf.assert_not_called()
+        self.assertTrue(uploaded_json)
+        self.assertEqual(uploaded_json[-1].get("editable_state"), original_editable)
+
+    def test_atomic_manual_fix_saves_multi_page_batch_once_and_deduplicates_retry(self):
+        artifacts = self._sample_artifacts()
+        artifacts_http = {key: f"https://signed/{key}" for key in artifacts}
+        mapping_summary = self._sample_mapping_summary()
+        version_state = deepcopy(mapping_summary["editable_state"])
+        WORKER._refresh_editable_state_systems_and_measures(version_state)
+        state_version = WORKER._editable_state_version(version_state)
+        request_id = "22222222-2222-2222-2222-222222222222"
+        request_json = {
+            "atomic": True,
+            "request_id": request_id,
+            "state_version": state_version,
+            "edits": [
+                {
+                    "type": "replace_manual_rows_for_page",
+                    "page": 1,
+                    "rows": [
+                        {
+                            "manual_row_id": "manual_page_1",
+                            "page": 1,
+                            "staff_kind": "single",
+                            "rect": {"left": 10, "right": 110, "top": 150, "bottom": 170},
+                            "cut_xs": [60],
+                        }
+                    ],
+                },
+                {
+                    "type": "replace_manual_rows_for_page",
+                    "page": 2,
+                    "rows": [
+                        {
+                            "manual_row_id": "manual_page_2",
+                            "page": 2,
+                            "staff_kind": "single",
+                            "rect": {"left": 10, "right": 110, "top": 20, "bottom": 40},
+                            "cut_xs": [60],
+                        }
+                    ],
+                },
+            ],
+        }
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json=request_json,
+        )
+        uploaded_json = []
+
+        def fake_upload_json(data, _uri):
+            uploaded_json.append(deepcopy(data))
+
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_download_gcs_to_file", return_value=None),
+            patch.object(WORKER, "_render_corrected_pdf", return_value=4) as render_pdf,
+            patch.object(WORKER, "_upload_file_to_gcs", return_value=None) as upload_pdf,
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=fake_upload_json),
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 200)
+        self.assertFalse((body.get("relabel") or {}).get("duplicate_request"))
+        render_pdf.assert_called_once()
+        upload_pdf.assert_called_once()
+        saved_mapping = uploaded_json[-1]
+        saved_pages = {
+            row.get("page")
+            for row in ((saved_mapping.get("editable_state") or {}).get("manual_rows") or [])
+        }
+        self.assertEqual(saved_pages, {1, 2})
+        receipts = saved_mapping.get("manual_fix_batches") or []
+        self.assertEqual([row.get("request_id") for row in receipts], [request_id])
+
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json=request_json,
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, saved_mapping, 111)),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
+            patch.object(WORKER, "_render_corrected_pdf") as retry_render,
+            patch.object(WORKER, "_upload_file_to_gcs") as retry_pdf_upload,
+            patch.object(WORKER, "_upload_json_to_gcs") as retry_json_upload,
+        ):
+            retry_body, retry_status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(retry_status, 200)
+        self.assertTrue((retry_body.get("relabel") or {}).get("duplicate_request"))
+        retry_render.assert_not_called()
+        retry_pdf_upload.assert_not_called()
+        retry_json_upload.assert_not_called()
+
+    def test_atomic_manual_fix_rejects_stale_state_before_render(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={
+                "atomic": True,
+                "request_id": "33333333-3333-3333-3333-333333333333",
+                "state_version": "stale-version",
+                "edits": [
+                    {
+                        "type": "replace_manual_rows_for_page",
+                        "page": 2,
+                        "rows": [],
+                    }
+                ],
+            },
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+            patch.object(WORKER, "_render_corrected_pdf") as render_pdf,
+            patch.object(WORKER, "_upload_file_to_gcs") as upload_pdf,
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+
+        self.assertEqual(status, 409)
+        self.assertEqual(body.get("code"), "state_version_conflict")
+        self.assertEqual(body.get("page"), 2)
+        render_pdf.assert_not_called()
+        upload_pdf.assert_not_called()
+
     def test_relabel_mapping_upload_failure_restores_previous_corrected_pdf(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
