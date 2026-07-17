@@ -2446,6 +2446,7 @@ def _editable_state_version(editable_state: dict) -> str:
         "systems": editable_state.get("systems") or [],
         "measures": editable_state.get("measures") or [],
         "auto_rows": editable_state.get("auto_rows") or [],
+        "auto_rows_authoritative_pages": editable_state.get("auto_rows_authoritative_pages") or [],
         "manual_rows": editable_state.get("manual_rows") or [],
         "measure_number_overrides": editable_state.get("measure_number_overrides") or {},
         "rest_measures": editable_state.get("rest_measures") or {},
@@ -2493,6 +2494,16 @@ def _manual_system_id(manual_row_id: str) -> str:
 def _manual_measure_id(manual_row_id: str, measure_local_index: int) -> str:
     safe_row_id = _normalize_artifact_key(manual_row_id) or "row"
     return f"{MANUAL_MEASURE_ID_PREFIX}{safe_row_id}_m{max(0, int(measure_local_index))}"
+
+
+def _manual_row_measure_ids(manual_row: dict, measure_count: int) -> list[str]:
+    manual_row_id = _normalize_artifact_key(manual_row.get("manual_row_id"))[:64]
+    raw_ids = manual_row.get("measure_ids")
+    if isinstance(raw_ids, list) and len(raw_ids) == measure_count:
+        cleaned = [_normalize_artifact_key(value)[:128] for value in raw_ids]
+        if all(cleaned) and len(set(cleaned)) == len(cleaned):
+            return cleaned
+    return [_manual_measure_id(manual_row_id, index) for index in range(measure_count)]
 
 
 def _parse_manual_row_rect(raw_rect: dict | None) -> tuple[float, float, float, float] | None:
@@ -2614,6 +2625,13 @@ def _editable_manual_rows(editable_state: dict) -> list[dict]:
         if not valid:
             continue
 
+        measure_ids = _manual_row_measure_ids(raw_row, len(cut_xs) + 1)
+        source_manual_row_id = _normalize_artifact_key(
+            raw_row.get("source_manual_row_id") or manual_row_id
+        )[:64]
+        if not source_manual_row_id:
+            source_manual_row_id = manual_row_id
+
         seen_ids.add(manual_row_id)
         cleaned.append(
             {
@@ -2627,6 +2645,8 @@ def _editable_manual_rows(editable_state: dict) -> list[dict]:
                     "bottom": float(bottom),
                 },
                 "cut_xs": [float(cut) for cut in cut_xs],
+                "measure_ids": measure_ids,
+                "source_manual_row_id": source_manual_row_id,
             }
         )
 
@@ -2687,6 +2707,7 @@ def _build_auto_rows_from_state(editable_state: dict) -> list[dict]:
             continue
         row = {
             "system_id": system_id,
+            "source_system_id": str(system_row.get("source_system_id") or system_id).strip(),
             "page": int(page),
             "rect": {
                 "left": float(left),
@@ -2713,6 +2734,17 @@ def _build_auto_rows_from_state(editable_state: dict) -> list[dict]:
         )
     )
     return rows
+
+
+def _editable_auto_rows_authoritative_pages(editable_state: dict) -> list[int]:
+    raw_pages = editable_state.get("auto_rows_authoritative_pages")
+    pages = sorted({
+        page
+        for page in (_safe_int(value, 0) for value in (raw_pages if isinstance(raw_pages, list) else []))
+        if page > 0
+    })
+    editable_state["auto_rows_authoritative_pages"] = pages
+    return pages
 
 
 def _editable_auto_rows(editable_state: dict) -> list[dict]:
@@ -2768,6 +2800,7 @@ def _editable_auto_rows(editable_state: dict) -> list[dict]:
             continue
         cleaned_row = {
             "system_id": system_id,
+            "source_system_id": _normalize_artifact_key(raw_row.get("source_system_id") or system_id)[:128],
             "page": int(page),
             "rect": {
                 "left": float(left),
@@ -2927,16 +2960,19 @@ def _normalize_manual_rows_payload(
     if not isinstance(raw_rows, list):
         return None, "invalid_rows_payload"
 
-    auto_systems = [row for row in _clone_auto_system_rows(editable_state) if _safe_int(row.get("page"), 0) == page]
-    auto_measures = [row for row in _clone_auto_measure_rows(editable_state) if _safe_int(row.get("page"), 0) == page]
     auto_rects = [
-        bounds
-        for bounds in (_system_visual_bounds(system_row, auto_measures) for system_row in auto_systems)
-        if bounds is not None
+        rect
+        for rect in (
+            _parse_manual_row_rect(row.get("rect"))
+            for row in _editable_auto_rows(editable_state)
+            if _safe_int(row.get("page"), 0) == page
+        )
+        if rect is not None
     ]
 
     cleaned: list[dict] = []
     seen_ids: set[str] = set()
+    seen_measure_ids: set[str] = set()
     seen_rects: list[tuple[float, float, float, float]] = []
 
     for raw_row in raw_rows:
@@ -2976,6 +3012,15 @@ def _normalize_manual_rows_payload(
             cut_xs.append(float(cut))
             prev_cut = float(cut)
 
+        measure_ids = _manual_row_measure_ids(raw_row, len(cut_xs) + 1)
+        if len(measure_ids) != len(cut_xs) + 1 or any(measure_id in seen_measure_ids for measure_id in measure_ids):
+            return None, "invalid_manual_measure_ids"
+        source_manual_row_id = _normalize_artifact_key(
+            raw_row.get("source_manual_row_id") or manual_row_id
+        )[:64]
+        if not source_manual_row_id:
+            return None, "invalid_source_manual_row_id"
+
         rect = (float(left), float(right), float(top), float(bottom))
         if any(_rects_strongly_overlap(rect, auto_rect) for auto_rect in auto_rects):
             return None, "manual_row_overlap_auto"
@@ -2983,6 +3028,7 @@ def _normalize_manual_rows_payload(
             return None, "manual_row_overlap_manual"
 
         seen_ids.add(manual_row_id)
+        seen_measure_ids.update(measure_ids)
         seen_rects.append(rect)
         cleaned.append(
             {
@@ -2996,6 +3042,8 @@ def _normalize_manual_rows_payload(
                     "bottom": float(bottom),
                 },
                 "cut_xs": [float(cut) for cut in cut_xs],
+                "measure_ids": measure_ids,
+                "source_manual_row_id": source_manual_row_id,
             }
         )
 
@@ -3022,6 +3070,7 @@ def _build_auto_rows_overlay(auto_rows: list[dict], editable_state: dict) -> tup
         if not isinstance(auto_row, dict):
             continue
         system_id = str(auto_row.get("system_id") or "").strip()
+        source_system_id = str(auto_row.get("source_system_id") or system_id).strip()
         page = _safe_int(auto_row.get("page"), 0)
         rect = (auto_row.get("rect") or {}) if isinstance(auto_row.get("rect"), dict) else {}
         left = _safe_float(rect.get("left"), 0.0)
@@ -3031,13 +3080,14 @@ def _build_auto_rows_overlay(auto_rows: list[dict], editable_state: dict) -> tup
         boxes = auto_row.get("boxes")
         if not system_id or page <= 0 or right <= left or bottom <= top or not isinstance(boxes, list):
             continue
-        existing_system = existing_systems_by_id.get(system_id) or {}
+        existing_system = existing_systems_by_id.get(system_id) or existing_systems_by_id.get(source_system_id) or {}
         system_index = _safe_int(existing_system.get("system_index"), 0)
         current_value = str(auto_row.get("current_value") or existing_system.get("current_value") or existing_system.get("value") or "").strip()
         staff_kind = str(auto_row.get("staff_kind") or existing_system.get("staff_kind") or "").strip().lower()
         systems.append(
             {
                 "system_id": system_id,
+                "source_system_id": source_system_id,
                 "page": int(page),
                 "system_index": int(system_index),
                 "current_value": current_value,
@@ -3066,6 +3116,7 @@ def _build_auto_rows_overlay(auto_rows: list[dict], editable_state: dict) -> tup
                 {
                     "measure_id": measure_id,
                     "system_id": system_id,
+                    "source_system_id": source_system_id,
                     "page": int(page),
                     "system_index": int(system_index),
                     "measure_local_index": int(local_idx),
@@ -3088,40 +3139,47 @@ def _normalize_auto_rows_payload(
     editable_state: dict,
 ) -> tuple[list[dict] | None, str | None]:
     current_auto_rows = [row for row in _editable_auto_rows(editable_state) if _safe_int(row.get("page"), 0) == page]
-    expected_system_ids = {
-        str(row.get("system_id") or "").strip()
+    expected_source_system_ids = {
+        str(row.get("source_system_id") or row.get("system_id") or "").strip()
         for row in current_auto_rows
-        if isinstance(row, dict) and str(row.get("system_id") or "").strip()
+        if isinstance(row, dict) and str(row.get("source_system_id") or row.get("system_id") or "").strip()
     }
     if not isinstance(rows, list):
         return None, "invalid_auto_rows"
-    if not expected_system_ids and rows:
+    if not expected_source_system_ids and rows:
         return None, "unexpected_auto_rows"
 
     cleaned: list[dict] = []
     seen_system_ids: set[str] = set()
     seen_measure_ids: set[str] = set()
-    current_by_system_id = {
-        str(row.get("system_id") or "").strip(): row
-        for row in current_auto_rows
-        if isinstance(row, dict) and str(row.get("system_id") or "").strip()
-    }
+    current_by_system_id = {}
+    current_by_source_system_id = {}
+    for row in current_auto_rows:
+        if not isinstance(row, dict):
+            continue
+        current_system_id = str(row.get("system_id") or "").strip()
+        source_system_id = str(row.get("source_system_id") or current_system_id).strip()
+        if current_system_id:
+            current_by_system_id[current_system_id] = row
+        if source_system_id and source_system_id not in current_by_source_system_id:
+            current_by_source_system_id[source_system_id] = row
 
     for raw_row in rows:
         if not isinstance(raw_row, dict):
             return None, "invalid_auto_row"
         system_id = _normalize_artifact_key(raw_row.get("system_id"))[:128]
+        source_system_id = _normalize_artifact_key(raw_row.get("source_system_id") or system_id)[:128]
         if not system_id or system_id in seen_system_ids:
             return None, "duplicate_auto_system_id"
-        if system_id not in expected_system_ids:
-            return None, "unknown_auto_system_id"
+        if not source_system_id or source_system_id not in expected_source_system_ids:
+            return None, "unknown_auto_source_system_id"
         if _safe_int(raw_row.get("page"), 0) != page:
             return None, "auto_row_page_mismatch"
         rect_tuple = _parse_manual_row_rect(raw_row.get("rect"))
         if rect_tuple is None:
             return None, "invalid_auto_row_rect"
         left, right, top, bottom = rect_tuple
-        current_row = current_by_system_id.get(system_id) or {}
+        current_row = current_by_system_id.get(system_id) or current_by_source_system_id.get(source_system_id) or {}
         current_rect = _parse_manual_row_rect(current_row.get("rect"))
         if current_rect is None:
             return None, "missing_auto_row_baseline"
@@ -3160,6 +3218,7 @@ def _normalize_auto_rows_payload(
             return None, "auto_row_missing_boxes"
         cleaned_row = {
             "system_id": system_id,
+            "source_system_id": source_system_id,
             "page": int(page),
             "rect": {
                 "left": float(left),
@@ -3177,9 +3236,6 @@ def _normalize_auto_rows_payload(
             cleaned_row["staff_kind"] = staff_kind
         cleaned.append(cleaned_row)
         seen_system_ids.add(system_id)
-
-    if seen_system_ids != expected_system_ids:
-        return None, "auto_systems_mismatch"
 
     cleaned.sort(
         key=lambda row: (
@@ -3208,6 +3264,7 @@ def _build_manual_rows_overlay(manual_rows: list[dict]) -> tuple[list[dict], lis
         if not manual_row_id or page <= 0 or right <= left or bottom <= top:
             continue
         staff_kind = str(manual_row.get("staff_kind") or MANUAL_STAFF_KIND_SINGLE).strip().lower()
+        source_manual_row_id = str(manual_row.get("source_manual_row_id") or manual_row_id).strip()
         system_id = _manual_system_id(manual_row_id)
         systems.append(
             {
@@ -3219,6 +3276,7 @@ def _build_manual_rows_overlay(manual_rows: list[dict]) -> tuple[list[dict], lis
                 "render_label": "",
                 "source": ROW_SOURCE_MANUAL,
                 "manual_row_id": manual_row_id,
+                "source_manual_row_id": source_manual_row_id,
                 "staff_kind": staff_kind,
                 "anchor": {"x": float(left), "y_top": float(top), "y_bottom": float(bottom)},
                 "x_left": float(left),
@@ -3228,10 +3286,11 @@ def _build_manual_rows_overlay(manual_rows: list[dict]) -> tuple[list[dict], lis
             }
         )
         boundaries = [float(left), *[float(cut) for cut in (manual_row.get("cut_xs") or [])], float(right)]
+        measure_ids = _manual_row_measure_ids(manual_row, len(boundaries) - 1)
         for idx in range(len(boundaries) - 1):
             measures.append(
                 {
-                    "measure_id": _manual_measure_id(manual_row_id, idx),
+                    "measure_id": measure_ids[idx],
                     "system_id": system_id,
                     "page": int(page),
                     "system_index": 0,
@@ -3243,6 +3302,7 @@ def _build_manual_rows_overlay(manual_rows: list[dict]) -> tuple[list[dict], lis
                     "y_bottom": float(bottom),
                     "source": ROW_SOURCE_MANUAL,
                     "manual_row_id": manual_row_id,
+                    "source_manual_row_id": source_manual_row_id,
                     "staff_kind": staff_kind,
                 }
             )
@@ -3306,7 +3366,7 @@ def _reindex_system_and_measure_order(systems: list[dict], measures: list[dict])
             measure["measure_local_index"] = int(local_index)
             measure["global_index"] = int(global_index)
             global_index += 1
-            if _row_source(measure) == ROW_SOURCE_MANUAL:
+            if _row_source(measure) == ROW_SOURCE_MANUAL and not str(measure.get("measure_id") or "").strip():
                 manual_row_id = _normalize_artifact_key(measure.get("manual_row_id"))[:64]
                 if manual_row_id:
                     measure["measure_id"] = _manual_measure_id(manual_row_id, local_index)
@@ -3320,25 +3380,24 @@ def _merge_manual_rows_into_state(editable_state: dict) -> tuple[list[dict], lis
     base_auto_measures = _clone_auto_measure_rows(editable_state)
     auto_rows = _editable_auto_rows(editable_state)
     overlay_auto_systems, overlay_auto_measures = _build_auto_rows_overlay(auto_rows, editable_state)
-    if overlay_auto_systems:
-        replaced_system_ids = {
-            str(row.get("system_id") or "").strip()
-            for row in overlay_auto_systems
-            if isinstance(row, dict) and str(row.get("system_id") or "").strip()
-        }
-        auto_systems = [
-            row for row in base_auto_systems
-            if str(row.get("system_id") or "").strip() not in replaced_system_ids
-        ]
-        auto_systems.extend(overlay_auto_systems)
-        auto_measures = [
-            row for row in base_auto_measures
-            if str(row.get("system_id") or "").strip() not in replaced_system_ids
-        ]
-        auto_measures.extend(overlay_auto_measures)
-    else:
-        auto_systems = base_auto_systems
-        auto_measures = base_auto_measures
+    authoritative_pages = set(_editable_auto_rows_authoritative_pages(editable_state))
+    replaced_system_ids = {
+        str(row.get("system_id") or "").strip()
+        for row in overlay_auto_systems
+        if isinstance(row, dict) and str(row.get("system_id") or "").strip()
+    }
+    auto_systems = [
+        row for row in base_auto_systems
+        if _safe_int(row.get("page"), 0) not in authoritative_pages
+        and str(row.get("system_id") or "").strip() not in replaced_system_ids
+    ]
+    auto_systems.extend(overlay_auto_systems)
+    auto_measures = [
+        row for row in base_auto_measures
+        if _safe_int(row.get("page"), 0) not in authoritative_pages
+        and str(row.get("system_id") or "").strip() not in replaced_system_ids
+    ]
+    auto_measures.extend(overlay_auto_measures)
     manual_systems, manual_measures = _build_manual_rows_overlay(manual_rows)
     return _reindex_system_and_measure_order(auto_systems + manual_systems, auto_measures + manual_measures)
 
@@ -3991,6 +4050,19 @@ def _clear_measure_state_for_ids(editable_state: dict, measure_ids: set[str] | l
         rest_measures.pop(measure_id, None)
         pickup_measures.pop(measure_id, None)
         endings_map.pop(measure_id, None)
+    label_ids = {f"label:{measure_id}" for measure_id in ids}
+    editable_state["hidden_label_ids"] = [
+        label_id for label_id in _editable_hidden_label_ids(editable_state)
+        if label_id not in label_ids
+    ]
+    editable_state["forced_label_ids"] = [
+        label_id for label_id in _editable_forced_label_ids(editable_state)
+        if label_id not in label_ids
+    ]
+    positions = _editable_label_positions(editable_state)
+    for label_id in label_ids:
+        positions.pop(label_id, None)
+    editable_state["label_positions"] = positions
 
 
 def _measure_ids_on_pages(
@@ -6090,7 +6162,12 @@ def _pending_dispatched_at(rec: dict) -> datetime:
     return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-def _reassign_measures_to_nearest_system(systems: list[dict], measures: list[dict]) -> int:
+def _reassign_measures_to_nearest_system(
+    systems: list[dict],
+    measures: list[dict],
+    *,
+    skip_pages: set[int] | None = None,
+) -> int:
     """Post-process measures to fix system misassignment from OMR.
 
     The OMR pipeline sometimes assigns measures to the wrong system based on
@@ -6131,6 +6208,7 @@ def _reassign_measures_to_nearest_system(systems: list[dict], measures: list[dic
     reassigned = 0
 
     # Step 2: For each measure, find the best-matching system by y-overlap.
+    protected_pages = skip_pages or set()
     for m in measures:
         if _row_source(m) == ROW_SOURCE_MANUAL:
             m.pop("_system_reassigned", None)
@@ -6140,6 +6218,9 @@ def _reassign_measures_to_nearest_system(systems: list[dict], measures: list[dic
             m_y_top = float(m["y_top"])
             m_y_bot = float(m["y_bottom"])
         except (KeyError, TypeError, ValueError):
+            continue
+        if m_page in protected_pages:
+            m.pop("_system_reassigned", None)
             continue
         candidates = page_systems.get(m_page)
         if not candidates:
@@ -6216,7 +6297,7 @@ def _reassign_measures_to_nearest_system(systems: list[dict], measures: list[dic
         for local_idx, m in enumerate(group):
             m["measure_local_index"] = local_idx
             sidx = m.get("system_index", 0)
-            if _row_source(m) == ROW_SOURCE_MANUAL:
+            if _row_source(m) == ROW_SOURCE_MANUAL and not str(m.get("measure_id") or "").strip():
                 manual_row_id = _normalize_artifact_key(m.get("manual_row_id"))[:64]
                 if manual_row_id:
                     m["measure_id"] = _manual_measure_id(manual_row_id, local_idx)
@@ -6400,7 +6481,12 @@ def _refresh_editable_state_systems_and_measures(
 
     _editable_rest_measures(editable_state)
     _editable_pickup_measures(editable_state)
-    reassign_count = _reassign_measures_to_nearest_system(systems, measures)
+    authoritative_pages = set(_editable_auto_rows_authoritative_pages(editable_state))
+    reassign_count = _reassign_measures_to_nearest_system(
+        systems,
+        measures,
+        skip_pages=authoritative_pages,
+    )
     systems, measures = _reindex_system_and_measure_order(systems, measures)
     systems, measures, _, _ = _recompute_measure_numbering(
         systems,
@@ -7467,6 +7553,9 @@ def _apply_replace_auto_rows_for_page_edit(
         )
     )
     editable_state["auto_rows"] = kept_rows
+    authoritative_pages = set(_editable_auto_rows_authoritative_pages(editable_state))
+    authoritative_pages.add(int(page))
+    editable_state["auto_rows_authoritative_pages"] = sorted(authoritative_pages)
     applied.append(
         {
             "type": "replace_auto_rows_for_page",
@@ -8234,6 +8323,7 @@ def get_job_state(job_id: str):
             "version": str(editable_state.get("version") or "system_state_v1"),
             "labels_mode": str(editable_state.get("labels_mode") or LABELS_MODE_SYSTEM_ONLY),
             "auto_rows": editable_state.get("auto_rows") or [],
+            "auto_rows_authoritative_pages": _editable_auto_rows_authoritative_pages(editable_state),
             "manual_rows": editable_state.get("manual_rows") or [],
             "rest_measures": editable_state.get("rest_measures") or {},
             "pickup_measures": editable_state.get("pickup_measures") or {},
@@ -9698,17 +9788,12 @@ def relabel_job(job_id: str):
         if isinstance(row, dict) and str(row.get("type") or "").strip() == "replace_manual_rows_for_page"
     }
     if manual_pages_updated:
-        manual_measure_ids_to_clear = {
-            str(row.get("measure_id") or "").strip()
-            for row in list(measures_before) + list(editable_state.get("measures") or [])
-            if isinstance(row, dict)
-            and _row_source(row) == ROW_SOURCE_MANUAL
-            and _safe_int(row.get("page"), 0) in manual_pages_updated
-            and str(row.get("measure_id") or "").strip()
-        }
-        if manual_measure_ids_to_clear:
-            _remove_ai_suggestion_entries(mapping_summary, manual_measure_ids_to_clear)
-            _clear_measure_state_for_ids(editable_state, manual_measure_ids_to_clear)
+        manual_measure_ids_before = _measure_ids_on_pages(measures_before, manual_pages_updated, source=ROW_SOURCE_MANUAL)
+        manual_measure_ids_after = _measure_ids_on_pages(editable_state.get("measures") or [], manual_pages_updated, source=ROW_SOURCE_MANUAL)
+        removed_manual_measure_ids = manual_measure_ids_before - manual_measure_ids_after
+        if removed_manual_measure_ids:
+            _remove_ai_suggestion_entries(mapping_summary, removed_manual_measure_ids)
+            _clear_measure_state_for_ids(editable_state, removed_manual_measure_ids)
     auto_pages_updated = {
         _safe_int(row.get("page"), 0)
         for row in applied
@@ -9726,12 +9811,25 @@ def relabel_job(job_id: str):
             and _is_excluded_from_counting(row)
             and str(row.get("measure_id") or "").strip()
         }
-        stale_auto_measure_ids = (auto_measure_ids_before | auto_measure_ids_after) | excluded_auto_measure_ids
-        if stale_auto_measure_ids:
-            _remove_ai_suggestion_entries(mapping_summary, stale_auto_measure_ids)
         removed_auto_measure_ids = (auto_measure_ids_before - auto_measure_ids_after) | excluded_auto_measure_ids
         if removed_auto_measure_ids:
+            _remove_ai_suggestion_entries(mapping_summary, removed_auto_measure_ids)
             _clear_measure_state_for_ids(editable_state, removed_auto_measure_ids)
+    system_ids_before = {
+        str(row.get("system_id") or "").strip()
+        for row in systems_before
+        if isinstance(row, dict) and str(row.get("system_id") or "").strip()
+    }
+    system_ids_after = {
+        str(row.get("system_id") or "").strip()
+        for row in systems
+        if isinstance(row, dict) and str(row.get("system_id") or "").strip()
+    }
+    removed_system_ids = system_ids_before - system_ids_after
+    if removed_system_ids:
+        rest_systems = _editable_rest_systems(editable_state)
+        for system_id in removed_system_ids:
+            rest_systems.pop(system_id, None)
     state_version_after = _editable_state_version(editable_state)
 
     before_values = {}

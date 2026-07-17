@@ -1779,6 +1779,12 @@ class RelabelLogicTests(unittest.TestCase):
                     "staff_kind": "single",
                     "rect": {"left": 12.0, "right": 90.0, "top": 70.0, "bottom": 80.0},
                     "cut_xs": [40.0, 65.0],
+                    "measure_ids": [
+                        "manual_measure_rowA_m0",
+                        "manual_measure_rowA_m1",
+                        "manual_measure_rowA_m2",
+                    ],
+                    "source_manual_row_id": "rowA",
                 }
             ],
         )
@@ -1805,6 +1811,134 @@ class RelabelLogicTests(unittest.TestCase):
         manual_batch = next((batch for batch in batches if batch[0].get("manual_row_id") == "rowA"), None)
         self.assertIsNotNone(manual_batch)
         self.assertEqual(len(manual_batch[1]), 3)
+
+    def test_replace_manual_rows_can_split_row_and_preserve_remaining_measure_ids(self):
+        state = self._sample_state_with_bounds()
+        WORKER._apply_relabel_edits(
+            state,
+            [
+                {
+                    "type": "replace_manual_rows_for_page",
+                    "page": 1,
+                    "rows": [
+                        {
+                            "manual_row_id": "rowA",
+                            "staff_kind": "single",
+                            "rect": {"left": 12, "right": 90, "top": 70, "bottom": 80},
+                            "cut_xs": [40, 65],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {
+                    "type": "replace_manual_rows_for_page",
+                    "page": 1,
+                    "rows": [
+                        {
+                            "manual_row_id": "rowA",
+                            "source_manual_row_id": "rowA",
+                            "staff_kind": "single",
+                            "rect": {"left": 12, "right": 40, "top": 70, "bottom": 80},
+                            "cut_xs": [],
+                            "measure_ids": ["manual_measure_rowA_m0"],
+                        },
+                        {
+                            "manual_row_id": "rowA_split_right",
+                            "source_manual_row_id": "rowA",
+                            "staff_kind": "single",
+                            "rect": {"left": 65, "right": 90, "top": 70, "bottom": 80},
+                            "cut_xs": [],
+                            "measure_ids": ["manual_measure_rowA_m2"],
+                        },
+                    ],
+                }
+            ],
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "replace_manual_rows_for_page", "page": 1, "rows_count": 2}])
+        manual_rows = state.get("manual_rows") or []
+        self.assertEqual([row.get("manual_row_id") for row in manual_rows], ["rowA", "rowA_split_right"])
+        self.assertEqual([row.get("source_manual_row_id") for row in manual_rows], ["rowA", "rowA"])
+        manual_measure_ids = [
+            row.get("measure_id")
+            for row in (state.get("measures") or [])
+            if row.get("source") == "manual"
+        ]
+        self.assertEqual(manual_measure_ids, ["manual_measure_rowA_m0", "manual_measure_rowA_m2"])
+
+    def test_replace_auto_rows_is_authoritative_and_supports_split_fragments(self):
+        state = self._sample_state_with_bounds()
+        _, applied, rejected, _ = WORKER._apply_relabel_edits(
+            state,
+            [
+                {
+                    "type": "replace_auto_rows_for_page",
+                    "page": 1,
+                    "rows": [
+                        {
+                            "system_id": "p1_s0",
+                            "source_system_id": "p1_s0",
+                            "page": 1,
+                            "rect": {"left": 10, "right": 25, "top": 10, "bottom": 20},
+                            "boxes": [
+                                {"measure_id": "p1_s0_m0", "left": 10, "right": 25},
+                            ],
+                        },
+                        {
+                            "system_id": "p1_s0_split_right",
+                            "source_system_id": "p1_s0",
+                            "page": 1,
+                            "rect": {"left": 50, "right": 65, "top": 10, "bottom": 20},
+                            "boxes": [
+                                {"measure_id": "p1_s0_m2", "left": 50, "right": 65},
+                            ],
+                        },
+                        {
+                            "system_id": "p1_s2",
+                            "source_system_id": "p1_s2",
+                            "page": 1,
+                            "rect": {"left": 10, "right": 65, "top": 90, "bottom": 100},
+                            "boxes": [
+                                {"measure_id": "p1_s2_m0", "left": 10, "right": 25},
+                                {"measure_id": "p1_s2_m1", "left": 30, "right": 45},
+                                {"measure_id": "p1_s2_m2", "left": 50, "right": 65},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(applied, [{"type": "replace_auto_rows_for_page", "page": 1, "rows_count": 3}])
+        self.assertEqual(state.get("auto_rows_authoritative_pages"), [1])
+        page_one_systems = {
+            str(row.get("system_id") or "")
+            for row in (state.get("systems") or [])
+            if row.get("page") == 1 and row.get("source") == "auto"
+        }
+        self.assertEqual(page_one_systems, {"p1_s0", "p1_s0_split_right", "p1_s2"})
+        page_one_measure_ids = {
+            str(row.get("measure_id") or "")
+            for row in (state.get("measures") or [])
+            if row.get("page") == 1 and row.get("source") == "auto"
+        }
+        self.assertEqual(
+            page_one_measure_ids,
+            {"p1_s0_m0", "p1_s0_m2", "p1_s2_m0", "p1_s2_m1", "p1_s2_m2"},
+        )
+        right_fragment = next(
+            row for row in (state.get("systems") or [])
+            if row.get("system_id") == "p1_s0_split_right"
+        )
+        self.assertEqual(right_fragment.get("source_system_id"), "p1_s0")
+        self.assertIn("p2_s0", {str(row.get("system_id") or "") for row in (state.get("systems") or [])})
 
     def test_replace_manual_rows_for_page_grand_staff_creates_shared_row(self):
         state = self._sample_state_with_bounds()

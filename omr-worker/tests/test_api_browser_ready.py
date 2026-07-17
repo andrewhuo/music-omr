@@ -2442,7 +2442,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(remaining_completeness.keys()), ["p1_s1_m0"])
         self.assertEqual((((saved_mapping.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept")), 1)
 
-    def test_relabel_replace_auto_rows_for_page_persists_excluded_boxes_and_clears_page_ai(self):
+    def test_relabel_replace_auto_rows_for_page_persists_excluded_boxes_and_clears_only_affected_ai(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
         mapping_summary = deepcopy(self._sample_mapping_summary())
@@ -2453,6 +2453,16 @@ class BrowserReadyApiTests(unittest.TestCase):
                 "p1_s0_m1": 140,
                 "p1_s1_m0": 90,
             }.get(measure.get("measure_id"), measure.get("x_left", 0))
+        editable_state["measure_number_overrides"] = {"p1_s0_m0": 10, "p1_s1_m0": 20}
+        editable_state["rest_measures"] = {"p1_s0_m0": 2, "p1_s1_m0": 3}
+        editable_state["pickup_measures"] = {"p1_s0_m0": True, "p1_s1_m0": True}
+        editable_state["endings"] = {"p1_s0_m0": "1", "p1_s1_m0": "2"}
+        editable_state["hidden_label_ids"] = ["label:p1_s0_m0", "label:p1_s1_m0"]
+        editable_state["forced_label_ids"] = ["label:p1_s0_m0", "label:p1_s1_m0"]
+        editable_state["label_positions"] = {
+            "label:p1_s0_m0": {"page": 1, "left": 30, "top": 10},
+            "label:p1_s1_m0": {"page": 1, "left": 30, "top": 70},
+        }
         mapping_summary["ai_suggestions"] = {
             "version": "ai_suggestions_v1",
             "generated_at_utc": "2026-04-30T12:00:00Z",
@@ -2531,10 +2541,17 @@ class BrowserReadyApiTests(unittest.TestCase):
         measure_rows = {row.get("measure_id"): row for row in (editable.get("measures") or [])}
         self.assertTrue((measure_rows.get("p1_s0_m0") or {}).get("excluded_from_counting"))
         ai = saved_mapping.get("ai_suggestions") or {}
-        self.assertEqual(ai.get("by_measure_id") or {}, {})
-        self.assertEqual(ai.get("time_signatures_by_measure_id") or {}, {})
-        self.assertEqual(ai.get("measure_completeness_by_measure_id") or {}, {})
-        self.assertEqual(((ai.get("summary") or {}).get("suggestions_kept")), 0)
+        self.assertEqual(sorted((ai.get("by_measure_id") or {}).keys()), ["p1_s1_m0"])
+        self.assertEqual(sorted((ai.get("time_signatures_by_measure_id") or {}).keys()), ["p1_s1_m0"])
+        self.assertEqual(sorted((ai.get("measure_completeness_by_measure_id") or {}).keys()), ["p1_s1_m0"])
+        self.assertEqual(((ai.get("summary") or {}).get("suggestions_kept")), 1)
+        self.assertEqual(editable.get("measure_number_overrides"), {"p1_s1_m0": 20})
+        self.assertEqual(editable.get("rest_measures"), {"p1_s1_m0": 3})
+        self.assertEqual(editable.get("pickup_measures"), {"p1_s1_m0": True})
+        self.assertEqual(editable.get("endings"), {"p1_s1_m0": "2"})
+        self.assertEqual(editable.get("hidden_label_ids"), ["label:p1_s1_m0"])
+        self.assertEqual(editable.get("forced_label_ids"), ["label:p1_s1_m0"])
+        self.assertEqual(sorted((editable.get("label_positions") or {}).keys()), ["label:p1_s1_m0"])
 
     def test_normalize_ai_suggestions_result_salvages_missing_maybe_rest_count_and_bad_warnings(self):
         editable_state = (self._sample_mapping_summary().get("editable_state") or {})
