@@ -72,12 +72,24 @@ FRIEND_ACCESS_RESERVATION_TTL_SEC = 15 * 60
 FRIEND_ACCESS_HISTORY_MAX = 40
 PAID_ACCESS_COLLECTION = str(os.environ.get("PAID_ACCESS_COLLECTION", "omr_paid_access") or "omr_paid_access").strip() or "omr_paid_access"
 APPLE_PURCHASE_COLLECTION = str(os.environ.get("APPLE_PURCHASE_COLLECTION", "omr_apple_purchases") or "omr_apple_purchases").strip() or "omr_apple_purchases"
-PAID_ACCESS_DEFAULT_CREDITS = 200
 PAID_ACCESS_RESERVATION_TTL_SEC = 15 * 60
 APPLE_BUNDLE_ID = str(os.environ.get("APPLE_BUNDLE_ID", "pineapple.Sheet-Music-Labeler") or "").strip()
-APPLE_MONTHLY_PRODUCT_ID = str(
-    os.environ.get("APPLE_MONTHLY_PRODUCT_ID", "pineapple.sheetmusiclabeler.pro.monthly") or ""
+APPLE_PLUS_PRODUCT_ID = str(
+    os.environ.get(
+        "APPLE_PLUS_PRODUCT_ID",
+        os.environ.get("APPLE_MONTHLY_PRODUCT_ID", "pineapple.sheetmusiclabeler.pro.monthly"),
+    )
+    or ""
 ).strip()
+APPLE_PRO_PRODUCT_ID = str(
+    os.environ.get("APPLE_PRO_PRODUCT_ID", "pineapple.sheetmusiclabeler.pro600.monthly") or ""
+).strip()
+APPLE_MONTHLY_PRODUCT_ID = APPLE_PLUS_PRODUCT_ID
+APPLE_SUBSCRIPTION_PRODUCTS = {
+    APPLE_PLUS_PRODUCT_ID: {"plan": "plus", "display_name": "Plus", "credits": 200},
+    APPLE_PRO_PRODUCT_ID: {"plan": "pro", "display_name": "Pro", "credits": 600},
+}
+PAID_ACCESS_DEFAULT_CREDITS = int(APPLE_SUBSCRIPTION_PRODUCTS[APPLE_PLUS_PRODUCT_ID]["credits"])
 APPLE_CREDIT_PACKS = {
     "pineapple.sheetmusiclabeler.credits.60": 60,
     "pineapple.sheetmusiclabeler.credits.140": 140,
@@ -1144,7 +1156,7 @@ def _friend_bearer_token() -> str:
 def _friend_parse_access_token(token: str) -> tuple[str, str]:
     device_key, separator, secret = str(token or "").strip().partition(".")
     if separator != "." or not re.fullmatch(r"[0-9a-f]{64}", device_key) or len(secret) < 32:
-        raise FriendAccessError("ai_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+        raise FriendAccessError("ai_access_required", "AI Suggestions require Plus, Pro, or Friend Access.", 403)
     return device_key, secret
 
 
@@ -1160,11 +1172,11 @@ def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | Non
         snap = ref.get(transaction=transaction)
         data = snap.to_dict() if bool(getattr(snap, "exists", False)) else None
         if not isinstance(data, dict):
-            raise FriendAccessError("ai_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+            raise FriendAccessError("ai_access_required", "AI Suggestions require Plus, Pro, or Friend Access.", 403)
         expected = str(data.get("token_hash") or "")
         actual = hashlib.sha256(secret.encode("utf-8")).hexdigest()
         if not expected or not hmac.compare_digest(actual, expected):
-            raise FriendAccessError("ai_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+            raise FriendAccessError("ai_access_required", "AI Suggestions require Plus, Pro, or Friend Access.", 403)
         if str(data.get("status") or "").lower() == "banned":
             raise FriendAccessError("friend_access_banned", "Friend Access is unavailable for this device.", 403)
         data = _friend_reset_month(data, config, now)
@@ -1190,6 +1202,7 @@ def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | Non
             "device_key": device_key,
             "reservation_id": reservation_id,
             "credits_remaining": max(0, _safe_int(data.get("credits_remaining"), 0)),
+            "monthly_credit_capacity": _friend_monthly_limit(config),
             "expires_at_utc": _to_utc_z(datetime(now.year + (1 if now.month == 12 else 0), 1 if now.month == 12 else now.month + 1, 1, tzinfo=timezone.utc)),
         }
 
@@ -1245,7 +1258,7 @@ def _friend_ai_access(*, reserve: bool = False, job_id: str | None = None, syste
     if not token and not _friend_access_enforced():
         return {"active": True, "bypass": True, "reservation_id": None}
     if not token:
-        raise FriendAccessError("ai_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+        raise FriendAccessError("ai_access_required", "AI Suggestions require Plus, Pro, or Friend Access.", 403)
     try:
         return _friend_verify_token(token, reserve=reserve, job_id=job_id, system_id=system_id)
     except FriendAccessError:
@@ -1437,7 +1450,18 @@ def _apple_transaction_data(payload, *, allowed_products: set[str]) -> dict:
 
 
 def _paid_transaction_data(payload) -> dict:
-    return _apple_transaction_data(payload, allowed_products={APPLE_MONTHLY_PRODUCT_ID})
+    return _apple_transaction_data(payload, allowed_products=set(APPLE_SUBSCRIPTION_PRODUCTS))
+
+
+def _paid_plan_details(product_id: str) -> dict:
+    details = APPLE_SUBSCRIPTION_PRODUCTS.get(str(product_id or "").strip())
+    if not isinstance(details, dict):
+        raise PaidAccessError("apple_purchase_invalid", "This purchase does not belong to this app plan.", 403)
+    return {
+        "plan": str(details.get("plan") or "plus"),
+        "display_name": str(details.get("display_name") or "Plus"),
+        "credits": max(0, _safe_int(details.get("credits"), 0)),
+    }
 
 
 def _pack_transaction_data(payload) -> dict:
@@ -1510,6 +1534,7 @@ def _paid_is_active(data: dict, now: datetime | None = None) -> bool:
 
 def _paid_apply_transaction(payload, *, app_transaction_id: str | None = None, device_id: str | None = None, issue_token: bool = False) -> dict:
     transaction_data = _paid_transaction_data(payload)
+    plan = _paid_plan_details(transaction_data["product_id"])
     client = _friend_store_client()
     if client is None:
         raise PaidAccessError("paid_access_unavailable", "Paid Access is temporarily unavailable.", 503, retryable=True)
@@ -1531,7 +1556,7 @@ def _paid_apply_transaction(payload, *, app_transaction_id: str | None = None, d
         is_new_period = transaction_data["transaction_id"] not in processed
         if is_new_period:
             processed.append(transaction_data["transaction_id"])
-            data["subscription_credits_remaining"] = PAID_ACCESS_DEFAULT_CREDITS if active else 0
+            data["subscription_credits_remaining"] = plan["credits"] if active else 0
             data["subscription_credits_used"] = 0
             data["credits_remaining"] = data["subscription_credits_remaining"]
             data["credits_used"] = 0
@@ -1539,6 +1564,9 @@ def _paid_apply_transaction(payload, *, app_transaction_id: str | None = None, d
         data.update(
             {
                 "product_id": transaction_data["product_id"],
+                "plan": plan["plan"],
+                "plan_display_name": plan["display_name"],
+                "monthly_credit_capacity": plan["credits"],
                 "bundle_id": transaction_data["bundle_id"],
                 "environment": transaction_data["environment"],
                 "original_transaction_id": transaction_data["original_transaction_id"],
@@ -1571,12 +1599,14 @@ def _paid_apply_transaction(payload, *, app_transaction_id: str | None = None, d
     except Exception as exc:
         logger.warning("PAID_ACCESS_SAVE_WARN detail=%s", _safe_error_text(exc))
         raise PaidAccessError("paid_access_unavailable", "Paid Access is temporarily unavailable.", 503, retryable=True) from exc
-    if not active:
-        raise PaidAccessError("paid_subscription_inactive", "This subscription is not currently active.", 403)
     return {
-        "active": True,
+        "active": bool(active),
         "paid_id": record_key[:10].upper(),
-        "credits_remaining": max(0, _safe_int(saved.get("credits_remaining", saved.get("subscription_credits_remaining")), 0)),
+        "plan": str(saved.get("plan") or plan["plan"]),
+        "plan_display_name": str(saved.get("plan_display_name") or plan["display_name"]),
+        "monthly_credit_capacity": max(0, _safe_int(saved.get("monthly_credit_capacity"), plan["credits"])) if active else 0,
+        "status": str(saved.get("status") or ("active" if active else "inactive")),
+        "credits_remaining": max(0, _safe_int(saved.get("credits_remaining", saved.get("subscription_credits_remaining")), 0)) if active else 0,
         "purchased_credits_remaining": max(0, _safe_int(saved.get("purchased_credits_remaining"), 0)),
         "expires_at_utc": saved.get("expires_at_utc"),
         "new_period": bool(is_new_period),
@@ -1714,7 +1744,7 @@ def _pack_refund_transaction(payload) -> dict:
 def _paid_parse_access_token(token: str) -> tuple[str, str, str]:
     pieces = str(token or "").strip().split(".")
     if len(pieces) != 3 or not all(re.fullmatch(r"[0-9a-f]{64}", value or "") for value in pieces[:2]) or len(pieces[2]) < 32:
-        raise PaidAccessError("paid_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+        raise PaidAccessError("paid_access_required", "AI Suggestions require Plus, Pro, or Friend Access.", 403)
     return pieces[0], pieces[1], pieces[2]
 
 
@@ -1731,14 +1761,21 @@ def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None 
         snap = ref.get(transaction=transaction)
         data = snap.to_dict() if bool(getattr(snap, "exists", False)) else None
         if not isinstance(data, dict):
-            raise PaidAccessError("paid_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+            raise PaidAccessError("paid_access_required", "AI Suggestions require Plus, Pro, or Friend Access.", 403)
         device = (data.get("device_tokens") or {}).get(device_key) or {}
         expected = str(device.get("token_hash") or "")
         actual = hashlib.sha256(secret.encode("utf-8")).hexdigest()
         if not expected or not hmac.compare_digest(expected, actual):
-            raise PaidAccessError("paid_access_required", "AI Suggestions require Pro or Friend Access.", 403)
+            raise PaidAccessError("paid_access_required", "AI Suggestions require Plus, Pro, or Friend Access.", 403)
         data = _paid_release_stale_reservations(data, now)
         pro_active = _paid_is_active(data, now)
+        stored_plan = APPLE_SUBSCRIPTION_PRODUCTS.get(str(data.get("product_id") or "")) or {}
+        plan_name = str(data.get("plan") or stored_plan.get("plan") or "plus")
+        plan_display_name = str(data.get("plan_display_name") or stored_plan.get("display_name") or "Plus")
+        monthly_capacity = max(
+            0,
+            _safe_int(data.get("monthly_credit_capacity"), stored_plan.get("credits", PAID_ACCESS_DEFAULT_CREDITS)),
+        ) if pro_active else 0
         legacy_remaining = data.get("credits_remaining")
         pro_remaining = max(0, _safe_int(legacy_remaining if legacy_remaining is not None else data.get("subscription_credits_remaining"), 0)) if pro_active else 0
         purchased_remaining = max(0, _safe_int(data.get("purchased_credits_remaining"), 0))
@@ -1748,7 +1785,7 @@ def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None 
             raise PaidAccessError("paid_subscription_inactive", "No paid AI credits are available.", 403)
         selected_source = str(source or ("pro" if pro_remaining > 0 else "purchased"))
         if reserve and selected_source == "pro" and pro_remaining <= 0:
-            raise PaidAccessError("paid_credits_exhausted", "Pro AI credits are used up for this billing period.", 403)
+            raise PaidAccessError("paid_credits_exhausted", "Paid AI credits are used up for this billing period.", 403)
         if reserve and selected_source == "purchased" and purchased_remaining <= 0:
             raise PaidAccessError("paid_credits_exhausted", "Purchased AI credits are used up.", 403)
         if reserve:
@@ -1779,6 +1816,10 @@ def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None 
             "record_key": record_key,
             "reservation_id": reservation_id,
             "paid_id": record_key[:10].upper(),
+            "plan": plan_name if pro_active else None,
+            "plan_display_name": plan_display_name if pro_active else None,
+            "monthly_credit_capacity": monthly_capacity,
+            "subscription_status": str(data.get("status") or ("active" if pro_active else "inactive")),
             "source": selected_source,
             "credits_remaining": pro_remaining,
             "pro_credits_remaining": pro_remaining,
@@ -1865,7 +1906,7 @@ def _ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: s
             paid = _paid_verify_token(paid_token)
             if paid.get("pro_active") and max(0, _safe_int(paid.get("pro_credits_remaining"), 0)) > 0:
                 candidates.append((str(paid.get("expires_at_utc") or "9999"), 1, "pro"))
-            if max(0, _safe_int(paid.get("purchased_credits_remaining"), 0)) > 0:
+            if _apple_packs_enabled() and max(0, _safe_int(paid.get("purchased_credits_remaining"), 0)) > 0:
                 candidates.append(("9999", 2, "purchased"))
         except PaidAccessError as exc:
             if exc.retryable:
@@ -1946,11 +1987,21 @@ def _paid_restore_wallet(*, app_transaction_id: str, device_id: str) -> dict:
         return data
 
     saved = _friend_run_transaction(client, _restore)
+    subscription_active = _paid_is_active(saved, now)
+    stored_plan = APPLE_SUBSCRIPTION_PRODUCTS.get(str(saved.get("product_id") or "")) or {}
+    monthly_capacity = max(
+        0,
+        _safe_int(saved.get("monthly_credit_capacity"), stored_plan.get("credits", PAID_ACCESS_DEFAULT_CREDITS)),
+    ) if subscription_active else 0
     return {
         "paid_id": record_key[:10].upper(),
         "access_token": token_box["value"],
-        "pro_active": _paid_is_active(saved, now),
-        "pro_credits_remaining": max(0, _safe_int(saved.get("subscription_credits_remaining", saved.get("credits_remaining")), 0)) if _paid_is_active(saved, now) else 0,
+        "pro_active": subscription_active,
+        "plan": str(saved.get("plan") or stored_plan.get("plan") or "plus") if subscription_active else None,
+        "plan_display_name": str(saved.get("plan_display_name") or stored_plan.get("display_name") or "Plus") if subscription_active else None,
+        "monthly_credit_capacity": monthly_capacity,
+        "subscription_status": str(saved.get("status") or ("active" if subscription_active else "inactive")),
+        "pro_credits_remaining": max(0, _safe_int(saved.get("subscription_credits_remaining", saved.get("credits_remaining")), 0)) if subscription_active else 0,
         "purchased_credits_remaining": max(0, _safe_int(saved.get("purchased_credits_remaining"), 0)),
         "purchased_credit_debt": max(0, _safe_int(saved.get("purchased_credit_debt"), 0)),
         "expires_at_utc": saved.get("expires_at_utc"),
@@ -1981,14 +2032,26 @@ def _combined_credit_status() -> dict:
         raise errors[0]
     friend_credits = max(0, _safe_int((friend_result or {}).get("credits_remaining"), 0))
     pro_credits = max(0, _safe_int((paid_result or {}).get("pro_credits_remaining"), 0))
-    purchased_credits = max(0, _safe_int((paid_result or {}).get("purchased_credits_remaining"), 0))
+    purchased_credits = (
+        max(0, _safe_int((paid_result or {}).get("purchased_credits_remaining"), 0))
+        if _apple_packs_enabled()
+        else 0
+    )
+    friend_capacity = max(0, _safe_int((friend_result or {}).get("monthly_credit_capacity"), 0))
+    paid_capacity = max(0, _safe_int((paid_result or {}).get("monthly_credit_capacity"), 0))
     return {
         "friend_credits": friend_credits,
         "pro_credits": pro_credits,
         "purchased_credits": purchased_credits,
         "total_credits": friend_credits + pro_credits + purchased_credits,
+        "friend_monthly_capacity": friend_capacity,
+        "paid_monthly_capacity": paid_capacity,
+        "total_monthly_capacity": friend_capacity + paid_capacity,
         "friend_active": bool(friend_result),
         "pro_active": bool((paid_result or {}).get("pro_active")),
+        "paid_plan": (paid_result or {}).get("plan"),
+        "paid_plan_display_name": (paid_result or {}).get("plan_display_name"),
+        "paid_subscription_status": (paid_result or {}).get("subscription_status"),
         "paid_wallet_active": bool(paid_result and (pro_credits + purchased_credits) > 0),
         "friend_id": (friend_result or {}).get("friend_id"),
         "paid_id": (paid_result or {}).get("paid_id"),
@@ -2010,8 +2073,8 @@ def _paid_update_notification_state(payload, *, notification_type: str, grace_ex
         status = "refunded" if event == "REFUND" else "revoked"
     elif event in {"EXPIRED", "GRACE_PERIOD_EXPIRED"}:
         status = "expired"
-    elif event in {"DID_FAIL_TO_RENEW"} and grace_expires_at is not None and _utc_now() < grace_expires_at:
-        status = "billing_grace"
+    elif event in {"DID_FAIL_TO_RENEW"}:
+        status = "billing_grace" if grace_expires_at is not None and _utc_now() < grace_expires_at else "billing_retry"
 
     def _update(transaction):
         snap = ref.get(transaction=transaction)
@@ -7941,6 +8004,27 @@ def health():
     return "omr-worker is running", 200
 
 
+@app.route("/privacy", methods=["GET"])
+def privacy_policy():
+    return (
+        """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sheet Music Labeler Privacy Policy</title>
+<style>body{font:16px -apple-system,BlinkMacSystemFont,sans-serif;line-height:1.55;max-width:760px;margin:40px auto;padding:0 20px;color:#202124}h1,h2{line-height:1.2}h2{margin-top:28px}small{color:#666}</style>
+</head><body><h1>Sheet Music Labeler Privacy Policy</h1><small>Last updated July 17, 2026</small>
+<p>Sheet Music Labeler processes sheet-music PDFs so it can detect measures, apply labels, provide manual editing, and, when enabled, generate AI suggestions.</p>
+<h2>Information we process</h2><p>We process PDFs you upload, generated output files, job and error diagnostics, random device identifiers used for Friend or paid access, Apple transaction identifiers, subscription status, and AI credit usage. We do not collect or store your payment-card information.</p>
+<h2>How information is used</h2><p>We use this information only to provide and secure the app, restore jobs, verify access, count AI usage, diagnose failures, and prevent duplicate purchases or charges.</p>
+<h2>Service providers</h2><p>Processing may use Apple, Google Cloud, GitHub Actions, and Amazon Web Services, including Amazon Bedrock for AI features. These providers process data as needed to deliver their services.</p>
+<h2>Storage and sharing</h2><p>We do not sell personal information. Files and operational records are retained only as needed to provide the service, restore results, protect purchases, and troubleshoot the app. Access records do not contain your plain Friend Code or plain access token.</p>
+<h2>Your choices</h2><p>You can avoid AI processing by not using AI Suggestions. You may request help with, or deletion of, associated service data by contacting us.</p>
+<h2>Contact</h2><p>Email <a href="mailto:suggestions.pineapple@gmail.com">suggestions.pineapple@gmail.com</a>.</p>
+</body></html>""",
+        200,
+        {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=3600"},
+    )
+
+
 @app.route("/process", methods=["POST"])
 def process_stub():
     # Backward-compatible stub endpoint.
@@ -8438,8 +8522,12 @@ def verify_paid_access():
         jsonify(
             {
                 "paid_access": {
-                    "active": True,
+                    "active": bool(result["active"]),
                     "paid_id": result["paid_id"],
+                    "plan": result["plan"],
+                    "plan_display_name": result["plan_display_name"],
+                    "monthly_credit_capacity": result["monthly_credit_capacity"],
+                    "status": result["status"],
                     "credits_remaining": result["credits_remaining"],
                     "purchased_credits_remaining": result["purchased_credits_remaining"],
                     "expires_at_utc": result["expires_at_utc"],
@@ -8463,6 +8551,10 @@ def get_paid_access_status():
                 "paid_access": {
                     "active": bool(result.get("pro_active")),
                     "paid_id": result["paid_id"],
+                    "plan": result.get("plan"),
+                    "plan_display_name": result.get("plan_display_name"),
+                    "monthly_credit_capacity": result.get("monthly_credit_capacity", 0),
+                    "status": result.get("subscription_status"),
                     "credits_remaining": result["pro_credits_remaining"],
                     "purchased_credits_remaining": result["purchased_credits_remaining"],
                     "expires_at_utc": result["expires_at_utc"],
@@ -8535,7 +8627,7 @@ def apple_app_store_notification():
                 result = _pack_refund_transaction(transaction)
             else:
                 result = {"status": "ignored_pack_event"}
-        elif notification_type in {"SUBSCRIBED", "DID_RENEW", "OFFER_REDEEMED"}:
+        elif notification_type in {"SUBSCRIBED", "DID_RENEW", "OFFER_REDEEMED", "DID_CHANGE_RENEWAL_PREF"}:
             result = _paid_apply_transaction(transaction)
         else:
             grace_expires_at = None

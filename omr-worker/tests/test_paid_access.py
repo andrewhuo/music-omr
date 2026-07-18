@@ -101,7 +101,7 @@ class PaidAccessTests(unittest.TestCase):
         key = WORKER._apple_wallet_key("app-wallet-1")
         return self.store.rows[(WORKER.PAID_ACCESS_COLLECTION, key)]
 
-    def test_initial_purchase_grants_exactly_200(self):
+    def test_initial_plus_purchase_grants_exactly_200(self):
         result = WORKER._paid_apply_transaction(
             _apple_payload(),
             device_id="device-identifier-1234",
@@ -111,6 +111,18 @@ class PaidAccessTests(unittest.TestCase):
         self.assertEqual(result["credits_remaining"], 200)
         self.assertTrue(result["new_period"])
         self.assertTrue(result["access_token"])
+        self.assertEqual(result["plan"], "plus")
+        self.assertEqual(result["monthly_credit_capacity"], 200)
+
+    def test_initial_pro_purchase_grants_exactly_600(self):
+        result = WORKER._paid_apply_transaction(
+            _apple_payload(product_id=WORKER.APPLE_PRO_PRODUCT_ID),
+            device_id="device-identifier-1234",
+            issue_token=True,
+        )
+        self.assertEqual(result["plan"], "pro")
+        self.assertEqual(result["credits_remaining"], 600)
+        self.assertEqual(result["monthly_credit_capacity"], 600)
 
     def test_repeated_transaction_does_not_grant_again(self):
         WORKER._paid_apply_transaction(_apple_payload())
@@ -127,13 +139,41 @@ class PaidAccessTests(unittest.TestCase):
         self.assertEqual(result["credits_remaining"], 200)
         self.assertEqual(self._record()["credits_used"], 0)
 
+    def test_upgrade_to_pro_resets_once_to_600(self):
+        WORKER._paid_apply_transaction(_apple_payload())
+        self._record()["credits_remaining"] = 23
+        upgraded = WORKER._paid_apply_transaction(
+            _apple_payload("tx-2", product_id=WORKER.APPLE_PRO_PRODUCT_ID)
+        )
+        self.assertEqual(upgraded["plan"], "pro")
+        self.assertEqual(upgraded["credits_remaining"], 600)
+        repeated = WORKER._paid_apply_transaction(
+            _apple_payload("tx-2", product_id=WORKER.APPLE_PRO_PRODUCT_ID)
+        )
+        self.assertFalse(repeated["new_period"])
+        self.assertEqual(repeated["credits_remaining"], 600)
+
+    def test_pro_renewal_resets_to_600_and_downgrade_resets_to_200(self):
+        WORKER._paid_apply_transaction(_apple_payload(product_id=WORKER.APPLE_PRO_PRODUCT_ID))
+        self._record()["credits_remaining"] = 7
+        renewed = WORKER._paid_apply_transaction(
+            _apple_payload("tx-2", product_id=WORKER.APPLE_PRO_PRODUCT_ID)
+        )
+        self.assertEqual(renewed["plan"], "pro")
+        self.assertEqual(renewed["credits_remaining"], 600)
+        self._record()["credits_remaining"] = 400
+        downgraded = WORKER._paid_apply_transaction(_apple_payload("tx-3"))
+        self.assertEqual(downgraded["plan"], "plus")
+        self.assertEqual(downgraded["credits_remaining"], 200)
+
     def test_expired_and_revoked_purchase_are_inactive(self):
-        with self.assertRaises(WORKER.PaidAccessError) as expired:
-            WORKER._paid_apply_transaction(_apple_payload(expires_days=-1))
-        self.assertEqual(expired.exception.code, "paid_subscription_inactive")
-        with self.assertRaises(WORKER.PaidAccessError) as revoked:
-            WORKER._paid_apply_transaction(_apple_payload("tx-2", revoked=True))
-        self.assertEqual(revoked.exception.code, "paid_subscription_inactive")
+        expired = WORKER._paid_apply_transaction(_apple_payload(expires_days=-1))
+        self.assertFalse(expired["active"])
+        self.assertEqual(expired["credits_remaining"], 0)
+        revoked = WORKER._paid_apply_transaction(_apple_payload("tx-2", revoked=True))
+        self.assertFalse(revoked["active"])
+        self.assertEqual(revoked["status"], "revoked")
+        self.assertEqual(revoked["credits_remaining"], 0)
 
     def test_wrong_bundle_or_product_fails_closed(self):
         for payload in (
@@ -175,6 +215,14 @@ class PaidAccessTests(unittest.TestCase):
         row["grace_expires_at_utc"] = "2026-01-02T00:00:00Z"
         self.assertFalse(WORKER._paid_is_active(row))
 
+    def test_failed_renewal_records_billing_problem(self):
+        WORKER._paid_apply_transaction(_apple_payload())
+        result = WORKER._paid_update_notification_state(
+            _apple_payload(), notification_type="DID_FAIL_TO_RENEW"
+        )
+        self.assertEqual(result["status"], "billing_retry")
+        self.assertEqual(self._record()["status"], "billing_retry")
+
     def test_disabled_rollout_rejects_purchase_without_touching_store(self):
         WORKER.request = SimpleNamespace(
             get_json=lambda silent=True: {"device_id": "device-identifier-1234", "signed_transaction": "x"},
@@ -185,6 +233,12 @@ class PaidAccessTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual((body.get("error") or {}).get("code"), "apple_purchase_not_enabled")
         self.assertEqual(self.store.rows, {})
+
+    def test_privacy_policy_is_public_html(self):
+        body, status, headers = WORKER.privacy_policy()
+        self.assertEqual(status, 200)
+        self.assertIn("Sheet Music Labeler Privacy Policy", body)
+        self.assertEqual(headers["Content-Type"], "text/html; charset=utf-8")
 
     def test_invalid_paid_token_stops_ai_before_processing(self):
         WORKER.request = SimpleNamespace(headers={"X-OMR-Paid-Token": "invalid"})
@@ -287,7 +341,33 @@ class PaidAccessTests(unittest.TestCase):
         self.assertEqual(paid_verify.call_args.kwargs["source"], "pro")
         self.assertEqual(friend_verify.call_count, 1)
 
-    def test_bad_friend_token_does_not_block_valid_paid_wallet(self):
+    def test_combined_status_reports_plan_and_monthly_capacity(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        friend_status = {
+            "active": True,
+            "friend_id": "F",
+            "credits_remaining": 496,
+            "monthly_credit_capacity": 500,
+        }
+        paid_status = {
+            "active": True,
+            "paid_id": "P",
+            "pro_active": True,
+            "pro_credits_remaining": 590,
+            "purchased_credits_remaining": 0,
+            "monthly_credit_capacity": 600,
+            "plan": "pro",
+            "plan_display_name": "Pro",
+        }
+        with patch.object(WORKER, "_friend_verify_token", return_value=friend_status), patch.object(
+            WORKER, "_paid_verify_token", return_value=paid_status
+        ):
+            result = WORKER._combined_credit_status()
+        self.assertEqual(result["paid_plan"], "pro")
+        self.assertEqual(result["total_credits"], 1086)
+        self.assertEqual(result["total_monthly_capacity"], 1100)
+
+    def test_disabled_pack_balance_does_not_unlock_ai(self):
         WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer bad", "X-OMR-Paid-Token": "paid"})
         paid_status = {
             "paid_id": "P",
@@ -300,8 +380,15 @@ class PaidAccessTests(unittest.TestCase):
             WORKER, "_friend_verify_token", side_effect=WORKER.FriendAccessError("ai_access_required", "bad", 403)
         ), patch.object(WORKER, "_paid_verify_token", return_value=paid_status):
             result = WORKER._combined_credit_status()
-        self.assertEqual(result["purchased_credits"], 60)
-        self.assertEqual(result["total_credits"], 60)
+        self.assertEqual(result["purchased_credits"], 0)
+        self.assertEqual(result["total_credits"], 0)
+
+        WORKER.request = SimpleNamespace(headers={"X-OMR-Paid-Token": "paid"})
+        with patch.object(WORKER, "_paid_verify_token", return_value=paid_status), self.assertRaises(
+            WORKER.PaidAccessError
+        ) as raised:
+            WORKER._ai_access()
+        self.assertEqual(raised.exception.code, "paid_credits_exhausted")
 
     def test_invalid_pack_product_fails_closed(self):
         with self.assertRaises(WORKER.PaidAccessError) as raised:
