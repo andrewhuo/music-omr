@@ -8283,7 +8283,10 @@ def get_job_state(job_id: str):
         return (
             jsonify(
                 {
-                    "error": "requested job_id does not match single-latest artifacts",
+                    "error": {
+                        "code": "resume_artifacts_mismatch",
+                        "message": "requested job_id does not match single-latest artifacts",
+                    },
                     "job_id": job_id,
                     "requested_run_id": exc.requested_run_id,
                     "artifact_run_id": exc.artifact_run_id,
@@ -8291,12 +8294,38 @@ def get_job_state(job_id: str):
             ),
             409,
         )
+    except FileNotFoundError:
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "code": "resume_artifacts_missing",
+                        "message": "Previous job artifacts are no longer available.",
+                    },
+                    "job_id": job_id,
+                    "run_id": run_id,
+                }
+            ),
+            410,
+        )
     except Exception as exc:
         return jsonify({"error": f"failed to load state: {exc}", "job_id": job_id, "run_id": run_id}), 502
 
-    editable_state = mapping_summary.get("editable_state") or {}
+    editable_state = mapping_summary.get("editable_state")
     if not isinstance(editable_state, dict):
-        return jsonify({"error": "editable_state missing in mapping_summary", "job_id": job_id, "run_id": run_id}), 409
+        return (
+            jsonify(
+                {
+                    "error": {
+                        "code": "resume_state_unusable",
+                        "message": "Previous job state is no longer usable.",
+                    },
+                    "job_id": job_id,
+                    "run_id": run_id,
+                }
+            ),
+            410,
+        )
 
     systems = editable_state.get("systems")
     if not isinstance(systems, list):

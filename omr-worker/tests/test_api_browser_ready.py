@@ -560,6 +560,55 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(((body.get("ai_suggest_run") or {}).get("status")), "idle")
         self.assertNotIn(WORKER.AI_COST_SUMMARY_KEY, body)
 
+    def test_get_job_state_marks_missing_artifacts_as_gone(self):
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, None, None)),
+            patch.object(
+                WORKER,
+                "_load_mapping_for_run",
+                side_effect=FileNotFoundError("per-run artifacts not found"),
+            ),
+        ):
+            body, status = _unpack(WORKER.get_job_state("missing-artifacts"))
+
+        self.assertEqual(status, 410)
+        self.assertEqual((body.get("error") or {}).get("code"), "resume_artifacts_missing")
+
+    def test_get_job_state_keeps_temporary_storage_failure_retryable(self):
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, None, None)),
+            patch.object(
+                WORKER,
+                "_load_mapping_for_run",
+                side_effect=RuntimeError("storage temporarily unavailable"),
+            ),
+        ):
+            body, status = _unpack(WORKER.get_job_state("temporary-storage-error"))
+
+        self.assertEqual(status, 502)
+        self.assertIn("storage temporarily unavailable", str(body.get("error") or ""))
+
+    def test_get_job_state_marks_missing_editable_state_as_unusable(self):
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, None, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=({}, {}, 111)),
+        ):
+            body, status = _unpack(WORKER.get_job_state("missing-state"))
+
+        self.assertEqual(status, 410)
+        self.assertEqual((body.get("error") or {}).get("code"), "resume_state_unusable")
+
+    def test_get_job_returns_404_for_unknown_saved_job(self):
+        with patch.object(
+            WORKER,
+            "_resolve_run_id_from_job_id",
+            return_value=(None, None, "unknown job_id: gone-job"),
+        ):
+            body, status = _unpack(WORKER.get_job("gone-job"))
+
+        self.assertEqual(status, 404)
+        self.assertIn("unknown job_id", str(body.get("error") or ""))
+
     def test_list_jobs_endpoint_returns_simple_rows(self):
         now = WORKER._utc_now()
         WORKER._PENDING_DISPATCHES["abc123"] = {
