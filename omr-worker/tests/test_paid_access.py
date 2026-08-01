@@ -114,15 +114,15 @@ class PaidAccessTests(unittest.TestCase):
         self.assertEqual(result["plan"], "plus")
         self.assertEqual(result["monthly_credit_capacity"], 200)
 
-    def test_initial_pro_purchase_grants_exactly_600(self):
+    def test_initial_pro_purchase_grants_exactly_500(self):
         result = WORKER._paid_apply_transaction(
             _apple_payload(product_id=WORKER.APPLE_PRO_PRODUCT_ID),
             device_id="device-identifier-1234",
             issue_token=True,
         )
         self.assertEqual(result["plan"], "pro")
-        self.assertEqual(result["credits_remaining"], 600)
-        self.assertEqual(result["monthly_credit_capacity"], 600)
+        self.assertEqual(result["credits_remaining"], 500)
+        self.assertEqual(result["monthly_credit_capacity"], 500)
 
     def test_repeated_transaction_does_not_grant_again(self):
         WORKER._paid_apply_transaction(_apple_payload())
@@ -139,28 +139,28 @@ class PaidAccessTests(unittest.TestCase):
         self.assertEqual(result["credits_remaining"], 200)
         self.assertEqual(self._record()["credits_used"], 0)
 
-    def test_upgrade_to_pro_resets_once_to_600(self):
+    def test_upgrade_to_pro_resets_once_to_500(self):
         WORKER._paid_apply_transaction(_apple_payload())
         self._record()["credits_remaining"] = 23
         upgraded = WORKER._paid_apply_transaction(
             _apple_payload("tx-2", product_id=WORKER.APPLE_PRO_PRODUCT_ID)
         )
         self.assertEqual(upgraded["plan"], "pro")
-        self.assertEqual(upgraded["credits_remaining"], 600)
+        self.assertEqual(upgraded["credits_remaining"], 500)
         repeated = WORKER._paid_apply_transaction(
             _apple_payload("tx-2", product_id=WORKER.APPLE_PRO_PRODUCT_ID)
         )
         self.assertFalse(repeated["new_period"])
-        self.assertEqual(repeated["credits_remaining"], 600)
+        self.assertEqual(repeated["credits_remaining"], 500)
 
-    def test_pro_renewal_resets_to_600_and_downgrade_resets_to_200(self):
+    def test_pro_renewal_resets_to_500_and_downgrade_resets_to_200(self):
         WORKER._paid_apply_transaction(_apple_payload(product_id=WORKER.APPLE_PRO_PRODUCT_ID))
         self._record()["credits_remaining"] = 7
         renewed = WORKER._paid_apply_transaction(
             _apple_payload("tx-2", product_id=WORKER.APPLE_PRO_PRODUCT_ID)
         )
         self.assertEqual(renewed["plan"], "pro")
-        self.assertEqual(renewed["credits_remaining"], 600)
+        self.assertEqual(renewed["credits_remaining"], 500)
         self._record()["credits_remaining"] = 400
         downgraded = WORKER._paid_apply_transaction(_apple_payload("tx-3"))
         self.assertEqual(downgraded["plan"], "plus")
@@ -346,16 +346,16 @@ class PaidAccessTests(unittest.TestCase):
         friend_status = {
             "active": True,
             "friend_id": "F",
-            "credits_remaining": 496,
+            "credits_remaining": 500,
             "monthly_credit_capacity": 500,
         }
         paid_status = {
             "active": True,
             "paid_id": "P",
             "pro_active": True,
-            "pro_credits_remaining": 590,
+            "pro_credits_remaining": 500,
             "purchased_credits_remaining": 0,
-            "monthly_credit_capacity": 600,
+            "monthly_credit_capacity": 500,
             "plan": "pro",
             "plan_display_name": "Pro",
         }
@@ -364,8 +364,8 @@ class PaidAccessTests(unittest.TestCase):
         ):
             result = WORKER._combined_credit_status()
         self.assertEqual(result["paid_plan"], "pro")
-        self.assertEqual(result["total_credits"], 1086)
-        self.assertEqual(result["total_monthly_capacity"], 1100)
+        self.assertEqual(result["total_credits"], 1000)
+        self.assertEqual(result["total_monthly_capacity"], 1000)
 
     def test_disabled_pack_balance_does_not_unlock_ai(self):
         WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer bad", "X-OMR-Paid-Token": "paid"})

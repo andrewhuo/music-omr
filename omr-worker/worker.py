@@ -82,12 +82,12 @@ APPLE_PLUS_PRODUCT_ID = str(
     or ""
 ).strip()
 APPLE_PRO_PRODUCT_ID = str(
-    os.environ.get("APPLE_PRO_PRODUCT_ID", "pineapple.sheetmusiclabeler.pro600.monthly") or ""
+    os.environ.get("APPLE_PRO_PRODUCT_ID", "pineapple.sheetmusiclabeler.pro500.monthly") or ""
 ).strip()
 APPLE_MONTHLY_PRODUCT_ID = APPLE_PLUS_PRODUCT_ID
 APPLE_SUBSCRIPTION_PRODUCTS = {
     APPLE_PLUS_PRODUCT_ID: {"plan": "plus", "display_name": "Plus", "credits": 200},
-    APPLE_PRO_PRODUCT_ID: {"plan": "pro", "display_name": "Pro", "credits": 600},
+    APPLE_PRO_PRODUCT_ID: {"plan": "pro", "display_name": "Pro", "credits": 500},
 }
 PAID_ACCESS_DEFAULT_CREDITS = int(APPLE_SUBSCRIPTION_PRODUCTS[APPLE_PLUS_PRODUCT_ID]["credits"])
 APPLE_CREDIT_PACKS = {
