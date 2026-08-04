@@ -699,6 +699,23 @@ class PaidAccessTests(unittest.TestCase):
         self.assertIn("stage=token_check", paid_log)
         self.assertNotIn("private-paid-secret", paid_log)
 
+    def test_access_store_log_reports_only_safe_missing_name(self):
+        error = NameError("name 'friend_credit_helper' is not defined")
+        error.name = "friend_credit_helper"
+        with self.assertLogs(WORKER.logger, level="WARNING") as captured:
+            WORKER._log_access_store_failure("friend", "token_check", error)
+        log = " ".join(captured.output)
+        self.assertIn("missing_name:friend_credit_helper", log)
+        self.assertNotIn("name 'friend_credit_helper' is not defined", log)
+
+        private_error = NameError("private-token-should-not-appear")
+        private_error.name = "private-token-should-not-appear"
+        with self.assertLogs(WORKER.logger, level="WARNING") as captured:
+            WORKER._log_access_store_failure("friend", "token_check", private_error)
+        private_log = " ".join(captured.output)
+        self.assertIn("service_code=missing_name", private_log)
+        self.assertNotIn("private-token-should-not-appear", private_log)
+
     def test_disabled_pack_balance_does_not_unlock_ai(self):
         WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer bad", "X-OMR-Paid-Token": "paid"})
         paid_status = {

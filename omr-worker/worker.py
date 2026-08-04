@@ -893,6 +893,11 @@ def _access_service_error_code(exc: Exception | None) -> str:
     if isinstance(exc, ModuleNotFoundError):
         module_name = str(getattr(exc, "name", "") or "").strip()
         return f"missing_module:{module_name}" if module_name else "missing_module"
+    if isinstance(exc, NameError):
+        missing_name = str(getattr(exc, "name", "") or "").strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", missing_name):
+            return f"missing_name:{missing_name}"
+        return "missing_name"
     try:
         value = exc.code() if callable(getattr(exc, "code", None)) else getattr(exc, "code", None)
     except Exception:
