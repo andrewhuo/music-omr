@@ -24,10 +24,13 @@ import fitz  # PyMuPDF
 import google.auth
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
+
+_FIRESTORE_IMPORT_ERROR = None
 try:
     from google.cloud import firestore
-except Exception:
+except Exception as exc:
     firestore = None
+    _FIRESTORE_IMPORT_ERROR = exc
 try:
     from appstoreserverlibrary.models.Environment import Environment as AppleEnvironment
     from appstoreserverlibrary.signed_data_verifier import SignedDataVerifier, VerificationException
@@ -884,15 +887,47 @@ def _friend_access_enforced() -> bool:
     return str(os.environ.get("FRIEND_ACCESS_ENFORCED", "0") or "0").strip().lower() in {"1", "true", "yes"}
 
 
-def _friend_store_client():
+def _access_service_error_code(exc: Exception | None) -> str:
+    if exc is None:
+        return "none"
+    if isinstance(exc, ModuleNotFoundError):
+        module_name = str(getattr(exc, "name", "") or "").strip()
+        return f"missing_module:{module_name}" if module_name else "missing_module"
+    try:
+        value = exc.code() if callable(getattr(exc, "code", None)) else getattr(exc, "code", None)
+    except Exception:
+        value = None
+    name = str(getattr(value, "name", "") or "").strip()
+    if name:
+        return name.lower()
+    if value is not None:
+        text = re.sub(r"[^A-Za-z0-9_.:\-]", "_", str(value).strip())[:80]
+        if text:
+            return text
+    errno = getattr(exc, "errno", None)
+    return f"errno:{errno}" if errno is not None else "none"
+
+
+def _log_access_store_failure(provider: str, stage: str, exc: Exception | None = None) -> None:
+    logger.warning(
+        "ACCESS_STORE_FAILURE provider=%s stage=%s error_type=%s service_code=%s",
+        str(provider or "shared"),
+        str(stage or "unknown"),
+        type(exc).__name__ if exc is not None else "Unavailable",
+        _access_service_error_code(exc),
+    )
+
+
+def _friend_store_client(provider: str = "shared"):
     global _FRIEND_STORE_CLIENT
     if firestore is None:
+        _log_access_store_failure(provider, "library_load", _FIRESTORE_IMPORT_ERROR)
         return None
     if _FRIEND_STORE_CLIENT is None:
         try:
             _FRIEND_STORE_CLIENT = firestore.Client()
         except Exception as exc:
-            logger.warning("FRIEND_ACCESS_STORE_WARN detail=%s", _safe_error_text(exc))
+            _log_access_store_failure(provider, "client_connection", exc)
             return None
     return _FRIEND_STORE_CLIENT
 
@@ -934,7 +969,7 @@ def _friend_run_transaction(client, callback):
 
 
 def _friend_config(client=None) -> dict:
-    store = client or _friend_store_client()
+    store = client or _friend_store_client("friend")
     if store is None:
         raise FriendAccessError(
             "friend_access_unavailable",
@@ -946,7 +981,7 @@ def _friend_config(client=None) -> dict:
         snap = store.collection(FRIEND_ACCESS_CONFIG_COLLECTION).document(FRIEND_ACCESS_CONFIG_DOCUMENT).get()
         data = snap.to_dict() if bool(getattr(snap, "exists", False)) else None
     except Exception as exc:
-        logger.warning("FRIEND_ACCESS_CONFIG_WARN detail=%s", _safe_error_text(exc))
+        _log_access_store_failure("friend", "configuration_read", exc)
         raise FriendAccessError(
             "friend_access_unavailable",
             "Friend Access is temporarily unavailable. Try again.",
@@ -1093,7 +1128,14 @@ def _friend_release_stale_reservations(data: dict, now: datetime | None = None) 
 
 def _friend_activate_device(device_id: str, code: str) -> dict:
     device_id = _friend_validate_device_id(device_id)
-    client = _friend_store_client()
+    client = _friend_store_client("friend")
+    if client is None:
+        raise FriendAccessError(
+            "friend_access_unavailable",
+            "Friend Access is temporarily unavailable. Try again.",
+            503,
+            retryable=True,
+        )
     config = _friend_config(client)
     if not bool(config.get("enabled")):
         raise FriendAccessError("friend_code_disabled", "This Friend Code is not currently available.", 403)
@@ -1162,7 +1204,14 @@ def _friend_parse_access_token(token: str) -> tuple[str, str]:
 
 def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
     device_key, secret = _friend_parse_access_token(token)
-    client = _friend_store_client()
+    client = _friend_store_client("friend")
+    if client is None:
+        raise FriendAccessError(
+            "friend_access_unavailable",
+            "Friend Access is temporarily unavailable. Try again.",
+            503,
+            retryable=True,
+        )
     config = _friend_config(client)
     ref = client.collection(FRIEND_ACCESS_COLLECTION).document(device_key)
     now = _utc_now()
@@ -1211,7 +1260,7 @@ def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | Non
     except FriendAccessError:
         raise
     except Exception as exc:
-        logger.warning("FRIEND_ACCESS_VERIFY_WARN detail=%s", _safe_error_text(exc))
+        _log_access_store_failure("friend", "credit_reservation" if reserve else "token_check", exc)
         raise FriendAccessError("friend_access_unavailable", "Friend Access is temporarily unavailable. Try again.", 503, retryable=True) from exc
 
 
@@ -1750,7 +1799,7 @@ def _paid_parse_access_token(token: str) -> tuple[str, str, str]:
 
 def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None = None, allow_empty: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
     record_key, device_key, secret = _paid_parse_access_token(token)
-    client = _friend_store_client()
+    client = _friend_store_client("paid")
     if client is None:
         raise PaidAccessError("paid_access_unavailable", "Paid Access is temporarily unavailable.", 503, retryable=True)
     ref = client.collection(PAID_ACCESS_COLLECTION).document(record_key)
@@ -1834,7 +1883,7 @@ def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None 
     except PaidAccessError:
         raise
     except Exception as exc:
-        logger.warning("PAID_ACCESS_VERIFY_WARN detail=%s", _safe_error_text(exc))
+        _log_access_store_failure("paid", "credit_reservation" if reserve else "token_check", exc)
         raise PaidAccessError("paid_access_unavailable", "Paid Access is temporarily unavailable.", 503, retryable=True) from exc
 
 
@@ -1892,27 +1941,37 @@ def _ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: s
 
     candidates = []
     access_errors = []
+    retryable_errors = []
+    verified_sources = 0
     if friend_token:
         try:
             friend = _friend_verify_token(friend_token)
+            verified_sources += 1
             if max(0, _safe_int(friend.get("credits_remaining"), 0)) > 0:
                 candidates.append((str(friend.get("expires_at_utc") or "9999"), 0, "friend"))
         except FriendAccessError as exc:
             if exc.retryable:
-                raise
-            access_errors.append(exc)
+                retryable_errors.append(exc)
+            else:
+                access_errors.append(exc)
     if paid_token:
         try:
-            paid = _paid_verify_token(paid_token)
+            paid = _paid_verify_token(paid_token, allow_empty=True)
+            verified_sources += 1
             if paid.get("pro_active") and max(0, _safe_int(paid.get("pro_credits_remaining"), 0)) > 0:
                 candidates.append((str(paid.get("expires_at_utc") or "9999"), 1, "pro"))
             if _apple_packs_enabled() and max(0, _safe_int(paid.get("purchased_credits_remaining"), 0)) > 0:
                 candidates.append(("9999", 2, "purchased"))
         except PaidAccessError as exc:
             if exc.retryable:
-                raise
-            access_errors.append(exc)
+                retryable_errors.append(exc)
+            else:
+                access_errors.append(exc)
     if not candidates:
+        if retryable_errors:
+            raise retryable_errors[0]
+        if verified_sources:
+            raise PaidAccessError("paid_credits_exhausted", "No AI credits are available.", 403)
         if access_errors:
             raise access_errors[0]
         raise PaidAccessError("paid_credits_exhausted", "No AI credits are available.", 403)
@@ -2013,23 +2072,31 @@ def _combined_credit_status() -> dict:
     paid_result = None
     friend_token = _friend_bearer_token()
     paid_token = _paid_header_token()
-    errors = []
+    friend_check = "absent"
+    paid_check = "absent"
+    retryable_errors = []
     if friend_token:
         try:
             friend_result = _friend_verify_token(friend_token)
+            friend_check = "verified"
         except FriendAccessError as exc:
             if exc.retryable:
-                raise
-            errors.append(exc)
+                friend_check = "temporarily_unavailable"
+                retryable_errors.append(exc)
+            else:
+                friend_check = "banned" if exc.code == "friend_access_banned" else "invalid"
     if paid_token:
         try:
             paid_result = _paid_verify_token(paid_token, allow_empty=True)
+            paid_check = "verified"
         except PaidAccessError as exc:
             if exc.retryable:
-                raise
-            errors.append(exc)
-    if not friend_result and not paid_result and errors:
-        raise errors[0]
+                paid_check = "temporarily_unavailable"
+                retryable_errors.append(exc)
+            else:
+                paid_check = "invalid"
+    if not friend_result and not paid_result and retryable_errors:
+        raise retryable_errors[0]
     friend_credits = max(0, _safe_int((friend_result or {}).get("credits_remaining"), 0))
     pro_credits = max(0, _safe_int((paid_result or {}).get("pro_credits_remaining"), 0))
     purchased_credits = (
@@ -2057,6 +2124,9 @@ def _combined_credit_status() -> dict:
         "paid_id": (paid_result or {}).get("paid_id"),
         "pro_expires_at_utc": (paid_result or {}).get("expires_at_utc"),
         "purchased_credit_debt": max(0, _safe_int((paid_result or {}).get("purchased_credit_debt"), 0)),
+        "friend_check": friend_check,
+        "paid_check": paid_check,
+        "partial": any(value in {"invalid", "banned", "temporarily_unavailable"} for value in (friend_check, paid_check)),
     }
 
 

@@ -1,5 +1,6 @@
 import unittest
 import sys
+import base64
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -366,6 +367,337 @@ class PaidAccessTests(unittest.TestCase):
         self.assertEqual(result["paid_plan"], "pro")
         self.assertEqual(result["total_credits"], 1000)
         self.assertEqual(result["total_monthly_capacity"], 1000)
+
+    def test_combined_status_endpoint_returns_source_checks_without_private_keys(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend"})
+        friend_status = {
+            "active": True,
+            "friend_id": "F",
+            "credits_remaining": 500,
+            "monthly_credit_capacity": 500,
+        }
+        with patch.object(WORKER, "_friend_verify_token", return_value=friend_status):
+            body, status = _unpack(WORKER.get_combined_credit_status())
+        self.assertEqual(status, 200)
+        credits = body["credits"]
+        self.assertEqual(credits["friend_check"], "verified")
+        self.assertEqual(credits["paid_check"], "absent")
+        self.assertFalse(credits["partial"])
+        for private_key in ("access_token", "device_key", "record_key", "token_hash"):
+            self.assertNotIn(private_key, credits)
+
+    def test_combined_status_uses_paid_when_friend_is_temporarily_unavailable(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        paid_status = {
+            "paid_id": "P",
+            "pro_active": True,
+            "pro_credits_remaining": 42,
+            "purchased_credits_remaining": 0,
+            "monthly_credit_capacity": 500,
+            "plan": "pro",
+            "plan_display_name": "Pro",
+        }
+        with patch.object(
+            WORKER,
+            "_friend_verify_token",
+            side_effect=WORKER.FriendAccessError(
+                "friend_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ), patch.object(WORKER, "_paid_verify_token", return_value=paid_status):
+            result = WORKER._combined_credit_status()
+        self.assertEqual(result["friend_check"], "temporarily_unavailable")
+        self.assertEqual(result["paid_check"], "verified")
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["total_credits"], 42)
+
+    def test_combined_status_uses_friend_when_paid_is_temporarily_unavailable(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        friend_status = {
+            "active": True,
+            "friend_id": "F",
+            "credits_remaining": 37,
+            "monthly_credit_capacity": 500,
+        }
+        with patch.object(WORKER, "_friend_verify_token", return_value=friend_status), patch.object(
+            WORKER,
+            "_paid_verify_token",
+            side_effect=WORKER.PaidAccessError(
+                "paid_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ):
+            result = WORKER._combined_credit_status()
+        self.assertEqual(result["friend_check"], "verified")
+        self.assertEqual(result["paid_check"], "temporarily_unavailable")
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["total_credits"], 37)
+
+    def test_invalid_or_banned_friend_does_not_block_paid_status(self):
+        paid_status = {
+            "paid_id": "P",
+            "pro_active": True,
+            "pro_credits_remaining": 20,
+            "purchased_credits_remaining": 0,
+            "monthly_credit_capacity": 200,
+        }
+        for code, expected_check in (("ai_access_required", "invalid"), ("friend_access_banned", "banned")):
+            with self.subTest(code=code):
+                WORKER.request = SimpleNamespace(
+                    headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"}
+                )
+                with patch.object(
+                    WORKER,
+                    "_friend_verify_token",
+                    side_effect=WORKER.FriendAccessError(code, "denied", 403),
+                ), patch.object(WORKER, "_paid_verify_token", return_value=paid_status):
+                    result = WORKER._combined_credit_status()
+                self.assertEqual(result["friend_check"], expected_check)
+                self.assertEqual(result["total_credits"], 20)
+
+    def test_combined_status_fails_when_no_wallet_can_be_verified(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        with patch.object(
+            WORKER,
+            "_friend_verify_token",
+            side_effect=WORKER.FriendAccessError(
+                "friend_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ), patch.object(
+            WORKER,
+            "_paid_verify_token",
+            side_effect=WORKER.PaidAccessError(
+                "paid_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ), self.assertRaises(WORKER.FriendAccessError) as raised:
+            WORKER._combined_credit_status()
+        self.assertTrue(raised.exception.retryable)
+
+    def test_combined_status_reports_invalid_tokens_without_exposing_them(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        with patch.object(
+            WORKER,
+            "_friend_verify_token",
+            side_effect=WORKER.FriendAccessError("ai_access_required", "denied", 403),
+        ), patch.object(
+            WORKER,
+            "_paid_verify_token",
+            side_effect=WORKER.PaidAccessError("paid_access_required", "denied", 403),
+        ):
+            result = WORKER._combined_credit_status()
+        self.assertEqual(result["friend_check"], "invalid")
+        self.assertEqual(result["paid_check"], "invalid")
+        self.assertEqual(result["total_credits"], 0)
+        for private_key in ("access_token", "device_key", "record_key", "token_hash"):
+            self.assertNotIn(private_key, result)
+
+    def test_ai_uses_verified_paid_wallet_when_friend_check_is_temporary(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        paid_status = {
+            "pro_active": True,
+            "pro_credits_remaining": 9,
+            "purchased_credits_remaining": 0,
+            "expires_at_utc": "2026-09-01T00:00:00Z",
+        }
+        reserved = {**paid_status, "provider": "paid", "reservation_id": "reservation"}
+        with patch.object(
+            WORKER,
+            "_friend_verify_token",
+            side_effect=WORKER.FriendAccessError(
+                "friend_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ), patch.object(WORKER, "_paid_verify_token", side_effect=[paid_status, reserved]) as paid_verify:
+            result = WORKER._ai_access(reserve=True, job_id="job", system_id="system")
+        self.assertEqual(result["provider"], "paid")
+        self.assertEqual(paid_verify.call_count, 2)
+        self.assertTrue(paid_verify.call_args.kwargs["reserve"])
+        self.assertEqual(paid_verify.call_args.kwargs["source"], "pro")
+
+    def test_ai_uses_verified_friend_wallet_when_paid_check_is_temporary(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        friend_status = {
+            "credits_remaining": 9,
+            "expires_at_utc": "2026-09-01T00:00:00Z",
+        }
+        reserved = {**friend_status, "reservation_id": "reservation"}
+        with patch.object(WORKER, "_friend_verify_token", side_effect=[friend_status, reserved]) as friend_verify, patch.object(
+            WORKER,
+            "_paid_verify_token",
+            side_effect=WORKER.PaidAccessError(
+                "paid_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ):
+            result = WORKER._ai_access(reserve=True, job_id="job", system_id="system")
+        self.assertEqual(result["provider"], "friend")
+        self.assertEqual(friend_verify.call_count, 2)
+        self.assertTrue(friend_verify.call_args.kwargs["reserve"])
+
+    def test_banned_friend_does_not_block_verified_paid_ai(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        paid_status = {
+            "pro_active": True,
+            "pro_credits_remaining": 9,
+            "purchased_credits_remaining": 0,
+            "expires_at_utc": "2026-09-01T00:00:00Z",
+        }
+        reserved = {**paid_status, "provider": "paid", "reservation_id": "reservation"}
+        with patch.object(
+            WORKER,
+            "_friend_verify_token",
+            side_effect=WORKER.FriendAccessError("friend_access_banned", "banned", 403),
+        ), patch.object(WORKER, "_paid_verify_token", side_effect=[paid_status, reserved]):
+            result = WORKER._ai_access(reserve=True)
+        self.assertEqual(result["provider"], "paid")
+
+    def test_ai_fails_closed_when_no_wallet_verifies(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        with patch.object(
+            WORKER,
+            "_friend_verify_token",
+            side_effect=WORKER.FriendAccessError(
+                "friend_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ), patch.object(
+            WORKER,
+            "_paid_verify_token",
+            side_effect=WORKER.PaidAccessError(
+                "paid_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ), self.assertRaises(WORKER.FriendAccessError):
+            WORKER._ai_access(reserve=True, job_id="job", system_id="system")
+
+    def test_ai_endpoint_stops_before_loading_job_when_no_wallet_verifies(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        with patch.object(
+            WORKER,
+            "_friend_verify_token",
+            side_effect=WORKER.FriendAccessError(
+                "friend_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ), patch.object(
+            WORKER,
+            "_paid_verify_token",
+            side_effect=WORKER.PaidAccessError(
+                "paid_access_unavailable", "temporary", 503, retryable=True
+            ),
+        ), patch.object(WORKER, "_resolve_run_id_from_job_id") as resolve:
+            body, status = _unpack(WORKER.ai_suggest_job("job"))
+        self.assertEqual(status, 503)
+        self.assertEqual((body.get("error") or {}).get("code"), "friend_access_unavailable")
+        resolve.assert_not_called()
+
+    def test_verified_empty_wallets_return_exhausted(self):
+        WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend", "X-OMR-Paid-Token": "paid"})
+        friend_status = {"credits_remaining": 0}
+        paid_status = {"pro_active": True, "pro_credits_remaining": 0, "purchased_credits_remaining": 0}
+        with patch.object(WORKER, "_friend_verify_token", return_value=friend_status), patch.object(
+            WORKER, "_paid_verify_token", return_value=paid_status
+        ), self.assertRaises(WORKER.PaidAccessError) as raised:
+            WORKER._ai_access(reserve=True)
+        self.assertEqual(raised.exception.code, "paid_credits_exhausted")
+
+    def test_friend_reactivation_keeps_identity_and_balance_but_rotates_token(self):
+        pepper = base64.urlsafe_b64encode(b"p" * 32).decode("ascii").rstrip("=")
+        config = {
+            "enabled": True,
+            "device_pepper": pepper,
+            "default_monthly_credits": 500,
+        }
+        with patch.object(WORKER, "_friend_config", return_value=config), patch.object(
+            WORKER, "_friend_check_activation_rate"
+        ), patch.object(WORKER, "_friend_code_matches", return_value=True), patch.object(
+            WORKER, "_friend_clear_activation_attempts"
+        ):
+            first = WORKER._friend_activate_device("device-identifier-1234", "private-code")
+            device_key = first["access_token"].split(".", 1)[0]
+            record = self.store.rows[(WORKER.FRIEND_ACCESS_COLLECTION, device_key)]
+            record["credits_remaining"] = 123
+            second = WORKER._friend_activate_device("device-identifier-1234", "private-code")
+        self.assertEqual(second["friend_id"], first["friend_id"])
+        self.assertNotEqual(second["access_token"], first["access_token"])
+        self.assertEqual(
+            self.store.rows[(WORKER.FRIEND_ACCESS_COLLECTION, device_key)]["credits_remaining"],
+            123,
+        )
+
+    def test_access_store_logs_safe_library_connection_and_config_stages(self):
+        import_error = ModuleNotFoundError("private-token-should-not-appear")
+        import_error.name = "google.cloud.firestore"
+        with patch.object(WORKER, "firestore", None), patch.object(
+            WORKER, "_FIRESTORE_IMPORT_ERROR", import_error
+        ), patch.object(WORKER, "_FRIEND_STORE_CLIENT", None), self.assertLogs(
+            WORKER.logger, level="WARNING"
+        ) as captured:
+            self.assertIsNone(self.patches[0].temp_original("friend"))
+        library_log = " ".join(captured.output)
+        self.assertIn("stage=library_load", library_log)
+        self.assertIn("missing_module:google.cloud.firestore", library_log)
+        self.assertNotIn("private-token-should-not-appear", library_log)
+
+        class PermissionFailure(RuntimeError):
+            def code(self):
+                return SimpleNamespace(name="PERMISSION_DENIED")
+
+        class BrokenFirestore:
+            @staticmethod
+            def Client():
+                raise PermissionFailure("private-client-detail-should-not-appear")
+
+        with patch.object(WORKER, "firestore", BrokenFirestore), patch.object(
+            WORKER, "_FRIEND_STORE_CLIENT", None
+        ), self.assertLogs(WORKER.logger, level="WARNING") as captured:
+            self.assertIsNone(self.patches[0].temp_original("paid"))
+        client_log = " ".join(captured.output)
+        self.assertIn("provider=paid", client_log)
+        self.assertIn("stage=client_connection", client_log)
+        self.assertNotIn("private-client-detail-should-not-appear", client_log)
+
+        class BrokenDocument:
+            def get(self):
+                raise PermissionFailure("private-device-id-should-not-appear")
+
+        class BrokenCollection:
+            def document(self, _key):
+                return BrokenDocument()
+
+        class BrokenStore:
+            def collection(self, _name):
+                return BrokenCollection()
+
+        with self.assertLogs(WORKER.logger, level="WARNING") as captured, self.assertRaises(
+            WORKER.FriendAccessError
+        ):
+            WORKER._friend_config(BrokenStore())
+        config_log = " ".join(captured.output)
+        self.assertIn("stage=configuration_read", config_log)
+        self.assertIn("service_code=permission_denied", config_log)
+        self.assertNotIn("private-device-id-should-not-appear", config_log)
+
+    def test_access_store_logs_token_and_reservation_stages_without_private_data(self):
+        config = {"default_monthly_credits": 500}
+        token = f"{'a' * 64}.{'private-secret-value-' * 3}"
+        for reserve, stage in ((False, "token_check"), (True, "credit_reservation")):
+            with self.subTest(stage=stage), patch.object(
+                WORKER, "_friend_config", return_value=config
+            ), patch.object(
+                WORKER, "_friend_run_transaction", side_effect=RuntimeError(token)
+            ), self.assertLogs(WORKER.logger, level="WARNING") as captured, self.assertRaises(
+                WORKER.FriendAccessError
+            ):
+                WORKER._friend_verify_token(token, reserve=reserve)
+            log = " ".join(captured.output)
+            self.assertIn(f"stage={stage}", log)
+            self.assertNotIn("private-secret-value", log)
+
+        paid_token = f"{'a' * 64}.{'b' * 64}.{'private-paid-secret-' * 3}"
+        with patch.object(
+            WORKER, "_friend_run_transaction", side_effect=RuntimeError(paid_token)
+        ), self.assertLogs(WORKER.logger, level="WARNING") as captured, self.assertRaises(
+            WORKER.PaidAccessError
+        ):
+            WORKER._paid_verify_token(paid_token)
+        paid_log = " ".join(captured.output)
+        self.assertIn("provider=paid", paid_log)
+        self.assertIn("stage=token_check", paid_log)
+        self.assertNotIn("private-paid-secret", paid_log)
 
     def test_disabled_pack_balance_does_not_unlock_ai(self):
         WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer bad", "X-OMR-Paid-Token": "paid"})
