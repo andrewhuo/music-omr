@@ -1256,7 +1256,7 @@ def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | Non
             "device_key": device_key,
             "reservation_id": reservation_id,
             "credits_remaining": max(0, _safe_int(data.get("credits_remaining"), 0)),
-            "monthly_credit_capacity": _friend_monthly_limit(config),
+            "monthly_credit_capacity": _friend_default_credits(config),
             "expires_at_utc": _to_utc_z(datetime(now.year + (1 if now.month == 12 else 0), 1 if now.month == 12 else now.month + 1, 1, tzinfo=timezone.utc)),
         }
 

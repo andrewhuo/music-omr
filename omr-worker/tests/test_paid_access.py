@@ -618,6 +618,24 @@ class PaidAccessTests(unittest.TestCase):
             123,
         )
 
+    def test_friend_verification_returns_current_balance_and_monthly_capacity(self):
+        pepper = base64.urlsafe_b64encode(b"p" * 32).decode("ascii").rstrip("=")
+        config = {
+            "enabled": True,
+            "device_pepper": pepper,
+            "default_monthly_credits": 500,
+        }
+        with patch.object(WORKER, "_friend_config", return_value=config), patch.object(
+            WORKER, "_friend_check_activation_rate"
+        ), patch.object(WORKER, "_friend_code_matches", return_value=True), patch.object(
+            WORKER, "_friend_clear_activation_attempts"
+        ):
+            activated = WORKER._friend_activate_device("device-identifier-1234", "private-code")
+            verified = WORKER._friend_verify_token(activated["access_token"])
+        self.assertTrue(verified["active"])
+        self.assertEqual(verified["credits_remaining"], 500)
+        self.assertEqual(verified["monthly_credit_capacity"], 500)
+
     def test_access_store_logs_safe_library_connection_and_config_stages(self):
         import_error = ModuleNotFoundError("private-token-should-not-appear")
         import_error.name = "google.cloud.firestore"
