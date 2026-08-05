@@ -58,7 +58,7 @@ def _run_transaction(_client, callback):
 def _apple_payload(transaction_id="tx-1", *, expires_days=30, revoked=False, bundle_id=None, product_id=None):
     now = WORKER._utc_now()
     return {
-        "productId": product_id or WORKER.APPLE_MONTHLY_PRODUCT_ID,
+        "productId": product_id or WORKER.APPLE_PRO_PRODUCT_ID,
         "bundleId": bundle_id or WORKER.APPLE_BUNDLE_ID,
         "transactionId": transaction_id,
         "originalTransactionId": "original-1",
@@ -102,28 +102,18 @@ class PaidAccessTests(unittest.TestCase):
         key = WORKER._apple_wallet_key("app-wallet-1")
         return self.store.rows[(WORKER.PAID_ACCESS_COLLECTION, key)]
 
-    def test_initial_plus_purchase_grants_exactly_200(self):
+    def test_initial_pro_purchase_grants_exactly_400(self):
         result = WORKER._paid_apply_transaction(
             _apple_payload(),
             device_id="device-identifier-1234",
             issue_token=True,
         )
         self.assertTrue(result["active"])
-        self.assertEqual(result["credits_remaining"], 200)
+        self.assertEqual(result["credits_remaining"], 400)
         self.assertTrue(result["new_period"])
         self.assertTrue(result["access_token"])
-        self.assertEqual(result["plan"], "plus")
-        self.assertEqual(result["monthly_credit_capacity"], 200)
-
-    def test_initial_pro_purchase_grants_exactly_500(self):
-        result = WORKER._paid_apply_transaction(
-            _apple_payload(product_id=WORKER.APPLE_PRO_PRODUCT_ID),
-            device_id="device-identifier-1234",
-            issue_token=True,
-        )
         self.assertEqual(result["plan"], "pro")
-        self.assertEqual(result["credits_remaining"], 500)
-        self.assertEqual(result["monthly_credit_capacity"], 500)
+        self.assertEqual(result["monthly_credit_capacity"], 400)
 
     def test_repeated_transaction_does_not_grant_again(self):
         WORKER._paid_apply_transaction(_apple_payload())
@@ -132,40 +122,13 @@ class PaidAccessTests(unittest.TestCase):
         self.assertFalse(result["new_period"])
         self.assertEqual(result["credits_remaining"], 137)
 
-    def test_renewal_resets_to_200_without_rollover(self):
+    def test_renewal_resets_to_400_without_rollover(self):
         WORKER._paid_apply_transaction(_apple_payload())
         self._record()["credits_remaining"] = 11
         result = WORKER._paid_apply_transaction(_apple_payload("tx-2"))
         self.assertTrue(result["new_period"])
-        self.assertEqual(result["credits_remaining"], 200)
+        self.assertEqual(result["credits_remaining"], 400)
         self.assertEqual(self._record()["credits_used"], 0)
-
-    def test_upgrade_to_pro_resets_once_to_500(self):
-        WORKER._paid_apply_transaction(_apple_payload())
-        self._record()["credits_remaining"] = 23
-        upgraded = WORKER._paid_apply_transaction(
-            _apple_payload("tx-2", product_id=WORKER.APPLE_PRO_PRODUCT_ID)
-        )
-        self.assertEqual(upgraded["plan"], "pro")
-        self.assertEqual(upgraded["credits_remaining"], 500)
-        repeated = WORKER._paid_apply_transaction(
-            _apple_payload("tx-2", product_id=WORKER.APPLE_PRO_PRODUCT_ID)
-        )
-        self.assertFalse(repeated["new_period"])
-        self.assertEqual(repeated["credits_remaining"], 500)
-
-    def test_pro_renewal_resets_to_500_and_downgrade_resets_to_200(self):
-        WORKER._paid_apply_transaction(_apple_payload(product_id=WORKER.APPLE_PRO_PRODUCT_ID))
-        self._record()["credits_remaining"] = 7
-        renewed = WORKER._paid_apply_transaction(
-            _apple_payload("tx-2", product_id=WORKER.APPLE_PRO_PRODUCT_ID)
-        )
-        self.assertEqual(renewed["plan"], "pro")
-        self.assertEqual(renewed["credits_remaining"], 500)
-        self._record()["credits_remaining"] = 400
-        downgraded = WORKER._paid_apply_transaction(_apple_payload("tx-3"))
-        self.assertEqual(downgraded["plan"], "plus")
-        self.assertEqual(downgraded["credits_remaining"], 200)
 
     def test_expired_and_revoked_purchase_are_inactive(self):
         expired = WORKER._paid_apply_transaction(_apple_payload(expires_days=-1))
@@ -180,6 +143,7 @@ class PaidAccessTests(unittest.TestCase):
         for payload in (
             _apple_payload(bundle_id="wrong.bundle"),
             _apple_payload(product_id="wrong.product"),
+            _apple_payload(product_id="pineapple.sheetmusiclabeler.pro500.monthly"),
         ):
             with self.assertRaises(WORKER.PaidAccessError) as raised:
                 WORKER._paid_apply_transaction(payload)
@@ -192,14 +156,14 @@ class PaidAccessTests(unittest.TestCase):
             issue_token=True,
         )
         reserved = WORKER._paid_verify_token(issued["access_token"], reserve=True, job_id="job", system_id="s1")
-        self.assertEqual(reserved["credits_remaining"], 199)
+        self.assertEqual(reserved["credits_remaining"], 399)
         WORKER._paid_finish_reservation(reserved, spent=False)
-        self.assertEqual(self._record()["credits_remaining"], 200)
+        self.assertEqual(self._record()["credits_remaining"], 400)
         WORKER._paid_finish_reservation(reserved, spent=False)
-        self.assertEqual(self._record()["credits_remaining"], 200)
+        self.assertEqual(self._record()["credits_remaining"], 400)
         reserved = WORKER._paid_verify_token(issued["access_token"], reserve=True, job_id="job", system_id="s2")
         WORKER._paid_finish_reservation(reserved, spent=True)
-        self.assertEqual(self._record()["credits_remaining"], 199)
+        self.assertEqual(self._record()["credits_remaining"], 399)
         self.assertEqual(self._record()["credits_used"], 1)
 
     def test_grace_period_is_active_only_until_its_end(self):
@@ -306,7 +270,7 @@ class PaidAccessTests(unittest.TestCase):
         WORKER._paid_apply_transaction(_apple_payload(), app_transaction_id="app-wallet-1")
         WORKER._paid_apply_transaction(_apple_payload("tx-2"), app_transaction_id="app-wallet-1")
         wallet = self.store.rows[(WORKER.PAID_ACCESS_COLLECTION, WORKER._apple_wallet_key("app-wallet-1"))]
-        self.assertEqual(wallet["subscription_credits_remaining"], 200)
+        self.assertEqual(wallet["subscription_credits_remaining"], 400)
         self.assertEqual(wallet["purchased_credits_remaining"], 60)
 
     def test_restore_uses_same_apple_wallet_on_new_device(self):
@@ -354,9 +318,9 @@ class PaidAccessTests(unittest.TestCase):
             "active": True,
             "paid_id": "P",
             "pro_active": True,
-            "pro_credits_remaining": 500,
+            "pro_credits_remaining": 400,
             "purchased_credits_remaining": 0,
-            "monthly_credit_capacity": 500,
+            "monthly_credit_capacity": 400,
             "plan": "pro",
             "plan_display_name": "Pro",
         }
@@ -365,8 +329,8 @@ class PaidAccessTests(unittest.TestCase):
         ):
             result = WORKER._combined_credit_status()
         self.assertEqual(result["paid_plan"], "pro")
-        self.assertEqual(result["total_credits"], 1000)
-        self.assertEqual(result["total_monthly_capacity"], 1000)
+        self.assertEqual(result["total_credits"], 900)
+        self.assertEqual(result["total_monthly_capacity"], 900)
 
     def test_combined_status_endpoint_returns_source_checks_without_private_keys(self):
         WORKER.request = SimpleNamespace(headers={"Authorization": "Bearer friend"})
@@ -393,7 +357,7 @@ class PaidAccessTests(unittest.TestCase):
             "pro_active": True,
             "pro_credits_remaining": 42,
             "purchased_credits_remaining": 0,
-            "monthly_credit_capacity": 500,
+            "monthly_credit_capacity": 400,
             "plan": "pro",
             "plan_display_name": "Pro",
         }
@@ -437,7 +401,7 @@ class PaidAccessTests(unittest.TestCase):
             "pro_active": True,
             "pro_credits_remaining": 20,
             "purchased_credits_remaining": 0,
-            "monthly_credit_capacity": 200,
+            "monthly_credit_capacity": 400,
         }
         for code, expected_check in (("ai_access_required", "invalid"), ("friend_access_banned", "banned")):
             with self.subTest(code=code):
@@ -783,7 +747,7 @@ class PaidAccessTests(unittest.TestCase):
         reserved = WORKER._paid_verify_token(packed["access_token"], reserve=True)
         self.assertEqual(reserved["source"], "pro")
         wallet = self.store.rows[(WORKER.PAID_ACCESS_COLLECTION, WORKER._apple_wallet_key("app-wallet-1"))]
-        self.assertEqual(wallet["subscription_credits_remaining"], 199)
+        self.assertEqual(wallet["subscription_credits_remaining"], 399)
         self.assertEqual(wallet["purchased_credits_remaining"], 60)
 
     def test_packs_deploy_disabled(self):
