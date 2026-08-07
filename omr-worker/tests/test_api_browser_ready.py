@@ -196,7 +196,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         os.environ["CORS_ALLOW_ORIGINS"] = "http://localhost:5173"
         os.environ["AI_PROVIDER"] = "bedrock"
         os.environ["AWS_REGION"] = "us-east-1"
-        os.environ["BEDROCK_MODEL_ID"] = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+        os.environ["BEDROCK_MODEL_ID"] = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
         os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-6"
         os.environ["ANTHROPIC_API_KEY"] = "test-key"
         os.environ["FRIEND_ACCESS_ENFORCED"] = "0"
@@ -1110,7 +1110,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("score_type"), "grand")
-        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("last_time_signature_update"))
         self.assertEqual((body.get("ai_suggest_run") or {}).get("time_signature_updates"), [])
@@ -1376,7 +1376,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
         cost_summary = mapping_summary.get(WORKER.AI_COST_SUMMARY_KEY) or {}
         self.assertEqual(cost_summary.get("successful_invocations"), 1)
@@ -1837,7 +1837,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         by_measure_id = result.get("by_measure_id") or {}
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "pickup")
-        self.assertEqual((result.get("model") or ""), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((result.get("model") or ""), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         self.assertEqual((result.get("pdf_source") or ""), "corrected")
         self.assertEqual(result.get("_internal_ai_usage"), {"input_tokens": 700, "output_tokens": 80, "retry_attempts": 2})
 
@@ -2075,7 +2075,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 2)
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0", "p1_s1_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 2)
 
     def test_ai_suggest_step_completes_cleanly_when_all_measures_are_excluded(self):
@@ -2291,6 +2291,13 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(create_once.call_count, 1)
         self.assertEqual(sleep_mock.call_count, 0)
 
+    def test_default_bedrock_model_is_sonnet_4_5(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                WORKER._configured_bedrock_model_id(),
+                "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            )
+
     def test_bedrock_messages_create_invokes_runtime_with_anthropic_body(self):
         calls: list[dict] = []
 
@@ -2306,7 +2313,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         fake_boto3 = types.ModuleType("boto3")
         fake_boto3.client = lambda service, region_name=None: _FakeBedrockClient()
         payload = {
-            "model": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": [{"type": "text", "text": "Return JSON."}]}],
         }
@@ -2316,7 +2323,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(result.get("content")[0].get("text"), "{}")
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].get("modelId"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual(calls[0].get("modelId"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         sent_body = json.loads(calls[0].get("body").decode("utf-8"))
         self.assertEqual(sent_body.get("anthropic_version"), "bedrock-2023-05-31")
         self.assertEqual(sent_body.get("max_tokens"), 64)
@@ -2330,7 +2337,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_bedrock_messages_create_once", side_effect=[temporary_1, temporary_2, success]) as create_once,
             patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
         ):
-            result = WORKER._bedrock_messages_create({"model": "global.anthropic.claude-haiku-4-5-20251001-v1:0"})
+            result = WORKER._bedrock_messages_create({"model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0"})
 
         self.assertEqual(result.get("content"), success.get("content"))
         self.assertEqual(result.get("_internal_bedrock_attempts"), 3)
@@ -2344,7 +2351,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
         ):
             with self.assertRaises(WORKER.AiSuggestError) as ctx:
-                WORKER._bedrock_messages_create({"model": "global.anthropic.claude-haiku-4-5-20251001-v1:0"})
+                WORKER._bedrock_messages_create({"model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0"})
 
         self.assertEqual(create_once.call_count, 4)
         self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [0.7, 1.5, 3.0])
@@ -2359,7 +2366,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER.time, "sleep", return_value=None) as sleep_mock,
         ):
             with self.assertRaises(WORKER.AiSuggestError):
-                WORKER._bedrock_messages_create({"model": "global.anthropic.claude-haiku-4-5-20251001-v1:0"})
+                WORKER._bedrock_messages_create({"model": "global.anthropic.claude-sonnet-4-5-20250929-v1:0"})
 
         self.assertEqual(create_once.call_count, 1)
         self.assertEqual(sleep_mock.call_count, 0)
@@ -2638,7 +2645,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
 
-        self.assertEqual(normalized.get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual(normalized.get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         by_measure_id = normalized.get("by_measure_id") or {}
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "uncertain")
         self.assertNotIn("maybe_label", by_measure_id.get("p1_s0_m0") or {})
@@ -3443,15 +3450,18 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Chords/stacked notes count as exactly one rhythmic event", rules_text)
         self.assertIn("For the first measure, arithmetic wins over context", rules_text)
         self.assertNotIn("Examples: in 2/4, one quarter note or quarter-note chord is 1 of 2 beats", rules_text)
-        self.assertNotIn("Ending / volta detection:", rules_text)
-        self.assertNotIn("ending_1", rules_text)
-        self.assertNotIn("ending_2", rules_text)
+        self.assertIn("Ending / volta detection:", rules_text)
+        self.assertIn("For single-staff music, inspect above this one staff for ending brackets.", rules_text)
+        self.assertIn("First ending markers include 1, 1., 1st, or prima volta.", rules_text)
+        self.assertIn("Second ending markers include 2, 2., 2nd, or seconda volta.", rules_text)
+        self.assertIn("Only label the measure where the bracket clearly starts.", rules_text)
         self.assertIn("Single-staff multi-measure rest rules:", rules_text)
         self.assertIn("Use the old-style reference images as examples only", rules_text)
         self.assertIn("Number first, symbol second: a readable big number 2 or higher", rules_text)
         self.assertIn("Do not return uncertain just because the symbol is messy", rules_text)
         self.assertIn("Overusing uncertain is worse than a reasonable confident suggestion.", rules_text)
-        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, uncertain.", rules_text)
+        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2, uncertain.", rules_text)
+        self.assertIn("For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.", rules_text)
         self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
         self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
         self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
@@ -3464,7 +3474,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
         self.assertEqual(
             suggestion_shape.get("label"),
-            "normal|pickup|multi_measure_rest|uncertain",
+            "normal|pickup|multi_measure_rest|ending_1|ending_2|uncertain",
         )
         self.assertEqual(suggestion_shape.get("measure_completeness"), "full|incomplete|unclear")
         self.assertEqual(
@@ -3502,14 +3512,17 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("A triplet is marked by a small 3 above or below a group", rules_text)
         self.assertIn("For the first measure, arithmetic wins over context", rules_text)
         self.assertNotIn("Examples: in 2/4, one top-staff quarter note/chord is 1 of 2 beats", rules_text)
-        self.assertNotIn("Ending / volta detection:", rules_text)
-        self.assertNotIn("ending_1", rules_text)
-        self.assertNotIn("ending_2", rules_text)
+        self.assertIn("Ending / volta detection:", rules_text)
+        self.assertIn("For grand-staff/piano music, inspect above the top staff only; do not duplicate ending labels for the bottom staff.", rules_text)
+        self.assertIn("First ending markers include 1, 1., 1st, or prima volta.", rules_text)
+        self.assertIn("Second ending markers include 2, 2., 2nd, or seconda volta.", rules_text)
+        self.assertIn("Only label the measure where the bracket clearly starts.", rules_text)
         self.assertIn("Grand-staff multi-measure rest rules:", rules_text)
         self.assertIn("For grand-staff multi-measure rest, use only the top staff/treble staff.", rules_text)
         self.assertIn("Number first, symbol second: a readable big number 2 or higher", rules_text)
         self.assertIn("Overusing uncertain is worse than a reasonable confident suggestion.", rules_text)
-        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, uncertain.", rules_text)
+        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2, uncertain.", rules_text)
+        self.assertIn("For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.", rules_text)
         self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
         self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
         self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
@@ -3524,7 +3537,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(intro.get("score_type"), "score")
         instructions = intro.get("instructions") or {}
-        self.assertEqual(instructions.get("allowed_labels"), ["normal", "pickup", "uncertain"])
+        self.assertEqual(instructions.get("allowed_labels"), ["normal", "pickup", "ending_1", "ending_2", "uncertain"])
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
         self.assertIn("Full-score pickup rules:", rules_text)
@@ -3548,13 +3561,16 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
         self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
         self.assertIn("Otherwise, later measures should be normal unless they are a valid multi_measure_rest.", rules_text)
-        self.assertNotIn("Ending / volta detection:", rules_text)
-        self.assertNotIn("ending_1", rules_text)
-        self.assertNotIn("ending_2", rules_text)
+        self.assertIn("Ending / volta detection:", rules_text)
+        self.assertIn("For full-score music, inspect above the top visible staff/system only; do not duplicate ending labels for each instrument.", rules_text)
+        self.assertIn("First ending markers include 1, 1., 1st, or prima volta.", rules_text)
+        self.assertIn("Second ending markers include 2, 2., 2nd, or seconda volta.", rules_text)
+        self.assertIn("Only label the measure where the bracket clearly starts.", rules_text)
         self.assertIn("Full-score multi-measure rest rules:", rules_text)
         self.assertIn("For full score V1, NEVER return multi_measure_rest.", rules_text)
         self.assertIn("rest_count must always be null for full-score prompts.", rules_text)
-        self.assertIn("Allowed labels: normal, pickup, uncertain.", rules_text)
+        self.assertIn("Allowed labels: normal, pickup, ending_1, ending_2, uncertain.", rules_text)
+        self.assertIn("For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.", rules_text)
         self.assertIn("For full score V1, never output multi_measure_rest, and rest_count must always be null.", rules_text)
         self.assertNotIn("Use the clearest staff/instrument's written rhythm/rests as the timing guide", rules_text)
         self.assertNotIn("For pickup detection in full scores, use only the top visible staff.", rules_text)
@@ -3566,7 +3582,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertNotIn("A visible count of 2 or more above that old-style symbol is strong evidence", rules_text)
         output_shape = instructions.get("output_shape") or {}
         suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
-        self.assertEqual(suggestion_shape.get("label"), "normal|pickup|uncertain")
+        self.assertEqual(suggestion_shape.get("label"), "normal|pickup|ending_1|ending_2|uncertain")
         self.assertEqual(suggestion_shape.get("maybe_label"), "pickup|null")
 
     def test_build_system_measure_request_missing_score_type_uses_legacy_prompt(self):
@@ -3611,6 +3627,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("If all visible staves show one aligned quarter-note event in 2/4", rules_text)
         self.assertIn("Use uncertain with maybe_label pickup only when first-measure pickup is possible", rules_text)
         self.assertIn("Use uncertain instead of pickup only when there is not enough visual evidence", rules_text)
+        self.assertIn("Ending / volta detection:", rules_text)
+        self.assertIn("Inspect above the staff/system for ending brackets.", rules_text)
+        self.assertIn("Do not return a finish/end measure for endings.", rules_text)
         self.assertIn("notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units", rules_text)
 
     def test_render_corrected_pdf_applies_label_erase_before_labels(self):
