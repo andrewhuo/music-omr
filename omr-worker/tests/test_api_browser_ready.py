@@ -738,6 +738,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len((body.get("relabel") or {}).get("applied_edits") or []), 2)
         self.assertNotIn(pair_id, ((saved[-1].get("ai_suggestions") or {}).get("ending_pairs_by_id") or {}))
+        self.assertIn(pair_id, ((saved[-1].get("ai_suggestions") or {}).get("resolved_ending_pair_ids") or []))
 
     def test_atomic_manual_fix_rejects_entire_multi_page_batch_before_render(self):
         artifacts = self._sample_artifacts()
@@ -1941,7 +1942,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         with self.assertRaises(WORKER.AiSuggestError):
             WORKER._normalize_ending_system_response(invalid, measures)
 
-    def test_ending_pair_builder_creates_complete_adjacent_pair(self):
+    def test_ending_pair_builder_creates_three_boundary_candidate(self):
         suggestions = WORKER._empty_ai_suggestions_state(111, "state", 4)
         suggestions["ending_events_by_measure_id"] = {
             "m1": {"start": "ending_1", "right_boundary": "continues", "confidence": "high"},
@@ -1956,9 +1957,69 @@ class BrowserReadyApiTests(unittest.TestCase):
         pairs = WORKER._rebuild_ai_ending_pairs(suggestions, measures, all_systems_completed=True)
         self.assertEqual(len(pairs), 1)
         pair = next(iter(pairs.values()))
-        self.assertEqual(pair["status"], "complete")
-        self.assertEqual(pair["ending_1_measure_ids"], ["m1", "m2"])
-        self.assertEqual(pair["ending_2_measure_ids"], ["m3", "m4"])
+        self.assertEqual(pair["status"], "candidate")
+        self.assertEqual(pair["review_mode"], "three_boundary")
+        self.assertEqual(pair["review_anchor_measure_ids"], ["m1", "m3"])
+        self.assertEqual(pair["ending_1_measure_ids"], ["m1"])
+        self.assertEqual(pair["ending_2_measure_ids"], ["m3"])
+
+    def test_ending_candidate_builder_keeps_unmatched_starts_and_never_pairs_two_first_endings(self):
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", 4)
+        suggestions["ending_events_by_measure_id"] = {
+            "m1": {"start": "ending_1", "right_boundary": "continues", "confidence": "low"},
+            "m2": {"start": "ending_1", "right_boundary": "continues", "confidence": "medium"},
+            "m4": {"start": "ending_2", "right_boundary": "open_stop", "confidence": "high"},
+        }
+        measures = [
+            {"measure_id": f"m{index}", "page": index, "system_index": 0, "measure_local_index": 0}
+            for index in range(1, 5)
+        ]
+
+        pairs = WORKER._rebuild_ai_ending_pairs(suggestions, measures, all_systems_completed=True)
+
+        self.assertEqual(len(pairs), 2)
+        ordered = sorted(pairs.values(), key=lambda row: row["order_measure_id"])
+        self.assertEqual(ordered[0]["review_anchor_measure_ids"], ["m1"])
+        self.assertEqual(ordered[1]["review_anchor_measure_ids"], ["m2", "m4"])
+
+    def test_ending_candidate_id_stays_stable_when_second_start_arrives(self):
+        measures = [
+            {"measure_id": "m1", "page": 1, "system_index": 0, "measure_local_index": 0},
+            {"measure_id": "m2", "page": 2, "system_index": 0, "measure_local_index": 0},
+        ]
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", 2)
+        suggestions["ending_events_by_measure_id"] = {
+            "m1": {"start": "ending_1", "right_boundary": "system_edge", "confidence": "medium"},
+        }
+        first = WORKER._rebuild_ai_ending_pairs(suggestions, measures, all_systems_completed=False)
+        first_id = next(iter(first))
+
+        suggestions["ending_events_by_measure_id"]["m2"] = {
+            "start": "ending_2",
+            "right_boundary": "open_stop",
+            "confidence": "high",
+        }
+        second = WORKER._rebuild_ai_ending_pairs(suggestions, measures, all_systems_completed=True)
+
+        self.assertEqual(list(second), [first_id])
+        self.assertEqual(second[first_id]["review_anchor_measure_ids"], ["m1", "m2"])
+
+    def test_resolved_ending_candidate_is_not_rebuilt(self):
+        measures = [
+            {"measure_id": "m1", "page": 1, "system_index": 0, "measure_local_index": 0},
+            {"measure_id": "m2", "page": 1, "system_index": 0, "measure_local_index": 1},
+        ]
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", 2)
+        suggestions["ending_events_by_measure_id"] = {
+            "m1": {"start": "ending_1", "right_boundary": "continues", "confidence": "high"},
+            "m2": {"start": "ending_2", "right_boundary": "open_stop", "confidence": "high"},
+        }
+        pair_id = WORKER._ending_pair_id("m1", "m2")
+        suggestions["resolved_ending_pair_ids"] = [pair_id]
+
+        pairs = WORKER._rebuild_ai_ending_pairs(suggestions, measures, all_systems_completed=True)
+
+        self.assertEqual(pairs, {})
 
     def test_two_system_credit_group_ids_round_up_in_pairs(self):
         ids = [WORKER._ai_credit_group_id("job", 111, "state", index) for index in range(6)]
@@ -2670,6 +2731,37 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(sorted(time_signatures_by_measure_id.keys()), ["p1_s1_m0"])
         self.assertEqual(sorted(measure_completeness_by_measure_id.keys()), ["p1_s1_m0"])
         self.assertEqual(((body.get("ai_suggestions") or {}).get("summary") or {}).get("suggestions_kept"), 1)
+
+    def test_dismiss_ai_ending_candidate_is_idempotent_and_persistent(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "state", 1)
+        pair_id = "ending_pair_test"
+        mapping_summary["ai_suggestions"]["ending_pairs_by_id"] = {
+            pair_id: {"pair_id": pair_id, "status": "candidate"}
+        }
+        WORKER.request = SimpleNamespace(
+            path=f"/api/omr/jobs/111/ai-ending-suggestions/{pair_id}/dismiss",
+            method="POST",
+            headers={},
+            files={},
+            json={},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None) as upload,
+        ):
+            first_body, first_status = _unpack(WORKER.dismiss_ai_ending_pair("111", pair_id))
+            second_body, second_status = _unpack(WORKER.dismiss_ai_ending_pair("111", pair_id))
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertEqual(first_body.get("dismissed_pair_id"), pair_id)
+        self.assertEqual(second_body.get("dismissed_pair_id"), pair_id)
+        self.assertIn(pair_id, mapping_summary["ai_suggestions"]["resolved_ending_pair_ids"])
+        self.assertNotIn(pair_id, mapping_summary["ai_suggestions"]["ending_pairs_by_id"])
+        self.assertEqual(upload.call_count, 2)
 
     def test_relabel_clears_touched_ai_suggestion(self):
         artifacts = self._sample_artifacts()

@@ -4043,6 +4043,7 @@ def _empty_ai_suggestions_state(
         "measure_completeness_by_measure_id": {},
         "ending_events_by_measure_id": {},
         "ending_pairs_by_id": {},
+        "resolved_ending_pair_ids": [],
         "warnings": [],
         "summary": {
             "systems_processed": 0,
@@ -4062,7 +4063,8 @@ def _ending_confidence_rank(value: str | None) -> int:
 
 
 def _ending_pair_id(ending_1_start: str | None, ending_2_start: str | None) -> str:
-    raw = f"{str(ending_1_start or 'missing')}|{str(ending_2_start or 'missing')}"
+    # Keep the candidate stable if a later system adds the matching Ending 2 start.
+    raw = str(ending_1_start or ending_2_start or "missing")
     return "ending_pair_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
@@ -4075,123 +4077,69 @@ def _rebuild_ai_ending_pairs(ai_suggestions: dict, ordered_measures: list[dict],
         for row in _sorted_measure_rows(ordered_measures or [])
         if isinstance(row, dict) and str(row.get("measure_id") or "").strip()
     ]
-    index_by_id = {measure_id: index for index, measure_id in enumerate(ordered)}
     pairs: dict[str, dict] = {}
-    pending_ending_1: list[dict] = []
-    active: dict | None = None
-    incomplete: list[dict] = []
-
-    def finish_active(*, complete: bool) -> None:
-        nonlocal active
-        if not isinstance(active, dict):
-            return
-        row = dict(active)
-        row["complete"] = bool(complete)
-        if row.get("measure_ids"):
-            if row.get("kind") == "ending_1" and complete:
-                pending_ending_1.append(row)
-            elif row.get("kind") == "ending_2" and complete:
-                ending_1 = pending_ending_1.pop(0) if pending_ending_1 else None
-                ending_2_start = (row.get("measure_ids") or [None])[0]
-                ending_1_start = ((ending_1 or {}).get("measure_ids") or [None])[0]
-                adjacent = bool(
-                    ending_1
-                    and index_by_id.get((ending_1.get("measure_ids") or [None])[-1], -2) + 1
-                    == index_by_id.get(ending_2_start, -1)
-                )
-                if ending_1 and adjacent:
-                    confidence = "high" if min(_ending_confidence_rank(ending_1.get("confidence")), _ending_confidence_rank(row.get("confidence"))) >= 2 else "medium"
-                    pair_id = _ending_pair_id(ending_1_start, ending_2_start)
-                    pairs[pair_id] = {
-                        "pair_id": pair_id,
-                        "status": "complete",
-                        "confidence": confidence,
-                        "order_measure_id": ending_1_start,
-                        "ending_1_start_measure_id": ending_1_start,
-                        "ending_1_end_measure_id": (ending_1.get("measure_ids") or [None])[-1],
-                        "ending_2_start_measure_id": ending_2_start,
-                        "ending_2_end_measure_id": (row.get("measure_ids") or [None])[-1],
-                        "ending_1_measure_ids": list(ending_1.get("measure_ids") or []),
-                        "ending_2_measure_ids": list(row.get("measure_ids") or []),
-                        "missing_boundaries": [],
-                    }
-                elif ending_1:
-                    incomplete.append({"ending_1": ending_1, "ending_2": row})
-            else:
-                incomplete.append({row.get("kind") or "unknown": row})
-        active = None
-
-    previous_measure_id: str | None = None
+    resolved_pair_ids = {
+        str(value or "").strip()
+        for value in (ai_suggestions.get("resolved_ending_pair_ids") or [])
+        if str(value or "").strip()
+    }
+    starts: list[dict] = []
     for measure_id in ordered:
         event = events.get(measure_id)
         if not isinstance(event, dict):
-            previous_measure_id = measure_id
             continue
-        start = str(event.get("start") or "none")
-        boundary = str(event.get("right_boundary") or "none")
-        confidence = str(event.get("confidence") or "low")
-
-        if active and start in {"ending_1", "ending_2"}:
-            if active.get("kind") == "ending_1" and start == "ending_2" and previous_measure_id:
-                finish_active(complete=True)
-            else:
-                finish_active(complete=False)
-        if active and start == "none" and boundary == "none":
-            finish_active(complete=False)
-        if start in {"ending_1", "ending_2"} and _ending_confidence_rank(confidence) >= 1:
-            active = {"kind": start, "measure_ids": [], "confidence": confidence}
-        if active and measure_id not in active["measure_ids"]:
-            active["measure_ids"].append(measure_id)
-        if boundary in {"closed_stop", "open_stop"}:
-            finish_active(complete=bool(active))
-        previous_measure_id = measure_id
-
-    if active and all_systems_completed:
-        last_event = events.get((active.get("measure_ids") or [None])[-1]) or {}
-        finish_active(
-            complete=active.get("kind") == "ending_2"
-            and str(last_event.get("right_boundary") or "none") in {"continues", "system_edge"}
+        kind = str(event.get("start") or "none").strip().lower()
+        if kind not in {"ending_1", "ending_2"}:
+            continue
+        starts.append(
+            {
+                "measure_id": measure_id,
+                "kind": kind,
+                "confidence": str(event.get("confidence") or "low").strip().lower(),
+            }
         )
-    elif active:
-        incomplete.append({active.get("kind") or "unknown": dict(active)})
 
-    for ending_1 in pending_ending_1:
-        incomplete.append({"ending_1": ending_1})
-    for row in incomplete:
-        ending_1 = row.get("ending_1") if isinstance(row.get("ending_1"), dict) else None
-        ending_2 = row.get("ending_2") if isinstance(row.get("ending_2"), dict) else None
-        starts = [
-            ((ending_1 or {}).get("measure_ids") or [None])[0],
-            ((ending_2 or {}).get("measure_ids") or [None])[0],
-        ]
-        if not any(starts):
+    index = 0
+    while index < len(starts):
+        first = starts[index]
+        candidates = [first]
+        if (
+            first["kind"] == "ending_1"
+            and index + 1 < len(starts)
+            and starts[index + 1]["kind"] == "ending_2"
+        ):
+            candidates.append(starts[index + 1])
+            index += 1
+
+        ending_1 = next((row for row in candidates if row["kind"] == "ending_1"), None)
+        ending_2 = next((row for row in candidates if row["kind"] == "ending_2"), None)
+        ending_1_start = (ending_1 or {}).get("measure_id")
+        ending_2_start = (ending_2 or {}).get("measure_id")
+        anchors = [row["measure_id"] for row in candidates]
+        pair_id = _ending_pair_id(ending_1_start, ending_2_start)
+        if pair_id in resolved_pair_ids:
+            index += 1
             continue
-        confidence_rows = [candidate for candidate in (ending_1, ending_2) if isinstance(candidate, dict)]
-        if not any(_ending_confidence_rank(candidate.get("confidence")) >= 1 for candidate in confidence_rows):
-            continue
-        pair_id = _ending_pair_id(starts[0], starts[1])
-        missing = []
-        if ending_1 is None:
-            missing.append("ending_1_start")
-        elif not ending_1.get("complete"):
-            missing.append("ending_1_end")
-        if ending_2 is None:
-            missing.extend(["ending_2_start", "ending_2_end"])
-        elif not ending_2.get("complete"):
-            missing.append("ending_2_end")
+        confidence = min(
+            candidates,
+            key=lambda row: _ending_confidence_rank(row.get("confidence")),
+        ).get("confidence") or "low"
         pairs[pair_id] = {
             "pair_id": pair_id,
-            "status": "needs_user_input",
-            "confidence": "medium",
-            "order_measure_id": starts[0] or starts[1],
-            "ending_1_start_measure_id": starts[0],
-            "ending_1_end_measure_id": ((ending_1 or {}).get("measure_ids") or [None])[-1],
-            "ending_2_start_measure_id": starts[1],
-            "ending_2_end_measure_id": ((ending_2 or {}).get("measure_ids") or [None])[-1],
-            "ending_1_measure_ids": list((ending_1 or {}).get("measure_ids") or []),
-            "ending_2_measure_ids": list((ending_2 or {}).get("measure_ids") or []),
-            "missing_boundaries": missing,
+            "status": "candidate",
+            "review_mode": "three_boundary",
+            "review_anchor_measure_ids": anchors,
+            "confidence": confidence,
+            "order_measure_id": anchors[0],
+            "ending_1_start_measure_id": ending_1_start,
+            "ending_1_end_measure_id": ending_1_start,
+            "ending_2_start_measure_id": ending_2_start,
+            "ending_2_end_measure_id": ending_2_start,
+            "ending_1_measure_ids": [ending_1_start] if ending_1_start else [],
+            "ending_2_measure_ids": [ending_2_start] if ending_2_start else [],
+            "missing_boundaries": ["ending_1_start", "ending_2_start", "ending_2_end"],
         }
+        index += 1
     ai_suggestions["ending_pairs_by_id"] = pairs
     return pairs
 
@@ -4502,6 +4450,26 @@ def _remove_ai_ending_pairs(mapping_summary: dict | None, pair_ids: set[str] | l
             removed.append(clean_id)
     ai_suggestions["ending_pairs_by_id"] = pairs
     return removed
+
+
+def _resolve_ai_ending_pairs(mapping_summary: dict | None, pair_ids: set[str] | list[str] | tuple[str, ...]) -> list[str]:
+    ai_suggestions = _current_ai_suggestions(mapping_summary)
+    if not isinstance(ai_suggestions, dict):
+        return []
+    resolved = {
+        str(value or "").strip()
+        for value in (ai_suggestions.get("resolved_ending_pair_ids") or [])
+        if str(value or "").strip()
+    }
+    clean_ids = {
+        str(value or "").strip()
+        for value in (pair_ids or [])
+        if str(value or "").strip()
+    }
+    resolved.update(clean_ids)
+    ai_suggestions["resolved_ending_pair_ids"] = sorted(resolved)
+    _remove_ai_ending_pairs(mapping_summary, clean_ids)
+    return sorted(clean_ids)
 
 
 def _clear_measure_state_for_ids(editable_state: dict, measure_ids: set[str] | list[str] | tuple[str, ...]) -> None:
@@ -10821,7 +10789,7 @@ def relabel_job(job_id: str):
     if applied_measure_ids:
         _remove_ai_suggestion_entries(mapping_summary, applied_measure_ids)
     if accepted_ai_ending_pair_ids:
-        _remove_ai_ending_pairs(mapping_summary, accepted_ai_ending_pair_ids)
+        _resolve_ai_ending_pairs(mapping_summary, accepted_ai_ending_pair_ids)
     manual_pages_updated = {
         _safe_int(row.get("page"), 0)
         for row in applied
@@ -11116,8 +11084,15 @@ def dismiss_ai_ending_pair(job_id: str, pair_id: str):
     except Exception as exc:
         return jsonify({"error": "failed to load state", "detail": _safe_error_text(exc), "job_id": job_id}), 502
     clean_pair_id = str(pair_id or "").strip()
-    if not _remove_ai_ending_pairs(mapping_summary, {clean_pair_id}):
+    ai_suggestions = _current_ai_suggestions(mapping_summary)
+    already_resolved = clean_pair_id in {
+        str(value or "").strip()
+        for value in ((ai_suggestions or {}).get("resolved_ending_pair_ids") or [])
+        if str(value or "").strip()
+    }
+    if not already_resolved and not _remove_ai_ending_pairs(mapping_summary, {clean_pair_id}):
         return jsonify({"job_id": job_id, "run_id": int(artifact_run_id), "status": "failed", "error": {"code": "suggestion_not_found", "message": "AI ending suggestion not found.", "retryable": False, "detail": clean_pair_id}}), 404
+    _resolve_ai_ending_pairs(mapping_summary, {clean_pair_id})
     try:
         _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
     except Exception as exc:
