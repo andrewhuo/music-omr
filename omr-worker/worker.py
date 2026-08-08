@@ -102,6 +102,15 @@ AWS_REGION = str(os.environ.get("AWS_REGION", "us-east-1") or "us-east-1").strip
 BEDROCK_MODEL_ID = str(
     os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0") or ""
 ).strip()
+BEDROCK_GENERAL_MODEL_ID = str(
+    os.environ.get("BEDROCK_GENERAL_MODEL_ID", "global.anthropic.claude-haiku-4-5-20251001-v1:0") or ""
+).strip()
+BEDROCK_ENDING_MODEL_ID = str(
+    os.environ.get("BEDROCK_ENDING_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0") or ""
+).strip()
+AI_ENDING_PASS_ENABLED = (
+    str(os.environ.get("AI_ENDING_PASS_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes")
+)
 BEDROCK_ANTHROPIC_VERSION = str(
     os.environ.get("BEDROCK_ANTHROPIC_VERSION", "bedrock-2023-05-31") or "bedrock-2023-05-31"
 ).strip() or "bedrock-2023-05-31"
@@ -144,6 +153,9 @@ STAFF_START_SAME_ROW_CENTER_TOLERANCE_RATIO = 0.45
 STAFF_START_SAME_ROW_MIN_HEIGHT_RATIO = 0.55
 STAFF_START_SAME_ROW_MAX_HEIGHT_RATIO = 1.80
 AI_SUGGESTIONS_VERSION = "ai_suggestions_v1"
+AI_SUGGESTIONS_ENDING_VERSION = "ai_ending_suggestions_v1"
+AI_SUGGEST_RUN_VERSION = "ai_suggest_run_v2"
+AI_CREDIT_SCHEME_VERSION = "two_systems_per_credit_v1"
 AI_COST_SUMMARY_VERSION = "ai_cost_summary_v1"
 AI_COST_SUMMARY_KEY = "internal_ai_cost_summary"
 AI_SUGGEST_RUN_STATUS_IDLE = "idle"
@@ -200,6 +212,38 @@ AI_OLD_STYLE_REFERENCE_EXAMPLES = (
         "caption": "Reference example B: visible count 3 with an old-style symbol. This is multi_measure_rest.",
     },
 )
+AI_ENDING_REFERENCE_EXAMPLES = (
+    {
+        "filename": "ending_1_start_continues.png",
+        "caption": "Ending reference A: Ending 1 starts here. The numbered left hook is visible and the horizontal bracket continues right.",
+    },
+    {
+        "filename": "ending_1_starts_and_stops.png",
+        "caption": "Ending reference B: Ending 1 starts and stops in this measure. Both the numbered left hook and right downward stop are visible.",
+    },
+    {
+        "filename": "ending_2_start_continues.png",
+        "caption": "Ending reference C: Ending 2 starts here. The numbered left hook is visible and the horizontal bracket continues right.",
+    },
+    {
+        "filename": "ending_2_starts_and_stops.png",
+        "caption": "Ending reference D: Ending 2 starts and stops in this measure. Both the numbered left hook and right downward stop are visible.",
+    },
+    {
+        "filename": "active_ending_continues.png",
+        "caption": "Ending reference E: An already-active ending continues through this measure. There is no new numbered start and no stop.",
+    },
+    {
+        "filename": "active_ending_stops_closed.png",
+        "caption": "Ending reference F: An already-active ending stops here with a downward right hook. This is a stop, not a new start.",
+    },
+    {
+        "filename": "active_ending_stops_open.png",
+        "caption": "Ending reference G: An already-active ending stops here without a downward hook. The horizontal line simply ends; this is an open stop, not continuation through the score.",
+    },
+)
+AI_ENDING_START_VALUES = {"none", "ending_1", "ending_2", "unsupported", "uncertain"}
+AI_ENDING_BOUNDARY_VALUES = {"none", "continues", "closed_stop", "open_stop", "system_edge", "uncertain"}
 
 # In-memory correlation for workflow dispatches that do not return run_id directly.
 _PENDING_DISPATCHES: dict[str, dict] = {}
@@ -1198,7 +1242,7 @@ def _friend_parse_access_token(token: str) -> tuple[str, str]:
     return device_key, secret
 
 
-def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
+def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | None = None, system_id: str | None = None, charge_id: str | None = None) -> dict:
     device_key, secret = _friend_parse_access_token(token)
     client = _friend_store_client("friend")
     if client is None:
@@ -1211,7 +1255,8 @@ def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | Non
     config = _friend_config(client)
     ref = client.collection(FRIEND_ACCESS_COLLECTION).document(device_key)
     now = _utc_now()
-    reservation_id = secrets.token_hex(16) if reserve else None
+    stable_charge_id = str(charge_id or "").strip() or None
+    reservation_id = stable_charge_id if stable_charge_id else (secrets.token_hex(16) if reserve else None)
 
     def _verify(transaction):
         snap = ref.get(transaction=transaction)
@@ -1226,17 +1271,23 @@ def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | Non
             raise FriendAccessError("friend_access_banned", "Friend Access is unavailable for this device.", 403)
         data = _friend_reset_month(data, config, now)
         data = _friend_release_stale_reservations(data, now)
+        charge_receipts = dict(data.get("ai_charge_receipts") or {})
+        already_charged = bool(stable_charge_id and stable_charge_id in charge_receipts)
+        existing_reservations = dict(data.get("reservations") or {})
+        reservation_exists = bool(reservation_id and str(reservation_id) in existing_reservations)
         if reserve:
-            remaining = max(0, _safe_int(data.get("credits_remaining"), 0))
-            if remaining <= 0:
-                raise FriendAccessError("ai_credits_exhausted", "Friend AI credits are used up for this month.", 403)
-            data["credits_remaining"] = remaining - 1
             reservations = dict(data.get("reservations") or {})
-            reservations[str(reservation_id)] = {
-                "created_at_utc": _to_utc_z(now),
-                "job_id": str(job_id or "") or None,
-                "system_id": str(system_id or "") or None,
-            }
+            if not already_charged and str(reservation_id) not in reservations:
+                remaining = max(0, _safe_int(data.get("credits_remaining"), 0))
+                if remaining <= 0:
+                    raise FriendAccessError("ai_credits_exhausted", "Friend AI credits are used up for this month.", 403)
+                data["credits_remaining"] = remaining - 1
+                reservations[str(reservation_id)] = {
+                    "created_at_utc": _to_utc_z(now),
+                    "job_id": str(job_id or "") or None,
+                    "system_id": str(system_id or "") or None,
+                    "charge_id": stable_charge_id,
+                }
             data["reservations"] = reservations
         data["last_seen_at_utc"] = _to_utc_z(now)
         data["updated_at_utc"] = _to_utc_z(now)
@@ -1246,6 +1297,9 @@ def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | Non
             "friend_id": str(data.get("friend_id") or ""),
             "device_key": device_key,
             "reservation_id": reservation_id,
+            "charge_id": stable_charge_id,
+            "already_charged": already_charged,
+            "reservation_exists": reservation_exists,
             "credits_remaining": max(0, _safe_int(data.get("credits_remaining"), 0)),
             "monthly_credit_capacity": _friend_default_credits(config),
             "expires_at_utc": _to_utc_z(datetime(now.year + (1 if now.month == 12 else 0), 1 if now.month == 12 else now.month + 1, 1, tzinfo=timezone.utc)),
@@ -1260,13 +1314,15 @@ def _friend_verify_token(token: str, *, reserve: bool = False, job_id: str | Non
         raise FriendAccessError("friend_access_unavailable", "Friend Access is temporarily unavailable. Try again.", 503, retryable=True) from exc
 
 
-def _friend_finish_reservation(access: dict | None, *, spent: bool) -> None:
-    if not isinstance(access, dict) or not access.get("reservation_id") or access.get("bypass"):
-        return
+def _friend_finish_reservation(access: dict | None, *, spent: bool) -> bool:
+    if not isinstance(access, dict) or access.get("already_charged") or access.get("bypass"):
+        return True
+    if not access.get("reservation_id"):
+        return False
     client = _friend_store_client()
     if client is None:
         logger.warning("FRIEND_ACCESS_FINISH_WARN reason=store_unavailable")
-        return
+        return False
     device_key = str(access.get("device_key") or "")
     reservation_id = str(access.get("reservation_id") or "")
     ref = client.collection(FRIEND_ACCESS_COLLECTION).document(device_key)
@@ -1283,6 +1339,11 @@ def _friend_finish_reservation(access: dict | None, *, spent: bool) -> None:
         data["reservations"] = reservations
         if spent:
             data["credits_used"] = max(0, _safe_int(data.get("credits_used"), 0)) + 1
+            charge_id = str(reservation.get("charge_id") or access.get("charge_id") or "").strip()
+            if charge_id:
+                receipts = dict(data.get("ai_charge_receipts") or {})
+                receipts[charge_id] = {"spent_at_utc": _to_utc_z(_utc_now())}
+                data["ai_charge_receipts"] = dict(list(receipts.items())[-1000:])
             action = "credit_spent"
         else:
             data["credits_remaining"] = max(0, _safe_int(data.get("credits_remaining"), 0)) + 1
@@ -1293,9 +1354,10 @@ def _friend_finish_reservation(access: dict | None, *, spent: bool) -> None:
         return True
 
     try:
-        _friend_run_transaction(client, _finish)
+        return bool(_friend_run_transaction(client, _finish))
     except Exception as exc:
         logger.warning("FRIEND_ACCESS_FINISH_WARN detail=%s", _safe_error_text(exc))
+        return False
 
 
 def _friend_ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
@@ -1793,14 +1855,15 @@ def _paid_parse_access_token(token: str) -> tuple[str, str, str]:
     return pieces[0], pieces[1], pieces[2]
 
 
-def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None = None, allow_empty: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
+def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None = None, allow_empty: bool = False, job_id: str | None = None, system_id: str | None = None, charge_id: str | None = None) -> dict:
     record_key, device_key, secret = _paid_parse_access_token(token)
     client = _friend_store_client("paid")
     if client is None:
         raise PaidAccessError("paid_access_unavailable", "Paid Access is temporarily unavailable.", 503, retryable=True)
     ref = client.collection(PAID_ACCESS_COLLECTION).document(record_key)
     now = _utc_now()
-    reservation_id = secrets.token_hex(16) if reserve else None
+    stable_charge_id = str(charge_id or "").strip() or None
+    reservation_id = stable_charge_id if stable_charge_id else (secrets.token_hex(16) if reserve else None)
 
     def _verify(transaction):
         snap = ref.get(transaction=transaction)
@@ -1813,6 +1876,10 @@ def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None 
         if not expected or not hmac.compare_digest(expected, actual):
             raise PaidAccessError("paid_access_required", "AI Suggestions require Pro or Friend Access.", 403)
         data = _paid_release_stale_reservations(data, now)
+        charge_receipts = dict(data.get("ai_charge_receipts") or {})
+        already_charged = bool(stable_charge_id and stable_charge_id in charge_receipts)
+        existing_reservations = dict(data.get("reservations") or {})
+        reservation_exists = bool(reservation_id and str(reservation_id) in existing_reservations)
         pro_active = _paid_is_active(data, now)
         stored_plan = APPLE_SUBSCRIPTION_PRODUCTS.get(str(data.get("product_id") or "")) or {}
         plan_name = str(data.get("plan") or stored_plan.get("plan") or "pro")
@@ -1829,26 +1896,30 @@ def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None 
                 raise PaidAccessError("paid_credits_exhausted", "Paid AI credits are used up for this billing period.", 403)
             raise PaidAccessError("paid_subscription_inactive", "No paid AI credits are available.", 403)
         selected_source = str(source or ("pro" if pro_remaining > 0 else "purchased"))
-        if reserve and selected_source == "pro" and pro_remaining <= 0:
+        if reserve and not already_charged and selected_source == "pro" and pro_remaining <= 0:
             raise PaidAccessError("paid_credits_exhausted", "Paid AI credits are used up for this billing period.", 403)
-        if reserve and selected_source == "purchased" and purchased_remaining <= 0:
+        if reserve and not already_charged and selected_source == "purchased" and purchased_remaining <= 0:
             raise PaidAccessError("paid_credits_exhausted", "Purchased AI credits are used up.", 403)
-        if reserve:
-            if selected_source == "pro":
-                data["subscription_credits_remaining"] = pro_remaining - 1
-                data["credits_remaining"] = pro_remaining - 1
-                pro_remaining -= 1
-            else:
-                data["purchased_credits_remaining"] = purchased_remaining - 1
-                purchased_remaining -= 1
+        if reserve and not already_charged:
             reservations = dict(data.get("reservations") or {})
-            reservations[str(reservation_id)] = {
-                "created_at_utc": _to_utc_z(now),
-                "job_id": str(job_id or "") or None,
-                "system_id": str(system_id or "") or None,
-                "source": selected_source,
-            }
-            data["reservations"] = reservations
+            if str(reservation_id) in reservations:
+                already_charged = False
+            else:
+                if selected_source == "pro":
+                    data["subscription_credits_remaining"] = pro_remaining - 1
+                    data["credits_remaining"] = pro_remaining - 1
+                    pro_remaining -= 1
+                else:
+                    data["purchased_credits_remaining"] = purchased_remaining - 1
+                    purchased_remaining -= 1
+                reservations[str(reservation_id)] = {
+                    "created_at_utc": _to_utc_z(now),
+                    "job_id": str(job_id or "") or None,
+                    "system_id": str(system_id or "") or None,
+                    "source": selected_source,
+                    "charge_id": stable_charge_id,
+                }
+                data["reservations"] = reservations
         device_tokens = dict(data.get("device_tokens") or {})
         device["last_seen_at_utc"] = _to_utc_z(now)
         device_tokens[device_key] = device
@@ -1860,6 +1931,9 @@ def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None 
             "provider": "paid",
             "record_key": record_key,
             "reservation_id": reservation_id,
+            "charge_id": stable_charge_id,
+            "already_charged": already_charged,
+            "reservation_exists": reservation_exists,
             "paid_id": record_key[:10].upper(),
             "plan": plan_name if pro_active else None,
             "plan_display_name": plan_display_name if pro_active else None,
@@ -1883,13 +1957,15 @@ def _paid_verify_token(token: str, *, reserve: bool = False, source: str | None 
         raise PaidAccessError("paid_access_unavailable", "Paid Access is temporarily unavailable.", 503, retryable=True) from exc
 
 
-def _paid_finish_reservation(access: dict | None, *, spent: bool) -> None:
-    if not isinstance(access, dict) or access.get("provider") != "paid" or not access.get("reservation_id"):
-        return
+def _paid_finish_reservation(access: dict | None, *, spent: bool) -> bool:
+    if not isinstance(access, dict) or access.get("already_charged"):
+        return True
+    if access.get("provider") != "paid" or not access.get("reservation_id"):
+        return False
     client = _friend_store_client()
     if client is None:
         logger.warning("PAID_ACCESS_FINISH_WARN reason=store_unavailable")
-        return
+        return False
     record_key = str(access.get("record_key") or "")
     reservation_id = str(access.get("reservation_id") or "")
     ref = client.collection(PAID_ACCESS_COLLECTION).document(record_key)
@@ -1911,6 +1987,11 @@ def _paid_finish_reservation(access: dict | None, *, spent: bool) -> None:
             data[key] = max(0, _safe_int(data.get(key), 0)) + 1
             if source == "pro":
                 data["credits_used"] = data[key]
+            charge_id = str(reservation.get("charge_id") or access.get("charge_id") or "").strip()
+            if charge_id:
+                receipts = dict(data.get("ai_charge_receipts") or {})
+                receipts[charge_id] = {"spent_at_utc": _to_utc_z(_utc_now()), "source": source}
+                data["ai_charge_receipts"] = dict(list(receipts.items())[-1000:])
         elif source == "purchased":
             data["purchased_credits_remaining"] = max(0, _safe_int(data.get("purchased_credits_remaining"), 0)) + 1
         else:
@@ -1921,12 +2002,13 @@ def _paid_finish_reservation(access: dict | None, *, spent: bool) -> None:
         return True
 
     try:
-        _friend_run_transaction(client, _finish)
+        return bool(_friend_run_transaction(client, _finish))
     except Exception as exc:
         logger.warning("PAID_ACCESS_FINISH_WARN detail=%s", _safe_error_text(exc))
+        return False
 
 
-def _ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: str | None = None) -> dict:
+def _ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: str | None = None, charge_id: str | None = None) -> dict:
     paid_token = _paid_header_token()
     friend_token = _friend_bearer_token()
     if not paid_token and not friend_token:
@@ -1941,8 +2023,11 @@ def _ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: s
     verified_sources = 0
     if friend_token:
         try:
-            friend = _friend_verify_token(friend_token)
+            friend = _friend_verify_token(friend_token, charge_id=charge_id)
             verified_sources += 1
+            if charge_id and (friend.get("already_charged") or friend.get("reservation_exists")):
+                friend["provider"] = "friend"
+                return friend
             if max(0, _safe_int(friend.get("credits_remaining"), 0)) > 0:
                 candidates.append((str(friend.get("expires_at_utc") or "9999"), 0, "friend"))
         except FriendAccessError as exc:
@@ -1952,8 +2037,10 @@ def _ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: s
                 access_errors.append(exc)
     if paid_token:
         try:
-            paid = _paid_verify_token(paid_token, allow_empty=True)
+            paid = _paid_verify_token(paid_token, allow_empty=True, charge_id=charge_id)
             verified_sources += 1
+            if charge_id and (paid.get("already_charged") or paid.get("reservation_exists")):
+                return paid
             if paid.get("pro_active") and max(0, _safe_int(paid.get("pro_credits_remaining"), 0)) > 0:
                 candidates.append((str(paid.get("expires_at_utc") or "9999"), 1, "pro"))
             if _apple_packs_enabled() and max(0, _safe_int(paid.get("purchased_credits_remaining"), 0)) > 0:
@@ -1976,20 +2063,21 @@ def _ai_access(*, reserve: bool = False, job_id: str | None = None, system_id: s
     if not reserve:
         return {"active": True, "provider": selected}
     if selected == "friend":
-        result = _friend_verify_token(friend_token, reserve=True, job_id=job_id, system_id=system_id)
+        result = _friend_verify_token(friend_token, reserve=True, job_id=job_id, system_id=system_id, charge_id=charge_id)
         result["provider"] = "friend"
         return result
-    return _paid_verify_token(paid_token, reserve=True, source=selected, job_id=job_id, system_id=system_id)
+    return _paid_verify_token(paid_token, reserve=True, source=selected, job_id=job_id, system_id=system_id, charge_id=charge_id)
 
 
-def _finish_ai_access(access: dict | None, *, spent: bool) -> None:
+def _finish_ai_access(access: dict | None, *, spent: bool) -> bool:
     if isinstance(access, dict) and access.get("provider") == "paid":
-        _paid_finish_reservation(access, spent=spent)
+        return _paid_finish_reservation(access, spent=spent)
     else:
         friend_access = dict(access) if isinstance(access, dict) else access
         if isinstance(friend_access, dict):
             friend_access.pop("provider", None)
-        _friend_finish_reservation(friend_access, spent=spent)
+        return _friend_finish_reservation(friend_access, spent=spent)
+    return False
 
 
 def _paid_error_response(exc: PaidAccessError):
@@ -3710,9 +3798,33 @@ def _configured_bedrock_model_id() -> str:
     return str(os.environ.get("BEDROCK_MODEL_ID", BEDROCK_MODEL_ID) or "").strip()
 
 
-def _requested_ai_model_name() -> str:
+def _configured_bedrock_general_model_id() -> str:
+    explicit = str(os.environ.get("BEDROCK_GENERAL_MODEL_ID", "") or "").strip()
+    if explicit:
+        return explicit
+    legacy = str(os.environ.get("BEDROCK_MODEL_ID", "") or "").strip()
+    return legacy or BEDROCK_GENERAL_MODEL_ID
+
+
+def _configured_bedrock_ending_model_id() -> str:
+    explicit = str(os.environ.get("BEDROCK_ENDING_MODEL_ID", "") or "").strip()
+    if explicit:
+        return explicit
+    legacy = str(os.environ.get("BEDROCK_MODEL_ID", "") or "").strip()
+    return legacy or BEDROCK_ENDING_MODEL_ID
+
+
+def _ending_pass_enabled() -> bool:
+    return str(os.environ.get("AI_ENDING_PASS_ENABLED", "1" if AI_ENDING_PASS_ENABLED else "0") or "0").strip().lower() in ("1", "true", "yes")
+
+
+def _requested_ai_model_name(pass_kind: str = "general") -> str:
     provider = _requested_ai_provider_name()
     if provider == "bedrock":
+        if str(pass_kind or "").strip().lower() == "ending":
+            return _configured_bedrock_ending_model_id() or _configured_bedrock_model_id() or "unknown"
+        if str(pass_kind or "").strip().lower() == "general":
+            return _configured_bedrock_general_model_id() or _configured_bedrock_model_id() or "unknown"
         return _configured_bedrock_model_id() or "unknown"
     if provider == "anthropic":
         return _configured_anthropic_model_name() or "unknown"
@@ -3791,6 +3903,8 @@ def _append_internal_ai_cost_usage(
     system_row: dict,
     model: str,
     usage: dict | None,
+    pass_kind: str = "general",
+    charge_id: str | None = None,
 ) -> dict:
     existing = mapping_summary.get(AI_COST_SUMMARY_KEY)
     summary = dict(existing) if isinstance(existing, dict) else {}
@@ -3810,6 +3924,8 @@ def _append_internal_ai_cost_usage(
             "page": page,
             "system_id": system_id,
             "model": str(model or _requested_ai_model_name()).strip() or "unknown",
+            "pass_kind": str(pass_kind or "general"),
+            "charge_id": str(charge_id or "") or None,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "retry_attempts": retry_attempts,
@@ -3841,6 +3957,18 @@ def _append_internal_ai_cost_usage(
         summary["estimated_ai_cost_usd"] = format(estimated_cost, "f")
         summary["cost_status"] = "estimated"
     mapping_summary[AI_COST_SUMMARY_KEY] = summary
+    if charge_id:
+        logger.info(
+            "AI_PASS_USAGE pass=%s system=%s model=%s input_tokens=%s output_tokens=%s retries=%s charge_id=%s usage_available=%s",
+            str(pass_kind or "general"),
+            system_id,
+            str(model or "unknown"),
+            input_tokens,
+            output_tokens,
+            retry_attempts,
+            str(charge_id),
+            usage_available,
+        )
     return summary
 
 
@@ -3868,7 +3996,11 @@ def _current_ai_suggest_run(
     remembered_time_signature = _normalize_ai_time_signature_value(row.get("remembered_time_signature"))
     last_time_signature_update = _normalize_ai_time_signature_update_row(row.get("last_time_signature_update"))
     time_signature_updates = _normalize_ai_time_signature_update_rows(row.get("time_signature_updates"))
+    pass_state_by_system_id = row.get("pass_state_by_system_id") if isinstance(row.get("pass_state_by_system_id"), dict) else {}
+    credit_groups = row.get("credit_groups") if isinstance(row.get("credit_groups"), dict) else {}
     clean = {
+        "version": str(row.get("version") or "ai_suggest_run_v1"),
+        "credit_scheme": str(row.get("credit_scheme") or "one_system_per_credit_v1"),
         "status": status,
         "started_at_utc": str(row.get("started_at_utc") or "").strip() or None,
         "updated_at_utc": str(row.get("updated_at_utc") or "").strip() or None,
@@ -3886,6 +4018,9 @@ def _current_ai_suggest_run(
         "remembered_time_signature": remembered_time_signature,
         "last_time_signature_update": last_time_signature_update,
         "time_signature_updates": time_signature_updates,
+        "pass_state_by_system_id": deepcopy(pass_state_by_system_id),
+        "credit_groups": deepcopy(credit_groups),
+        "ending_carry_kind": str(row.get("ending_carry_kind") or "").strip() or None,
     }
     return clean
 
@@ -3905,6 +4040,8 @@ def _empty_ai_suggestions_state(
         "decision_debug_by_measure_id": {},
         "time_signatures_by_measure_id": {},
         "measure_completeness_by_measure_id": {},
+        "ending_events_by_measure_id": {},
+        "ending_pairs_by_id": {},
         "warnings": [],
         "summary": {
             "systems_processed": 0,
@@ -3919,6 +4056,145 @@ def _empty_ai_suggestions_state(
     return ai_suggestions
 
 
+def _ending_confidence_rank(value: str | None) -> int:
+    return {"low": 0, "medium": 1, "high": 2}.get(str(value or "").strip().lower(), 0)
+
+
+def _ending_pair_id(ending_1_start: str | None, ending_2_start: str | None) -> str:
+    raw = f"{str(ending_1_start or 'missing')}|{str(ending_2_start or 'missing')}"
+    return "ending_pair_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _rebuild_ai_ending_pairs(ai_suggestions: dict, ordered_measures: list[dict], *, all_systems_completed: bool) -> dict:
+    events = ai_suggestions.get("ending_events_by_measure_id")
+    if not isinstance(events, dict):
+        events = {}
+    ordered = [
+        str(row.get("measure_id") or "").strip()
+        for row in _sorted_measure_rows(ordered_measures or [])
+        if isinstance(row, dict) and str(row.get("measure_id") or "").strip()
+    ]
+    index_by_id = {measure_id: index for index, measure_id in enumerate(ordered)}
+    pairs: dict[str, dict] = {}
+    pending_ending_1: list[dict] = []
+    active: dict | None = None
+    incomplete: list[dict] = []
+
+    def finish_active(*, complete: bool) -> None:
+        nonlocal active
+        if not isinstance(active, dict):
+            return
+        row = dict(active)
+        row["complete"] = bool(complete)
+        if row.get("measure_ids"):
+            if row.get("kind") == "ending_1" and complete:
+                pending_ending_1.append(row)
+            elif row.get("kind") == "ending_2" and complete:
+                ending_1 = pending_ending_1.pop(0) if pending_ending_1 else None
+                ending_2_start = (row.get("measure_ids") or [None])[0]
+                ending_1_start = ((ending_1 or {}).get("measure_ids") or [None])[0]
+                adjacent = bool(
+                    ending_1
+                    and index_by_id.get((ending_1.get("measure_ids") or [None])[-1], -2) + 1
+                    == index_by_id.get(ending_2_start, -1)
+                )
+                if ending_1 and adjacent:
+                    confidence = "high" if min(_ending_confidence_rank(ending_1.get("confidence")), _ending_confidence_rank(row.get("confidence"))) >= 2 else "medium"
+                    pair_id = _ending_pair_id(ending_1_start, ending_2_start)
+                    pairs[pair_id] = {
+                        "pair_id": pair_id,
+                        "status": "complete",
+                        "confidence": confidence,
+                        "order_measure_id": ending_1_start,
+                        "ending_1_start_measure_id": ending_1_start,
+                        "ending_1_end_measure_id": (ending_1.get("measure_ids") or [None])[-1],
+                        "ending_2_start_measure_id": ending_2_start,
+                        "ending_2_end_measure_id": (row.get("measure_ids") or [None])[-1],
+                        "ending_1_measure_ids": list(ending_1.get("measure_ids") or []),
+                        "ending_2_measure_ids": list(row.get("measure_ids") or []),
+                        "missing_boundaries": [],
+                    }
+                elif ending_1:
+                    incomplete.append({"ending_1": ending_1, "ending_2": row})
+            else:
+                incomplete.append({row.get("kind") or "unknown": row})
+        active = None
+
+    previous_measure_id: str | None = None
+    for measure_id in ordered:
+        event = events.get(measure_id)
+        if not isinstance(event, dict):
+            previous_measure_id = measure_id
+            continue
+        start = str(event.get("start") or "none")
+        boundary = str(event.get("right_boundary") or "none")
+        confidence = str(event.get("confidence") or "low")
+
+        if active and start in {"ending_1", "ending_2"}:
+            if active.get("kind") == "ending_1" and start == "ending_2" and previous_measure_id:
+                finish_active(complete=True)
+            else:
+                finish_active(complete=False)
+        if active and start == "none" and boundary == "none":
+            finish_active(complete=False)
+        if start in {"ending_1", "ending_2"} and _ending_confidence_rank(confidence) >= 1:
+            active = {"kind": start, "measure_ids": [], "confidence": confidence}
+        if active and measure_id not in active["measure_ids"]:
+            active["measure_ids"].append(measure_id)
+        if boundary in {"closed_stop", "open_stop"}:
+            finish_active(complete=bool(active))
+        previous_measure_id = measure_id
+
+    if active and all_systems_completed:
+        last_event = events.get((active.get("measure_ids") or [None])[-1]) or {}
+        finish_active(
+            complete=active.get("kind") == "ending_2"
+            and str(last_event.get("right_boundary") or "none") in {"continues", "system_edge"}
+        )
+    elif active:
+        incomplete.append({active.get("kind") or "unknown": dict(active)})
+
+    for ending_1 in pending_ending_1:
+        incomplete.append({"ending_1": ending_1})
+    for row in incomplete:
+        ending_1 = row.get("ending_1") if isinstance(row.get("ending_1"), dict) else None
+        ending_2 = row.get("ending_2") if isinstance(row.get("ending_2"), dict) else None
+        starts = [
+            ((ending_1 or {}).get("measure_ids") or [None])[0],
+            ((ending_2 or {}).get("measure_ids") or [None])[0],
+        ]
+        if not any(starts):
+            continue
+        confidence_rows = [candidate for candidate in (ending_1, ending_2) if isinstance(candidate, dict)]
+        if not any(_ending_confidence_rank(candidate.get("confidence")) >= 1 for candidate in confidence_rows):
+            continue
+        pair_id = _ending_pair_id(starts[0], starts[1])
+        missing = []
+        if ending_1 is None:
+            missing.append("ending_1_start")
+        elif not ending_1.get("complete"):
+            missing.append("ending_1_end")
+        if ending_2 is None:
+            missing.extend(["ending_2_start", "ending_2_end"])
+        elif not ending_2.get("complete"):
+            missing.append("ending_2_end")
+        pairs[pair_id] = {
+            "pair_id": pair_id,
+            "status": "needs_user_input",
+            "confidence": "medium",
+            "order_measure_id": starts[0] or starts[1],
+            "ending_1_start_measure_id": starts[0],
+            "ending_1_end_measure_id": ((ending_1 or {}).get("measure_ids") or [None])[-1],
+            "ending_2_start_measure_id": starts[1],
+            "ending_2_end_measure_id": ((ending_2 or {}).get("measure_ids") or [None])[-1],
+            "ending_1_measure_ids": list((ending_1 or {}).get("measure_ids") or []),
+            "ending_2_measure_ids": list((ending_2 or {}).get("measure_ids") or []),
+            "missing_boundaries": missing,
+        }
+    ai_suggestions["ending_pairs_by_id"] = pairs
+    return pairs
+
+
 def _new_ai_suggest_run_state(
     run_id: int,
     source_state_version: str | None,
@@ -3928,6 +4204,8 @@ def _new_ai_suggest_run_state(
 ) -> dict:
     now_txt = _utc_now().isoformat().replace("+00:00", "Z")
     row = {
+        "version": AI_SUGGEST_RUN_VERSION,
+        "credit_scheme": AI_CREDIT_SCHEME_VERSION,
         "status": status,
         "started_at_utc": now_txt if status in {AI_SUGGEST_RUN_STATUS_RUNNING, AI_SUGGEST_RUN_STATUS_COMPLETED} else None,
         "updated_at_utc": now_txt,
@@ -3945,8 +4223,17 @@ def _new_ai_suggest_run_state(
         "remembered_time_signature": None,
         "last_time_signature_update": None,
         "time_signature_updates": [],
+        "pass_state_by_system_id": {},
+        "credit_groups": {},
+        "ending_carry_kind": None,
     }
     return row
+
+
+def _ai_credit_group_id(job_id: str, run_id: int, source_state_version: str | None, system_index: int) -> str:
+    pair_index = max(0, int(system_index)) // 2
+    raw = f"{job_id}|{int(run_id)}|{str(source_state_version or '')}|{pair_index}"
+    return "ai-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _normalize_ai_score_type(raw_value) -> str | None:
@@ -4091,6 +4378,39 @@ def _merge_ai_suggestions_state(
     return base
 
 
+def _merge_ai_ending_system_state(
+    ai_suggestions: dict,
+    ending_result: dict,
+    ordered_measures: list[dict],
+    *,
+    all_systems_completed: bool,
+) -> dict:
+    result = dict(ai_suggestions or {})
+    events_by_measure_id = dict(result.get("ending_events_by_measure_id") or {})
+    warnings = [dict(row) for row in (result.get("warnings") or []) if isinstance(row, dict)]
+    for event in ending_result.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        measure_id = str(event.get("measure_id") or "").strip()
+        if measure_id:
+            events_by_measure_id[measure_id] = dict(event)
+        if str(event.get("start") or "").strip() == "unsupported":
+            warnings.append(
+                {
+                    "type": "unsupported_ending_ignored",
+                    "system_id": str(ending_result.get("system_id") or "") or None,
+                    "message": "A third or combined ending was ignored.",
+                }
+            )
+    result["ending_events_by_measure_id"] = events_by_measure_id
+    result["ending_version"] = AI_SUGGESTIONS_ENDING_VERSION
+    result["ending_provider"] = str(ending_result.get("provider") or _requested_ai_provider_name())
+    result["ending_model"] = str(ending_result.get("model") or _requested_ai_model_name("ending"))
+    result["warnings"] = warnings
+    _rebuild_ai_ending_pairs(result, ordered_measures, all_systems_completed=all_systems_completed)
+    return result
+
+
 def _ai_suggest_error_payload(exc: AiSuggestError | Exception, default_message: str = "Claude suggestion request failed.") -> dict:
     if isinstance(exc, AiSuggestError):
         payload = {
@@ -4163,6 +4483,23 @@ def _remove_ai_suggestion_entries(mapping_summary: dict | None, measure_ids: set
         ai_suggestions["time_signatures_by_measure_id"] = time_signatures_by_measure_id
         ai_suggestions["measure_completeness_by_measure_id"] = measure_completeness_by_measure_id
         _refresh_ai_suggestions_summary(ai_suggestions)
+    return removed
+
+
+def _remove_ai_ending_pairs(mapping_summary: dict | None, pair_ids: set[str] | list[str] | tuple[str, ...]) -> list[str]:
+    ai_suggestions = _current_ai_suggestions(mapping_summary)
+    if not isinstance(ai_suggestions, dict):
+        return []
+    pairs = ai_suggestions.get("ending_pairs_by_id")
+    if not isinstance(pairs, dict):
+        return []
+    removed: list[str] = []
+    for pair_id in pair_ids or []:
+        clean_id = str(pair_id or "").strip()
+        if clean_id and clean_id in pairs:
+            pairs.pop(clean_id, None)
+            removed.append(clean_id)
+    ai_suggestions["ending_pairs_by_id"] = pairs
     return removed
 
 
@@ -4835,7 +5172,7 @@ def _anthropic_messages_create(payload: dict) -> dict:
 
 
 def _bedrock_messages_create_once(payload: dict) -> dict:
-    model_id = _configured_bedrock_model_id()
+    model_id = str((payload or {}).get("model") or _configured_bedrock_model_id()).strip()
     region_name = _aws_region_name()
     if not model_id or not region_name:
         raise AiSuggestError(provider_status=503, detail="provider_not_configured")
@@ -5146,6 +5483,31 @@ def _measure_crop_rect(
     return _measure_crop_spec(page_rect, measure_row, next_measure_row, system_row, prev_system_row, next_system_row)["clip"]
 
 
+def _ending_measure_crop_spec(
+    page_rect,
+    measure_row: dict,
+    next_measure_row: dict | None,
+    system_row: dict | None,
+    prev_system_row: dict | None = None,
+    next_system_row: dict | None = None,
+) -> dict:
+    spec = _measure_crop_spec(page_rect, measure_row, next_measure_row, system_row, prev_system_row, next_system_row)
+    bounds = dict(spec.get("measure_bounds") or {})
+    width = max(1.0, _safe_float(bounds.get("width"), 1.0))
+    x_pad = min(width * 0.25, max(8.0, width * 0.08))
+    clip = spec["clip"]
+    spec["clip"] = fitz.Rect(
+        max(0.0, float(clip.x0) - x_pad),
+        float(clip.y0),
+        min(float(page_rect.width), float(clip.x1) + x_pad),
+        float(clip.y1),
+    )
+    spec["padding"] = dict(spec.get("padding") or {})
+    spec["padding"]["left"] = min(x_pad, max(0.0, float(clip.x0)))
+    spec["padding"]["right"] = min(x_pad, max(0.0, float(page_rect.width) - float(clip.x1)))
+    return spec
+
+
 def _render_measure_crop_png(page, clip: fitz.Rect) -> bytes:
     pix = page.get_pixmap(matrix=fitz.Matrix(AI_MEASURE_CROP_SCALE, AI_MEASURE_CROP_SCALE), clip=clip, alpha=False)
     return bytes(pix.tobytes("png"))
@@ -5434,6 +5796,46 @@ def _build_old_style_multi_rest_reference_content() -> tuple[list[dict], int]:
             }
         )
     return content, len(example_rows)
+
+
+def _build_ending_reference_content() -> tuple[list[dict], int]:
+    content: list[dict] = []
+    rows: list[dict] = []
+    for row in AI_ENDING_REFERENCE_EXAMPLES:
+        image_path = AI_REFERENCE_EXAMPLES_DIR / str(row.get("filename") or "")
+        try:
+            image_bytes = image_path.read_bytes()
+        except FileNotFoundError:
+            logger.warning("AI_ENDING_REFERENCE_MISSING filename=%s", image_path.name)
+            continue
+        except Exception as exc:
+            logger.warning("AI_ENDING_REFERENCE_LOAD_FAILED filename=%s error_type=%s", image_path.name, type(exc).__name__)
+            continue
+        rows.append({"caption": str(row.get("caption") or ""), "image_bytes": image_bytes})
+    if not rows:
+        return content, 0
+    content.append(
+        {
+            "type": "text",
+            "text": (
+                "The next seven images are labeled ending-bracket references only. "
+                "After them, classify the real target-measure crops."
+            ),
+        }
+    )
+    for row in rows:
+        content.append({"type": "text", "text": row["caption"]})
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(row["image_bytes"]).decode("ascii"),
+                },
+            }
+        )
+    return content, len(rows)
 
 
 def _ai_prompt_base_rules() -> list[str]:
@@ -5904,6 +6306,223 @@ def _build_system_measure_request(
         },
         int(reference_examples_attached),
     )
+
+
+def _build_ending_system_request(
+    job_id: str,
+    run_id: int,
+    system_row: dict,
+    measure_rows: list[dict],
+    page,
+    *,
+    active_ending_in: str | None = None,
+    pdf_source: str = "baseline",
+    prev_system_row: dict | None = None,
+    next_system_row: dict | None = None,
+    score_type: str | None = None,
+) -> tuple[dict, int]:
+    system_id = str(system_row.get("system_id") or "").strip()
+    normalized_score_type = _normalize_ai_score_type(score_type)
+    scope = {
+        "single": "Inspect above the single staff.",
+        "grand": "Inspect above the top staff of the grand staff only.",
+        "score": "Inspect above the top visible staff of the full system only.",
+    }.get(normalized_score_type, "Inspect above the top staff of the system.")
+    intro = {
+        "job_id": str(job_id),
+        "run_id": int(run_id),
+        "system_id": system_id,
+        "score_type": normalized_score_type,
+        "active_ending_in": active_ending_in if active_ending_in in {"ending_1", "ending_2"} else None,
+        "instructions": {
+            "task": "Inspect every target measure for repeat-ending (volta) bracket structure.",
+            "rules": [
+                scope,
+                "Return exactly one result for every target measure, in the supplied order.",
+                "Each real crop contains the target measure plus a small amount of neighboring context. Classify only the center target measure.",
+                "A repeat-ending bracket is a thin straight horizontal line above the staff, often beginning with a downward left hook and 1, 1., 1st, 2, 2., or 2nd.",
+                "A start at a left barline belongs to the measure on its right. A stop at a right barline belongs to the measure on its left.",
+                "A measure may contain both a start and a stop.",
+                "closed_stop means a downward right hook. open_stop means the horizontal line visibly ends without a hook. Both stop the ending.",
+                "continues means the bracket crosses the target measure's right boundary into the next measure.",
+                "system_edge means the bracket reaches the right edge of the system and may continue on the next system or page.",
+                "A continuing horizontal line without a number is not a new start.",
+                "Do not treat fingering, rehearsal numbers, measure numbers, lyrics, repeat dots, slurs, ties, beams, hairpins, staff lines, or ordinary barlines as ending brackets.",
+                "If a visible numbered bracket is neither Ending 1 nor Ending 2, use unsupported.",
+                "Use uncertain instead of guessing when the bracket structure cannot be read.",
+                "Return JSON only.",
+            ],
+            "output_shape": {
+                "ending_measures": [
+                    {
+                        "measure_id": "string",
+                        "start": "none|ending_1|ending_2|unsupported|uncertain",
+                        "right_boundary": "none|continues|closed_stop|open_stop|system_edge|uncertain",
+                        "confidence": "low|medium|high",
+                        "evidence": "short visual description, maximum 20 words",
+                    }
+                ]
+            },
+        },
+        "measures": [
+            {
+                "measure_id": str(row.get("measure_id") or "").strip(),
+                "order_index_in_system": _safe_int(row.get("measure_local_index"), index),
+            }
+            for index, row in enumerate(measure_rows)
+        ],
+    }
+    content: list[dict] = [{"type": "text", "text": json.dumps(intro, ensure_ascii=True)}]
+    reference_content, reference_count = _build_ending_reference_content()
+    content.extend(reference_content)
+    for index, row in enumerate(measure_rows):
+        next_row = measure_rows[index + 1] if index + 1 < len(measure_rows) else None
+        crop_spec = _ending_measure_crop_spec(page.rect, row, next_row, system_row, prev_system_row, next_system_row)
+        image_bytes = _render_measure_crop_png(page, crop_spec["clip"])
+        content.append(
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "target_measure_id": str(row.get("measure_id") or "").strip(),
+                        "order_index_in_system": _safe_int(row.get("measure_local_index"), index),
+                        "pdf_source": pdf_source,
+                    },
+                    ensure_ascii=True,
+                ),
+            }
+        )
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                },
+            }
+        )
+    return (
+        {
+            "model": _requested_ai_model_name("ending"),
+            "max_tokens": ANTHROPIC_MAX_TOKENS,
+            "messages": [{"role": "user", "content": content}],
+        },
+        int(reference_count),
+    )
+
+
+def _normalize_ending_system_response(parsed: dict, measure_rows: list[dict]) -> list[dict]:
+    raw_rows = parsed.get("ending_measures") if isinstance(parsed, dict) else None
+    if not isinstance(raw_rows, list):
+        raise AiSuggestError(detail="malformed_response: ending_measures missing")
+    expected = [str(row.get("measure_id") or "").strip() for row in measure_rows]
+    if len(raw_rows) != len(expected):
+        raise AiSuggestError(detail="malformed_response: ending measure count mismatch")
+    normalized: list[dict] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(raw_rows):
+        if not isinstance(raw, dict):
+            raise AiSuggestError(detail="malformed_response: ending entry must be object")
+        measure_id = str(raw.get("measure_id") or "").strip()
+        if measure_id != expected[index] or measure_id in seen:
+            raise AiSuggestError(detail="malformed_response: ending measures must match supplied order")
+        start = str(raw.get("start") or "none").strip().lower()
+        boundary = str(raw.get("right_boundary") or "none").strip().lower()
+        confidence = str(raw.get("confidence") or "low").strip().lower()
+        if start not in AI_ENDING_START_VALUES or boundary not in AI_ENDING_BOUNDARY_VALUES:
+            raise AiSuggestError(detail=f"malformed_response: invalid ending value for {measure_id}")
+        if confidence not in AI_SUGGESTION_CONFIDENCE_ALLOWED:
+            raise AiSuggestError(detail=f"malformed_response: invalid ending confidence for {measure_id}")
+        evidence = " ".join(str(raw.get("evidence") or "").split())
+        normalized.append(
+            {
+                "measure_id": measure_id,
+                "start": start,
+                "right_boundary": boundary,
+                "confidence": confidence,
+                "evidence": " ".join(evidence.split()[:20]),
+            }
+        )
+        seen.add(measure_id)
+    return normalized
+
+
+def _ending_carry_after_system(active_ending_in: str | None, events: list[dict]) -> str | None:
+    active = active_ending_in if active_ending_in in {"ending_1", "ending_2"} else None
+    for event in events:
+        start = str(event.get("start") or "none")
+        boundary = str(event.get("right_boundary") or "none")
+        if start in {"ending_1", "ending_2"}:
+            active = start
+        if boundary in {"closed_stop", "open_stop"}:
+            active = None
+        elif active and boundary == "none" and start == "none":
+            active = None
+    return active
+
+
+def _generate_ai_endings_for_system_batch(
+    job_id: str,
+    run_id: int,
+    systems: list[dict] | None,
+    system_row: dict,
+    system_measures: list[dict],
+    artifacts: dict,
+    *,
+    active_ending_in: str | None,
+    score_type: str | None,
+) -> dict:
+    model_name = _requested_ai_model_name("ending")
+    if not model_name or model_name == "unknown":
+        raise AiSuggestError(provider_status=503, detail="ending_provider_not_configured")
+    with TemporaryDirectory(prefix="omr-ai-ending-step-") as tmp:
+        in_pdf, pdf_source = _resolve_ai_crop_pdf_source(artifacts, Path(tmp))
+        doc = fitz.open(str(in_pdf))
+        try:
+            ordered_systems = _sorted_system_rows(systems or [])
+            prev_system_row, next_system_row = _same_page_neighbor_systems(ordered_systems, system_row)
+            page_number = _safe_int(system_row.get("page"), _safe_int(system_measures[0].get("page"), 1))
+            page_index = max(0, int(page_number) - 1)
+            if page_index >= len(doc):
+                raise AiSuggestError(provider_status=500, detail=f"invalid_page_index:{page_number}")
+            payload, reference_count = _build_ending_system_request(
+                job_id,
+                run_id,
+                system_row,
+                system_measures,
+                doc[page_index],
+                active_ending_in=active_ending_in,
+                pdf_source=pdf_source,
+                prev_system_row=prev_system_row,
+                next_system_row=next_system_row,
+                score_type=score_type,
+            )
+            last_error: AiSuggestError | None = None
+            for attempt in (1, 2):
+                try:
+                    message = _ai_messages_create(payload)
+                    events = _normalize_ending_system_response(_parse_anthropic_suggestions_message(message), system_measures)
+                    return {
+                        "version": AI_SUGGESTIONS_ENDING_VERSION,
+                        "provider": _requested_ai_provider_name(),
+                        "model": model_name,
+                        "system_id": str(system_row.get("system_id") or ""),
+                        "events": events,
+                        "active_ending_out": _ending_carry_after_system(active_ending_in, events),
+                        "reference_examples_attached": reference_count,
+                        "_internal_ai_usage": _ai_usage_from_message(message),
+                        "retry_attempts": attempt,
+                    }
+                except AiSuggestError as exc:
+                    last_error = exc
+                    if attempt == 1 and "malformed_response" in str(exc.detail or ""):
+                        logger.warning("AI_ENDING_MALFORMED_RETRY system_id=%s", str(system_row.get("system_id") or ""))
+                        continue
+                    raise
+            raise last_error or AiSuggestError(detail="ending_pass_failed")
+        finally:
+            doc.close()
 
 
 def _generate_ai_suggestions_for_system_batch(
@@ -9049,6 +9668,211 @@ def cancel_ai_suggest_job(job_id: str):
     return jsonify(response), 200
 
 
+def _step_ai_suggest_v2(
+    *,
+    job_id: str,
+    artifact_run_id: int,
+    mapping_summary: dict,
+    artifacts: dict,
+    systems: list[dict],
+    measures: list[dict],
+    system_batches: list[tuple[dict, list[dict]]],
+    source_state_version: str | None,
+    ai_suggestions: dict,
+    ai_suggest_run: dict,
+    next_system_index: int,
+    started: float,
+) -> tuple:
+    systems_total = len(system_batches)
+    system_row, system_measures = system_batches[next_system_index]
+    system_id = str(system_row.get("system_id") or "").strip()
+    charge_id = _ai_credit_group_id(job_id, artifact_run_id, source_state_version, next_system_index)
+    pass_states = dict(ai_suggest_run.get("pass_state_by_system_id") or {})
+    pass_state = dict(pass_states.get(system_id) or {})
+    credit_groups = dict(ai_suggest_run.get("credit_groups") or {})
+    credit_group = dict(credit_groups.get(charge_id) or {})
+    credit_group.setdefault("group_index", next_system_index // 2)
+    credit_group.setdefault("system_ids", [
+        str(system_batches[index][0].get("system_id") or "")
+        for index in range((next_system_index // 2) * 2, min(systems_total, (next_system_index // 2) * 2 + 2))
+    ])
+
+    try:
+        ai_access = _ai_access(
+            reserve=not bool(credit_group.get("charged")),
+            job_id=job_id,
+            system_id=system_id or None,
+            charge_id=charge_id,
+        )
+    except FriendAccessError as exc:
+        return _friend_error_response(exc)
+    except PaidAccessError as exc:
+        return _paid_error_response(exc)
+
+    score_type = _normalize_ai_score_type(ai_suggest_run.get("score_type"))
+    remembered_time_signature_in = _normalize_ai_time_signature_value(ai_suggest_run.get("remembered_time_signature"))
+    debug_crops = None
+    reference_examples_attached = 0
+
+    if pass_state.get("general") != "completed":
+        try:
+            system_result = _generate_ai_suggestions_for_system_batch(
+                job_id,
+                artifact_run_id,
+                systems,
+                system_row,
+                system_measures,
+                source_state_version,
+                artifacts,
+                remembered_time_signature_in=remembered_time_signature_in,
+                score_type=score_type,
+            )
+            debug_crops = system_result.pop("debug_crops", None)
+            reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
+            usage = system_result.pop("_internal_ai_usage", None)
+            system_result.pop("remembered_time_signature_out", None)
+            system_result.pop("last_time_signature_update", None)
+            system_result.pop("time_signature_updates", None)
+            ai_suggestions = _merge_ai_suggestions_state(ai_suggestions, system_result, artifact_run_id, source_state_version)
+            _append_internal_ai_cost_usage(
+                mapping_summary,
+                job_id=job_id,
+                run_id=artifact_run_id,
+                system_row=system_row,
+                model=str(system_result.get("model") or _requested_ai_model_name("general")),
+                usage=usage if isinstance(usage, dict) else None,
+                pass_kind="general",
+                charge_id=charge_id,
+            )
+            pass_state["general"] = "completed"
+            pass_state["general_model"] = str(system_result.get("model") or _requested_ai_model_name("general"))
+            pass_states[system_id] = pass_state
+            ai_suggest_run["pass_state_by_system_id"] = pass_states
+            mapping_summary["ai_suggestions"] = ai_suggestions
+            mapping_summary["ai_suggest_run"] = ai_suggest_run
+            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        except Exception as exc:
+            _finish_ai_access(ai_access, spent=False)
+            error_payload = _ai_suggest_error_payload(exc)
+            ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED if next_system_index > 0 else AI_SUGGEST_RUN_STATUS_FAILED
+            ai_suggest_run["last_error"] = error_payload
+            ai_suggest_run["failed_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
+            mapping_summary["ai_suggest_run"] = ai_suggest_run
+            mapping_summary["ai_suggestions"] = ai_suggestions
+            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+            return jsonify({"job_id": job_id, "run_id": artifact_run_id, "status": ai_suggest_run["status"], "ai_suggestions": ai_suggestions, "ai_suggest_run": ai_suggest_run, "error": error_payload}), 200
+
+    if not credit_group.get("charged"):
+        if not _finish_ai_access(ai_access, spent=True):
+            credit_group["status"] = "charge_pending"
+            credit_groups[charge_id] = credit_group
+            ai_suggest_run["credit_groups"] = credit_groups
+            ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED
+            ai_suggest_run["last_error"] = {
+                "code": "ai_credit_finalize_pending",
+                "message": "AI results were saved, but credit confirmation must be retried.",
+                "retryable": True,
+                "provider_status": 503,
+                "detail": "credit_finalize_pending",
+            }
+            mapping_summary["ai_suggest_run"] = ai_suggest_run
+            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+            return jsonify({"job_id": job_id, "run_id": artifact_run_id, "status": AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED, "ai_suggestions": ai_suggestions, "ai_suggest_run": ai_suggest_run, "error": ai_suggest_run["last_error"]}), 200
+        credit_group.update(
+            {
+                "status": "charged",
+                "charged": True,
+                "charged_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+                "provider": str(ai_access.get("provider") or "friend"),
+            }
+        )
+        credit_groups[charge_id] = credit_group
+        ai_suggest_run["credit_groups"] = credit_groups
+        mapping_summary["ai_suggest_run"] = ai_suggest_run
+        _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+
+    if _ending_pass_enabled() and pass_state.get("ending") != "completed":
+        try:
+            ending_result = _generate_ai_endings_for_system_batch(
+                job_id,
+                artifact_run_id,
+                systems,
+                system_row,
+                system_measures,
+                artifacts,
+                active_ending_in=ai_suggest_run.get("ending_carry_kind"),
+                score_type=score_type,
+            )
+            ending_usage = ending_result.pop("_internal_ai_usage", None)
+            ai_suggest_run["ending_carry_kind"] = ending_result.get("active_ending_out")
+            ai_suggestions = _merge_ai_ending_system_state(
+                ai_suggestions,
+                ending_result,
+                measures,
+                all_systems_completed=next_system_index + 1 >= systems_total,
+            )
+            _append_internal_ai_cost_usage(
+                mapping_summary,
+                job_id=job_id,
+                run_id=artifact_run_id,
+                system_row=system_row,
+                model=str(ending_result.get("model") or _requested_ai_model_name("ending")),
+                usage=ending_usage if isinstance(ending_usage, dict) else None,
+                pass_kind="ending",
+                charge_id=charge_id,
+            )
+            pass_state["ending"] = "completed"
+            pass_state["ending_model"] = str(ending_result.get("model") or _requested_ai_model_name("ending"))
+        except Exception as exc:
+            pass_state["ending"] = "retryable_failed"
+            pass_states[system_id] = pass_state
+            error_payload = _ai_suggest_error_payload(exc, default_message="Ending detection temporarily failed.")
+            ai_suggest_run["pass_state_by_system_id"] = pass_states
+            ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED
+            ai_suggest_run["last_error"] = error_payload
+            ai_suggest_run["failed_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
+            mapping_summary["ai_suggestions"] = ai_suggestions
+            mapping_summary["ai_suggest_run"] = ai_suggest_run
+            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+            logger.warning("AI_ENDING_PASS_FAILED system_id=%s error_type=%s charge_id=%s", system_id, type(exc).__name__, charge_id)
+            return jsonify({"job_id": job_id, "run_id": artifact_run_id, "status": AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED, "ai_suggestions": ai_suggestions, "ai_suggest_run": ai_suggest_run, "error": error_payload}), 200
+    elif not _ending_pass_enabled():
+        pass_state["ending"] = "disabled"
+
+    pass_states[system_id] = pass_state
+    completed_count = min(systems_total, next_system_index + 1)
+    now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+    ai_suggest_run["pass_state_by_system_id"] = pass_states
+    ai_suggest_run["systems_completed"] = completed_count
+    ai_suggest_run["next_system_index"] = completed_count
+    ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_COMPLETED if completed_count >= systems_total else AI_SUGGEST_RUN_STATUS_RUNNING
+    ai_suggest_run["updated_at_utc"] = now_txt
+    ai_suggest_run["last_error"] = None
+    ai_suggest_run["failed_at_utc"] = None
+    if completed_count >= systems_total:
+        ai_suggest_run["completed_at_utc"] = now_txt
+        _rebuild_ai_ending_pairs(ai_suggestions, measures, all_systems_completed=True)
+    mapping_summary["ai_suggestions"] = ai_suggestions
+    mapping_summary["ai_suggest_run"] = ai_suggest_run
+    _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+    logger.info("AI_SYSTEM_COMPLETE system_id=%s pass=combined charge_id=%s", system_id, charge_id)
+    response = {
+        "job_id": job_id,
+        "run_id": artifact_run_id,
+        "status": ai_suggest_run["status"],
+        "ai_suggestions": ai_suggestions,
+        "ai_suggest_run": ai_suggest_run,
+        "reference_examples_attached": int(reference_examples_attached),
+        "storage_mode": _storage_mode_for_artifacts(artifacts),
+        "artifacts": artifacts,
+        "artifacts_http": _artifact_http_uris_for_run(artifact_run_id, artifacts),
+        "duration_ms": int((time.time() - started) * 1000),
+    }
+    if isinstance(debug_crops, dict):
+        response["debug_crops"] = debug_crops
+    return jsonify(response), 200
+
+
 @app.route("/api/omr/jobs/<job_id>/ai-suggest/step", methods=["POST"])
 def ai_suggest_job_step(job_id: str):
     started = time.time()
@@ -9276,6 +10100,22 @@ def ai_suggest_job_step(job_id: str):
             200,
         )
 
+    if str(ai_suggest_run.get("version") or "") == AI_SUGGEST_RUN_VERSION:
+        return _step_ai_suggest_v2(
+            job_id=job_id,
+            artifact_run_id=int(artifact_run_id),
+            mapping_summary=mapping_summary,
+            artifacts=artifacts,
+            systems=systems,
+            measures=measures,
+            system_batches=system_batches,
+            source_state_version=source_state_version,
+            ai_suggestions=ai_suggestions,
+            ai_suggest_run=ai_suggest_run,
+            next_system_index=next_system_index,
+            started=started,
+        )
+
     system_row, system_measures = system_batches[next_system_index]
     try:
         ai_access = _ai_access(
@@ -9457,6 +10297,11 @@ def relabel_job(job_id: str):
     atomic = payload.get("atomic") is True
     request_id = str(payload.get("request_id") or "").strip()
     requested_state_version = str(payload.get("state_version") or "").strip()
+    accepted_ai_ending_pair_ids = {
+        str(value or "").strip()
+        for value in (payload.get("accepted_ai_ending_pair_ids") or [])
+        if str(value or "").strip()
+    } if isinstance(payload.get("accepted_ai_ending_pair_ids"), list) else set()
     edits_requested_count = len(edits) if isinstance(edits, list) else 0
 
     if atomic and not re.fullmatch(r"[A-Za-z0-9-]{16,128}", request_id):
@@ -9970,6 +10815,8 @@ def relabel_job(job_id: str):
     }
     if applied_measure_ids:
         _remove_ai_suggestion_entries(mapping_summary, applied_measure_ids)
+    if accepted_ai_ending_pair_ids:
+        _remove_ai_ending_pairs(mapping_summary, accepted_ai_ending_pair_ids)
     manual_pages_updated = {
         _safe_int(row.get("page"), 0)
         for row in applied
@@ -10249,6 +11096,28 @@ def dismiss_ai_suggestion(job_id: str, measure_id: str):
         ),
         200,
     )
+
+
+@app.route("/api/omr/jobs/<job_id>/ai-ending-suggestions/<pair_id>/dismiss", methods=["POST"])
+def dismiss_ai_ending_pair(job_id: str, pair_id: str):
+    run_id, rec, err = _resolve_run_id_from_job_id(job_id)
+    if err:
+        return jsonify({"error": err, "job_id": job_id}), 409
+    artifact_key = _job_artifact_key(job_id, int(run_id), rec if isinstance(rec, dict) else None)
+    try:
+        artifacts, mapping_summary, artifact_run_id = _load_mapping_for_run(int(run_id), artifact_key=artifact_key)
+    except StaleArtifactsError as exc:
+        return jsonify({"error": "requested job_id does not match artifacts", "requested_run_id": exc.requested_run_id, "artifact_run_id": exc.artifact_run_id}), 409
+    except Exception as exc:
+        return jsonify({"error": "failed to load state", "detail": _safe_error_text(exc), "job_id": job_id}), 502
+    clean_pair_id = str(pair_id or "").strip()
+    if not _remove_ai_ending_pairs(mapping_summary, {clean_pair_id}):
+        return jsonify({"job_id": job_id, "run_id": int(artifact_run_id), "status": "failed", "error": {"code": "suggestion_not_found", "message": "AI ending suggestion not found.", "retryable": False, "detail": clean_pair_id}}), 404
+    try:
+        _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+    except Exception as exc:
+        return jsonify({"job_id": job_id, "run_id": int(artifact_run_id), "status": "failed", "error": {"code": "ai_suggestion_dismiss_failed", "message": "failed to dismiss AI ending suggestion", "retryable": True, "detail": _safe_error_text(exc)}}), 500
+    return jsonify({"job_id": job_id, "run_id": int(artifact_run_id), "status": "succeeded", "dismissed_pair_id": clean_pair_id, "ai_suggestions": mapping_summary.get("ai_suggestions")}), 200
 
 
 @app.route("/api/omr/jobs/<job_id>/cleanup", methods=["POST"])

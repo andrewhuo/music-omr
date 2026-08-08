@@ -197,6 +197,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         os.environ["AI_PROVIDER"] = "bedrock"
         os.environ["AWS_REGION"] = "us-east-1"
         os.environ["BEDROCK_MODEL_ID"] = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        os.environ["BEDROCK_GENERAL_MODEL_ID"] = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+        os.environ["BEDROCK_ENDING_MODEL_ID"] = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
         os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-6"
         os.environ["ANTHROPIC_API_KEY"] = "test-key"
         os.environ["FRIEND_ACCESS_ENFORCED"] = "0"
@@ -696,6 +698,47 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(relabel.get("labels_mode"), "all_measures")
         self.assertEqual(relabel.get("labels_redrawn_count"), 2)
 
+    def test_atomic_relabel_removes_accepted_ending_pair(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "state", 3)
+        pair_id = "ending_pair_test"
+        mapping_summary["ai_suggestions"]["ending_pairs_by_id"] = {
+            pair_id: {"pair_id": pair_id, "status": "complete"}
+        }
+        version_state = deepcopy(mapping_summary["editable_state"])
+        WORKER._refresh_editable_state_systems_and_measures(version_state)
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/relabel",
+            method="POST",
+            headers={},
+            files={},
+            json={
+                "atomic": True,
+                "request_id": "44444444-4444-4444-4444-444444444444",
+                "state_version": WORKER._editable_state_version(version_state),
+                "accepted_ai_ending_pair_ids": [pair_id],
+                "edits": [
+                    {"type": "set_ending", "measure_id": "p1_s0_m0", "value": "1"},
+                    {"type": "set_ending", "measure_id": "p1_s0_m1", "value": "2"},
+                ],
+            },
+        )
+        saved = []
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value={}),
+            patch.object(WORKER, "_download_gcs_to_file"),
+            patch.object(WORKER, "_render_corrected_pdf", return_value=2),
+            patch.object(WORKER, "_upload_file_to_gcs"),
+            patch.object(WORKER, "_upload_json_to_gcs", side_effect=lambda data, _uri: saved.append(deepcopy(data))),
+        ):
+            body, status = _unpack(WORKER.relabel_job("111"))
+        self.assertEqual(status, 200)
+        self.assertEqual(len((body.get("relabel") or {}).get("applied_edits") or []), 2)
+        self.assertNotIn(pair_id, ((saved[-1].get("ai_suggestions") or {}).get("ending_pairs_by_id") or {}))
+
     def test_atomic_manual_fix_rejects_entire_multi_page_batch_before_render(self):
         artifacts = self._sample_artifacts()
         mapping_summary = self._sample_mapping_summary()
@@ -1110,7 +1153,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("score_type"), "grand")
-        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("last_time_signature_update"))
         self.assertEqual((body.get("ai_suggest_run") or {}).get("time_signature_updates"), [])
@@ -1376,7 +1419,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
         cost_summary = mapping_summary.get(WORKER.AI_COST_SUMMARY_KEY) or {}
         self.assertEqual(cost_summary.get("successful_invocations"), 1)
@@ -1837,7 +1880,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         by_measure_id = result.get("by_measure_id") or {}
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "pickup")
-        self.assertEqual((result.get("model") or ""), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
+        self.assertEqual((result.get("model") or ""), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((result.get("pdf_source") or ""), "corrected")
         self.assertEqual(result.get("_internal_ai_usage"), {"input_tokens": 700, "output_tokens": 80, "retry_attempts": 2})
 
@@ -1853,6 +1896,181 @@ class BrowserReadyApiTests(unittest.TestCase):
         system_row, system_measures = system_batches[0]
         self.assertEqual(system_row.get("system_id"), "p1_s1")
         self.assertEqual([row.get("measure_id") for row in system_measures], ["p1_s1_m0"])
+
+    def test_ending_reference_catalog_loads_all_seven_captioned_images(self):
+        content, count = WORKER._build_ending_reference_content()
+        self.assertEqual(count, 7)
+        self.assertEqual(sum(1 for row in content if row.get("type") == "image"), 7)
+        captions = [row.get("text") for row in content if row.get("type") == "text"]
+        for reference in WORKER.AI_ENDING_REFERENCE_EXAMPLES:
+            self.assertIn(reference["caption"], captions)
+
+    def test_ending_crop_adds_capped_horizontal_context_at_page_edges(self):
+        page = _FakeRect(0, 0, 200, 300)
+        measure = {
+            "measure_id": "m1",
+            "x_left": 2,
+            "x_right": 102,
+            "y_top": 50,
+            "y_bottom": 90,
+        }
+        base = {
+            "clip": _FakeRect(0, 40, 110, 100),
+            "measure_bounds": {"left": 2, "right": 102, "top": 50, "bottom": 90, "width": 100, "height": 40},
+            "padding": {},
+        }
+        with patch.object(WORKER, "_measure_crop_spec", return_value=base), patch.object(WORKER.fitz, "Rect", _FakeRect):
+            result = WORKER._ending_measure_crop_spec(page, measure, None, None)
+        self.assertEqual(result["clip"].x0, 0)
+        self.assertEqual(result["clip"].x1, 118)
+        self.assertEqual(result["padding"]["left"], 0)
+        self.assertEqual(result["padding"]["right"], 8)
+
+    def test_ending_response_requires_one_ordered_result_per_measure(self):
+        measures = [{"measure_id": "m1"}, {"measure_id": "m2"}]
+        valid = {
+            "ending_measures": [
+                {"measure_id": "m1", "start": "ending_1", "right_boundary": "continues", "confidence": "high", "evidence": "numbered bracket"},
+                {"measure_id": "m2", "start": "ending_2", "right_boundary": "open_stop", "confidence": "medium", "evidence": "open line end"},
+            ]
+        }
+        normalized = WORKER._normalize_ending_system_response(valid, measures)
+        self.assertEqual([row["measure_id"] for row in normalized], ["m1", "m2"])
+        invalid = deepcopy(valid)
+        invalid["ending_measures"].reverse()
+        with self.assertRaises(WORKER.AiSuggestError):
+            WORKER._normalize_ending_system_response(invalid, measures)
+
+    def test_ending_pair_builder_creates_complete_adjacent_pair(self):
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", 4)
+        suggestions["ending_events_by_measure_id"] = {
+            "m1": {"start": "ending_1", "right_boundary": "continues", "confidence": "high"},
+            "m2": {"start": "none", "right_boundary": "closed_stop", "confidence": "high"},
+            "m3": {"start": "ending_2", "right_boundary": "continues", "confidence": "high"},
+            "m4": {"start": "none", "right_boundary": "open_stop", "confidence": "high"},
+        }
+        measures = [
+            {"measure_id": f"m{index}", "page": 1, "system_index": 0, "measure_local_index": index - 1}
+            for index in range(1, 5)
+        ]
+        pairs = WORKER._rebuild_ai_ending_pairs(suggestions, measures, all_systems_completed=True)
+        self.assertEqual(len(pairs), 1)
+        pair = next(iter(pairs.values()))
+        self.assertEqual(pair["status"], "complete")
+        self.assertEqual(pair["ending_1_measure_ids"], ["m1", "m2"])
+        self.assertEqual(pair["ending_2_measure_ids"], ["m3", "m4"])
+
+    def test_two_system_credit_group_ids_round_up_in_pairs(self):
+        ids = [WORKER._ai_credit_group_id("job", 111, "state", index) for index in range(6)]
+        self.assertEqual(ids[0], ids[1])
+        self.assertEqual(ids[2], ids[3])
+        self.assertEqual(ids[4], ids[5])
+        self.assertEqual(len(set(ids[:1])), 1)
+        self.assertEqual(len(set(ids[:2])), 1)
+        self.assertEqual(len(set(ids[:3])), 2)
+        self.assertEqual(len(set(ids[:4])), 2)
+        self.assertEqual(len(set(ids[:5])), 3)
+        self.assertEqual(len(set(ids[:6])), 3)
+
+    def test_v2_two_systems_charge_once(self):
+        mapping = self._sample_mapping_summary()
+        systems = mapping["editable_state"]["systems"]
+        measures = mapping["editable_state"]["measures"]
+        batches = WORKER._ai_suggest_system_batches(mapping["editable_state"])
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", len(measures))
+        run = WORKER._new_ai_suggest_run_state(111, "state", len(batches), score_type="single")
+
+        def general_result(*args, **kwargs):
+            system = args[3]
+            return {
+                "version": WORKER.AI_SUGGESTIONS_VERSION,
+                "provider": "bedrock",
+                "model": WORKER._requested_ai_model_name("general"),
+                "system_id": system["system_id"],
+                "by_measure_id": {},
+                "warnings": [],
+                "summary": {"systems_processed": 1, "measures_seen": 1, "suggestions_kept": 0, "normal_measures_omitted": 1},
+            }
+
+        with (
+            patch.dict(os.environ, {"AI_ENDING_PASS_ENABLED": "0"}),
+            patch.object(WORKER, "_ai_access", return_value={"provider": "friend"}) as access,
+            patch.object(WORKER, "_finish_ai_access", return_value=True) as finish,
+            patch.object(WORKER, "_generate_ai_suggestions_for_system_batch", side_effect=general_result),
+            patch.object(WORKER, "_upload_json_to_gcs"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value={}),
+        ):
+            WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=suggestions, ai_suggest_run=run, next_system_index=0, started=WORKER.time.time(),
+            )
+            WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=mapping["ai_suggestions"], ai_suggest_run=mapping["ai_suggest_run"], next_system_index=1,
+                started=WORKER.time.time(),
+            )
+        self.assertEqual(finish.call_count, 1)
+        self.assertEqual(access.call_count, 2)
+        self.assertTrue(access.call_args_list[0].kwargs["reserve"])
+        self.assertFalse(access.call_args_list[1].kwargs["reserve"])
+        self.assertEqual(
+            access.call_args_list[0].kwargs["charge_id"],
+            access.call_args_list[1].kwargs["charge_id"],
+        )
+
+    def test_v2_ending_retry_does_not_rerun_general_or_recharge(self):
+        mapping = self._sample_mapping_summary()
+        systems = mapping["editable_state"]["systems"]
+        measures = mapping["editable_state"]["measures"]
+        batches = WORKER._ai_suggest_system_batches(mapping["editable_state"])
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", len(measures))
+        run = WORKER._new_ai_suggest_run_state(111, "state", len(batches), score_type="single")
+        general = {
+            "version": WORKER.AI_SUGGESTIONS_VERSION,
+            "provider": "bedrock",
+            "model": WORKER._requested_ai_model_name("general"),
+            "system_id": batches[0][0]["system_id"],
+            "by_measure_id": {},
+            "warnings": [],
+            "summary": {"systems_processed": 1, "measures_seen": 2, "suggestions_kept": 0, "normal_measures_omitted": 2},
+        }
+        ending = {
+            "version": WORKER.AI_SUGGESTIONS_ENDING_VERSION,
+            "provider": "bedrock",
+            "model": WORKER._requested_ai_model_name("ending"),
+            "system_id": batches[0][0]["system_id"],
+            "events": [
+                {"measure_id": row["measure_id"], "start": "none", "right_boundary": "none", "confidence": "high", "evidence": "none"}
+                for row in batches[0][1]
+            ],
+            "active_ending_out": None,
+        }
+        with (
+            patch.dict(os.environ, {"AI_ENDING_PASS_ENABLED": "1"}),
+            patch.object(WORKER, "_ai_access", return_value={"provider": "friend"}),
+            patch.object(WORKER, "_finish_ai_access", return_value=True) as finish,
+            patch.object(WORKER, "_generate_ai_suggestions_for_system_batch", return_value=general) as general_call,
+            patch.object(WORKER, "_generate_ai_endings_for_system_batch", side_effect=[WORKER.AiSuggestError(detail="temporary"), ending]) as ending_call,
+            patch.object(WORKER, "_upload_json_to_gcs"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value={}),
+        ):
+            first, _ = WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=suggestions, ai_suggest_run=run, next_system_index=0, started=WORKER.time.time(),
+            )
+            self.assertEqual(first["status"], WORKER.AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED)
+            WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=mapping["ai_suggestions"], ai_suggest_run=mapping["ai_suggest_run"], next_system_index=0,
+                started=WORKER.time.time(),
+            )
+        self.assertEqual(general_call.call_count, 1)
+        self.assertEqual(ending_call.call_count, 2)
+        self.assertEqual(finish.call_count, 1)
 
     def test_ai_suggest_step_real_system_batch_path_no_longer_crashes(self):
         artifacts = self._sample_artifacts()
@@ -2075,7 +2293,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 2)
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0", "p1_s1_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 2)
 
     def test_ai_suggest_step_completes_cleanly_when_all_measures_are_excluded(self):
@@ -2297,6 +2515,20 @@ class BrowserReadyApiTests(unittest.TestCase):
                 WORKER._configured_bedrock_model_id(),
                 "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
             )
+
+    def test_separate_bedrock_models_use_exact_defaults_and_legacy_fallback(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                WORKER._configured_bedrock_general_model_id(),
+                "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            )
+            self.assertEqual(
+                WORKER._configured_bedrock_ending_model_id(),
+                "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            )
+        with patch.dict(os.environ, {"BEDROCK_MODEL_ID": "legacy-model"}, clear=True):
+            self.assertEqual(WORKER._configured_bedrock_general_model_id(), "legacy-model")
+            self.assertEqual(WORKER._configured_bedrock_ending_model_id(), "legacy-model")
 
     def test_bedrock_messages_create_invokes_runtime_with_anthropic_body(self):
         calls: list[dict] = []
@@ -2645,7 +2877,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
 
-        self.assertEqual(normalized.get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
+        self.assertEqual(normalized.get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
         by_measure_id = normalized.get("by_measure_id") or {}
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "uncertain")
         self.assertNotIn("maybe_label", by_measure_id.get("p1_s0_m0") or {})

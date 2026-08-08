@@ -166,6 +166,26 @@ class PaidAccessTests(unittest.TestCase):
         self.assertEqual(self._record()["credits_remaining"], 399)
         self.assertEqual(self._record()["credits_used"], 1)
 
+    def test_stable_charge_id_cannot_charge_twice(self):
+        issued = WORKER._paid_apply_transaction(
+            _apple_payload(),
+            device_id="device-identifier-1234",
+            issue_token=True,
+        )
+        charge_id = "ai-stable-pair-0"
+        first = WORKER._paid_verify_token(
+            issued["access_token"], reserve=True, job_id="job", system_id="s1", charge_id=charge_id
+        )
+        self.assertTrue(WORKER._paid_finish_reservation(first, spent=True))
+        self.assertEqual(self._record()["credits_remaining"], 399)
+        second = WORKER._paid_verify_token(
+            issued["access_token"], reserve=True, job_id="job", system_id="s2", charge_id=charge_id
+        )
+        self.assertTrue(second["already_charged"])
+        self.assertTrue(WORKER._paid_finish_reservation(second, spent=True))
+        self.assertEqual(self._record()["credits_remaining"], 399)
+        self.assertEqual(self._record()["credits_used"], 1)
+
     def test_grace_period_is_active_only_until_its_end(self):
         WORKER._paid_apply_transaction(
             _apple_payload(),
