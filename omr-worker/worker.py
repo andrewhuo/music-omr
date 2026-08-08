@@ -1335,6 +1335,7 @@ def _friend_finish_reservation(access: dict | None, *, spent: bool) -> bool:
         reservations = dict(data.get("reservations") or {})
         if reservation_id not in reservations:
             return False
+        reservation = dict(reservations.get(reservation_id) or {})
         reservations.pop(reservation_id, None)
         data["reservations"] = reservations
         if spent:
@@ -9764,6 +9765,10 @@ def _step_ai_suggest_v2(
 
     if not credit_group.get("charged"):
         if not _finish_ai_access(ai_access, spent=True):
+            logger.warning(
+                "AI_CREDIT_FINALIZE_PENDING provider=%s stage=spend",
+                str(ai_access.get("provider") or "friend"),
+            )
             credit_group["status"] = "charge_pending"
             credit_groups[charge_id] = credit_group
             ai_suggest_run["credit_groups"] = credit_groups

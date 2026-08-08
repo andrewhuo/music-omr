@@ -620,6 +620,63 @@ class PaidAccessTests(unittest.TestCase):
         self.assertEqual(verified["credits_remaining"], 500)
         self.assertEqual(verified["monthly_credit_capacity"], 500)
 
+    def test_friend_stable_charge_spends_releases_and_cannot_duplicate(self):
+        pepper = base64.urlsafe_b64encode(b"p" * 32).decode("ascii").rstrip("=")
+        config = {
+            "enabled": True,
+            "device_pepper": pepper,
+            "default_monthly_credits": 500,
+        }
+        with patch.object(WORKER, "_friend_config", return_value=config), patch.object(
+            WORKER, "_friend_check_activation_rate"
+        ), patch.object(WORKER, "_friend_code_matches", return_value=True), patch.object(
+            WORKER, "_friend_clear_activation_attempts"
+        ):
+            activated = WORKER._friend_activate_device("device-identifier-1234", "private-code")
+            device_key = activated["access_token"].split(".", 1)[0]
+
+            first = WORKER._friend_verify_token(
+                activated["access_token"],
+                reserve=True,
+                job_id="job",
+                system_id="system-1",
+                charge_id="pair-0",
+            )
+            self.assertEqual(first["credits_remaining"], 499)
+            self.assertTrue(WORKER._friend_finish_reservation(first, spent=True))
+
+            record = self.store.rows[(WORKER.FRIEND_ACCESS_COLLECTION, device_key)]
+            self.assertEqual(record["credits_remaining"], 499)
+            self.assertEqual(record["credits_used"], 1)
+            self.assertEqual(record["reservations"], {})
+            self.assertIn("pair-0", record["ai_charge_receipts"])
+
+            duplicate = WORKER._friend_verify_token(
+                activated["access_token"],
+                reserve=True,
+                job_id="job",
+                system_id="system-2",
+                charge_id="pair-0",
+            )
+            self.assertTrue(duplicate["already_charged"])
+            self.assertTrue(WORKER._friend_finish_reservation(duplicate, spent=True))
+            record = self.store.rows[(WORKER.FRIEND_ACCESS_COLLECTION, device_key)]
+            self.assertEqual(record["credits_remaining"], 499)
+            self.assertEqual(record["credits_used"], 1)
+
+            released = WORKER._friend_verify_token(
+                activated["access_token"],
+                reserve=True,
+                job_id="job",
+                system_id="system-3",
+                charge_id="pair-1",
+            )
+            self.assertEqual(released["credits_remaining"], 498)
+            self.assertTrue(WORKER._friend_finish_reservation(released, spent=False))
+            record = self.store.rows[(WORKER.FRIEND_ACCESS_COLLECTION, device_key)]
+            self.assertEqual(record["credits_remaining"], 499)
+            self.assertNotIn("pair-1", record.get("ai_charge_receipts") or {})
+
     def test_access_store_logs_safe_library_connection_and_config_stages(self):
         import_error = ModuleNotFoundError("private-token-should-not-appear")
         import_error.name = "google.cloud.firestore"
