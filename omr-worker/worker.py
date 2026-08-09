@@ -5247,18 +5247,142 @@ def _extract_json_object_text(text: str) -> str:
     raise AiSuggestError(detail="malformed_response: missing json object")
 
 
+def _ai_message_text_parts(message: dict | None) -> list[str]:
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        str(block.get("text") or "")
+        for block in content
+        if isinstance(block, dict) and str(block.get("type") or "").strip() == "text"
+    ]
+
+
+def _ai_general_response_diagnostics(
+    message: dict | None,
+    *,
+    system_id: str,
+    measure_count: int,
+    reference_count: int,
+    model: str,
+) -> dict:
+    row = message if isinstance(message, dict) else {}
+    content = row.get("content") if isinstance(row.get("content"), list) else []
+    text_parts = _ai_message_text_parts(row)
+    text = "\n".join(text_parts)
+    stripped = _strip_json_fences(text).strip()
+    usage = row.get("usage") if isinstance(row.get("usage"), dict) else {}
+    output_tokens = max(0, _safe_int(usage.get("output_tokens"), 0))
+    raw_stop_reason = str(row.get("stop_reason") or "unknown").strip().lower()
+    stop_reason = raw_stop_reason if raw_stop_reason in {"end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn"} else "other"
+    block_types: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            block_type = "invalid"
+        else:
+            raw_type = str(block.get("type") or "").strip().lower()
+            block_type = raw_type if raw_type in {"text", "tool_use", "thinking", "redacted_thinking"} else "other"
+        if block_type not in block_types:
+            block_types.append(block_type)
+    return {
+        "model": str(model or "unknown"),
+        "system_id": str(system_id or "unknown"),
+        "measure_count": max(0, int(measure_count)),
+        "reference_count": max(0, int(reference_count)),
+        "max_tokens": int(ANTHROPIC_MAX_TOKENS),
+        "stop_reason": stop_reason,
+        "input_tokens": max(0, _safe_int(usage.get("input_tokens"), 0)),
+        "output_tokens": output_tokens,
+        "content_blocks": len(content),
+        "block_types": ",".join(block_types) if block_types else "none",
+        "text_blocks": len(text_parts),
+        "text_chars": len(text),
+        "starts_object": stripped.startswith("{"),
+        "ends_object": stripped.endswith("}"),
+        "open_braces": text.count("{"),
+        "close_braces": text.count("}"),
+        "open_brackets": text.count("["),
+        "close_brackets": text.count("]"),
+        "provider_attempts": max(1, _safe_int(row.get("_internal_bedrock_attempts"), 1)),
+        "output_limit_reached": stop_reason == "max_tokens" or output_tokens >= int(ANTHROPIC_MAX_TOKENS),
+    }
+
+
+def _ai_general_failure_diagnostics(exc: Exception, response_diagnostics: dict | None) -> dict:
+    detail = str(getattr(exc, "detail", "") or "").lower()
+    if "no text content" in detail or "content missing" in detail:
+        category = "missing_text"
+    elif "missing json object" in detail:
+        category = "missing_object"
+    elif "invalid json" in detail:
+        category = "invalid_json"
+    elif "duplicate measure_id" in detail:
+        category = "duplicate_measures"
+    elif "unknown measure_id" in detail:
+        category = "unknown_measures"
+    elif "suggestions missing" in detail or "missing_measure_ids" in detail:
+        category = "missing_measures"
+    else:
+        category = "malformed_response"
+    position = re.search(r"line\s+(\d+)\s+column\s+(\d+)\s+\(char\s+(\d+)\)", detail)
+    diagnostics = dict(response_diagnostics or {})
+    diagnostics.update(
+        {
+            "category": category,
+            "error_line": int(position.group(1)) if position else 0,
+            "error_column": int(position.group(2)) if position else 0,
+            "error_char": int(position.group(3)) if position else 0,
+        }
+    )
+    return diagnostics
+
+
+def _log_ai_general_response_debug(diagnostics: dict) -> None:
+    if not _ai_suggest_debug_enabled():
+        return
+    logger.info(
+        "AI_GENERAL_RESPONSE_DEBUG model=%s system=%s measures=%s references=%s max_tokens=%s "
+        "stop_reason=%s input_tokens=%s output_tokens=%s content_blocks=%s block_types=%s "
+        "text_blocks=%s text_chars=%s starts_object=%s ends_object=%s open_braces=%s "
+        "close_braces=%s open_brackets=%s close_brackets=%s provider_attempts=%s output_limit_reached=%s",
+        diagnostics.get("model"), diagnostics.get("system_id"), diagnostics.get("measure_count"),
+        diagnostics.get("reference_count"), diagnostics.get("max_tokens"), diagnostics.get("stop_reason"),
+        diagnostics.get("input_tokens"), diagnostics.get("output_tokens"), diagnostics.get("content_blocks"),
+        diagnostics.get("block_types"), diagnostics.get("text_blocks"), diagnostics.get("text_chars"),
+        diagnostics.get("starts_object"), diagnostics.get("ends_object"), diagnostics.get("open_braces"),
+        diagnostics.get("close_braces"), diagnostics.get("open_brackets"), diagnostics.get("close_brackets"),
+        diagnostics.get("provider_attempts"), diagnostics.get("output_limit_reached"),
+    )
+
+
+def _log_ai_general_parse_failed(diagnostics: dict) -> None:
+    if not _ai_suggest_debug_enabled():
+        return
+    logger.warning(
+        "AI_GENERAL_PARSE_FAILED category=%s model=%s system=%s measures=%s references=%s max_tokens=%s "
+        "stop_reason=%s input_tokens=%s output_tokens=%s text_blocks=%s text_chars=%s "
+        "starts_object=%s ends_object=%s open_braces=%s close_braces=%s open_brackets=%s "
+        "close_brackets=%s provider_attempts=%s output_limit_reached=%s error_line=%s error_column=%s error_char=%s",
+        diagnostics.get("category"), diagnostics.get("model"), diagnostics.get("system_id"),
+        diagnostics.get("measure_count"), diagnostics.get("reference_count"), diagnostics.get("max_tokens"),
+        diagnostics.get("stop_reason"), diagnostics.get("input_tokens"), diagnostics.get("output_tokens"),
+        diagnostics.get("text_blocks"), diagnostics.get("text_chars"), diagnostics.get("starts_object"),
+        diagnostics.get("ends_object"), diagnostics.get("open_braces"), diagnostics.get("close_braces"),
+        diagnostics.get("open_brackets"), diagnostics.get("close_brackets"), diagnostics.get("provider_attempts"),
+        diagnostics.get("output_limit_reached"), diagnostics.get("error_line"), diagnostics.get("error_column"),
+        diagnostics.get("error_char"),
+    )
+
+
 def _parse_anthropic_suggestions_message(message: dict) -> dict:
     if not isinstance(message, dict):
         raise AiSuggestError(detail="malformed_provider_response")
     content = message.get("content")
     if not isinstance(content, list):
         raise AiSuggestError(detail="malformed_provider_response: content missing")
-    text_parts: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        if str(block.get("type") or "").strip() == "text":
-            text_parts.append(str(block.get("text") or ""))
+    text_parts = _ai_message_text_parts(message)
     if not text_parts:
         raise AiSuggestError(detail="malformed_response: no text content")
     try:
@@ -6495,6 +6619,7 @@ def _generate_ai_suggestions_for_system_batch(
     debug_crop_rows: list[dict] = []
     pdf_source = "baseline"
     reference_examples_attached = 0
+    response_diagnostics: dict | None = None
 
     def _finalize_debug_crops() -> dict | None:
         if not debug_enabled or not debug_crop_rows:
@@ -6530,6 +6655,14 @@ def _generate_ai_suggestions_for_system_batch(
                 score_type=score_type,
             )
             message = _ai_messages_create(payload)
+            response_diagnostics = _ai_general_response_diagnostics(
+                message,
+                system_id=str(system_row.get("system_id") or ""),
+                measure_count=len(system_measures),
+                reference_count=reference_examples_attached,
+                model=model_name,
+            )
+            _log_ai_general_response_debug(response_diagnostics)
             parsed = _parse_anthropic_suggestions_message(message)
             system_suggestions = parsed.get("suggestions")
             if not isinstance(system_suggestions, list):
@@ -6564,6 +6697,8 @@ def _generate_ai_suggestions_for_system_batch(
                 normalized["debug_crops"] = debug_crops
             return normalized
         except AiSuggestError as exc:
+            if response_diagnostics is not None:
+                _log_ai_general_parse_failed(_ai_general_failure_diagnostics(exc, response_diagnostics))
             debug_crops = _finalize_debug_crops()
             if debug_crops is not None:
                 exc.debug_crops = debug_crops

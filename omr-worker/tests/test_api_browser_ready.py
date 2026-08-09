@@ -1825,6 +1825,108 @@ class BrowserReadyApiTests(unittest.TestCase):
             ],
         )
 
+    def test_ai_general_response_debug_logs_safe_complete_metrics(self):
+        private_sentinel = "PRIVATE_MUSIC_RESPONSE_MUST_NOT_BE_LOGGED"
+        message = {
+            "content": [{"type": "text", "text": json.dumps({"suggestions": [], "private": private_sentinel})}],
+            "usage": {"input_tokens": 1200, "output_tokens": 96},
+            "stop_reason": "end_turn",
+            "_internal_bedrock_attempts": 1,
+        }
+        diagnostics = WORKER._ai_general_response_diagnostics(
+            message,
+            system_id="p1_s4",
+            measure_count=11,
+            reference_count=4,
+            model="sonnet-test",
+        )
+
+        self.assertEqual(diagnostics.get("stop_reason"), "end_turn")
+        self.assertEqual(diagnostics.get("text_blocks"), 1)
+        self.assertTrue(diagnostics.get("starts_object"))
+        self.assertTrue(diagnostics.get("ends_object"))
+        self.assertFalse(diagnostics.get("output_limit_reached"))
+        self.assertNotIn(private_sentinel, json.dumps(diagnostics))
+
+        with (
+            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=True),
+            patch.object(WORKER.logger, "info") as info_log,
+        ):
+            WORKER._log_ai_general_response_debug(diagnostics)
+
+        logged = " ".join(str(value) for value in info_log.call_args.args)
+        self.assertIn("AI_GENERAL_RESPONSE_DEBUG", logged)
+        self.assertNotIn(private_sentinel, logged)
+
+    def test_ai_general_parse_failure_identifies_output_limit_without_logging_text(self):
+        private_sentinel = "PRIVATE_TRUNCATED_RESPONSE_MUST_NOT_BE_LOGGED"
+        message = {
+            "content": [{"type": "text", "text": '{"suggestions":[' + private_sentinel}],
+            "usage": {"input_tokens": 2200, "output_tokens": WORKER.ANTHROPIC_MAX_TOKENS},
+            "stop_reason": "max_tokens",
+            "_internal_bedrock_attempts": 2,
+        }
+        response = WORKER._ai_general_response_diagnostics(
+            message,
+            system_id="p1_s4",
+            measure_count=11,
+            reference_count=4,
+            model="sonnet-test",
+        )
+        exc = WORKER.AiSuggestError(
+            detail="malformed_response: invalid json Expecting ',' delimiter: line 157 column 6 (char 5288)"
+        )
+        failure = WORKER._ai_general_failure_diagnostics(exc, response)
+
+        self.assertEqual(failure.get("category"), "invalid_json")
+        self.assertEqual(failure.get("error_line"), 157)
+        self.assertEqual(failure.get("error_column"), 6)
+        self.assertEqual(failure.get("error_char"), 5288)
+        self.assertTrue(failure.get("output_limit_reached"))
+        self.assertNotIn(private_sentinel, json.dumps(failure))
+
+        with (
+            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=True),
+            patch.object(WORKER.logger, "warning") as warning_log,
+        ):
+            WORKER._log_ai_general_parse_failed(failure)
+
+        logged = " ".join(str(value) for value in warning_log.call_args.args)
+        self.assertIn("AI_GENERAL_PARSE_FAILED", logged)
+        self.assertNotIn(private_sentinel, logged)
+
+    def test_ai_general_failure_categories_cover_structural_errors(self):
+        cases = {
+            "malformed_response: no text content": "missing_text",
+            "malformed_response: missing json object": "missing_object",
+            "malformed_response: invalid json bad": "invalid_json",
+            "malformed_response: suggestions missing for p1_s4": "missing_measures",
+            "malformed_response: missing_measure_ids=p1_s4_m2": "missing_measures",
+            "malformed_response: duplicate measure_id p1_s4_m2": "duplicate_measures",
+            "malformed_response: unknown measure_id p1_s9_m0": "unknown_measures",
+        }
+        for detail, expected in cases.items():
+            with self.subTest(detail=detail):
+                diagnostics = WORKER._ai_general_failure_diagnostics(WORKER.AiSuggestError(detail=detail), {})
+                self.assertEqual(diagnostics.get("category"), expected)
+
+    def test_ai_general_diagnostic_logs_are_disabled_with_crop_debugging(self):
+        diagnostics = {
+            "category": "invalid_json",
+            "model": "sonnet-test",
+            "system_id": "p1_s4",
+        }
+        with (
+            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=False),
+            patch.object(WORKER.logger, "info") as info_log,
+            patch.object(WORKER.logger, "warning") as warning_log,
+        ):
+            WORKER._log_ai_general_response_debug(diagnostics)
+            WORKER._log_ai_general_parse_failed(diagnostics)
+
+        info_log.assert_not_called()
+        warning_log.assert_not_called()
+
     def test_generate_ai_suggestions_for_system_batch_uses_neighbor_systems_without_crashing(self):
         artifacts = self._sample_artifacts()
         editable_state = self._sample_mapping_summary().get("editable_state") or {}
