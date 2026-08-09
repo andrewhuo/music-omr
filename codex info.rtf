@@ -282,6 +282,19 @@ Eventual fixes and follow-up work\
 - Clean up backend and app code, remove risky debug code while keeping useful failure reports, and run final regression tests for upload, processing, AI, edits, download, cancel, resume, reconnect, Free, Friend, and Pro access.\
 - Finish App Store Connect launch work: archive/signing, screenshots, app description, privacy/support information, sandbox verification, upload, and submission for review.\
 \
+Current recommended work order\
+\
+1. Finish current Sonnet testing: Pickup, old and modern multi-measure rests, and Ending detection. Decide whether Sonnet stays.\
+2. Add AI Continue or Restart: Continue from Staff X without repeating completed work, or Restart after choosing the score type and spending credits again.\
+3. Add an AI Review indicator: show a blue count badge on the AI button and open pending suggestions immediately.\
+4. Finalize the credit charging rule so the app and backend follow one clearly documented calculation.\
+5. Add false-measure detection for time-signature-only or nonmusical boxes, with accepted deletions included in batch Save.\
+6. Add a manual Reconnect command in More that performs an immediate health check without interrupting jobs.\
+7. Complete the still-unspecified small Manual Fix UI adjustment after its exact behavior is defined.\
+8. Test the real Pro purchase in Apple Sandbox, including purchase, restore, credits, AI spending, and download timing.\
+9. Clean up obsolete backend and app code while preserving old-job compatibility and useful safe diagnostics.\
+10. Run the final iPad release walkthrough covering the complete workflow, payments, credits, errors, privacy, and deployment settings.\
+\
 App Summary for Naming\
 \
 This is an iPhone and iPad app for musicians who practice, teach, rehearse, or study from PDF sheet music. It automatically detects musical systems and measures, adds clear measure numbers directly to the score, and lets the user quickly correct anything that was detected incorrectly.\
