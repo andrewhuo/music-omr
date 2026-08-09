@@ -197,7 +197,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         os.environ["AI_PROVIDER"] = "bedrock"
         os.environ["AWS_REGION"] = "us-east-1"
         os.environ["BEDROCK_MODEL_ID"] = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-        os.environ["BEDROCK_GENERAL_MODEL_ID"] = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+        os.environ["BEDROCK_GENERAL_MODEL_ID"] = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
         os.environ["BEDROCK_ENDING_MODEL_ID"] = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
         os.environ["ANTHROPIC_MODEL"] = "claude-sonnet-4-6"
         os.environ["ANTHROPIC_API_KEY"] = "test-key"
@@ -1154,7 +1154,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("systems_completed"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 0)
         self.assertEqual((body.get("ai_suggest_run") or {}).get("score_type"), "grand")
-        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("remembered_time_signature"))
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("last_time_signature_update"))
         self.assertEqual((body.get("ai_suggest_run") or {}).get("time_signature_updates"), [])
@@ -1420,7 +1420,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 1)
         cost_summary = mapping_summary.get(WORKER.AI_COST_SUMMARY_KEY) or {}
         self.assertEqual(cost_summary.get("successful_invocations"), 1)
@@ -1881,7 +1881,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         by_measure_id = result.get("by_measure_id") or {}
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0"])
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "pickup")
-        self.assertEqual((result.get("model") or ""), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((result.get("model") or ""), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         self.assertEqual((result.get("pdf_source") or ""), "corrected")
         self.assertEqual(result.get("_internal_ai_usage"), {"input_tokens": 700, "output_tokens": 80, "retry_attempts": 2})
 
@@ -2226,11 +2226,10 @@ class BrowserReadyApiTests(unittest.TestCase):
             (((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")),
             "m0",
         )
-        _, expected_reference_examples = WORKER._build_old_style_multi_rest_reference_content()
-        self.assertEqual(body.get("reference_examples_attached"), expected_reference_examples)
+        self.assertEqual(body.get("reference_examples_attached"), 0)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
         self.assertEqual(((body.get("debug_crops") or {}).get("pdf_source")), "corrected")
-        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), expected_reference_examples)
+        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 0)
         warnings = ((body.get("ai_suggestions") or {}).get("warnings")) or []
         warnings_text = "\n".join(str((row or {}).get("message") or "") for row in warnings)
         self.assertIn("remembered_time_signature_out", warnings_text)
@@ -2354,7 +2353,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((body.get("ai_suggest_run") or {}).get("next_system_index"), 2)
         by_measure_id = ((body.get("ai_suggestions") or {}).get("by_measure_id") or {})
         self.assertEqual(sorted(by_measure_id.keys()), ["p1_s0_m0", "p1_s1_m0"])
-        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual((body.get("ai_suggestions") or {}).get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         self.assertEqual((((body.get("ai_suggestions") or {}).get("summary") or {}).get("systems_processed")), 2)
 
     def test_ai_suggest_step_completes_cleanly_when_all_measures_are_excluded(self):
@@ -2581,7 +2580,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 WORKER._configured_bedrock_general_model_id(),
-                "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
             )
             self.assertEqual(
                 WORKER._configured_bedrock_ending_model_id(),
@@ -2969,7 +2968,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
 
-        self.assertEqual(normalized.get("model"), "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+        self.assertEqual(normalized.get("model"), "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         by_measure_id = normalized.get("by_measure_id") or {}
         self.assertEqual((by_measure_id.get("p1_s0_m0") or {}).get("label"), "uncertain")
         self.assertNotIn("maybe_label", by_measure_id.get("p1_s0_m0") or {})
@@ -2987,7 +2986,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertTrue(any((row or {}).get("type") == "normalization_adjusted" for row in warnings))
         self.assertEqual(((normalized.get("summary") or {}).get("normal_measures_omitted")), 1)
 
-    def test_normalize_ai_suggestions_result_downgrades_bad_multirest_and_invalid_confidence(self):
+    def test_normalize_ai_suggestions_result_treats_bad_multirest_as_normal(self):
         editable_state = (self._sample_mapping_summary().get("editable_state") or {})
         raw_result = {
             "provider": "claude",
@@ -3018,16 +3017,14 @@ class BrowserReadyApiTests(unittest.TestCase):
         normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
 
         by_measure_id = normalized.get("by_measure_id") or {}
-        first = by_measure_id.get("p1_s0_m0") or {}
-        self.assertEqual(first.get("label"), "uncertain")
-        self.assertEqual(first.get("confidence"), "low")
-        self.assertEqual(first.get("measure_completeness"), "full")
-        self.assertEqual(first.get("measure_completeness_source"), "ai")
+        self.assertNotIn("p1_s0_m0", by_measure_id)
         second = by_measure_id.get("p1_s0_m1") or {}
         self.assertEqual(second.get("label"), "uncertain")
         self.assertNotIn("maybe_label", second)
         self.assertEqual(second.get("measure_completeness"), "unclear")
+        self.assertEqual(((normalized.get("summary") or {}).get("normal_measures_omitted")), 2)
         warnings = normalized.get("warnings") or []
+        self.assertTrue(any("treated multi_measure_rest as normal" in str((row or {}).get("message") or "").lower() for row in warnings))
         self.assertGreaterEqual(
             len([row for row in warnings if (row or {}).get("type") == "normalization_adjusted"]),
             2,
@@ -3739,8 +3736,9 @@ class BrowserReadyApiTests(unittest.TestCase):
                 score_type=score_type,
             )
 
-        _, expected_reference_examples = WORKER._build_old_style_multi_rest_reference_content()
-        self.assertEqual(reference_examples_attached, expected_reference_examples)
+        _, expected_reference_examples = WORKER._build_multi_rest_reference_content()
+        expected_for_score_type = expected_reference_examples if score_type in ("single", "grand") else 0
+        self.assertEqual(reference_examples_attached, expected_for_score_type)
         self.assertNotIn("reference_examples_attached", payload)
 
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
@@ -3779,18 +3777,16 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("First ending markers include 1, 1., 1st, or prima volta.", rules_text)
         self.assertIn("Second ending markers include 2, 2., 2nd, or seconda volta.", rules_text)
         self.assertIn("Only label the measure where the bracket clearly starts.", rules_text)
-        self.assertIn("Single-staff multi-measure rest rules:", rules_text)
-        self.assertIn("Use the old-style reference images as examples only", rules_text)
-        self.assertIn("Number first, symbol second: a readable big number 2 or higher", rules_text)
-        self.assertIn("Do not return uncertain just because the symbol is messy", rules_text)
-        self.assertIn("Overusing uncertain is worse than a reasonable confident suggestion.", rules_text)
-        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2, uncertain.", rules_text)
+        self.assertIn("Multi-measure rest decision order:", rules_text)
+        self.assertIn("For single-staff multi-measure rests, inspect the one visible staff.", rules_text)
+        self.assertIn("The supplied reference images are examples only", rules_text)
+        self.assertIn("A readable count of 2 or more with a modern H-bar", rules_text)
+        self.assertIn("Ignore unrelated measure numbers, rehearsal marks, fingerings, lyrics, ending numbers", rules_text)
+        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2.", rules_text)
+        self.assertIn("Never return uncertain, maybe_label, or maybe_rest_count", rules_text)
         self.assertIn("For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.", rules_text)
         self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
-        self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
-        self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
-        self.assertIn("Otherwise, later measures should be normal unless they are a valid multi_measure_rest.", rules_text)
-        self.assertIn("If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable", rules_text)
+        self.assertIn("Later measures must be normal unless they are a valid multi_measure_rest", rules_text)
         self.assertNotIn("Treble and bass are not beat 1 and beat 2", rules_text)
         self.assertNotIn("Different instruments are not beat 1", rules_text)
         self.assertNotIn("For full score V1, do not use multi_measure_rest jumps", rules_text)
@@ -3798,8 +3794,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
         self.assertEqual(
             suggestion_shape.get("label"),
-            "normal|pickup|multi_measure_rest|ending_1|ending_2|uncertain",
+            "normal|pickup|multi_measure_rest|ending_1|ending_2",
         )
+        self.assertNotIn("maybe_label", suggestion_shape)
+        self.assertNotIn("maybe_rest_count", suggestion_shape)
         self.assertEqual(suggestion_shape.get("measure_completeness"), "full|incomplete|unclear")
         self.assertEqual(
             suggestion_shape.get("unclear_reason"),
@@ -3824,7 +3822,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         rules_text = "\n".join(str(row) for row in rules)
         self.assertIn("For all AI Suggest decisions in grand-staff/piano music, use only the top staff/treble staff.", rules_text)
         self.assertIn("Ignore the bottom staff completely for time signature, pickup, and multi-measure rest.", rules_text)
-        self.assertIn("do not switch to the bottom staff; use unknown or uncertain instead.", rules_text)
+        self.assertIn("do not switch to the bottom staff; make the best top-staff choice with low confidence.", rules_text)
         self.assertIn("Grand-staff pickup rules:", rules_text)
         self.assertIn("Use only the top staff's visible meter in this crop.", rules_text)
         self.assertIn("Common time looks like a large C after the clef/key signature and means 4/4.", rules_text)
@@ -3841,17 +3839,14 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("First ending markers include 1, 1., 1st, or prima volta.", rules_text)
         self.assertIn("Second ending markers include 2, 2., 2nd, or seconda volta.", rules_text)
         self.assertIn("Only label the measure where the bracket clearly starts.", rules_text)
-        self.assertIn("Grand-staff multi-measure rest rules:", rules_text)
-        self.assertIn("For grand-staff multi-measure rest, use only the top staff/treble staff.", rules_text)
-        self.assertIn("Number first, symbol second: a readable big number 2 or higher", rules_text)
-        self.assertIn("Overusing uncertain is worse than a reasonable confident suggestion.", rules_text)
-        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2, uncertain.", rules_text)
+        self.assertIn("Multi-measure rest decision order:", rules_text)
+        self.assertIn("For grand-staff multi-measure rests, inspect only the top staff/treble staff.", rules_text)
+        self.assertIn("A readable count of 2 or more with a modern H-bar", rules_text)
+        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2.", rules_text)
+        self.assertIn("Never return uncertain, maybe_label, or maybe_rest_count", rules_text)
         self.assertIn("For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.", rules_text)
         self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
-        self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
-        self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
-        self.assertIn("Otherwise, later measures should be normal unless they are a valid multi_measure_rest.", rules_text)
-        self.assertIn("if the top staff has readable count 2 or higher plus rest-like multi-rest symbol", rules_text)
+        self.assertIn("Later measures must be normal unless they are a valid multi_measure_rest", rules_text)
         self.assertNotIn("Label multi_measure_rest only if both staves clearly share the same multi-measure rest count", rules_text)
         self.assertNotIn("Use one clear staff's written rhythm/rests as the timing guide", rules_text)
         self.assertNotIn("Different instruments are not beat 1", rules_text)
@@ -3861,7 +3856,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(intro.get("score_type"), "score")
         instructions = intro.get("instructions") or {}
-        self.assertEqual(instructions.get("allowed_labels"), ["normal", "pickup", "ending_1", "ending_2", "uncertain"])
+        self.assertEqual(instructions.get("allowed_labels"), ["normal", "pickup", "ending_1", "ending_2"])
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
         self.assertIn("Full-score pickup rules:", rules_text)
@@ -3870,7 +3865,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("For score pickup, start at the top visible staff.", rules_text)
         self.assertIn("If a staff shows only a full-measure rest in the first measure, skip to the next staff down.", rules_text)
         self.assertIn("Use the first staff with notes or readable rhythm; do not add multiple staves.", rules_text)
-        self.assertIn("If every staff is resting or unreadable, use uncertain with maybe_label pickup.", rules_text)
+        self.assertIn("If every staff is resting or unreadable, make the best pickup-or-normal choice with low confidence.", rules_text)
         self.assertIn("Use the first active staff's visible meter in this crop.", rules_text)
         self.assertIn("If the first active staff meter is unreadable but common/cut/numeric meter is partially visible", rules_text)
         self.assertIn("Common time looks like a large C after the clef/key signature and means 4/4.", rules_text)
@@ -3880,11 +3875,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("A dot immediately to the right of a note/rest adds half its value.", rules_text)
         self.assertIn("A triplet is marked by a small 3 above or below a group", rules_text)
         self.assertIn("For the first measure, arithmetic wins over context", rules_text)
-        self.assertIn("overusing uncertain is worse than a reasonable wrong pickup suggestion", rules_text)
+        self.assertIn("Always make the best pickup-or-normal choice", rules_text)
         self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
-        self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
-        self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
-        self.assertIn("Otherwise, later measures should be normal unless they are a valid multi_measure_rest.", rules_text)
+        self.assertIn("Later measures must be normal unless they are a valid multi_measure_rest", rules_text)
         self.assertIn("Ending / volta detection:", rules_text)
         self.assertIn("For full-score music, inspect above the top visible staff/system only; do not duplicate ending labels for each instrument.", rules_text)
         self.assertIn("First ending markers include 1, 1., 1st, or prima volta.", rules_text)
@@ -3893,7 +3886,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Full-score multi-measure rest rules:", rules_text)
         self.assertIn("For full score V1, NEVER return multi_measure_rest.", rules_text)
         self.assertIn("rest_count must always be null for full-score prompts.", rules_text)
-        self.assertIn("Allowed labels: normal, pickup, ending_1, ending_2, uncertain.", rules_text)
+        self.assertIn("Allowed labels: normal, pickup, ending_1, ending_2.", rules_text)
+        self.assertIn("Never return uncertain, maybe_label, or maybe_rest_count", rules_text)
         self.assertIn("For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.", rules_text)
         self.assertIn("For full score V1, never output multi_measure_rest, and rest_count must always be null.", rules_text)
         self.assertNotIn("Use the clearest staff/instrument's written rhythm/rests as the timing guide", rules_text)
@@ -3906,8 +3900,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertNotIn("A visible count of 2 or more above that old-style symbol is strong evidence", rules_text)
         output_shape = instructions.get("output_shape") or {}
         suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
-        self.assertEqual(suggestion_shape.get("label"), "normal|pickup|ending_1|ending_2|uncertain")
-        self.assertEqual(suggestion_shape.get("maybe_label"), "pickup|null")
+        self.assertEqual(suggestion_shape.get("label"), "normal|pickup|ending_1|ending_2")
+        self.assertNotIn("maybe_label", suggestion_shape)
+        self.assertNotIn("maybe_rest_count", suggestion_shape)
 
     def test_build_system_measure_request_missing_score_type_uses_legacy_prompt(self):
         intro = self._build_ai_prompt_intro(score_type=None)
@@ -3923,8 +3918,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Ignore fingering/count numbers near notes, above the staff, or below the staff.", rules_text)
         self.assertIn("Do not remember, inherit, carry, or track time signatures across measures.", rules_text)
         self.assertIn("Set measure_completeness only as needed", rules_text)
-        self.assertIn("Prefer useful suggestions over silence.", rules_text)
-        self.assertIn("If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason", rules_text)
+        self.assertIn("Always make the best useful choice from the allowed labels", rules_text)
+        self.assertIn("If measure_completeness is unclear, you may include unclear_reason", rules_text)
         self.assertIn("Do not write sentences for unclear_reason. Use only one short code or omit the field.", rules_text)
         self.assertIn("Only use meter for first-measure pickup judgment.", rules_text)
         self.assertIn("Read meter as top/bottom: top is how many beat-units fill a full measure", rules_text)
@@ -3937,9 +3932,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("For later non-first measures, do not label pickup.", rules_text)
         self.assertIn("If is_first_measure_of_score is false, do not label pickup.", rules_text)
         self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
-        self.assertIn("Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.", rules_text)
-        self.assertIn("For non-first measures, only use uncertain when the crop itself is visually unusable", rules_text)
-        self.assertIn("Otherwise, later measures should be normal unless they are a valid multi_measure_rest.", rules_text)
+        self.assertIn("Later measures must be normal unless they are a valid multi_measure_rest", rules_text)
         self.assertIn("Grand-staff pickup rules:", rules_text)
         self.assertIn("One staff may play while the other rests or is silent", rules_text)
         self.assertIn("Use the visible meter in this crop only", rules_text)
@@ -3949,8 +3942,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("In 4/4, one half-note chord is 2 of 4 beats", rules_text)
         self.assertIn("In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats", rules_text)
         self.assertIn("If all visible staves show one aligned quarter-note event in 2/4", rules_text)
-        self.assertIn("Use uncertain with maybe_label pickup only when first-measure pickup is possible", rules_text)
-        self.assertIn("Use uncertain instead of pickup only when there is not enough visual evidence", rules_text)
+        self.assertIn("If the first measure is hard to read, make the best pickup-or-normal choice", rules_text)
+        self.assertIn("never return uncertain or maybe fields", rules_text)
         self.assertIn("Ending / volta detection:", rules_text)
         self.assertIn("Inspect above the staff/system for ending brackets.", rules_text)
         self.assertIn("Do not return a finish/end measure for endings.", rules_text)
@@ -4259,7 +4252,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(page.insert_text_calls[0]["point"], (25.0, 22.0))
         self.assertEqual(page.insert_text_calls[0]["text"], "1")
 
-    def test_build_system_measure_request_includes_old_style_multi_rest_guidance(self):
+    def test_build_system_measure_request_includes_unified_multi_rest_guidance(self):
         mapping_summary = self._sample_mapping_summary()
         editable_state = mapping_summary.get("editable_state") or {}
         system_row = (editable_state.get("systems") or [])[0]
@@ -4283,11 +4276,11 @@ class BrowserReadyApiTests(unittest.TestCase):
         intro = json.loads((content[0] or {}).get("text") or "{}")
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
-        self.assertIn("A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.", rules_text)
-        self.assertIn("In the older style, the vertical bars may be short or long, and there may be more than one.", rules_text)
-        self.assertIn("A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.", rules_text)
-        self.assertIn("A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.", rules_text)
-        self.assertIn("For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count.", rules_text)
+        self.assertIn("Multi-measure rest decision order:", rules_text)
+        self.assertIn("A readable count of 2 or more with a modern H-bar", rules_text)
+        self.assertIn("A count of 1 or an ordinary quarter, half, whole, or full-measure rest means normal.", rules_text)
+        self.assertIn("Ignore unrelated measure numbers, rehearsal marks, fingerings, lyrics, ending numbers", rules_text)
+        self.assertIn("make the best normal-or-multi_measure_rest choice", rules_text)
 
     def test_build_system_measure_request_includes_reference_examples_before_real_measures(self):
         mapping_summary = self._sample_mapping_summary()
@@ -4300,6 +4293,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             tmp_path = Path(tmpdir)
             (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
             (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
+            (tmp_path / "modern_rest_positive_8.png").write_bytes(b"modern-reference")
+            (tmp_path / "old_style_rest_positive_16.png").write_bytes(b"large-count-reference")
             with (
                 patch.object(WORKER, "AI_REFERENCE_EXAMPLES_DIR", tmp_path),
                 patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
@@ -4312,18 +4307,23 @@ class BrowserReadyApiTests(unittest.TestCase):
                     measure_rows,
                     page,
                     pdf_source="corrected",
+                    score_type="single",
                 )
 
-        self.assertEqual(reference_examples_attached, 2)
+        self.assertEqual(reference_examples_attached, 4)
         self.assertNotIn("reference_examples_attached", payload)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         self.assertEqual((content[0] or {}).get("type"), "text")
-        self.assertIn("Reference examples for old-style multi-measure rest recognition.", (content[1] or {}).get("text") or "")
-        self.assertIn("visible count 1", (content[2] or {}).get("text") or "")
+        self.assertIn("Reference examples for multi-measure rest recognition.", (content[1] or {}).get("text") or "")
+        self.assertIn("printed count is 1", (content[2] or {}).get("text") or "")
         self.assertEqual((content[3] or {}).get("type"), "image")
-        self.assertIn("visible count 3", (content[4] or {}).get("text") or "")
+        self.assertIn("printed count is 3", (content[4] or {}).get("text") or "")
         self.assertEqual((content[5] or {}).get("type"), "image")
-        self.assertEqual(json.loads((content[6] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
+        self.assertIn("printed count is 8", (content[6] or {}).get("text") or "")
+        self.assertEqual((content[7] or {}).get("type"), "image")
+        self.assertIn("printed count is 16", (content[8] or {}).get("text") or "")
+        self.assertEqual((content[9] or {}).get("type"), "image")
+        self.assertEqual(json.loads((content[10] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
 
     def test_build_system_measure_request_skips_missing_reference_examples(self):
         mapping_summary = self._sample_mapping_summary()
@@ -4346,6 +4346,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     measure_rows,
                     page,
                     pdf_source="corrected",
+                    score_type="single",
                 )
 
         self.assertEqual(reference_examples_attached, 0)
@@ -4391,6 +4392,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             tmp_path = Path(tmpdir)
             (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
             (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
+            (tmp_path / "modern_rest_positive_8.png").write_bytes(b"modern-reference")
+            (tmp_path / "old_style_rest_positive_16.png").write_bytes(b"large-count-reference")
             with (
                 patch.object(WORKER, "AI_REFERENCE_EXAMPLES_DIR", tmp_path),
                 patch.object(WORKER, "_resolve_ai_crop_pdf_source", return_value=(Path("/tmp/audiveris_out_corrected.pdf"), "corrected")),
@@ -4407,11 +4410,12 @@ class BrowserReadyApiTests(unittest.TestCase):
                     system_measures,
                     "test-state",
                     artifacts,
+                    score_type="single",
                 )
 
         self.assertEqual(len(captured_payloads), 1)
         self.assertNotIn("reference_examples_attached", captured_payloads[0])
-        self.assertEqual(result.get("reference_examples_attached"), 2)
+        self.assertEqual(result.get("reference_examples_attached"), 4)
 
     def test_profile_system_layouts_flags_short_partial_staff(self):
         systems = [

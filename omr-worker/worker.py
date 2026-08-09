@@ -103,7 +103,7 @@ BEDROCK_MODEL_ID = str(
     os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0") or ""
 ).strip()
 BEDROCK_GENERAL_MODEL_ID = str(
-    os.environ.get("BEDROCK_GENERAL_MODEL_ID", "global.anthropic.claude-haiku-4-5-20251001-v1:0") or ""
+    os.environ.get("BEDROCK_GENERAL_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0") or ""
 ).strip()
 BEDROCK_ENDING_MODEL_ID = str(
     os.environ.get("BEDROCK_ENDING_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0") or ""
@@ -202,14 +202,22 @@ AI_SUGGEST_OVERLOAD_RETRY_DELAYS_SEC = (2.0, 5.0)
 BEDROCK_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
 TRANSIENT_RETRY_DELAYS_SEC = (0.7, 1.5, 3.0)
 AI_REFERENCE_EXAMPLES_DIR = Path(__file__).resolve().parent / "reference_examples"
-AI_OLD_STYLE_REFERENCE_EXAMPLES = (
+AI_MULTI_REST_REFERENCE_EXAMPLES = (
     {
         "filename": "old_style_rest_negative_1.png",
-        "caption": "Reference example A: visible count 1 with an old-style-looking symbol. This is normal, not multi_measure_rest.",
+        "caption": "Reference A: the printed count is 1, so this is one normal measure, not a multi_measure_rest.",
     },
     {
         "filename": "old_style_rest_positive_3.png",
-        "caption": "Reference example B: visible count 3 with an old-style symbol. This is multi_measure_rest.",
+        "caption": "Reference B: the printed count is 3 above an old-style rest symbol. Return multi_measure_rest with rest_count 3.",
+    },
+    {
+        "filename": "modern_rest_positive_8.png",
+        "caption": "Reference C: the printed count is 8 above a modern thick H-bar rest. Return multi_measure_rest with rest_count 8.",
+    },
+    {
+        "filename": "old_style_rest_positive_16.png",
+        "caption": "Reference D: the printed count is 16 above an old-style rest symbol. Return multi_measure_rest with rest_count 16.",
     },
 )
 AI_ENDING_REFERENCE_EXAMPLES = (
@@ -4855,11 +4863,10 @@ def _normalize_ai_suggestions_result(
                 normalization_warnings.append(
                     _ai_suggest_normalization_warning(
                         measure_row,
-                        f"Downgraded multi_measure_rest to uncertain for {measure_id} because rest_count was missing or invalid.",
+                        f"Treated multi_measure_rest as normal for {measure_id} because rest_count was missing or invalid.",
                     )
                 )
-                entry["label"] = "uncertain"
-                kept_by_measure_id[measure_id] = entry
+                normal_measures_omitted += 1
                 continue
             if maybe_label is not None or maybe_rest_count is not None:
                 normalization_warnings.append(
@@ -5717,10 +5724,10 @@ def _load_ai_debug_batch_trace(artifacts: dict) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _build_old_style_multi_rest_reference_content() -> tuple[list[dict], int]:
+def _build_multi_rest_reference_content() -> tuple[list[dict], int]:
     content: list[dict] = []
     example_rows: list[dict] = []
-    for row in AI_OLD_STYLE_REFERENCE_EXAMPLES:
+    for row in AI_MULTI_REST_REFERENCE_EXAMPLES:
         filename = str((row or {}).get("filename") or "").strip()
         if not filename:
             continue
@@ -5745,7 +5752,7 @@ def _build_old_style_multi_rest_reference_content() -> tuple[list[dict], int]:
         {
             "type": "text",
             "text": (
-                "Reference examples for old-style multi-measure rest recognition. "
+                "Reference examples for multi-measure rest recognition. "
                 "The next example images are references only; the real measure crops follow after them."
             ),
         }
@@ -5823,13 +5830,11 @@ def _ai_prompt_base_rules() -> list[str]:
         "Only label pickup when is_first_measure_of_score is true.",
         "If is_first_measure_of_score is false, do not label pickup.",
         "Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, clear normal = full, unclear = unclear.",
-        "Prefer useful suggestions over silence. If a crop strongly looks like pickup or multi_measure_rest, suggest it even with medium or low confidence.",
-        "If a measure is uncertain or its measure_completeness is unclear, you may include unclear_reason using one of these exact codes only: time_signature_not_clear, too_dense_to_count, crop_cut_off, split_may_be_wrong, ornament_or_tie_confusion, not_enough_visual_evidence.",
+        "Always make the best useful choice from the allowed labels, even when confidence is low.",
+        "If measure_completeness is unclear, you may include unclear_reason using one of these exact codes only: time_signature_not_clear, too_dense_to_count, crop_cut_off, split_may_be_wrong, ornament_or_tie_confusion, not_enough_visual_evidence.",
         "Do not write sentences for unclear_reason. Use only one short code or omit the field.",
         "For non-first measures, do not judge pickup or beat completeness.",
-        "Do not label a later measure uncertain just because it looks short, sparse, tied, syncopated, or rhythmically incomplete.",
-        "For non-first measures, only use uncertain when the crop itself is visually unusable, the measure split/box appears wrong, or a possible multi-measure rest count is unreadable.",
-        "Otherwise, later measures should be normal unless they are a valid multi_measure_rest.",
+        "Later measures must be normal unless they are a valid multi_measure_rest or a clearly numbered ending start.",
     ]
 
 
@@ -5839,9 +5844,8 @@ def _ai_prompt_duration_basics() -> list[str]:
         "Count written note/rest durations only. Never count visual width, spacing, number of noteheads, or number of staves as beats.",
         "Chords or stacked notes count as exactly one rhythmic event using the written note value. Do not count each notehead separately.",
         "For later non-first measures, do not label pickup.",
-        "Use uncertain with maybe_label pickup only when first-measure pickup is possible but the visible meter or rhythmic duration cannot be read reliably because the notation is unclear, dense, or cut off.",
+        "If the first measure is hard to read, make the best pickup-or-normal choice and use low confidence.",
         "A whole note, two half notes, or other sparse-looking content in the first measure is usually a slow full measure, not a pickup. Do not label pickup just because the first measure looks sparse or simple.",
-        "Use uncertain instead of pickup only when there is not enough visual evidence to determine the first measure's visible meter or rhythmic duration.",
     ]
 
 
@@ -5899,8 +5903,29 @@ def _ai_prompt_ending_rules(score_type: str) -> list[str]:
         "The bracket may end with a right vertical line, or the horizontal line may simply stop.",
         "Only label the measure where the bracket clearly starts.",
         "If the crop only shows a continuing horizontal line with no readable number/start, do not label it as a new ending.",
-        "If the bracket start is clear but the number is unreadable, return uncertain.",
+        "If the bracket number is unreadable, do not invent an ending label; make the best normal, pickup, or multi-measure-rest choice instead.",
         "Do not return a finish/end measure for endings.",
+    ]
+
+
+def _ai_prompt_multi_rest_rules(score_type: str) -> list[str]:
+    if score_type == "grand":
+        scope_rule = "For grand-staff multi-measure rests, inspect only the top staff/treble staff."
+    elif score_type == "single":
+        scope_rule = "For single-staff multi-measure rests, inspect the one visible staff."
+    else:
+        scope_rule = "Inspect the visible rest symbol and its printed count in the target measure."
+    return [
+        "Multi-measure rest decision order:",
+        scope_rule,
+        "Check this before pickup or meter; meter does not determine a multi-measure rest.",
+        "The supplied reference images are examples only. The real target measure images follow them.",
+        "First find a printed count that belongs to the rest symbol in the target measure.",
+        "A readable count of 2 or more with a modern H-bar, thick horizontal block, or old-style bar-piece rest symbol means multi_measure_rest.",
+        "Return the printed count exactly as rest_count; the symbol's number of bars does not need to match it.",
+        "A count of 1 or an ordinary quarter, half, whole, or full-measure rest means normal.",
+        "Ignore unrelated measure numbers, rehearsal marks, fingerings, lyrics, ending numbers, and numbers attached to notes.",
+        "If the count or symbol is difficult to read, make the best normal-or-multi_measure_rest choice and use low confidence.",
     ]
 
 
@@ -5928,21 +5953,9 @@ def _ai_prompt_single_rules() -> list[str]:
         "If the first measure's written duration is less than the visible meter, label pickup and set measure_completeness to incomplete.",
         "For the first measure, arithmetic wins over context; do not call a short first measure full because it looks musically complete.",
         "Only label normal/full if the written notes/rests clearly add up to the full visible meter.",
-        "If first-measure pickup is possible but the visible meter or rhythm is unclear, use uncertain with maybe_label pickup.",
+        "If the first-measure meter or rhythm is unclear, make the best pickup-or-normal choice and use low confidence.",
         *_ai_prompt_ending_rules("single"),
-        "Single-staff multi-measure rest rules:",
-        "Check multi-measure rests before pickup or meter. Do not inspect meter for multi-measure rests.",
-        "Use the old-style reference images as examples only; the real measure crops come after them. Old-style rests can look different from modern H-bars.",
-        "A multi-measure rest symbol can be a modern H-bar or thick horizontal block across the staff.",
-        "A multi-measure rest symbol can also be old-style vertical bars, horizontal bars, or small bar pieces inside the staff.",
-        "Normal quarter/eighth/half/whole rests are not multi-measure rests by themselves.",
-        "Number first, symbol second: a readable big number 2 or higher above/near a rest-like old/modern symbol means multi_measure_rest.",
-        "Use the printed big number as rest_count. Do not require the bar pattern to visually match the count.",
-        "Do not return uncertain just because the symbol is messy, unfamiliar, or old-looking.",
-        "A visible count of 1 is normal, not multi_measure_rest.",
-        "If there is no readable count, do not return a confident multi_measure_rest.",
-        "If it is clearly only a normal one-measure rest, label normal.",
-        "Use uncertain only when the count is unreadable or the number may be a rehearsal/measure number instead of a rest count.",
+        *_ai_prompt_multi_rest_rules("single"),
     ]
 
 
@@ -5952,7 +5965,7 @@ def _ai_prompt_grand_rules() -> list[str]:
         "For all AI Suggest decisions in grand-staff/piano music, use only the top staff/treble staff.",
         "Ignore the bottom staff completely for time signature, pickup, and multi-measure rest.",
         "Do not inspect, compare, add, or use the bottom staff as fallback.",
-        "If the top staff is hard to read, unreadable, empty, or cut off, do not switch to the bottom staff; use unknown or uncertain instead.",
+        "If the top staff is hard to read, unreadable, empty, or cut off, do not switch to the bottom staff; make the best top-staff choice with low confidence.",
         "Grand-staff pickup rules:",
         "This is grand-staff/piano music. For pickup counting, use only the top staff/treble staff.",
         "Ignore the bottom staff completely for pickup duration. Do not inspect it, use it as fallback, compare it, or add it.",
@@ -5960,7 +5973,7 @@ def _ai_prompt_grand_rules() -> list[str]:
         "Only check pickup when is_first_measure_of_score is true.",
         "Use only the top staff's visible meter in this crop.",
         "If the same meter appears on both staves, ignore the bottom duplicate.",
-        "If the top staff meter is unreadable, use unknown/uncertain.",
+        "If the top staff meter is unreadable, make the best pickup-or-normal choice with low confidence.",
         "Read meter as top/bottom: top = how many beat-units fill a full measure; bottom = which note value is one beat-unit.",
         "Bottom number examples: 4 means quarter-note beats, 8 means eighth-note beats, 2 means half-note beats.",
         "Common time looks like a large C after the clef/key signature and means 4/4.",
@@ -5977,22 +5990,9 @@ def _ai_prompt_grand_rules() -> list[str]:
         "If the top staff's written duration is less than the visible meter, the whole first measure is pickup/incomplete.",
         "For the first measure, arithmetic wins over context; do not call a short first measure full because it looks musically complete.",
         "Only label normal/full if the top staff clearly fills the visible meter.",
-        "If the top staff meter/rhythm is unreadable or cut off, use uncertain with maybe_label pickup.",
+        "If the top staff meter or rhythm is unreadable or cut off, make the best pickup-or-normal choice with low confidence.",
         *_ai_prompt_ending_rules("grand"),
-        "Grand-staff multi-measure rest rules:",
-        "For grand-staff multi-measure rest, use only the top staff/treble staff.",
-        "Check multi-measure rests before pickup or meter. Do not inspect meter for multi-measure rests.",
-        "Use the old-style reference images as examples only; the real measure crops come after them. Old-style rests can look different from modern H-bars.",
-        "A multi-measure rest symbol can be a modern H-bar or thick horizontal block across the staff.",
-        "A multi-measure rest symbol can also be old-style vertical bars, horizontal bars, or small bar pieces inside the staff.",
-        "Normal quarter/eighth/half/whole rests are not multi-measure rests by themselves.",
-        "Number first, symbol second: a readable big number 2 or higher above/near a rest-like old/modern symbol means multi_measure_rest.",
-        "Use the printed big number as rest_count. Do not require the bar pattern to visually match the count.",
-        "Do not return uncertain just because the symbol is messy, unfamiliar, or old-looking.",
-        "A visible count of 1 is normal, not multi_measure_rest.",
-        "If there is no readable count, do not return a confident multi_measure_rest.",
-        "If it is clearly only a normal one-measure rest, label normal.",
-        "Use uncertain only when the count is unreadable or the number may be a rehearsal/measure number instead of a rest count.",
+        *_ai_prompt_multi_rest_rules("grand"),
     ]
 
 
@@ -6002,11 +6002,10 @@ def _ai_prompt_score_rules() -> list[str]:
         "For score pickup, start at the top visible staff.",
         "If a staff shows only a full-measure rest in the first measure, skip to the next staff down.",
         "Use the first staff with notes or readable rhythm; do not add multiple staves.",
-        "If every staff is resting or unreadable, use uncertain with maybe_label pickup.",
+        "If every staff is resting or unreadable, make the best pickup-or-normal choice with low confidence.",
         "Only check pickup when is_first_measure_of_score is true.",
         "Use the first active staff's visible meter in this crop.",
         "If the first active staff meter is unreadable but common/cut/numeric meter is partially visible, make the best reasonable meter read and continue.",
-        "Use uncertain only if no meter can be reasonably read at all.",
         "Read meter as top/bottom: top = how many beat-units fill a full measure; bottom = which note value is one beat-unit.",
         "Bottom number examples: 4 means quarter-note beats, 8 means eighth-note beats, 2 means half-note beats.",
         "Common time looks like a large C after the clef/key signature and means 4/4.",
@@ -6022,11 +6021,10 @@ def _ai_prompt_score_rules() -> list[str]:
         "A chord/stack on the first active staff is exactly one rhythmic event, no matter how many noteheads it has. Use the written note value.",
         "If the first active staff's written duration is less than the visible meter, the whole first measure is pickup/incomplete.",
         "For the first measure, arithmetic wins over context; do not call a short first measure full because it looks intentional, musical, complete, or like an opening gesture.",
-        "For pickup, overusing uncertain is worse than a reasonable wrong pickup suggestion.",
-        "Do not use uncertain just because the notation is old, small, light, or slightly messy.",
+        "Always make the best pickup-or-normal choice, even when the notation is old, small, light, or slightly messy.",
         "Only label normal/full if the first active staff clearly fills the visible meter.",
-        "If you cannot confidently choose pickup, but the first active staff may be short, use uncertain with maybe_label pickup.",
-        "If the first active staff meter/rhythm is completely unreadable, empty, or cut off, use uncertain with maybe_label pickup.",
+        "If the first active staff may be short, choose pickup with low confidence.",
+        "If the first active staff meter or rhythm is completely unreadable, empty, or cut off, make the best pickup-or-normal choice with low confidence.",
         *_ai_prompt_ending_rules("score"),
         "Full-score multi-measure rest rules:",
         "For full score V1, NEVER return multi_measure_rest.",
@@ -6034,18 +6032,16 @@ def _ai_prompt_score_rules() -> list[str]:
         "Do not use any printed rest count, H-bar, old-style rest symbol, or instrument rest to skip score measures.",
         "A rest count on one staff only means that instrument may be resting; it does not mean the score should skip measures.",
         "Even if multiple staves show rest symbols, full-score V1 must still count visible score measures normally.",
-        "If a full-score rest situation is confusing, label normal or uncertain, but never multi_measure_rest.",
+        "If a full-score rest situation is confusing, label normal, never multi_measure_rest.",
         "rest_count must always be null for full-score prompts.",
     ]
 
 
 def _ai_prompt_output_rules() -> list[str]:
     return [
-        "If label is uncertain and you have a tentative guess, maybe_label may be pickup or multi_measure_rest, and maybe_rest_count is only allowed for maybe_label multi_measure_rest.",
-        "If maybe_label is multi_measure_rest, always include maybe_rest_count if the count number is at all readable. Only omit maybe_rest_count if the number is completely unreadable.",
-        "A wrong confident answer is worse than uncertain.",
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
+        "Always choose normal, pickup, multi_measure_rest, ending_1, or ending_2; never return uncertain or maybe fields.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
@@ -6054,17 +6050,13 @@ def _ai_prompt_output_rules() -> list[str]:
 
 def _ai_prompt_single_output_rules() -> list[str]:
     return [
-        "Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2, uncertain.",
+        "Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2.",
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
-        "Overusing uncertain is worse than a reasonable confident suggestion.",
-        "Use uncertain only when the visual evidence is truly unreadable or conflicting.",
-        "For multi-rest: if readable count 2 or higher plus rest-like multi-rest symbol, output multi_measure_rest.",
-        "For multi-rest: use uncertain only when the number is hard to read or might not be a rest count.",
+        "Never return uncertain, maybe_label, or maybe_rest_count; make the best allowed choice and use low confidence when needed.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
         "Do not output ending finish/end measures.",
-        "If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable, include maybe_rest_count.",
         "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
@@ -6072,17 +6064,13 @@ def _ai_prompt_single_output_rules() -> list[str]:
 
 def _ai_prompt_grand_output_rules() -> list[str]:
     return [
-        "Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2, uncertain.",
+        "Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2.",
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
-        "Overusing uncertain is worse than a reasonable confident suggestion.",
-        "Use uncertain only when the top-staff visual evidence is truly unreadable or conflicting.",
-        "For multi-rest: if the top staff has readable count 2 or higher plus rest-like multi-rest symbol, output multi_measure_rest.",
-        "For multi-rest: use uncertain only when the top-staff number is hard to read or might not be a rest count.",
+        "Never return uncertain, maybe_label, or maybe_rest_count; make the best allowed choice and use low confidence when needed.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
         "Do not output ending finish/end measures.",
-        "If label is uncertain with maybe_label = multi_measure_rest and the count is partly readable, include maybe_rest_count.",
         "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
@@ -6090,8 +6078,8 @@ def _ai_prompt_grand_output_rules() -> list[str]:
 
 def _ai_prompt_score_output_rules() -> list[str]:
     return [
-        "Allowed labels: normal, pickup, ending_1, ending_2, uncertain.",
-        "For pickup, overusing uncertain is worse than a reasonable pickup suggestion. For all other cases, use uncertain when evidence is truly unreadable.",
+        "Allowed labels: normal, pickup, ending_1, ending_2.",
+        "Never return uncertain, maybe_label, or maybe_rest_count; make the best allowed choice and use low confidence when needed.",
         "Do not skip any measure_id. Every input measure_id must appear exactly once.",
         "For full score V1, never output multi_measure_rest, and rest_count must always be null.",
         "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
@@ -6110,13 +6098,7 @@ def _ai_prompt_legacy_rules() -> list[str]:
         "In grand-staff or full-score music, vertically aligned notes/rests across staves happen at the same time, not one after another. Do not add treble plus bass or multiple instruments as separate beats; count the timeline horizontally.",
         "For grand-staff/piano crops, judge pickup by the whole vertical measure across both staves. One staff may play while the other rests or is silent; do not require both staves to have notes.",
         "Examples: in 2/4, one quarter-note chord is 1 of 2 beats, so pickup if first measure. In 4/4, one half-note chord is 2 of 4 beats, so pickup if first measure. In 6/8, one dotted-quarter chord is 3 of 6 eighth-beats, so pickup if first unless more duration follows. If all visible staves show one aligned quarter-note event in 2/4, that is one beat total, so pickup if first unless another beat or rest follows.",
-        "A multi-measure rest may use either the modern H-bar style or an older style made from a horizontal bar plus one or more vertical bars.",
-        "In the older style, the vertical bars may be short or long, and there may be more than one.",
-        "Check multi-measure rests before meter. A confident multi_measure_rest label requires a clearly readable count number of 2 or more. Without a visible count number, return uncertain.",
-        "A visible count of 2 or more above that old-style symbol is strong evidence for multi_measure_rest.",
-        "If label is multi_measure_rest, include integer rest_count of 2 or more. A visible count of 1 means the measure is normal, not multi_measure_rest.",
-        "A plain one-measure rest without the old-style vertical-bar structure is normal, not multi_measure_rest.",
-        "For grand-staff/piano crops, return multi_measure_rest only if both staves clearly share the same multi-measure rest count. If one staff has music, no count, or a different count, do not return multi_measure_rest.",
+        *_ai_prompt_multi_rest_rules("legacy"),
         *_ai_prompt_ending_rules("legacy"),
         *_ai_prompt_output_rules(),
     ]
@@ -6151,9 +6133,8 @@ def _build_system_measure_request(
     system_id = str(system_row.get("system_id") or "").strip()
     page_number = _safe_int(system_row.get("page"), _safe_int((measure_rows[0] if measure_rows else {}).get("page"), 1))
     normalized_score_type = _normalize_ai_score_type(score_type)
-    score_allowed_labels = ["normal", "pickup", "ending_1", "ending_2", "uncertain"] if normalized_score_type == "score" else ["normal", "pickup", "multi_measure_rest", "ending_1", "ending_2", "uncertain"]
-    score_label_shape = "normal|pickup|ending_1|ending_2|uncertain" if normalized_score_type == "score" else "normal|pickup|multi_measure_rest|ending_1|ending_2|uncertain"
-    score_maybe_label_shape = "pickup|null" if normalized_score_type == "score" else "pickup|multi_measure_rest|null"
+    score_allowed_labels = ["normal", "pickup", "ending_1", "ending_2"] if normalized_score_type == "score" else ["normal", "pickup", "multi_measure_rest", "ending_1", "ending_2"]
+    score_label_shape = "normal|pickup|ending_1|ending_2" if normalized_score_type == "score" else "normal|pickup|multi_measure_rest|ending_1|ending_2"
     intro = {
         "job_id": str(job_id),
         "run_id": int(run_id),
@@ -6162,7 +6143,7 @@ def _build_system_measure_request(
         "score_type": normalized_score_type,
         "remembered_time_signature_in": None,
         "instructions": {
-            "task": "Classify each already-detected sheet-music measure conservatively.",
+            "task": "Classify every already-detected sheet-music measure using the best allowed label.",
             "allowed_labels": score_allowed_labels,
             "rules": _ai_prompt_rules_for_score_type(score_type),
             "output_shape": {
@@ -6175,8 +6156,6 @@ def _build_system_measure_request(
                         "unclear_reason": "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
                         "rest_count": "integer|null",
                         "confidence": "low|medium|high",
-                        "maybe_label": score_maybe_label_shape,
-                        "maybe_rest_count": "integer|null",
                         "decision_debug": {
                             "active_meter_read": "2/4|3/4|4/4|6/8|common_time|cut_time|unknown|null",
                             "duration_judgment": "full|short|unclear|null",
@@ -6204,7 +6183,10 @@ def _build_system_measure_request(
         ],
     }
     content.append({"type": "text", "text": json.dumps(intro, ensure_ascii=True)})
-    reference_content, reference_examples_attached = _build_old_style_multi_rest_reference_content()
+    if normalized_score_type in ("single", "grand"):
+        reference_content, reference_examples_attached = _build_multi_rest_reference_content()
+    else:
+        reference_content, reference_examples_attached = [], 0
     content.extend(reference_content)
 
     for idx, row in enumerate(measure_rows):
