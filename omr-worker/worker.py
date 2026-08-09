@@ -167,10 +167,10 @@ AI_SUGGEST_RUN_STATUS_CANCELLED = "cancelled"
 AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED = "partial_failed"
 AI_SUGGEST_START_MODES_ALLOWED = {"start", "continue", "restart"}
 AI_SUGGESTION_ENDING_LABELS = {"ending_1", "ending_2"}
-AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
+AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "false_measure", "uncertain"}
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
 AI_SUGGESTION_MAYBE_LABELS_ALLOWED = {"pickup", "multi_measure_rest"}
-AI_SUGGESTION_COMPLETENESS_ALLOWED = {"full", "incomplete", "unclear"}
+AI_SUGGESTION_COMPLETENESS_ALLOWED = {"full", "incomplete", "unclear", "not_applicable"}
 AI_SCORE_TYPES_ALLOWED = {"single", "grand", "score"}
 AI_SUGGESTION_UNCLEAR_REASONS_ALLOWED = {
     "time_signature_not_clear",
@@ -220,6 +220,16 @@ AI_MULTI_REST_REFERENCE_EXAMPLES = (
     {
         "filename": "old_style_rest_positive_16.png",
         "caption": "Reference D: the printed count is 16 above an old-style rest symbol. Return multi_measure_rest with rest_count 16.",
+    },
+)
+AI_FALSE_MEASURE_REFERENCE_EXAMPLES = (
+    {
+        "filename": "false_measure_6_8_only.png",
+        "caption": "False-measure reference A: This narrow detected box contains only a 6/8 time signature, staff lines, and barlines. It contains no notes or rests and consumes no musical time. Return false_measure.",
+    },
+    {
+        "filename": "false_measure_common_time_only.png",
+        "caption": "False-measure reference B: This narrow detected box contains only a clef, common-time symbol, staff lines, and barlines. It contains no notes or rests and consumes no musical time. Return false_measure.",
     },
 )
 AI_ENDING_REFERENCE_EXAMPLES = (
@@ -4897,7 +4907,7 @@ def _normalize_ai_suggestions_result(
         maybe_rest_count = row.get("maybe_rest_count")
         raw_unclear_reason = row.get("unclear_reason")
         decision_debug = None
-        if is_first_measure_of_score:
+        if is_first_measure_of_score and label != "false_measure":
             if row.get("decision_debug") is None:
                 normalization_warnings.append(
                     _ai_suggest_normalization_warning(
@@ -4930,6 +4940,8 @@ def _normalize_ai_suggestions_result(
             measure_completeness = "incomplete"
         elif label == "multi_measure_rest":
             measure_completeness = "full"
+        elif label == "false_measure":
+            measure_completeness = "not_applicable"
         elif ignored_ending_label:
             measure_completeness = "full"
         elif not is_first_measure_of_score and label == "normal" and measure_completeness == "incomplete":
@@ -5022,6 +5034,16 @@ def _normalize_ai_suggestions_result(
                     )
                 )
             entry["rest_count"] = int(rest_count)
+        elif label == "false_measure":
+            if rest_count is not None or maybe_label is not None or maybe_rest_count is not None or raw_unclear_reason is not None:
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Ignored extra fields on false_measure suggestion for {measure_id}.",
+                    )
+                )
+            entry.pop("unclear_reason", None)
+            entry["rest_count"] = None
         else:
             if rest_count is not None:
                 normalization_warnings.append(
@@ -6044,6 +6066,50 @@ def _build_multi_rest_reference_content() -> tuple[list[dict], int]:
     return content, len(example_rows)
 
 
+def _build_false_measure_reference_content() -> tuple[list[dict], int]:
+    content: list[dict] = []
+    rows: list[dict] = []
+    for row in AI_FALSE_MEASURE_REFERENCE_EXAMPLES:
+        image_path = AI_REFERENCE_EXAMPLES_DIR / str(row.get("filename") or "")
+        try:
+            image_bytes = image_path.read_bytes()
+        except FileNotFoundError:
+            logger.warning("AI_FALSE_MEASURE_REFERENCE_MISSING filename=%s", image_path.name)
+            continue
+        except Exception as exc:
+            logger.warning(
+                "AI_FALSE_MEASURE_REFERENCE_LOAD_FAILED filename=%s error_type=%s",
+                image_path.name,
+                type(exc).__name__,
+            )
+            continue
+        rows.append({"caption": str(row.get("caption") or ""), "image_bytes": image_bytes})
+    if not rows:
+        return content, 0
+    content.append(
+        {
+            "type": "text",
+            "text": (
+                "The next two images are false-measure references only. "
+                "After them, classify the real target candidate-box crops."
+            ),
+        }
+    )
+    for row in rows:
+        content.append({"type": "text", "text": row["caption"]})
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(row["image_bytes"]).decode("ascii"),
+                },
+            }
+        )
+    return content, len(rows)
+
+
 def _build_ending_reference_content() -> tuple[list[dict], int]:
     content: list[dict] = []
     rows: list[dict] = []
@@ -6084,13 +6150,30 @@ def _build_ending_reference_content() -> tuple[list[dict], int]:
     return content, len(rows)
 
 
+def _ai_prompt_false_measure_rules() -> list[str]:
+    return [
+        "False-measure check - perform this before every other classification:",
+        "A false measure is an incorrect measure box containing no music that consumes time.",
+        "Return false_measure only when the target box contains no notes, no chords, no ordinary rests, no full-measure rests, and no multi-measure-rest symbol.",
+        "Clefs, key signatures, numeric time signatures, common time, cut time, staff lines, barlines, repeat barlines, repeat dots, and nearby text do not consume musical time by themselves.",
+        "A target box containing only those setup symbols is false_measure.",
+        "If any staff inside the target box contains a note, chord, ordinary rest, full-measure rest, or multi-measure-rest symbol, it is a real measure and must not be false_measure.",
+        "Setup symbols followed by notes or rests inside the same target box belong to a real measure.",
+        "Do not choose false_measure merely because the box is narrow, begins a page or system, or contains a time-signature change.",
+        "For Grand Staff and Full Score, the target is a real measure if any staff contains music that consumes time.",
+        "Classify only the target candidate box. Any neighboring material visible at the crop edges is context only.",
+        "Always make the best allowed choice. Never return uncertain.",
+    ]
+
+
 def _ai_prompt_base_rules() -> list[str]:
     return [
-        "Each image contains exactly one already-detected measure.",
+        "Each image contains exactly one already-detected measure candidate box. Some candidate boxes may contain only setup notation and may not be real measures.",
         "Staff means one set of 5 horizontal music lines for one instrument or voice.",
         "System means the full horizontal row of music containing all staves on that line of the score.",
         "Do not infer additional measures from rhythmic groupings, repeat dots, barline decorations, edge marks, spacing, or decorations.",
         "Process the provided measures left to right in order.",
+        *_ai_prompt_false_measure_rules(),
         "A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.",
         "Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.",
         "Do not remember, inherit, carry, or track time signatures across measures.",
@@ -6099,12 +6182,12 @@ def _ai_prompt_base_rules() -> list[str]:
         "For multi-measure rests, ignore meter completely.",
         "Only label pickup when is_first_measure_of_score is true.",
         "If is_first_measure_of_score is false, do not label pickup.",
-        "Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, clear normal = full, unclear = unclear.",
+        "Set measure_completeness only as needed: pickup = incomplete, multi_measure_rest = full, false_measure = not_applicable, clear normal = full, unclear = unclear.",
         "Always make the best useful choice from the allowed labels, even when confidence is low.",
         "If measure_completeness is unclear, you may include unclear_reason using one of these exact codes only: time_signature_not_clear, too_dense_to_count, crop_cut_off, split_may_be_wrong, ornament_or_tie_confusion, not_enough_visual_evidence.",
         "Do not write sentences for unclear_reason. Use only one short code or omit the field.",
         "For non-first measures, do not judge pickup or beat completeness.",
-        "Later measures must be normal unless they are a valid multi_measure_rest or a clearly numbered ending start.",
+        "Later measures must be normal unless they are a valid multi_measure_rest, false_measure, or a clearly numbered ending start.",
     ]
 
 
@@ -6311,50 +6394,54 @@ def _ai_prompt_output_rules() -> list[str]:
     return [
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
-        "Always choose normal, pickup, multi_measure_rest, ending_1, or ending_2; never return uncertain or maybe fields.",
+        "Always choose normal, pickup, multi_measure_rest, false_measure, ending_1, or ending_2; never return uncertain or maybe fields.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
-        "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "For false_measure, measure_completeness must be not_applicable, unclear_reason and rest_count must be null, and decision_debug may be null.",
+        "For the first measure of the score only, decision_debug is required unless label is false_measure. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
 
 
 def _ai_prompt_single_output_rules() -> list[str]:
     return [
-        "Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2.",
+        "Allowed labels: normal, pickup, multi_measure_rest, false_measure, ending_1, ending_2.",
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
         "Never return uncertain, maybe_label, or maybe_rest_count; make the best allowed choice and use low confidence when needed.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
+        "For false_measure, measure_completeness must be not_applicable, unclear_reason and rest_count must be null, and decision_debug may be null.",
         "Do not output ending finish/end measures.",
-        "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "For the first measure of the score only, decision_debug is required unless label is false_measure. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
 
 
 def _ai_prompt_grand_output_rules() -> list[str]:
     return [
-        "Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2.",
+        "Allowed labels: normal, pickup, multi_measure_rest, false_measure, ending_1, ending_2.",
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
         "Never return uncertain, maybe_label, or maybe_rest_count; make the best allowed choice and use low confidence when needed.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
+        "For false_measure, measure_completeness must be not_applicable, unclear_reason and rest_count must be null, and decision_debug may be null.",
         "Do not output ending finish/end measures.",
-        "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "For the first measure of the score only, decision_debug is required unless label is false_measure. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
 
 
 def _ai_prompt_score_output_rules() -> list[str]:
     return [
-        "Allowed labels: normal, pickup, ending_1, ending_2.",
+        "Allowed labels: normal, pickup, false_measure, ending_1, ending_2.",
         "Never return uncertain, maybe_label, or maybe_rest_count; make the best allowed choice and use low confidence when needed.",
         "Do not skip any measure_id. Every input measure_id must appear exactly once.",
         "For full score V1, never output multi_measure_rest, and rest_count must always be null.",
         "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
+        "For false_measure, measure_completeness must be not_applicable, unclear_reason and rest_count must be null, and decision_debug may be null.",
         "Do not output ending finish/end measures.",
-        "For the first measure of the score only, decision_debug is required. Do not omit it. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
+        "For the first measure of the score only, decision_debug is required unless label is false_measure. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
         "Return JSON only.",
     ]
 
@@ -6403,8 +6490,8 @@ def _build_system_measure_request(
     system_id = str(system_row.get("system_id") or "").strip()
     page_number = _safe_int(system_row.get("page"), _safe_int((measure_rows[0] if measure_rows else {}).get("page"), 1))
     normalized_score_type = _normalize_ai_score_type(score_type)
-    score_allowed_labels = ["normal", "pickup", "ending_1", "ending_2"] if normalized_score_type == "score" else ["normal", "pickup", "multi_measure_rest", "ending_1", "ending_2"]
-    score_label_shape = "normal|pickup|ending_1|ending_2" if normalized_score_type == "score" else "normal|pickup|multi_measure_rest|ending_1|ending_2"
+    score_allowed_labels = ["normal", "pickup", "false_measure", "ending_1", "ending_2"] if normalized_score_type == "score" else ["normal", "pickup", "multi_measure_rest", "false_measure", "ending_1", "ending_2"]
+    score_label_shape = "normal|pickup|false_measure|ending_1|ending_2" if normalized_score_type == "score" else "normal|pickup|multi_measure_rest|false_measure|ending_1|ending_2"
     intro = {
         "job_id": str(job_id),
         "run_id": int(run_id),
@@ -6413,7 +6500,7 @@ def _build_system_measure_request(
         "score_type": normalized_score_type,
         "remembered_time_signature_in": None,
         "instructions": {
-            "task": "Classify every already-detected sheet-music measure using the best allowed label.",
+            "task": "Classify every already-detected sheet-music measure candidate box using the best allowed label.",
             "allowed_labels": score_allowed_labels,
             "rules": _ai_prompt_rules_for_score_type(score_type),
             "output_shape": {
@@ -6422,7 +6509,7 @@ def _build_system_measure_request(
                     {
                         "measure_id": "string",
                         "label": score_label_shape,
-                        "measure_completeness": "full|incomplete|unclear",
+                        "measure_completeness": "full|incomplete|unclear|not_applicable",
                         "unclear_reason": "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
                         "rest_count": "integer|null",
                         "confidence": "low|medium|high",
@@ -6453,11 +6540,13 @@ def _build_system_measure_request(
         ],
     }
     content.append({"type": "text", "text": json.dumps(intro, ensure_ascii=True)})
+    false_reference_content, false_reference_count = _build_false_measure_reference_content()
+    content.extend(false_reference_content)
+    reference_examples_attached = int(false_reference_count)
     if normalized_score_type in ("single", "grand"):
-        reference_content, reference_examples_attached = _build_multi_rest_reference_content()
-    else:
-        reference_content, reference_examples_attached = [], 0
-    content.extend(reference_content)
+        rest_reference_content, rest_reference_count = _build_multi_rest_reference_content()
+        content.extend(rest_reference_content)
+        reference_examples_attached += int(rest_reference_count)
 
     for idx, row in enumerate(measure_rows):
         next_row = measure_rows[idx + 1] if idx + 1 < len(measure_rows) else None

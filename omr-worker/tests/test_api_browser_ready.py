@@ -2861,10 +2861,10 @@ class BrowserReadyApiTests(unittest.TestCase):
             (((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")),
             "m0",
         )
-        self.assertEqual(body.get("reference_examples_attached"), 0)
+        self.assertEqual(body.get("reference_examples_attached"), 2)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
         self.assertEqual(((body.get("debug_crops") or {}).get("pdf_source")), "corrected")
-        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 0)
+        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 2)
         warnings = ((body.get("ai_suggestions") or {}).get("warnings")) or []
         warnings_text = "\n".join(str((row or {}).get("message") or "") for row in warnings)
         self.assertIn("remembered_time_signature_out", warnings_text)
@@ -3737,6 +3737,77 @@ class BrowserReadyApiTests(unittest.TestCase):
             },
         )
 
+    def test_normalize_ai_suggestions_result_keeps_false_measure_without_first_measure_debug(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 0},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "m0",
+                    "label": "false_measure",
+                    "measure_completeness": "full",
+                    "unclear_reason": None,
+                    "rest_count": None,
+                    "confidence": "high",
+                    "decision_debug": None,
+                }
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        entry = (normalized.get("by_measure_id") or {}).get("m0") or {}
+        self.assertEqual(entry.get("label"), "false_measure")
+        self.assertIsNone(entry.get("rest_count"))
+        self.assertNotIn("decision_debug", entry)
+        self.assertEqual(
+            normalized.get("measure_completeness_by_measure_id"),
+            {"m0": {"measure_completeness": "not_applicable", "measure_completeness_source": "ai"}},
+        )
+        warnings = normalized.get("warnings") or []
+        self.assertFalse(any("first_measure_decision_debug_missing" in str(row.get("message") or "") for row in warnings))
+
+    def test_normalize_ai_suggestions_result_drops_false_measure_extra_fields(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [
+                {"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 1},
+            ],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [
+                {
+                    "measure_id": "m0",
+                    "label": "false_measure",
+                    "measure_completeness": "unclear",
+                    "unclear_reason": "split_may_be_wrong",
+                    "rest_count": 4,
+                    "maybe_label": "pickup",
+                    "maybe_rest_count": 3,
+                    "confidence": "medium",
+                }
+            ],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        entry = (normalized.get("by_measure_id") or {}).get("m0") or {}
+        self.assertEqual(entry.get("label"), "false_measure")
+        self.assertIsNone(entry.get("rest_count"))
+        self.assertNotIn("unclear_reason", entry)
+        self.assertNotIn("maybe_label", entry)
+        self.assertNotIn("maybe_rest_count", entry)
+        warnings = normalized.get("warnings") or []
+        self.assertTrue(any("extra fields on false_measure" in str(row.get("message") or "") for row in warnings))
+
     def test_normalize_ai_suggestions_result_keeps_first_measure_decision_debug_on_pickup(self):
         editable_state = {
             "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
@@ -4371,8 +4442,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                 score_type=score_type,
             )
 
-        _, expected_reference_examples = WORKER._build_multi_rest_reference_content()
-        expected_for_score_type = expected_reference_examples if score_type in ("single", "grand") else 0
+        _, expected_false_references = WORKER._build_false_measure_reference_content()
+        _, expected_rest_references = WORKER._build_multi_rest_reference_content()
+        expected_for_score_type = expected_false_references
+        if score_type in ("single", "grand"):
+            expected_for_score_type += expected_rest_references
         self.assertEqual(reference_examples_attached, expected_for_score_type)
         self.assertNotIn("reference_examples_attached", payload)
 
@@ -4389,6 +4463,9 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("This is single-staff music. Judge rhythm using only this one staff.", rules_text)
         self.assertIn("Do not remember, inherit, carry, or track time signatures across measures.", rules_text)
         self.assertIn("Single-staff pickup rules:", rules_text)
+        self.assertIn("False-measure check - perform this before every other classification:", rules_text)
+        self.assertIn("A target box containing only those setup symbols is false_measure.", rules_text)
+        self.assertIn("If any staff inside the target box contains a note, chord, ordinary rest", rules_text)
         self.assertIn("Read meter as top/bottom: top = how many beat-units fill a full measure", rules_text)
         self.assertIn("Bottom number examples: 4 means quarter-note beats", rules_text)
         self.assertIn("Common time looks like a large C after the clef/key signature and means 4/4.", rules_text)
@@ -4417,7 +4494,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("The supplied reference images are examples only", rules_text)
         self.assertIn("A readable count of 2 or more with a modern H-bar", rules_text)
         self.assertIn("Ignore unrelated measure numbers, rehearsal marks, fingerings, lyrics, ending numbers", rules_text)
-        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2.", rules_text)
+        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, false_measure, ending_1, ending_2.", rules_text)
         self.assertIn("Never return uncertain, maybe_label, or maybe_rest_count", rules_text)
         self.assertIn("For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.", rules_text)
         self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
@@ -4429,11 +4506,11 @@ class BrowserReadyApiTests(unittest.TestCase):
         suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
         self.assertEqual(
             suggestion_shape.get("label"),
-            "normal|pickup|multi_measure_rest|ending_1|ending_2",
+            "normal|pickup|multi_measure_rest|false_measure|ending_1|ending_2",
         )
         self.assertNotIn("maybe_label", suggestion_shape)
         self.assertNotIn("maybe_rest_count", suggestion_shape)
-        self.assertEqual(suggestion_shape.get("measure_completeness"), "full|incomplete|unclear")
+        self.assertEqual(suggestion_shape.get("measure_completeness"), "full|incomplete|unclear|not_applicable")
         self.assertEqual(
             suggestion_shape.get("unclear_reason"),
             "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
@@ -4477,7 +4554,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Multi-measure rest decision order:", rules_text)
         self.assertIn("For grand-staff multi-measure rests, inspect only the top staff/treble staff.", rules_text)
         self.assertIn("A readable count of 2 or more with a modern H-bar", rules_text)
-        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, ending_1, ending_2.", rules_text)
+        self.assertIn("Allowed labels: normal, pickup, multi_measure_rest, false_measure, ending_1, ending_2.", rules_text)
         self.assertIn("Never return uncertain, maybe_label, or maybe_rest_count", rules_text)
         self.assertIn("For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.", rules_text)
         self.assertIn("For non-first measures, do not judge pickup or beat completeness.", rules_text)
@@ -4491,7 +4568,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(intro.get("score_type"), "score")
         instructions = intro.get("instructions") or {}
-        self.assertEqual(instructions.get("allowed_labels"), ["normal", "pickup", "ending_1", "ending_2"])
+        self.assertEqual(instructions.get("allowed_labels"), ["normal", "pickup", "false_measure", "ending_1", "ending_2"])
         rules = ((intro.get("instructions") or {}).get("rules")) or []
         rules_text = "\n".join(str(row) for row in rules)
         self.assertIn("Full-score pickup rules:", rules_text)
@@ -4521,7 +4598,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Full-score multi-measure rest rules:", rules_text)
         self.assertIn("For full score V1, NEVER return multi_measure_rest.", rules_text)
         self.assertIn("rest_count must always be null for full-score prompts.", rules_text)
-        self.assertIn("Allowed labels: normal, pickup, ending_1, ending_2.", rules_text)
+        self.assertIn("Allowed labels: normal, pickup, false_measure, ending_1, ending_2.", rules_text)
         self.assertIn("Never return uncertain, maybe_label, or maybe_rest_count", rules_text)
         self.assertIn("For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.", rules_text)
         self.assertIn("For full score V1, never output multi_measure_rest, and rest_count must always be null.", rules_text)
@@ -4535,7 +4612,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertNotIn("A visible count of 2 or more above that old-style symbol is strong evidence", rules_text)
         output_shape = instructions.get("output_shape") or {}
         suggestion_shape = ((output_shape.get("suggestions") or [])[0] or {})
-        self.assertEqual(suggestion_shape.get("label"), "normal|pickup|ending_1|ending_2")
+        self.assertEqual(suggestion_shape.get("label"), "normal|pickup|false_measure|ending_1|ending_2")
         self.assertNotIn("maybe_label", suggestion_shape)
         self.assertNotIn("maybe_rest_count", suggestion_shape)
 
@@ -4571,7 +4648,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Grand-staff pickup rules:", rules_text)
         self.assertIn("One staff may play while the other rests or is silent", rules_text)
         self.assertIn("Use the visible meter in this crop only", rules_text)
-        self.assertIn("For the first measure of the score only, decision_debug is required. Do not omit it.", rules_text)
+        self.assertIn("For the first measure of the score only, decision_debug is required unless label is false_measure.", rules_text)
         self.assertIn("debug_note explaining what you saw rhythmically", rules_text)
         self.assertIn("Examples: in 2/4, one quarter-note chord is 1 of 2 beats", rules_text)
         self.assertIn("In 4/4, one half-note chord is 2 of 4 beats", rules_text)
@@ -4958,6 +5035,8 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
+            (tmp_path / "false_measure_6_8_only.png").write_bytes(b"false-six-eight-reference")
+            (tmp_path / "false_measure_common_time_only.png").write_bytes(b"false-common-time-reference")
             (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
             (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
             (tmp_path / "modern_rest_positive_8.png").write_bytes(b"modern-reference")
@@ -4977,20 +5056,25 @@ class BrowserReadyApiTests(unittest.TestCase):
                     score_type="single",
                 )
 
-        self.assertEqual(reference_examples_attached, 4)
+        self.assertEqual(reference_examples_attached, 6)
         self.assertNotIn("reference_examples_attached", payload)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         self.assertEqual((content[0] or {}).get("type"), "text")
-        self.assertIn("Reference examples for multi-measure rest recognition.", (content[1] or {}).get("text") or "")
-        self.assertIn("printed count is 1", (content[2] or {}).get("text") or "")
+        self.assertIn("false-measure references", (content[1] or {}).get("text") or "")
+        self.assertIn("only a 6/8 time signature", (content[2] or {}).get("text") or "")
         self.assertEqual((content[3] or {}).get("type"), "image")
-        self.assertIn("printed count is 3", (content[4] or {}).get("text") or "")
+        self.assertIn("only a clef, common-time symbol", (content[4] or {}).get("text") or "")
         self.assertEqual((content[5] or {}).get("type"), "image")
-        self.assertIn("printed count is 8", (content[6] or {}).get("text") or "")
-        self.assertEqual((content[7] or {}).get("type"), "image")
-        self.assertIn("printed count is 16", (content[8] or {}).get("text") or "")
-        self.assertEqual((content[9] or {}).get("type"), "image")
-        self.assertEqual(json.loads((content[10] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
+        self.assertIn("Reference examples for multi-measure rest recognition.", (content[6] or {}).get("text") or "")
+        self.assertIn("printed count is 1", (content[7] or {}).get("text") or "")
+        self.assertEqual((content[8] or {}).get("type"), "image")
+        self.assertIn("printed count is 3", (content[9] or {}).get("text") or "")
+        self.assertEqual((content[10] or {}).get("type"), "image")
+        self.assertIn("printed count is 8", (content[11] or {}).get("text") or "")
+        self.assertEqual((content[12] or {}).get("type"), "image")
+        self.assertIn("printed count is 16", (content[13] or {}).get("text") or "")
+        self.assertEqual((content[14] or {}).get("type"), "image")
+        self.assertEqual(json.loads((content[15] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
 
     def test_build_system_measure_request_skips_missing_reference_examples(self):
         mapping_summary = self._sample_mapping_summary()
@@ -5021,6 +5105,38 @@ class BrowserReadyApiTests(unittest.TestCase):
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         self.assertEqual(json.loads((content[1] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
         self.assertEqual(len([row for row in content if (row or {}).get("type") == "image"]), len(measure_rows))
+
+    def test_build_system_measure_request_score_attaches_only_false_measure_references(self):
+        mapping_summary = self._sample_mapping_summary()
+        editable_state = mapping_summary.get("editable_state") or {}
+        system_row = (editable_state.get("systems") or [])[0]
+        measure_rows = [row for row in (editable_state.get("measures") or []) if row.get("system_id") == "p1_s0"]
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            (tmp_path / "false_measure_6_8_only.png").write_bytes(b"false-six-eight-reference")
+            (tmp_path / "false_measure_common_time_only.png").write_bytes(b"false-common-time-reference")
+            with (
+                patch.object(WORKER, "AI_REFERENCE_EXAMPLES_DIR", tmp_path),
+                patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
+                patch.object(WORKER.fitz, "Rect", _FakeRect),
+            ):
+                payload, reference_examples_attached = WORKER._build_system_measure_request(
+                    "111",
+                    111,
+                    system_row,
+                    measure_rows,
+                    page,
+                    pdf_source="corrected",
+                    score_type="score",
+                )
+
+        self.assertEqual(reference_examples_attached, 2)
+        content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
+        text_content = "\n".join(str(row.get("text") or "") for row in content if row.get("type") == "text")
+        self.assertIn("false-measure references", text_content)
+        self.assertNotIn("multi-measure rest recognition", text_content)
 
     def test_generate_ai_suggestions_system_batch_does_not_send_local_debug_field_to_provider(self):
         artifacts = self._sample_artifacts()
@@ -5057,6 +5173,8 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
+            (tmp_path / "false_measure_6_8_only.png").write_bytes(b"false-six-eight-reference")
+            (tmp_path / "false_measure_common_time_only.png").write_bytes(b"false-common-time-reference")
             (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
             (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
             (tmp_path / "modern_rest_positive_8.png").write_bytes(b"modern-reference")
@@ -5082,7 +5200,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(len(captured_payloads), 1)
         self.assertNotIn("reference_examples_attached", captured_payloads[0])
-        self.assertEqual(result.get("reference_examples_attached"), 4)
+        self.assertEqual(result.get("reference_examples_attached"), 6)
 
     def test_profile_system_layouts_flags_short_partial_staff(self):
         systems = [
