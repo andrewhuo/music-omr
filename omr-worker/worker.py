@@ -155,7 +155,8 @@ STAFF_START_SAME_ROW_MAX_HEIGHT_RATIO = 1.80
 AI_SUGGESTIONS_VERSION = "ai_suggestions_v1"
 AI_SUGGESTIONS_ENDING_VERSION = "ai_ending_suggestions_v1"
 AI_SUGGEST_RUN_VERSION = "ai_suggest_run_v2"
-AI_CREDIT_SCHEME_VERSION = "two_systems_per_credit_v1"
+AI_CREDIT_SCHEME_TWO_SYSTEMS_V1 = "two_systems_per_credit_v1"
+AI_CREDIT_SCHEME_VERSION = "general_per_system_plus_ending_pair_v2"
 AI_COST_SUMMARY_VERSION = "ai_cost_summary_v1"
 AI_COST_SUMMARY_KEY = "internal_ai_cost_summary"
 AI_SUGGEST_RUN_STATUS_IDLE = "idle"
@@ -4240,6 +4241,24 @@ def _ai_credit_group_id(
         raw = f"{job_id}|{int(run_id)}|{str(source_state_version or '')}|{execution_part}|{pair_index}"
     else:
         raw = f"{job_id}|{int(run_id)}|{str(source_state_version or '')}|{pair_index}"
+    return "ai-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _ai_credit_pass_id(
+    job_id: str,
+    run_id: int,
+    source_state_version: str | None,
+    system_index: int,
+    pass_kind: str,
+    execution_id: str | None = None,
+) -> str:
+    normalized_kind = "ending" if str(pass_kind or "").strip().lower() == "ending" else "general"
+    charge_index = max(0, int(system_index)) // 2 if normalized_kind == "ending" else max(0, int(system_index))
+    execution_part = str(execution_id or "").strip()
+    raw = (
+        f"{job_id}|{int(run_id)}|{str(source_state_version or '')}|{execution_part}|"
+        f"{AI_CREDIT_SCHEME_VERSION}|{normalized_kind}|{charge_index}"
+    )
     return "ai-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -10082,7 +10101,7 @@ def cancel_ai_suggest_job(job_id: str):
     return jsonify(response), 200
 
 
-def _step_ai_suggest_v2(
+def _step_ai_suggest_two_system_credit_v1(
     *,
     job_id: str,
     artifact_run_id: int,
@@ -10299,6 +10318,348 @@ def _step_ai_suggest_v2(
     if isinstance(debug_crops, dict):
         response["debug_crops"] = debug_crops
     return jsonify(response), 200
+
+
+def _step_ai_suggest_split_credit_v2(
+    *,
+    job_id: str,
+    artifact_run_id: int,
+    mapping_summary: dict,
+    artifacts: dict,
+    systems: list[dict],
+    measures: list[dict],
+    system_batches: list[tuple[dict, list[dict]]],
+    source_state_version: str | None,
+    ai_suggestions: dict,
+    ai_suggest_run: dict,
+    next_system_index: int,
+    started: float,
+) -> tuple:
+    systems_total = len(system_batches)
+    system_row, system_measures = system_batches[next_system_index]
+    system_id = str(system_row.get("system_id") or "").strip()
+    execution_id = ai_suggest_run.get("execution_id")
+    ending_enabled = _ending_pass_enabled()
+    general_charge_id = _ai_credit_pass_id(
+        job_id,
+        artifact_run_id,
+        source_state_version,
+        next_system_index,
+        "general",
+        execution_id=execution_id,
+    )
+    ending_charge_id = _ai_credit_pass_id(
+        job_id,
+        artifact_run_id,
+        source_state_version,
+        next_system_index,
+        "ending",
+        execution_id=execution_id,
+    ) if ending_enabled else None
+    pass_states = dict(ai_suggest_run.get("pass_state_by_system_id") or {})
+    pass_state = dict(pass_states.get(system_id) or {})
+    credit_groups = dict(ai_suggest_run.get("credit_groups") or {})
+
+    general_group = dict(credit_groups.get(general_charge_id) or {})
+    general_group.setdefault("kind", "general")
+    general_group.setdefault("group_index", next_system_index)
+    general_group.setdefault("system_ids", [system_id])
+    credit_groups[general_charge_id] = general_group
+
+    ending_group = None
+    if ending_charge_id:
+        ending_group = dict(credit_groups.get(ending_charge_id) or {})
+        ending_group.setdefault("kind", "ending")
+        ending_group.setdefault("group_index", next_system_index // 2)
+        ending_group.setdefault("system_ids", [
+            str(system_batches[index][0].get("system_id") or "")
+            for index in range((next_system_index // 2) * 2, min(systems_total, (next_system_index // 2) * 2 + 2))
+        ])
+        credit_groups[ending_charge_id] = ending_group
+
+    def save_credit_state() -> None:
+        ai_suggest_run["credit_groups"] = credit_groups
+        mapping_summary["ai_suggest_run"] = ai_suggest_run
+        mapping_summary["ai_suggestions"] = ai_suggestions
+        _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+
+    accesses: dict[str, dict] = {}
+
+    def release_access(charge_id: str) -> bool:
+        access = accesses.get(charge_id)
+        group = dict(credit_groups.get(charge_id) or {})
+        if not isinstance(access, dict) or access.get("already_charged") or group.get("charged"):
+            return True
+        released = _finish_ai_access(access, spent=False)
+        group["status"] = "released" if released else "reservation_pending"
+        credit_groups[charge_id] = group
+        return released
+
+    required_charges = [(general_charge_id, "general")]
+    if ending_charge_id:
+        required_charges.append((ending_charge_id, "ending"))
+
+    try:
+        for charge_id, kind in required_charges:
+            group = dict(credit_groups.get(charge_id) or {})
+            if group.get("charged"):
+                continue
+            access = _ai_access(
+                reserve=True,
+                job_id=job_id,
+                system_id=system_id or None,
+                charge_id=charge_id,
+            )
+            accesses[charge_id] = access
+            if access.get("already_charged"):
+                group.update(
+                    {
+                        "status": "charged",
+                        "charged": True,
+                        "provider": str(access.get("provider") or "friend"),
+                    }
+                )
+            else:
+                group.update(
+                    {
+                        "status": "reserved",
+                        "charged": False,
+                        "provider": str(access.get("provider") or "friend"),
+                    }
+                )
+            group["kind"] = kind
+            credit_groups[charge_id] = group
+            save_credit_state()
+    except (FriendAccessError, PaidAccessError) as exc:
+        release_ok = True
+        for charge_id in list(accesses):
+            release_ok = release_access(charge_id) and release_ok
+        now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+        ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED if next_system_index > 0 else AI_SUGGEST_RUN_STATUS_FAILED
+        ai_suggest_run["failed_at_utc"] = now_txt
+        ai_suggest_run["last_error"] = {
+            "code": exc.code,
+            "message": exc.message,
+            "retryable": bool(exc.retryable),
+            "provider_status": int(exc.status_code),
+            "detail": exc.code if release_ok else "credit_release_pending",
+        }
+        _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
+        save_credit_state()
+        return _friend_error_response(exc) if isinstance(exc, FriendAccessError) else _paid_error_response(exc)
+
+    def credit_pending_response(charge_id: str, kind: str) -> tuple:
+        group = dict(credit_groups.get(charge_id) or {})
+        group["status"] = "charge_pending"
+        credit_groups[charge_id] = group
+        logger.warning(
+            "AI_CREDIT_FINALIZE_PENDING provider=%s stage=spend kind=%s",
+            str((accesses.get(charge_id) or {}).get("provider") or group.get("provider") or "friend"),
+            kind,
+        )
+        ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED
+        ai_suggest_run["last_error"] = {
+            "code": "ai_credit_finalize_pending",
+            "message": "AI results were saved, but credit confirmation must be retried.",
+            "retryable": True,
+            "provider_status": 503,
+            "detail": f"{kind}_credit_finalize_pending",
+        }
+        _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
+        save_credit_state()
+        return jsonify({
+            "job_id": job_id,
+            "run_id": artifact_run_id,
+            "status": AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED,
+            "ai_suggestions": ai_suggestions,
+            "ai_suggest_run": ai_suggest_run,
+            "error": ai_suggest_run["last_error"],
+        }), 200
+
+    def finalize_charge(charge_id: str, kind: str) -> tuple | None:
+        group = dict(credit_groups.get(charge_id) or {})
+        if group.get("charged"):
+            return None
+        access = accesses.get(charge_id)
+        if not isinstance(access, dict) or not _finish_ai_access(access, spent=True):
+            return credit_pending_response(charge_id, kind)
+        group.update(
+            {
+                "status": "charged",
+                "charged": True,
+                "charged_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+                "provider": str(access.get("provider") or "friend"),
+            }
+        )
+        credit_groups[charge_id] = group
+        save_credit_state()
+        return None
+
+    score_type = _normalize_ai_score_type(ai_suggest_run.get("score_type"))
+    remembered_time_signature_in = _normalize_ai_time_signature_value(ai_suggest_run.get("remembered_time_signature"))
+    debug_crops = None
+    reference_examples_attached = 0
+
+    if pass_state.get("general") != "completed":
+        try:
+            system_result = _generate_ai_suggestions_for_system_batch(
+                job_id,
+                artifact_run_id,
+                systems,
+                system_row,
+                system_measures,
+                source_state_version,
+                artifacts,
+                remembered_time_signature_in=remembered_time_signature_in,
+                score_type=score_type,
+            )
+            debug_crops = system_result.pop("debug_crops", None)
+            reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
+            usage = system_result.pop("_internal_ai_usage", None)
+            system_result.pop("remembered_time_signature_out", None)
+            system_result.pop("last_time_signature_update", None)
+            system_result.pop("time_signature_updates", None)
+            ai_suggestions = _merge_ai_suggestions_state(ai_suggestions, system_result, artifact_run_id, source_state_version)
+            _append_internal_ai_cost_usage(
+                mapping_summary,
+                job_id=job_id,
+                run_id=artifact_run_id,
+                system_row=system_row,
+                model=str(system_result.get("model") or _requested_ai_model_name("general")),
+                usage=usage if isinstance(usage, dict) else None,
+                pass_kind="general",
+                charge_id=general_charge_id,
+            )
+            pass_state["general"] = "completed"
+            pass_state["general_model"] = str(system_result.get("model") or _requested_ai_model_name("general"))
+            pass_states[system_id] = pass_state
+            ai_suggest_run["pass_state_by_system_id"] = pass_states
+            mapping_summary["ai_suggestions"] = ai_suggestions
+            mapping_summary["ai_suggest_run"] = ai_suggest_run
+            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        except Exception as exc:
+            release_access(general_charge_id)
+            if ending_charge_id:
+                release_access(ending_charge_id)
+            error_payload = _ai_suggest_error_payload(exc)
+            ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED if next_system_index > 0 else AI_SUGGEST_RUN_STATUS_FAILED
+            ai_suggest_run["last_error"] = error_payload
+            ai_suggest_run["failed_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
+            _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
+            save_credit_state()
+            return jsonify({"job_id": job_id, "run_id": artifact_run_id, "status": ai_suggest_run["status"], "ai_suggestions": ai_suggestions, "ai_suggest_run": ai_suggest_run, "error": error_payload}), 200
+
+    pending = finalize_charge(general_charge_id, "general")
+    if pending is not None:
+        if ending_charge_id:
+            release_access(ending_charge_id)
+            save_credit_state()
+        return pending
+
+    if ending_enabled and pass_state.get("ending") != "completed":
+        try:
+            ending_result = _generate_ai_endings_for_system_batch(
+                job_id,
+                artifact_run_id,
+                systems,
+                system_row,
+                system_measures,
+                artifacts,
+                active_ending_in=ai_suggest_run.get("ending_carry_kind"),
+                score_type=score_type,
+            )
+            ending_usage = ending_result.pop("_internal_ai_usage", None)
+            ai_suggest_run["ending_carry_kind"] = ending_result.get("active_ending_out")
+            ai_suggestions = _merge_ai_ending_system_state(
+                ai_suggestions,
+                ending_result,
+                measures,
+                all_systems_completed=next_system_index + 1 >= systems_total,
+            )
+            _append_internal_ai_cost_usage(
+                mapping_summary,
+                job_id=job_id,
+                run_id=artifact_run_id,
+                system_row=system_row,
+                model=str(ending_result.get("model") or _requested_ai_model_name("ending")),
+                usage=ending_usage if isinstance(ending_usage, dict) else None,
+                pass_kind="ending",
+                charge_id=ending_charge_id,
+            )
+            pass_state["ending"] = "completed"
+            pass_state["ending_model"] = str(ending_result.get("model") or _requested_ai_model_name("ending"))
+            pass_states[system_id] = pass_state
+            ai_suggest_run["pass_state_by_system_id"] = pass_states
+            mapping_summary["ai_suggestions"] = ai_suggestions
+            mapping_summary["ai_suggest_run"] = ai_suggest_run
+            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        except Exception as exc:
+            if ending_charge_id:
+                release_access(ending_charge_id)
+            pass_state["ending"] = "retryable_failed"
+            pass_states[system_id] = pass_state
+            error_payload = _ai_suggest_error_payload(exc, default_message="Ending detection temporarily failed.")
+            ai_suggest_run["pass_state_by_system_id"] = pass_states
+            ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED
+            ai_suggest_run["last_error"] = error_payload
+            ai_suggest_run["failed_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
+            _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
+            save_credit_state()
+            logger.warning("AI_ENDING_PASS_FAILED system_id=%s error_type=%s charge_id=%s", system_id, type(exc).__name__, ending_charge_id)
+            return jsonify({"job_id": job_id, "run_id": artifact_run_id, "status": AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED, "ai_suggestions": ai_suggestions, "ai_suggest_run": ai_suggest_run, "error": error_payload}), 200
+    elif not ending_enabled:
+        pass_state["ending"] = "disabled"
+
+    if ending_charge_id:
+        pending = finalize_charge(ending_charge_id, "ending")
+        if pending is not None:
+            return pending
+
+    pass_states[system_id] = pass_state
+    completed_count = min(systems_total, next_system_index + 1)
+    now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+    ai_suggest_run["pass_state_by_system_id"] = pass_states
+    ai_suggest_run["systems_completed"] = completed_count
+    ai_suggest_run["next_system_index"] = completed_count
+    ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_COMPLETED if completed_count >= systems_total else AI_SUGGEST_RUN_STATUS_RUNNING
+    ai_suggest_run["updated_at_utc"] = now_txt
+    ai_suggest_run["last_error"] = None
+    ai_suggest_run["failed_at_utc"] = None
+    if completed_count >= systems_total:
+        ai_suggest_run["completed_at_utc"] = now_txt
+        _rebuild_ai_ending_pairs(ai_suggestions, measures, all_systems_completed=True)
+    _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
+    mapping_summary["ai_suggestions"] = ai_suggestions
+    mapping_summary["ai_suggest_run"] = ai_suggest_run
+    _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+    logger.info(
+        "AI_SYSTEM_COMPLETE system_id=%s pass=combined general_charge_id=%s ending_charge_id=%s",
+        system_id,
+        general_charge_id,
+        ending_charge_id or "disabled",
+    )
+    response = {
+        "job_id": job_id,
+        "run_id": artifact_run_id,
+        "status": ai_suggest_run["status"],
+        "ai_suggestions": ai_suggestions,
+        "ai_suggest_run": ai_suggest_run,
+        "reference_examples_attached": int(reference_examples_attached),
+        "storage_mode": _storage_mode_for_artifacts(artifacts),
+        "artifacts": artifacts,
+        "artifacts_http": _artifact_http_uris_for_run(artifact_run_id, artifacts),
+        "duration_ms": int((time.time() - started) * 1000),
+    }
+    if isinstance(debug_crops, dict):
+        response["debug_crops"] = debug_crops
+    return jsonify(response), 200
+
+
+def _step_ai_suggest_v2(**kwargs) -> tuple:
+    ai_suggest_run = kwargs.get("ai_suggest_run") if isinstance(kwargs.get("ai_suggest_run"), dict) else {}
+    if str(ai_suggest_run.get("credit_scheme") or "") == AI_CREDIT_SCHEME_VERSION:
+        return _step_ai_suggest_split_credit_v2(**kwargs)
+    return _step_ai_suggest_two_system_credit_v1(**kwargs)
 
 
 @app.route("/api/omr/jobs/<job_id>/ai-suggest/step", methods=["POST"])

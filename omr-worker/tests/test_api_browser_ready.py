@@ -1383,6 +1383,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(first_run.get("execution_id"), second_run.get("execution_id"))
         self.assertEqual(first_run.get("start_request_id"), request_id)
         self.assertEqual(first_run.get("score_type"), "grand")
+        self.assertEqual(first_run.get("credit_scheme"), WORKER.AI_CREDIT_SCHEME_VERSION)
         self.assertEqual(first_run.get("next_system_index"), 0)
         self.assertEqual((first_body.get("ai_suggestions") or {}).get("by_measure_id"), {})
         self.assertEqual(mapping_summary.get("editable_state"), original_editable)
@@ -1489,6 +1490,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertNotEqual(old_id, new_id)
         self.assertNotEqual(new_id, legacy_id)
         self.assertEqual(legacy_id, WORKER._ai_credit_group_id("job", 111, "state", 1))
+        self.assertNotEqual(
+            WORKER._ai_credit_pass_id("job", 111, "state", 0, "general", execution_id="old"),
+            WORKER._ai_credit_pass_id("job", 111, "state", 0, "general", execution_id="new"),
+        )
 
     def test_restart_finalizes_saved_pending_charge_before_replacement(self):
         run = {
@@ -2466,6 +2471,201 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(len(set(ids[:5])), 3)
         self.assertEqual(len(set(ids[:6])), 3)
 
+    def test_split_credit_ids_charge_one_and_a_half_per_system(self):
+        for systems_total, expected in ((1, 2), (2, 3), (3, 5), (4, 6), (5, 8), (6, 9)):
+            charge_ids = set()
+            for index in range(systems_total):
+                charge_ids.add(WORKER._ai_credit_pass_id("job", 111, "state", index, "general", execution_id="run"))
+                charge_ids.add(WORKER._ai_credit_pass_id("job", 111, "state", index, "ending", execution_id="run"))
+            self.assertEqual(len(charge_ids), expected)
+
+    def test_split_credit_two_systems_spend_three_credits(self):
+        mapping = self._sample_mapping_summary()
+        systems = mapping["editable_state"]["systems"]
+        measures = mapping["editable_state"]["measures"]
+        batches = WORKER._ai_suggest_system_batches(mapping["editable_state"])
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", len(measures))
+        run = WORKER._new_ai_suggest_run_state(111, "state", len(batches), score_type="single")
+
+        def general_result(*args, **kwargs):
+            system = args[3]
+            return {
+                "version": WORKER.AI_SUGGESTIONS_VERSION,
+                "provider": "bedrock",
+                "model": WORKER._requested_ai_model_name("general"),
+                "system_id": system["system_id"],
+                "by_measure_id": {},
+                "warnings": [],
+                "summary": {"systems_processed": 1, "measures_seen": 1, "suggestions_kept": 0, "normal_measures_omitted": 1},
+            }
+
+        def ending_result(*args, **kwargs):
+            system = args[3]
+            return {
+                "version": WORKER.AI_SUGGESTIONS_ENDING_VERSION,
+                "provider": "bedrock",
+                "model": WORKER._requested_ai_model_name("ending"),
+                "system_id": system["system_id"],
+                "events": [],
+                "active_ending_out": None,
+            }
+
+        with (
+            patch.dict(os.environ, {"AI_ENDING_PASS_ENABLED": "1"}),
+            patch.object(WORKER, "_ai_access", return_value={"provider": "friend"}) as access,
+            patch.object(WORKER, "_finish_ai_access", return_value=True) as finish,
+            patch.object(WORKER, "_generate_ai_suggestions_for_system_batch", side_effect=general_result),
+            patch.object(WORKER, "_generate_ai_endings_for_system_batch", side_effect=ending_result),
+            patch.object(WORKER, "_upload_json_to_gcs"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value={}),
+        ):
+            WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=suggestions, ai_suggest_run=run, next_system_index=0, started=WORKER.time.time(),
+            )
+            WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=mapping["ai_suggestions"], ai_suggest_run=mapping["ai_suggest_run"],
+                next_system_index=0, started=WORKER.time.time(),
+            )
+            WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=mapping["ai_suggestions"], ai_suggest_run=mapping["ai_suggest_run"],
+                next_system_index=1, started=WORKER.time.time(),
+            )
+
+        self.assertEqual(access.call_count, 3)
+        self.assertEqual(finish.call_count, 3)
+        self.assertTrue(all(call.kwargs["reserve"] for call in access.call_args_list))
+        self.assertEqual(len({call.kwargs["charge_id"] for call in access.call_args_list}), 3)
+        charged = [row for row in mapping["ai_suggest_run"]["credit_groups"].values() if row.get("charged")]
+        self.assertEqual(len(charged), 3)
+        self.assertEqual(sorted(row.get("kind") for row in charged), ["ending", "general", "general"])
+
+    def test_split_credit_ending_retry_spends_general_then_ending_once(self):
+        mapping = self._sample_mapping_summary()
+        systems = mapping["editable_state"]["systems"]
+        measures = mapping["editable_state"]["measures"]
+        batches = WORKER._ai_suggest_system_batches(mapping["editable_state"])
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", len(measures))
+        run = WORKER._new_ai_suggest_run_state(111, "state", len(batches), score_type="single")
+        general = {
+            "version": WORKER.AI_SUGGESTIONS_VERSION,
+            "provider": "bedrock",
+            "model": WORKER._requested_ai_model_name("general"),
+            "system_id": batches[0][0]["system_id"],
+            "by_measure_id": {},
+            "warnings": [],
+            "summary": {"systems_processed": 1, "measures_seen": 2, "suggestions_kept": 0, "normal_measures_omitted": 2},
+        }
+        ending = {
+            "version": WORKER.AI_SUGGESTIONS_ENDING_VERSION,
+            "provider": "bedrock",
+            "model": WORKER._requested_ai_model_name("ending"),
+            "system_id": batches[0][0]["system_id"],
+            "events": [],
+            "active_ending_out": None,
+        }
+        with (
+            patch.dict(os.environ, {"AI_ENDING_PASS_ENABLED": "1"}),
+            patch.object(WORKER, "_ai_access", return_value={"provider": "friend"}) as access,
+            patch.object(WORKER, "_finish_ai_access", return_value=True) as finish,
+            patch.object(WORKER, "_generate_ai_suggestions_for_system_batch", return_value=general) as general_call,
+            patch.object(WORKER, "_generate_ai_endings_for_system_batch", side_effect=[WORKER.AiSuggestError(detail="temporary"), ending]) as ending_call,
+            patch.object(WORKER, "_upload_json_to_gcs"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value={}),
+        ):
+            first, _ = WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=suggestions, ai_suggest_run=run, next_system_index=0, started=WORKER.time.time(),
+            )
+            self.assertEqual(first["status"], WORKER.AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED)
+            WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=mapping["ai_suggestions"], ai_suggest_run=mapping["ai_suggest_run"],
+                next_system_index=0, started=WORKER.time.time(),
+            )
+
+        self.assertEqual(general_call.call_count, 1)
+        self.assertEqual(ending_call.call_count, 2)
+        self.assertEqual(access.call_count, 3)
+        self.assertEqual([call.kwargs["spent"] for call in finish.call_args_list], [True, False, True])
+        charged = [row for row in mapping["ai_suggest_run"]["credit_groups"].values() if row.get("charged")]
+        self.assertEqual(len(charged), 2)
+
+    def test_split_credit_reservation_failure_releases_before_ai(self):
+        mapping = self._sample_mapping_summary()
+        systems = mapping["editable_state"]["systems"]
+        measures = mapping["editable_state"]["measures"]
+        batches = WORKER._ai_suggest_system_batches(mapping["editable_state"])
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", len(measures))
+        run = WORKER._new_ai_suggest_run_state(111, "state", len(batches), score_type="single")
+        exhausted = WORKER.PaidAccessError("paid_credits_exhausted", "No AI credits are available.", 403)
+
+        with (
+            patch.dict(os.environ, {"AI_ENDING_PASS_ENABLED": "1"}),
+            patch.object(WORKER, "_ai_access", side_effect=[{"provider": "friend"}, exhausted]),
+            patch.object(WORKER, "_finish_ai_access", return_value=True) as finish,
+            patch.object(WORKER, "_generate_ai_suggestions_for_system_batch") as general_call,
+            patch.object(WORKER, "_generate_ai_endings_for_system_batch") as ending_call,
+            patch.object(WORKER, "_upload_json_to_gcs"),
+        ):
+            _, status = WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=suggestions, ai_suggest_run=run, next_system_index=0, started=WORKER.time.time(),
+            )
+
+        self.assertEqual(status, 403)
+        finish.assert_called_once_with({"provider": "friend"}, spent=False)
+        general_call.assert_not_called()
+        ending_call.assert_not_called()
+        self.assertEqual(mapping["ai_suggest_run"]["status"], WORKER.AI_SUGGEST_RUN_STATUS_FAILED)
+        self.assertTrue(mapping["ai_suggest_run"]["can_continue"])
+
+    def test_split_credit_ending_disabled_spends_one_per_system(self):
+        mapping = self._sample_mapping_summary()
+        systems = mapping["editable_state"]["systems"]
+        measures = mapping["editable_state"]["measures"]
+        batches = WORKER._ai_suggest_system_batches(mapping["editable_state"])
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", len(measures))
+        run = WORKER._new_ai_suggest_run_state(111, "state", len(batches), score_type="single")
+
+        def general_result(*args, **kwargs):
+            return {
+                "version": WORKER.AI_SUGGESTIONS_VERSION,
+                "provider": "bedrock",
+                "model": WORKER._requested_ai_model_name("general"),
+                "system_id": args[3]["system_id"],
+                "by_measure_id": {},
+                "warnings": [],
+                "summary": {"systems_processed": 1, "measures_seen": 1, "suggestions_kept": 0, "normal_measures_omitted": 1},
+            }
+
+        with (
+            patch.dict(os.environ, {"AI_ENDING_PASS_ENABLED": "0"}),
+            patch.object(WORKER, "_ai_access", return_value={"provider": "friend"}) as access,
+            patch.object(WORKER, "_finish_ai_access", return_value=True) as finish,
+            patch.object(WORKER, "_generate_ai_suggestions_for_system_batch", side_effect=general_result),
+            patch.object(WORKER, "_generate_ai_endings_for_system_batch") as ending_call,
+            patch.object(WORKER, "_upload_json_to_gcs"),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value={}),
+        ):
+            WORKER._step_ai_suggest_v2(
+                job_id="job", artifact_run_id=111, mapping_summary=mapping, artifacts=self._sample_artifacts(),
+                systems=systems, measures=measures, system_batches=batches, source_state_version="state",
+                ai_suggestions=suggestions, ai_suggest_run=run, next_system_index=0, started=WORKER.time.time(),
+            )
+
+        self.assertEqual(access.call_count, 1)
+        self.assertEqual(finish.call_count, 1)
+        ending_call.assert_not_called()
+
     def test_v2_two_systems_charge_once(self):
         mapping = self._sample_mapping_summary()
         systems = mapping["editable_state"]["systems"]
@@ -2473,6 +2673,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         batches = WORKER._ai_suggest_system_batches(mapping["editable_state"])
         suggestions = WORKER._empty_ai_suggestions_state(111, "state", len(measures))
         run = WORKER._new_ai_suggest_run_state(111, "state", len(batches), score_type="single")
+        run["credit_scheme"] = WORKER.AI_CREDIT_SCHEME_TWO_SYSTEMS_V1
 
         def general_result(*args, **kwargs):
             system = args[3]
@@ -2521,6 +2722,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         batches = WORKER._ai_suggest_system_batches(mapping["editable_state"])
         suggestions = WORKER._empty_ai_suggestions_state(111, "state", len(measures))
         run = WORKER._new_ai_suggest_run_state(111, "state", len(batches), score_type="single")
+        run["credit_scheme"] = WORKER.AI_CREDIT_SCHEME_TWO_SYSTEMS_V1
         general = {
             "version": WORKER.AI_SUGGESTIONS_VERSION,
             "provider": "bedrock",
