@@ -1234,6 +1234,220 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIsNone((body.get("ai_suggest_run") or {}).get("score_type"))
 
+    def test_ai_suggest_explicit_continue_preserves_progress_and_score_type(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggestions"]["by_measure_id"] = {
+            "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"}
+        }
+        mapping_summary["ai_suggest_run"] = WORKER._new_ai_suggest_run_state(
+            111,
+            "test-state",
+            2,
+            score_type="grand",
+            execution_id="existing-execution",
+        )
+        mapping_summary["ai_suggest_run"].update(
+            {
+                "status": "partial_failed",
+                "systems_completed": 1,
+                "next_system_index": 1,
+                "last_error": {"message": "temporary failure"},
+            }
+        )
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/ai-suggest",
+            method="POST",
+            headers={},
+            files={},
+            json={},
+            get_json=lambda silent=True: {"mode": "continue"},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(
+                WORKER,
+                "_refresh_editable_state_systems_and_measures",
+                return_value=(
+                    mapping_summary["editable_state"]["systems"],
+                    mapping_summary["editable_state"]["measures"],
+                    0,
+                    [],
+                ),
+            ),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value={}),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 200)
+        run = body.get("ai_suggest_run") or {}
+        self.assertEqual(run.get("status"), "running")
+        self.assertEqual(run.get("systems_completed"), 1)
+        self.assertEqual(run.get("next_system_index"), 1)
+        self.assertEqual(run.get("score_type"), "grand")
+        self.assertEqual(run.get("execution_id"), "existing-execution")
+        self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {})), ["p1_s0_m0"])
+
+    def test_ai_suggest_explicit_continue_rejects_first_general_failure(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggest_run"] = WORKER._new_ai_suggest_run_state(111, "test-state", 2, score_type="single")
+        mapping_summary["ai_suggest_run"].update({"status": "failed", "last_error": {"message": "bad response"}})
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/ai-suggest",
+            method="POST",
+            headers={},
+            files={},
+            json={},
+            get_json=lambda silent=True: {"mode": "continue"},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 409)
+        self.assertEqual((body.get("error") or {}).get("code"), "ai_restart_required")
+
+    def test_ai_suggest_restart_is_idempotent_and_replaces_only_ai_state(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        original_editable = deepcopy(mapping_summary["editable_state"])
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggestions"]["by_measure_id"] = {
+            "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "high"}
+        }
+        mapping_summary["ai_suggest_run"] = WORKER._new_ai_suggest_run_state(
+            111,
+            "test-state",
+            2,
+            score_type="single",
+            execution_id="old-execution",
+        )
+        mapping_summary["ai_suggest_run"].update({"status": "cancelled", "systems_completed": 1, "next_system_index": 1})
+        request_id = "cb864bc0-2b37-41c0-934f-b9e4ab5aa69b"
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/ai-suggest",
+            method="POST",
+            headers={},
+            files={},
+            json={},
+            get_json=lambda silent=True: {"mode": "restart", "score_type": "grand", "request_id": request_id},
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(
+                WORKER,
+                "_refresh_editable_state_systems_and_measures",
+                return_value=(
+                    mapping_summary["editable_state"]["systems"],
+                    mapping_summary["editable_state"]["measures"],
+                    0,
+                    [],
+                ),
+            ),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value={}),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None) as upload,
+        ):
+            first_body, first_status = _unpack(WORKER.ai_suggest_job("111"))
+            second_body, second_status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual((first_status, second_status), (200, 200))
+        first_run = first_body.get("ai_suggest_run") or {}
+        second_run = second_body.get("ai_suggest_run") or {}
+        self.assertNotEqual(first_run.get("execution_id"), "old-execution")
+        self.assertEqual(first_run.get("execution_id"), second_run.get("execution_id"))
+        self.assertEqual(first_run.get("start_request_id"), request_id)
+        self.assertEqual(first_run.get("score_type"), "grand")
+        self.assertEqual(first_run.get("next_system_index"), 0)
+        self.assertEqual((first_body.get("ai_suggestions") or {}).get("by_measure_id"), {})
+        self.assertEqual(mapping_summary.get("editable_state"), original_editable)
+        self.assertEqual(upload.call_count, 1)
+
+    def test_first_system_ending_failure_counts_as_resumable_progress(self):
+        run = WORKER._new_ai_suggest_run_state(111, "state", 2, score_type="single")
+        run.update(
+            {
+                "status": "partial_failed",
+                "systems_completed": 0,
+                "next_system_index": 0,
+                "pass_state_by_system_id": {
+                    "p1_s0": {"general": "completed", "ending": "retryable_failed"}
+                },
+            }
+        )
+
+        normalized = WORKER._current_ai_suggest_run({"ai_suggest_run": run}, 111, "state")
+
+        self.assertTrue(normalized.get("has_saved_progress"))
+        self.assertTrue(normalized.get("can_continue"))
+
+    def test_restart_execution_ids_create_new_credit_groups(self):
+        old_id = WORKER._ai_credit_group_id("job", 111, "state", 0, execution_id="old")
+        new_id = WORKER._ai_credit_group_id("job", 111, "state", 0, execution_id="new")
+        legacy_id = WORKER._ai_credit_group_id("job", 111, "state", 0)
+
+        self.assertNotEqual(old_id, new_id)
+        self.assertNotEqual(new_id, legacy_id)
+        self.assertEqual(legacy_id, WORKER._ai_credit_group_id("job", 111, "state", 1))
+
+    def test_restart_finalizes_saved_pending_charge_before_replacement(self):
+        run = {
+            "credit_groups": {
+                "charge-1": {
+                    "status": "charge_pending",
+                    "charged": False,
+                    "system_ids": ["p1_s0", "p1_s1"],
+                }
+            }
+        }
+        access = {"provider": "friend", "reservation_id": "charge-1"}
+        with (
+            patch.object(WORKER, "_ai_access", return_value=access) as reserve,
+            patch.object(WORKER, "_finish_ai_access", return_value=True) as finish,
+        ):
+            WORKER._reconcile_ai_restart_credit_groups(run, "job")
+
+        group = run["credit_groups"]["charge-1"]
+        self.assertTrue(group.get("charged"))
+        self.assertEqual(group.get("status"), "charged")
+        reserve.assert_called_once_with(
+            reserve=True,
+            job_id="job",
+            system_id="p1_s0",
+            charge_id="charge-1",
+        )
+        finish.assert_called_once_with(access, spent=True)
+
+    def test_restart_blocks_when_saved_pending_charge_cannot_finalize(self):
+        run = {
+            "credit_groups": {
+                "charge-1": {
+                    "status": "charge_pending",
+                    "charged": False,
+                    "system_ids": ["p1_s0"],
+                }
+            }
+        }
+        with (
+            patch.object(WORKER, "_ai_access", return_value={"provider": "friend", "reservation_id": "charge-1"}),
+            patch.object(WORKER, "_finish_ai_access", return_value=False),
+        ):
+            with self.assertRaises(WORKER.AiSuggestError) as raised:
+                WORKER._reconcile_ai_restart_credit_groups(run, "job")
+
+        self.assertEqual(raised.exception.code, "ai_restart_credit_pending")
+        self.assertFalse(run["credit_groups"]["charge-1"].get("charged"))
+
     def test_ai_suggest_start_rejects_invalid_score_type(self):
         mapping_summary = self._sample_mapping_summary()
         WORKER.request = SimpleNamespace(

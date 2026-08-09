@@ -164,6 +164,7 @@ AI_SUGGEST_RUN_STATUS_COMPLETED = "completed"
 AI_SUGGEST_RUN_STATUS_FAILED = "failed"
 AI_SUGGEST_RUN_STATUS_CANCELLED = "cancelled"
 AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED = "partial_failed"
+AI_SUGGEST_START_MODES_ALLOWED = {"start", "continue", "restart"}
 AI_SUGGESTION_ENDING_LABELS = {"ending_1", "ending_2"}
 AI_SUGGESTION_LABELS_ALLOWED = {"normal", "pickup", "multi_measure_rest", "uncertain"}
 AI_SUGGESTION_CONFIDENCE_ALLOWED = {"low", "medium", "high"}
@@ -3985,6 +3986,34 @@ def _requested_anthropic_model_name() -> str:
     return _configured_anthropic_model_name() or "unknown"
 
 
+def _refresh_ai_run_recovery_flags(row: dict, current_source_state_version: str | None = None) -> dict:
+    pass_state_by_system_id = row.get("pass_state_by_system_id") if isinstance(row.get("pass_state_by_system_id"), dict) else {}
+    run_source_state_version = str(row.get("source_state_version") or current_source_state_version or "").strip() or None
+    current_source = str(current_source_state_version or "").strip() or None
+    source_state_matches = not (
+        run_source_state_version
+        and current_source
+        and run_source_state_version != current_source
+    )
+    has_saved_progress = max(0, _safe_int(row.get("systems_completed"), 0)) > 0 or any(
+        isinstance(pass_state, dict)
+        and (
+            str(pass_state.get("general") or "").strip() == "completed"
+            or str(pass_state.get("ending") or "").strip() in {"completed", "retryable_failed"}
+        )
+        for pass_state in pass_state_by_system_id.values()
+    )
+    status = str(row.get("status") or AI_SUGGEST_RUN_STATUS_IDLE).strip().lower()
+    row["has_saved_progress"] = has_saved_progress
+    row["can_continue"] = (
+        status in {AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED, AI_SUGGEST_RUN_STATUS_CANCELLED}
+        and has_saved_progress
+        and source_state_matches
+        and max(0, _safe_int(row.get("next_system_index"), 0)) < max(0, _safe_int(row.get("systems_total"), 0))
+    )
+    return row
+
+
 def _current_ai_suggest_run(
     mapping_summary: dict | None,
     run_id: int | None = None,
@@ -4007,6 +4036,7 @@ def _current_ai_suggest_run(
     time_signature_updates = _normalize_ai_time_signature_update_rows(row.get("time_signature_updates"))
     pass_state_by_system_id = row.get("pass_state_by_system_id") if isinstance(row.get("pass_state_by_system_id"), dict) else {}
     credit_groups = row.get("credit_groups") if isinstance(row.get("credit_groups"), dict) else {}
+    run_source_state_version = str(row.get("source_state_version") or source_state_version or "").strip() or None
     clean = {
         "version": str(row.get("version") or "ai_suggest_run_v1"),
         "credit_scheme": str(row.get("credit_scheme") or "one_system_per_credit_v1"),
@@ -4020,8 +4050,12 @@ def _current_ai_suggest_run(
         "systems_completed": max(0, _safe_int(row.get("systems_completed"), 0)),
         "next_system_index": max(0, _safe_int(row.get("next_system_index"), 0)),
         "source_run_id": int(run_id) if isinstance(run_id, int) and run_id > 0 else _safe_int(row.get("source_run_id"), 0),
-        "source_state_version": str(row.get("source_state_version") or source_state_version or "").strip() or None,
+        "source_state_version": run_source_state_version,
         "score_type": _normalize_ai_score_type(row.get("score_type")),
+        "execution_id": str(row.get("execution_id") or "").strip() or None,
+        "start_request_id": str(row.get("start_request_id") or "").strip() or None,
+        "has_saved_progress": False,
+        "can_continue": False,
         "model": str(row.get("model") or _requested_ai_model_name()).strip() or "unknown",
         "last_error": row.get("last_error") if isinstance(row.get("last_error"), dict) else None,
         "remembered_time_signature": remembered_time_signature,
@@ -4031,7 +4065,7 @@ def _current_ai_suggest_run(
         "credit_groups": deepcopy(credit_groups),
         "ending_carry_kind": str(row.get("ending_carry_kind") or "").strip() or None,
     }
-    return clean
+    return _refresh_ai_run_recovery_flags(clean, source_state_version)
 
 
 def _empty_ai_suggestions_state(
@@ -4158,6 +4192,8 @@ def _new_ai_suggest_run_state(
     systems_total: int,
     status: str = AI_SUGGEST_RUN_STATUS_RUNNING,
     score_type: str | None = None,
+    execution_id: str | None = None,
+    start_request_id: str | None = None,
 ) -> dict:
     now_txt = _utc_now().isoformat().replace("+00:00", "Z")
     row = {
@@ -4175,6 +4211,10 @@ def _new_ai_suggest_run_state(
         "source_run_id": int(run_id),
         "source_state_version": str(source_state_version or "").strip() or None,
         "score_type": _normalize_ai_score_type(score_type),
+        "execution_id": str(execution_id or uuid.uuid4()).strip(),
+        "start_request_id": str(start_request_id or "").strip() or None,
+        "has_saved_progress": False,
+        "can_continue": False,
         "model": _requested_ai_model_name(),
         "last_error": None,
         "remembered_time_signature": None,
@@ -4187,10 +4227,97 @@ def _new_ai_suggest_run_state(
     return row
 
 
-def _ai_credit_group_id(job_id: str, run_id: int, source_state_version: str | None, system_index: int) -> str:
+def _ai_credit_group_id(
+    job_id: str,
+    run_id: int,
+    source_state_version: str | None,
+    system_index: int,
+    execution_id: str | None = None,
+) -> str:
     pair_index = max(0, int(system_index)) // 2
-    raw = f"{job_id}|{int(run_id)}|{str(source_state_version or '')}|{pair_index}"
+    execution_part = str(execution_id or "").strip()
+    if execution_part:
+        raw = f"{job_id}|{int(run_id)}|{str(source_state_version or '')}|{execution_part}|{pair_index}"
+    else:
+        raw = f"{job_id}|{int(run_id)}|{str(source_state_version or '')}|{pair_index}"
     return "ai-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _ai_execution_id(
+    job_id: str,
+    run_id: int,
+    source_state_version: str | None,
+    request_id: str,
+) -> str:
+    raw = f"{job_id}|{int(run_id)}|{str(source_state_version or '')}|{request_id}"
+    return "airun-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _normalize_ai_start_request_id(raw_value) -> str | None:
+    text = str(raw_value or "").strip()
+    if not text or len(text) > 128:
+        return None
+    try:
+        return str(uuid.UUID(text))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _reconcile_ai_restart_credit_groups(ai_suggest_run: dict, job_id: str) -> None:
+    credit_groups = ai_suggest_run.get("credit_groups") if isinstance(ai_suggest_run.get("credit_groups"), dict) else {}
+    changed = False
+    for charge_id, raw_group in credit_groups.items():
+        group = dict(raw_group) if isinstance(raw_group, dict) else {}
+        if group.get("charged"):
+            continue
+        status = str(group.get("status") or "").strip().lower()
+        system_ids = group.get("system_ids") if isinstance(group.get("system_ids"), list) else []
+        system_id = str(system_ids[0] or "").strip() if system_ids else None
+        if status == "charge_pending":
+            access = _ai_access(
+                reserve=True,
+                job_id=job_id,
+                system_id=system_id,
+                charge_id=str(charge_id),
+            )
+            if not _finish_ai_access(access, spent=True):
+                raise AiSuggestError(
+                    code="ai_restart_credit_pending",
+                    message="The previous AI credit is still being confirmed. Try Restart again.",
+                    retryable=True,
+                    provider_status=503,
+                    detail="credit_finalize_pending",
+                )
+            group.update(
+                {
+                    "status": "charged",
+                    "charged": True,
+                    "charged_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
+                    "provider": str(access.get("provider") or "friend"),
+                }
+            )
+            credit_groups[str(charge_id)] = group
+            changed = True
+        elif status in {"reserved", "reservation_pending"}:
+            access = _ai_access(
+                reserve=True,
+                job_id=job_id,
+                system_id=system_id,
+                charge_id=str(charge_id),
+            )
+            if not _finish_ai_access(access, spent=False):
+                raise AiSuggestError(
+                    code="ai_restart_credit_pending",
+                    message="The previous AI credit is still being released. Try Restart again.",
+                    retryable=True,
+                    provider_status=503,
+                    detail="credit_release_pending",
+                )
+            group["status"] = "released"
+            credit_groups[str(charge_id)] = group
+            changed = True
+    if changed:
+        ai_suggest_run["credit_groups"] = credit_groups
 
 
 def _normalize_ai_score_type(raw_value) -> str | None:
@@ -9514,6 +9641,46 @@ def ai_suggest_job(job_id: str):
     request_payload = request.get_json(silent=True) or {}
     if not isinstance(request_payload, dict):
         request_payload = {}
+    raw_mode = request_payload.get("mode")
+    explicit_mode = raw_mode is not None
+    mode = str(raw_mode or "").strip().lower() if explicit_mode else None
+    if explicit_mode and mode not in AI_SUGGEST_START_MODES_ALLOWED:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "invalid_ai_start_mode",
+                        "message": "mode must be start, continue, or restart",
+                        "retryable": False,
+                        "provider_status": 400,
+                        "detail": "invalid_ai_start_mode",
+                    },
+                }
+            ),
+            400,
+        )
+    request_id = _normalize_ai_start_request_id(request_payload.get("request_id"))
+    if mode in {"start", "restart"} and request_id is None:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "invalid_ai_request_id",
+                        "message": "A stable request ID is required to start AI suggestions.",
+                        "retryable": False,
+                        "provider_status": 400,
+                        "detail": "invalid_ai_request_id",
+                    },
+                }
+            ),
+            400,
+        )
     raw_score_type = request_payload.get("score_type")
     score_type = _normalize_ai_score_type(raw_score_type)
     if raw_score_type is not None and score_type is None:
@@ -9529,6 +9696,24 @@ def ai_suggest_job(job_id: str):
                         "retryable": False,
                         "provider_status": 400,
                         "detail": "invalid_score_type",
+                    },
+                }
+            ),
+            400,
+        )
+    if mode in {"start", "restart"} and score_type is None:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(run_id),
+                    "status": "failed",
+                    "error": {
+                        "code": "score_type_required",
+                        "message": "Choose Single Staff, Grand Staff, or Full Score.",
+                        "retryable": False,
+                        "provider_status": 400,
+                        "detail": "score_type_required",
                     },
                 }
             ),
@@ -9551,7 +9736,121 @@ def ai_suggest_job(job_id: str):
     existing_ai_suggestions = _current_ai_suggestions(mapping_summary)
     existing_ai_suggest_run = _current_ai_suggest_run(mapping_summary, int(artifact_run_id), source_state_version)
     system_batches = _ai_suggest_system_batches(editable_state)
-    if existing_ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED and isinstance(existing_ai_suggestions, dict):
+    if (
+        mode in {"start", "restart"}
+        and request_id
+        and str(existing_ai_suggest_run.get("start_request_id") or "") == request_id
+        and existing_ai_suggest_run.get("execution_id")
+    ):
+        return jsonify(
+            {
+                "job_id": job_id,
+                "run_id": int(artifact_run_id),
+                "status": str(existing_ai_suggest_run.get("status") or AI_SUGGEST_RUN_STATUS_RUNNING),
+                "ai_suggestions": existing_ai_suggestions,
+                "ai_suggest_run": existing_ai_suggest_run,
+                "storage_mode": _storage_mode_for_artifacts(artifacts),
+                "artifacts": artifacts,
+                "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+                "duration_ms": int((time.time() - started) * 1000),
+            }
+        ), 200
+
+    if mode == "continue":
+        if not existing_ai_suggest_run.get("can_continue") or not isinstance(existing_ai_suggestions, dict):
+            return (
+                jsonify(
+                    {
+                        "job_id": job_id,
+                        "run_id": int(artifact_run_id),
+                        "status": str(existing_ai_suggest_run.get("status") or AI_SUGGEST_RUN_STATUS_FAILED),
+                        "ai_suggestions": existing_ai_suggestions,
+                        "ai_suggest_run": existing_ai_suggest_run,
+                        "error": {
+                            "code": "ai_restart_required",
+                            "message": "This AI run cannot continue. Restart AI Suggestions instead.",
+                            "retryable": False,
+                            "provider_status": 409,
+                            "detail": "restart_required",
+                        },
+                    }
+                ),
+                409,
+            )
+        now_txt = _utc_now().isoformat().replace("+00:00", "Z")
+        existing_ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_RUNNING
+        existing_ai_suggest_run["updated_at_utc"] = now_txt
+        existing_ai_suggest_run["failed_at_utc"] = None
+        existing_ai_suggest_run["cancelled_at_utc"] = None
+        existing_ai_suggest_run["last_error"] = None
+        existing_ai_suggest_run["systems_total"] = len(system_batches)
+        _refresh_ai_run_recovery_flags(existing_ai_suggest_run, source_state_version)
+        mapping_summary["ai_suggestions"] = existing_ai_suggestions
+        mapping_summary["ai_suggest_run"] = existing_ai_suggest_run
+        _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
+        return jsonify(
+            {
+                "job_id": job_id,
+                "run_id": int(artifact_run_id),
+                "status": AI_SUGGEST_RUN_STATUS_RUNNING,
+                "ai_suggestions": existing_ai_suggestions,
+                "ai_suggest_run": existing_ai_suggest_run,
+                "storage_mode": _storage_mode_for_artifacts(artifacts),
+                "artifacts": artifacts,
+                "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
+                "duration_ms": int((time.time() - started) * 1000),
+            }
+        ), 200
+
+    if mode == "start" and str(existing_ai_suggest_run.get("status") or "") in {
+        AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED,
+        AI_SUGGEST_RUN_STATUS_CANCELLED,
+    }:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": str(existing_ai_suggest_run.get("status") or AI_SUGGEST_RUN_STATUS_FAILED),
+                    "ai_suggestions": existing_ai_suggestions,
+                    "ai_suggest_run": existing_ai_suggest_run,
+                    "error": {
+                        "code": "ai_recovery_choice_required",
+                        "message": "Choose Continue or Restart for the unfinished AI run.",
+                        "retryable": False,
+                        "provider_status": 409,
+                        "detail": "recovery_choice_required",
+                    },
+                }
+            ),
+            409,
+        )
+
+    if mode == "restart":
+        try:
+            _reconcile_ai_restart_credit_groups(existing_ai_suggest_run, job_id)
+        except FriendAccessError as exc:
+            return _friend_error_response(exc)
+        except PaidAccessError as exc:
+            return _paid_error_response(exc)
+        except AiSuggestError as exc:
+            error_payload = _ai_suggest_error_payload(exc)
+            return jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": str(existing_ai_suggest_run.get("status") or AI_SUGGEST_RUN_STATUS_FAILED),
+                    "ai_suggestions": existing_ai_suggestions,
+                    "ai_suggest_run": existing_ai_suggest_run,
+                    "error": error_payload,
+                }
+            ), int(error_payload.get("provider_status") or 503)
+
+    if (
+        not explicit_mode
+        and existing_ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED
+        and isinstance(existing_ai_suggestions, dict)
+    ):
         now_txt = _utc_now().isoformat().replace("+00:00", "Z")
         existing_ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_RUNNING
         existing_ai_suggest_run["updated_at_utc"] = now_txt
@@ -9590,6 +9889,12 @@ def ai_suggest_job(job_id: str):
         len(system_batches),
         status=run_status,
         score_type=score_type,
+        execution_id=(
+            _ai_execution_id(job_id, int(artifact_run_id), source_state_version, request_id)
+            if request_id
+            else None
+        ),
+        start_request_id=request_id,
     )
     try:
         _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
@@ -9718,6 +10023,7 @@ def cancel_ai_suggest_job(job_id: str):
         ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_CANCELLED
         ai_suggest_run["updated_at_utc"] = now_txt
         ai_suggest_run["cancelled_at_utc"] = now_txt
+        _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
         mapping_summary["ai_suggest_run"] = ai_suggest_run
         try:
             _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
@@ -9772,7 +10078,13 @@ def _step_ai_suggest_v2(
     systems_total = len(system_batches)
     system_row, system_measures = system_batches[next_system_index]
     system_id = str(system_row.get("system_id") or "").strip()
-    charge_id = _ai_credit_group_id(job_id, artifact_run_id, source_state_version, next_system_index)
+    charge_id = _ai_credit_group_id(
+        job_id,
+        artifact_run_id,
+        source_state_version,
+        next_system_index,
+        execution_id=ai_suggest_run.get("execution_id"),
+    )
     pass_states = dict(ai_suggest_run.get("pass_state_by_system_id") or {})
     pass_state = dict(pass_states.get(system_id) or {})
     credit_groups = dict(ai_suggest_run.get("credit_groups") or {})
@@ -9843,6 +10155,7 @@ def _step_ai_suggest_v2(
             ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED if next_system_index > 0 else AI_SUGGEST_RUN_STATUS_FAILED
             ai_suggest_run["last_error"] = error_payload
             ai_suggest_run["failed_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
+            _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
             mapping_summary["ai_suggest_run"] = ai_suggest_run
             mapping_summary["ai_suggestions"] = ai_suggestions
             _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
@@ -9865,6 +10178,7 @@ def _step_ai_suggest_v2(
                 "provider_status": 503,
                 "detail": "credit_finalize_pending",
             }
+            _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
             mapping_summary["ai_suggest_run"] = ai_suggest_run
             _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
             return jsonify({"job_id": job_id, "run_id": artifact_run_id, "status": AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED, "ai_suggestions": ai_suggestions, "ai_suggest_run": ai_suggest_run, "error": ai_suggest_run["last_error"]}), 200
@@ -9921,6 +10235,7 @@ def _step_ai_suggest_v2(
             ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED
             ai_suggest_run["last_error"] = error_payload
             ai_suggest_run["failed_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
+            _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
             mapping_summary["ai_suggestions"] = ai_suggestions
             mapping_summary["ai_suggest_run"] = ai_suggest_run
             _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
@@ -9942,6 +10257,7 @@ def _step_ai_suggest_v2(
     if completed_count >= systems_total:
         ai_suggest_run["completed_at_utc"] = now_txt
         _rebuild_ai_ending_pairs(ai_suggestions, measures, all_systems_completed=True)
+    _refresh_ai_run_recovery_flags(ai_suggest_run, source_state_version)
     mapping_summary["ai_suggestions"] = ai_suggestions
     mapping_summary["ai_suggest_run"] = ai_suggest_run
     _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
