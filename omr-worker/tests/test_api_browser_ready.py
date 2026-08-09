@@ -1927,6 +1927,33 @@ class BrowserReadyApiTests(unittest.TestCase):
         info_log.assert_not_called()
         warning_log.assert_not_called()
 
+    def test_ai_output_limit_allows_complete_response_larger_than_old_ceiling(self):
+        provider_payload = {
+            "suggestions": [],
+            "warnings": [],
+            "padding": "x" * 8000,
+        }
+        message = {
+            "content": [{"type": "text", "text": json.dumps(provider_payload)}],
+            "usage": {"input_tokens": 3000, "output_tokens": 2400},
+            "stop_reason": "end_turn",
+        }
+
+        diagnostics = WORKER._ai_general_response_diagnostics(
+            message,
+            system_id="p1_s4",
+            measure_count=11,
+            reference_count=4,
+            model="sonnet-test",
+        )
+        parsed = WORKER._parse_anthropic_suggestions_message(message)
+
+        self.assertEqual(WORKER.ANTHROPIC_MAX_TOKENS, 5000)
+        self.assertEqual(diagnostics.get("max_tokens"), 5000)
+        self.assertEqual(diagnostics.get("output_tokens"), 2400)
+        self.assertFalse(diagnostics.get("output_limit_reached"))
+        self.assertEqual(parsed.get("suggestions"), [])
+
     def test_generate_ai_suggestions_for_system_batch_uses_neighbor_systems_without_crashing(self):
         artifacts = self._sample_artifacts()
         editable_state = self._sample_mapping_summary().get("editable_state") or {}
@@ -4383,6 +4410,38 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("A count of 1 or an ordinary quarter, half, whole, or full-measure rest means normal.", rules_text)
         self.assertIn("Ignore unrelated measure numbers, rehearsal marks, fingerings, lyrics, ending numbers", rules_text)
         self.assertIn("make the best normal-or-multi_measure_rest choice", rules_text)
+
+    def test_general_and_ending_requests_use_five_thousand_token_limit(self):
+        mapping_summary = self._sample_mapping_summary()
+        editable_state = mapping_summary.get("editable_state") or {}
+        system_row = (editable_state.get("systems") or [])[0]
+        measure_rows = [row for row in (editable_state.get("measures") or []) if row.get("system_id") == "p1_s0"]
+        page = _FakePage(_FakeRect(0, 0, 200, 160))
+
+        with (
+            patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
+            patch.object(WORKER.fitz, "Rect", _FakeRect),
+        ):
+            general_payload, _ = WORKER._build_system_measure_request(
+                "111",
+                111,
+                system_row,
+                measure_rows,
+                page,
+                pdf_source="corrected",
+                score_type="single",
+            )
+            ending_payload, _ = WORKER._build_ending_system_request(
+                "111",
+                111,
+                system_row,
+                measure_rows,
+                page,
+                score_type="single",
+            )
+
+        self.assertEqual(general_payload.get("max_tokens"), 5000)
+        self.assertEqual(ending_payload.get("max_tokens"), 5000)
 
     def test_build_system_measure_request_includes_reference_examples_before_real_measures(self):
         mapping_summary = self._sample_mapping_summary()
