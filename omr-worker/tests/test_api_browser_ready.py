@@ -1267,7 +1267,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         with (
             patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
             patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
-            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(WORKER, "_editable_state_version", return_value="changed-state"),
             patch.object(
                 WORKER,
                 "_refresh_editable_state_systems_and_measures",
@@ -1292,7 +1292,7 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(run.get("execution_id"), "existing-execution")
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {})), ["p1_s0_m0"])
 
-    def test_ai_suggest_explicit_continue_rejects_first_general_failure(self):
+    def test_ai_suggest_explicit_continue_retries_first_general_failure(self):
         artifacts = self._sample_artifacts()
         mapping_summary = self._sample_mapping_summary()
         mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
@@ -1309,12 +1309,27 @@ class BrowserReadyApiTests(unittest.TestCase):
         with (
             patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
             patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
-            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
+            patch.object(WORKER, "_editable_state_version", return_value="changed-state"),
+            patch.object(
+                WORKER,
+                "_refresh_editable_state_systems_and_measures",
+                return_value=(
+                    mapping_summary["editable_state"]["systems"],
+                    mapping_summary["editable_state"]["measures"],
+                    0,
+                    [],
+                ),
+            ),
+            patch.object(WORKER, "_artifact_http_uris_for_run", return_value={}),
+            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
         ):
             body, status = _unpack(WORKER.ai_suggest_job("111"))
 
-        self.assertEqual(status, 409)
-        self.assertEqual((body.get("error") or {}).get("code"), "ai_restart_required")
+        self.assertEqual(status, 200)
+        run = body.get("ai_suggest_run") or {}
+        self.assertEqual(run.get("status"), "running")
+        self.assertEqual(run.get("next_system_index"), 0)
+        self.assertEqual(run.get("score_type"), "single")
 
     def test_ai_suggest_restart_is_idempotent_and_replaces_only_ai_state(self):
         artifacts = self._sample_artifacts()
@@ -1373,6 +1388,48 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(mapping_summary.get("editable_state"), original_editable)
         self.assertEqual(upload.call_count, 1)
 
+    def test_ai_suggest_restart_rejects_completed_run(self):
+        artifacts = self._sample_artifacts()
+        mapping_summary = self._sample_mapping_summary()
+        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
+        mapping_summary["ai_suggest_run"] = WORKER._new_ai_suggest_run_state(
+            111,
+            "test-state",
+            2,
+            score_type="single",
+            execution_id="completed-execution",
+            start_request_id="04c4a634-657b-4513-bea7-66db9541760b",
+        )
+        mapping_summary["ai_suggest_run"].update(
+            {
+                "status": "completed",
+                "systems_completed": 2,
+                "next_system_index": 2,
+            }
+        )
+        WORKER.request = SimpleNamespace(
+            path="/api/omr/jobs/111/ai-suggest",
+            method="POST",
+            headers={},
+            files={},
+            json={},
+            get_json=lambda silent=True: {
+                "mode": "restart",
+                "score_type": "grand",
+                "request_id": "87b7b3a0-662b-4c9b-833a-41cb7636aa0d",
+            },
+        )
+        with (
+            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
+            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
+            patch.object(WORKER, "_editable_state_version", return_value="changed-state"),
+        ):
+            body, status = _unpack(WORKER.ai_suggest_job("111"))
+
+        self.assertEqual(status, 409)
+        self.assertEqual((body.get("error") or {}).get("code"), "ai_run_completed")
+        self.assertEqual((body.get("ai_suggest_run") or {}).get("execution_id"), "completed-execution")
+
     def test_first_system_ending_failure_counts_as_resumable_progress(self):
         run = WORKER._new_ai_suggest_run_state(111, "state", 2, score_type="single")
         run.update(
@@ -1390,6 +1447,39 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertTrue(normalized.get("has_saved_progress"))
         self.assertTrue(normalized.get("can_continue"))
+
+    def test_cancelled_run_stays_resumable_after_state_version_changes(self):
+        run = WORKER._new_ai_suggest_run_state(111, "original-state", 12, score_type="single")
+        run.update(
+            {
+                "status": "cancelled",
+                "systems_completed": 3,
+                "next_system_index": 3,
+            }
+        )
+
+        normalized = WORKER._current_ai_suggest_run(
+            {"ai_suggest_run": run},
+            111,
+            "state-after-cleanup-or-save",
+        )
+
+        self.assertTrue(normalized.get("has_saved_progress"))
+        self.assertTrue(normalized.get("can_continue"))
+
+    def test_completed_run_is_not_resumable(self):
+        run = WORKER._new_ai_suggest_run_state(111, "state", 3, score_type="single")
+        run.update(
+            {
+                "status": "completed",
+                "systems_completed": 3,
+                "next_system_index": 3,
+            }
+        )
+
+        normalized = WORKER._current_ai_suggest_run({"ai_suggest_run": run}, 111, "different-state")
+
+        self.assertFalse(normalized.get("can_continue"))
 
     def test_restart_execution_ids_create_new_credit_groups(self):
         old_id = WORKER._ai_credit_group_id("job", 111, "state", 0, execution_id="old")

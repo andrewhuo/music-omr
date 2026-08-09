@@ -3988,13 +3988,6 @@ def _requested_anthropic_model_name() -> str:
 
 def _refresh_ai_run_recovery_flags(row: dict, current_source_state_version: str | None = None) -> dict:
     pass_state_by_system_id = row.get("pass_state_by_system_id") if isinstance(row.get("pass_state_by_system_id"), dict) else {}
-    run_source_state_version = str(row.get("source_state_version") or current_source_state_version or "").strip() or None
-    current_source = str(current_source_state_version or "").strip() or None
-    source_state_matches = not (
-        run_source_state_version
-        and current_source
-        and run_source_state_version != current_source
-    )
     has_saved_progress = max(0, _safe_int(row.get("systems_completed"), 0)) > 0 or any(
         isinstance(pass_state, dict)
         and (
@@ -4004,12 +3997,19 @@ def _refresh_ai_run_recovery_flags(row: dict, current_source_state_version: str 
         for pass_state in pass_state_by_system_id.values()
     )
     status = str(row.get("status") or AI_SUGGEST_RUN_STATUS_IDLE).strip().lower()
+    systems_total = max(0, _safe_int(row.get("systems_total"), 0))
+    next_system_index = max(0, _safe_int(row.get("next_system_index"), 0))
+    score_type = _normalize_ai_score_type(row.get("score_type"))
     row["has_saved_progress"] = has_saved_progress
     row["can_continue"] = (
-        status in {AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED, AI_SUGGEST_RUN_STATUS_CANCELLED}
-        and has_saved_progress
-        and source_state_matches
-        and max(0, _safe_int(row.get("next_system_index"), 0)) < max(0, _safe_int(row.get("systems_total"), 0))
+        status in {
+            AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED,
+            AI_SUGGEST_RUN_STATUS_CANCELLED,
+            AI_SUGGEST_RUN_STATUS_FAILED,
+        }
+        and score_type is not None
+        and systems_total > 0
+        and next_system_index < systems_total
     )
     return row
 
@@ -9805,6 +9805,7 @@ def ai_suggest_job(job_id: str):
     if mode == "start" and str(existing_ai_suggest_run.get("status") or "") in {
         AI_SUGGEST_RUN_STATUS_PARTIAL_FAILED,
         AI_SUGGEST_RUN_STATUS_CANCELLED,
+        AI_SUGGEST_RUN_STATUS_FAILED,
     }:
         return (
             jsonify(
@@ -9820,6 +9821,27 @@ def ai_suggest_job(job_id: str):
                         "retryable": False,
                         "provider_status": 409,
                         "detail": "recovery_choice_required",
+                    },
+                }
+            ),
+            409,
+        )
+
+    if mode == "restart" and str(existing_ai_suggest_run.get("status") or "") == AI_SUGGEST_RUN_STATUS_COMPLETED:
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "run_id": int(artifact_run_id),
+                    "status": AI_SUGGEST_RUN_STATUS_COMPLETED,
+                    "ai_suggestions": existing_ai_suggestions,
+                    "ai_suggest_run": existing_ai_suggest_run,
+                    "error": {
+                        "code": "ai_run_completed",
+                        "message": "This AI run is already complete.",
+                        "retryable": False,
+                        "provider_status": 409,
+                        "detail": "completed",
                     },
                 }
             ),
@@ -10423,41 +10445,6 @@ def ai_suggest_job_step(job_id: str):
         if isinstance(debug_batch_trace, dict):
             response["debug_batch_trace"] = debug_batch_trace
         return jsonify(response), 409
-
-    if ai_suggest_run.get("source_state_version") and ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_RUNNING:
-        if str(ai_suggest_run.get("source_state_version") or "") != str(source_state_version or ""):
-            now_txt = _utc_now().isoformat().replace("+00:00", "Z")
-            error_payload = {
-                "code": "ai_suggest_failed",
-                "message": "AI suggestion source state changed during generation.",
-                "retryable": True,
-                "provider_status": 409,
-                "detail": "source_state_version_mismatch",
-            }
-            ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_FAILED
-            ai_suggest_run["updated_at_utc"] = now_txt
-            ai_suggest_run["failed_at_utc"] = now_txt
-            ai_suggest_run["last_error"] = error_payload
-            mapping_summary["ai_suggest_run"] = ai_suggest_run
-            _upload_json_to_gcs(mapping_summary, artifacts["mapping_summary"])
-            return (
-                jsonify(
-                    {
-                        "job_id": job_id,
-                        "run_id": int(artifact_run_id),
-                        "status": AI_SUGGEST_RUN_STATUS_FAILED,
-                        "ai_suggestions": ai_suggestions,
-                        "ai_suggest_run": ai_suggest_run,
-                        "error": error_payload,
-                        "storage_mode": _storage_mode_for_artifacts(artifacts),
-                        "artifacts": artifacts,
-                        "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
-                        "duration_ms": int((time.time() - started) * 1000),
-                        **({"debug_batch_trace": debug_batch_trace} if isinstance(debug_batch_trace, dict) else {}),
-                    }
-                ),
-                200,
-            )
 
     if ai_suggest_run.get("status") in {AI_SUGGEST_RUN_STATUS_COMPLETED, AI_SUGGEST_RUN_STATUS_FAILED, AI_SUGGEST_RUN_STATUS_CANCELLED}:
         response = {
