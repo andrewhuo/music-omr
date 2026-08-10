@@ -231,6 +231,10 @@ AI_FALSE_MEASURE_REFERENCE_EXAMPLES = (
         "filename": "false_measure_common_time_only.png",
         "caption": "False-measure reference B: This narrow detected box contains only a clef, common-time symbol, staff lines, and barlines. It contains no notes or rests and consumes no musical time. Return false_measure.",
     },
+    {
+        "filename": "false_measure_key_and_6_8_only.png",
+        "caption": "False-measure reference C: This detected candidate box contains a key signature made of flats followed by a 6/8 time signature, staff lines, and barlines. No clef is visible inside the box. It contains no notes or rests and consumes no musical time. Return false_measure.",
+    },
 )
 AI_ENDING_REFERENCE_EXAMPLES = (
     {
@@ -6090,7 +6094,7 @@ def _build_false_measure_reference_content() -> tuple[list[dict], int]:
         {
             "type": "text",
             "text": (
-                "The next two images are false-measure references only. "
+                f"The next {len(rows)} images are false-measure references only. "
                 "After them, classify the real target candidate-box crops."
             ),
         }
@@ -6156,6 +6160,12 @@ def _ai_prompt_false_measure_rules() -> list[str]:
         "A false measure is an incorrect measure box containing no music that consumes time.",
         "Return false_measure only when the target box contains no notes, no chords, no ordinary rests, no full-measure rests, and no multi-measure-rest symbol.",
         "Clefs, key signatures, numeric time signatures, common time, cut time, staff lines, barlines, repeat barlines, repeat dots, and nearby text do not consume musical time by themselves.",
+        "Setup symbols may appear alone or in any combination. A clef is not required.",
+        "A candidate containing only a key signature and a numeric, common-time, or cut-time signature, with no notes or rests, is false_measure.",
+        "A group of sharps, flats, or naturals in the normal key-signature position is setup notation. Do not mistake those accidentals for notes.",
+        "Setup symbols may belong to the following real measure even when the detector incorrectly places them inside a separate candidate box.",
+        "The candidate may occur at the beginning of a page, system, section, or after a mid-score signature change. Position alone does not determine the answer.",
+        "A signature change inside a candidate that also contains notes or rests is part of a real measure. A separately boxed setup-only signature change is false_measure.",
         "A target box containing only those setup symbols is false_measure.",
         "If any staff inside the target box contains a note, chord, ordinary rest, full-measure rest, or multi-measure-rest symbol, it is a real measure and must not be false_measure.",
         "Setup symbols followed by notes or rests inside the same target box belong to a real measure.",

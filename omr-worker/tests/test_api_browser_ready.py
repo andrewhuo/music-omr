@@ -2344,6 +2344,17 @@ class BrowserReadyApiTests(unittest.TestCase):
         for reference in WORKER.AI_ENDING_REFERENCE_EXAMPLES:
             self.assertIn(reference["caption"], captions)
 
+    def test_false_measure_reference_catalog_loads_all_three_captioned_images(self):
+        content, count = WORKER._build_false_measure_reference_content()
+        self.assertEqual(count, 3)
+        self.assertEqual(sum(1 for row in content if row.get("type") == "image"), 3)
+        captions = [row.get("text") for row in content if row.get("type") == "text"]
+        self.assertIn("The next 3 images are false-measure references only.", captions[0])
+        self.assertEqual(
+            captions[1:],
+            [reference["caption"] for reference in WORKER.AI_FALSE_MEASURE_REFERENCE_EXAMPLES],
+        )
+
     def test_ending_crop_adds_capped_horizontal_context_at_page_edges(self):
         page = _FakeRect(0, 0, 200, 300)
         measure = {
@@ -2861,10 +2872,10 @@ class BrowserReadyApiTests(unittest.TestCase):
             (((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")),
             "m0",
         )
-        self.assertEqual(body.get("reference_examples_attached"), 2)
+        self.assertEqual(body.get("reference_examples_attached"), 3)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
         self.assertEqual(((body.get("debug_crops") or {}).get("pdf_source")), "corrected")
-        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 2)
+        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 3)
         warnings = ((body.get("ai_suggestions") or {}).get("warnings")) or []
         warnings_text = "\n".join(str((row or {}).get("message") or "") for row in warnings)
         self.assertIn("remembered_time_signature_out", warnings_text)
@@ -4466,6 +4477,10 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("False-measure check - perform this before every other classification:", rules_text)
         self.assertIn("A target box containing only those setup symbols is false_measure.", rules_text)
         self.assertIn("If any staff inside the target box contains a note, chord, ordinary rest", rules_text)
+        self.assertIn("Setup symbols may appear alone or in any combination. A clef is not required.", rules_text)
+        self.assertIn("A candidate containing only a key signature and a numeric, common-time, or cut-time signature", rules_text)
+        self.assertIn("Do not mistake those accidentals for notes.", rules_text)
+        self.assertIn("A separately boxed setup-only signature change is false_measure.", rules_text)
         self.assertIn("Read meter as top/bottom: top = how many beat-units fill a full measure", rules_text)
         self.assertIn("Bottom number examples: 4 means quarter-note beats", rules_text)
         self.assertIn("Common time looks like a large C after the clef/key signature and means 4/4.", rules_text)
@@ -5025,6 +5040,10 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(general_payload.get("max_tokens"), 5000)
         self.assertEqual(ending_payload.get("max_tokens"), 5000)
+        ending_content = (((ending_payload.get("messages") or [])[0] or {}).get("content")) or []
+        ending_text = "\n".join(str(row.get("text") or "") for row in ending_content if row.get("type") == "text")
+        for reference in WORKER.AI_FALSE_MEASURE_REFERENCE_EXAMPLES:
+            self.assertNotIn(reference["caption"], ending_text)
 
     def test_build_system_measure_request_includes_reference_examples_before_real_measures(self):
         mapping_summary = self._sample_mapping_summary()
@@ -5037,6 +5056,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             tmp_path = Path(tmpdir)
             (tmp_path / "false_measure_6_8_only.png").write_bytes(b"false-six-eight-reference")
             (tmp_path / "false_measure_common_time_only.png").write_bytes(b"false-common-time-reference")
+            (tmp_path / "false_measure_key_and_6_8_only.png").write_bytes(b"false-key-and-six-eight-reference")
             (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
             (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
             (tmp_path / "modern_rest_positive_8.png").write_bytes(b"modern-reference")
@@ -5056,7 +5076,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     score_type="single",
                 )
 
-        self.assertEqual(reference_examples_attached, 6)
+        self.assertEqual(reference_examples_attached, 7)
         self.assertNotIn("reference_examples_attached", payload)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         self.assertEqual((content[0] or {}).get("type"), "text")
@@ -5065,16 +5085,18 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((content[3] or {}).get("type"), "image")
         self.assertIn("only a clef, common-time symbol", (content[4] or {}).get("text") or "")
         self.assertEqual((content[5] or {}).get("type"), "image")
-        self.assertIn("Reference examples for multi-measure rest recognition.", (content[6] or {}).get("text") or "")
-        self.assertIn("printed count is 1", (content[7] or {}).get("text") or "")
-        self.assertEqual((content[8] or {}).get("type"), "image")
-        self.assertIn("printed count is 3", (content[9] or {}).get("text") or "")
+        self.assertIn("No clef is visible inside the box", (content[6] or {}).get("text") or "")
+        self.assertEqual((content[7] or {}).get("type"), "image")
+        self.assertIn("Reference examples for multi-measure rest recognition.", (content[8] or {}).get("text") or "")
+        self.assertIn("printed count is 1", (content[9] or {}).get("text") or "")
         self.assertEqual((content[10] or {}).get("type"), "image")
-        self.assertIn("printed count is 8", (content[11] or {}).get("text") or "")
+        self.assertIn("printed count is 3", (content[11] or {}).get("text") or "")
         self.assertEqual((content[12] or {}).get("type"), "image")
-        self.assertIn("printed count is 16", (content[13] or {}).get("text") or "")
+        self.assertIn("printed count is 8", (content[13] or {}).get("text") or "")
         self.assertEqual((content[14] or {}).get("type"), "image")
-        self.assertEqual(json.loads((content[15] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
+        self.assertIn("printed count is 16", (content[15] or {}).get("text") or "")
+        self.assertEqual((content[16] or {}).get("type"), "image")
+        self.assertEqual(json.loads((content[17] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
 
     def test_build_system_measure_request_skips_missing_reference_examples(self):
         mapping_summary = self._sample_mapping_summary()
@@ -5117,6 +5139,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             tmp_path = Path(tmpdir)
             (tmp_path / "false_measure_6_8_only.png").write_bytes(b"false-six-eight-reference")
             (tmp_path / "false_measure_common_time_only.png").write_bytes(b"false-common-time-reference")
+            (tmp_path / "false_measure_key_and_6_8_only.png").write_bytes(b"false-key-and-six-eight-reference")
             with (
                 patch.object(WORKER, "AI_REFERENCE_EXAMPLES_DIR", tmp_path),
                 patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
@@ -5132,7 +5155,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     score_type="score",
                 )
 
-        self.assertEqual(reference_examples_attached, 2)
+        self.assertEqual(reference_examples_attached, 3)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         text_content = "\n".join(str(row.get("text") or "") for row in content if row.get("type") == "text")
         self.assertIn("false-measure references", text_content)
@@ -5175,6 +5198,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             tmp_path = Path(tmpdir)
             (tmp_path / "false_measure_6_8_only.png").write_bytes(b"false-six-eight-reference")
             (tmp_path / "false_measure_common_time_only.png").write_bytes(b"false-common-time-reference")
+            (tmp_path / "false_measure_key_and_6_8_only.png").write_bytes(b"false-key-and-six-eight-reference")
             (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
             (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
             (tmp_path / "modern_rest_positive_8.png").write_bytes(b"modern-reference")
@@ -5200,7 +5224,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(len(captured_payloads), 1)
         self.assertNotIn("reference_examples_attached", captured_payloads[0])
-        self.assertEqual(result.get("reference_examples_attached"), 6)
+        self.assertEqual(result.get("reference_examples_attached"), 7)
 
     def test_profile_system_layouts_flags_short_partial_staff(self):
         systems = [
