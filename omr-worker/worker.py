@@ -236,6 +236,16 @@ AI_FALSE_MEASURE_REFERENCE_EXAMPLES = (
         "caption": "False-measure reference C: This detected candidate box contains a key signature made of flats followed by a 6/8 time signature, staff lines, and barlines. No clef is visible inside the box. It contains no notes or rests and consumes no musical time. Return false_measure.",
     },
 )
+AI_MUSIC_CONTENT_REFERENCE_EXAMPLES = (
+    {
+        "filename": "normal_6_8_clipped_high_note_and_rests.png",
+        "caption": "Normal reference: This candidate contains a clef, key signature, and 6/8 time signature followed by ordinary rests. A high note is partially clipped: its stem and short ledger lines remain visible even though its notehead is outside the crop. This music consumes time. Return normal, never false_measure, and set contains_time_consuming_music to true.",
+    },
+    {
+        "filename": "note_and_rest_catalog.png",
+        "caption": "Music-symbol catalog: These are common notes and ordinary rests. Any complete or partially visible note or ordinary rest inside a target candidate means musical time is present. Whole and half rests may appear as small rectangles attached to a staff line. Engraving styles may vary. This image is a symbol reference only, not a target measure.",
+    },
+)
 AI_ENDING_REFERENCE_EXAMPLES = (
     {
         "filename": "ending_1_start_continues.png",
@@ -4098,6 +4108,7 @@ def _empty_ai_suggestions_state(
         "decision_debug_by_measure_id": {},
         "time_signatures_by_measure_id": {},
         "measure_completeness_by_measure_id": {},
+        "music_content_by_measure_id": {},
         "ending_events_by_measure_id": {},
         "ending_pairs_by_id": {},
         "resolved_ending_pair_ids": [],
@@ -4468,6 +4479,8 @@ def _merge_ai_suggestions_state(
     time_signatures_by_measure_id.update(dict(system_suggestions.get("time_signatures_by_measure_id") or {}))
     measure_completeness_by_measure_id = dict(base.get("measure_completeness_by_measure_id") or {})
     measure_completeness_by_measure_id.update(dict(system_suggestions.get("measure_completeness_by_measure_id") or {}))
+    music_content_by_measure_id = dict(base.get("music_content_by_measure_id") or {})
+    music_content_by_measure_id.update(dict(system_suggestions.get("music_content_by_measure_id") or {}))
     warnings = list(base.get("warnings") or [])
     warnings.extend(list(system_suggestions.get("warnings") or []))
     base["version"] = AI_SUGGESTIONS_VERSION
@@ -4482,6 +4495,7 @@ def _merge_ai_suggestions_state(
     base["decision_debug_by_measure_id"] = decision_debug_by_measure_id
     base["time_signatures_by_measure_id"] = time_signatures_by_measure_id
     base["measure_completeness_by_measure_id"] = measure_completeness_by_measure_id
+    base["music_content_by_measure_id"] = music_content_by_measure_id
     base["warnings"] = warnings
     summary = base.get("summary")
     if not isinstance(summary, dict):
@@ -4864,6 +4878,7 @@ def _normalize_ai_suggestions_result(
     kept_by_measure_id: dict[str, dict] = {}
     decision_debug_by_measure_id: dict[str, dict] = {}
     measure_completeness_by_measure_id: dict[str, dict] = {}
+    music_content_by_measure_id: dict[str, dict] = {}
     normal_measures_omitted = 0
     normalization_warnings: list[dict] = []
     fallback_measure_row = ordered_measures[0] if ordered_measures else {}
@@ -4895,6 +4910,62 @@ def _normalize_ai_suggestions_result(
             label = "normal"
         if label not in AI_SUGGESTION_LABELS_ALLOWED:
             raise AiSuggestError(detail=f"malformed_response: invalid label for {measure_id}")
+
+        raw_music_presence = row.get("contains_time_consuming_music")
+        contains_time_consuming_music = raw_music_presence if type(raw_music_presence) is bool else None
+        if contains_time_consuming_music is None:
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_row,
+                    f"Missing or invalid contains_time_consuming_music for {measure_id}.",
+                )
+            )
+            if label == "false_measure":
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Treated false_measure as normal for {measure_id} because music presence was not confirmed.",
+                    )
+                )
+                label = "normal"
+        elif contains_time_consuming_music:
+            if label == "false_measure":
+                normalization_warnings.append(
+                    _ai_suggest_normalization_warning(
+                        measure_row,
+                        f"Treated false_measure as normal for {measure_id} because music was present.",
+                    )
+                )
+                label = "normal"
+        elif ignored_ending_label:
+            contains_time_consuming_music = True
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_row,
+                    f"Ignored contradictory music-content flag on ending label for {measure_id}.",
+                )
+            )
+        elif label == "normal":
+            label = "false_measure"
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_row,
+                    f"Treated normal as false_measure for {measure_id} because no music was present.",
+                )
+            )
+        elif label in {"pickup", "multi_measure_rest"}:
+            contains_time_consuming_music = True
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_row,
+                    f"Preserved {label} for {measure_id} and corrected its contradictory music-content flag.",
+                )
+            )
+
+        if contains_time_consuming_music is not None:
+            music_content_by_measure_id[measure_id] = {
+                "contains_time_consuming_music": contains_time_consuming_music,
+            }
         confidence = str(row.get("confidence") or "").strip().lower()
         is_first_measure_of_score = _safe_int(measure_row.get("global_index"), -1) == 0
         if confidence not in AI_SUGGESTION_CONFIDENCE_ALLOWED:
@@ -4947,6 +5018,14 @@ def _normalize_ai_suggestions_result(
         elif label == "false_measure":
             measure_completeness = "not_applicable"
         elif ignored_ending_label:
+            measure_completeness = "full"
+        elif label == "normal" and measure_completeness == "not_applicable":
+            normalization_warnings.append(
+                _ai_suggest_normalization_warning(
+                    measure_row,
+                    f"Restored normal completeness for {measure_id} after false-measure normalization.",
+                )
+            )
             measure_completeness = "full"
         elif not is_first_measure_of_score and label == "normal" and measure_completeness == "incomplete":
             normalization_warnings.append(
@@ -5007,6 +5086,8 @@ def _normalize_ai_suggestions_result(
             "order_index_in_system": _safe_int(measure_row.get("measure_local_index"), 0),
             "is_first_measure_of_score": is_first_measure_of_score,
         }
+        if contains_time_consuming_music is not None:
+            entry["contains_time_consuming_music"] = contains_time_consuming_music
         if unclear_reason is not None:
             entry["unclear_reason"] = unclear_reason
         if decision_debug is not None:
@@ -5187,6 +5268,7 @@ def _normalize_ai_suggestions_result(
         "decision_debug_by_measure_id": decision_debug_by_measure_id,
         "time_signatures_by_measure_id": time_signatures_by_measure_id,
         "measure_completeness_by_measure_id": measure_completeness_by_measure_id,
+        "music_content_by_measure_id": music_content_by_measure_id,
         "warnings": warnings,
         "summary": {
             "systems_processed": systems_processed,
@@ -6114,6 +6196,50 @@ def _build_false_measure_reference_content() -> tuple[list[dict], int]:
     return content, len(rows)
 
 
+def _build_music_content_reference_content() -> tuple[list[dict], int]:
+    content: list[dict] = []
+    rows: list[dict] = []
+    for row in AI_MUSIC_CONTENT_REFERENCE_EXAMPLES:
+        image_path = AI_REFERENCE_EXAMPLES_DIR / str(row.get("filename") or "")
+        try:
+            image_bytes = image_path.read_bytes()
+        except FileNotFoundError:
+            logger.warning("AI_MUSIC_CONTENT_REFERENCE_MISSING filename=%s", image_path.name)
+            continue
+        except Exception as exc:
+            logger.warning(
+                "AI_MUSIC_CONTENT_REFERENCE_LOAD_FAILED filename=%s error_type=%s",
+                image_path.name,
+                type(exc).__name__,
+            )
+            continue
+        rows.append({"caption": str(row.get("caption") or ""), "image_bytes": image_bytes})
+    if not rows:
+        return content, 0
+    content.append(
+        {
+            "type": "text",
+            "text": (
+                f"The next {len(rows)} images teach music-content recognition. "
+                "They are references only; classify the real target candidate-box crops afterward."
+            ),
+        }
+    )
+    for row in rows:
+        content.append({"type": "text", "text": row["caption"]})
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(row["image_bytes"]).decode("ascii"),
+                },
+            }
+        )
+    return content, len(rows)
+
+
 def _build_ending_reference_content() -> tuple[list[dict], int]:
     content: list[dict] = []
     rows: list[dict] = []
@@ -6176,6 +6302,19 @@ def _ai_prompt_false_measure_rules() -> list[str]:
     ]
 
 
+def _ai_prompt_music_content_rules() -> list[str]:
+    return [
+        "First decide whether the target candidate contains any music that consumes time.",
+        "Set contains_time_consuming_music to true when any note, chord, ordinary rest, full-measure rest, or multi-measure-rest symbol is visible.",
+        "Notes can extend above or below the staff. A note still counts when its notehead is clipped but its stem, beam, flag, or short ledger lines provide clear evidence of the note.",
+        "Short ledger lines crossed by a note stem are not staff lines or barlines. Do not confuse them with a barline crossing the five main staff lines.",
+        "Ordinary whole and half rests may look like small rectangles resting on or hanging from a staff line. They consume musical time and make the candidate a real measure.",
+        "If contains_time_consuming_music is true, false_measure is forbidden.",
+        "Set contains_time_consuming_music to false only when the target contains setup notation but no evidence of notes or rests.",
+        "A separately boxed courtesy key or time signature at the right edge of a system is false_measure when it contains no music, even though it describes the following system.",
+    ]
+
+
 def _ai_prompt_base_rules() -> list[str]:
     return [
         "Each image contains exactly one already-detected measure candidate box. Some candidate boxes may contain only setup notation and may not be real measures.",
@@ -6183,6 +6322,7 @@ def _ai_prompt_base_rules() -> list[str]:
         "System means the full horizontal row of music containing all staves on that line of the score.",
         "Do not infer additional measures from rhythmic groupings, repeat dots, barline decorations, edge marks, spacing, or decorations.",
         "Process the provided measures left to right in order.",
+        *_ai_prompt_music_content_rules(),
         *_ai_prompt_false_measure_rules(),
         "A numeric time signature is two vertically stacked meter numbers immediately after the clef/key signature, such as 2 over 4.",
         "Ignore fingering/count numbers near notes, above the staff, or below the staff. They are not time signatures.",
@@ -6405,6 +6545,7 @@ def _ai_prompt_output_rules() -> list[str]:
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
         "Always choose normal, pickup, multi_measure_rest, false_measure, ending_1, or ending_2; never return uncertain or maybe fields.",
+        "Every result must include contains_time_consuming_music as true or false.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "For false_measure, measure_completeness must be not_applicable, unclear_reason and rest_count must be null, and decision_debug may be null.",
         "For the first measure of the score only, decision_debug is required unless label is false_measure. Include notehead_fill_read, stem_or_beam_read, dot_seen, note_value_read, counted_beat_units, and debug_note explaining what you saw rhythmically, what meter you used, and why you chose the label.",
@@ -6418,6 +6559,7 @@ def _ai_prompt_single_output_rules() -> list[str]:
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
         "Never return uncertain, maybe_label, or maybe_rest_count; make the best allowed choice and use low confidence when needed.",
+        "Every result must include contains_time_consuming_music as true or false.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
         "For false_measure, measure_completeness must be not_applicable, unclear_reason and rest_count must be null, and decision_debug may be null.",
@@ -6433,6 +6575,7 @@ def _ai_prompt_grand_output_rules() -> list[str]:
         "Do not skip any provided measure_id.",
         "Do not output labels outside the allowed set.",
         "Never return uncertain, maybe_label, or maybe_rest_count; make the best allowed choice and use low confidence when needed.",
+        "Every result must include contains_time_consuming_music as true or false.",
         "If label is multi_measure_rest, rest_count must be an integer >= 2. If label is not multi_measure_rest, rest_count must be null.",
         "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
         "For false_measure, measure_completeness must be not_applicable, unclear_reason and rest_count must be null, and decision_debug may be null.",
@@ -6446,6 +6589,7 @@ def _ai_prompt_score_output_rules() -> list[str]:
     return [
         "Allowed labels: normal, pickup, false_measure, ending_1, ending_2.",
         "Never return uncertain, maybe_label, or maybe_rest_count; make the best allowed choice and use low confidence when needed.",
+        "Every result must include contains_time_consuming_music as true or false.",
         "Do not skip any measure_id. Every input measure_id must appear exactly once.",
         "For full score V1, never output multi_measure_rest, and rest_count must always be null.",
         "For ending_1 and ending_2, rest_count must be null and measure_completeness should be full.",
@@ -6519,6 +6663,7 @@ def _build_system_measure_request(
                     {
                         "measure_id": "string",
                         "label": score_label_shape,
+                        "contains_time_consuming_music": "boolean",
                         "measure_completeness": "full|incomplete|unclear|not_applicable",
                         "unclear_reason": "time_signature_not_clear|too_dense_to_count|crop_cut_off|split_may_be_wrong|ornament_or_tie_confusion|not_enough_visual_evidence|null",
                         "rest_count": "integer|null",
@@ -6553,6 +6698,9 @@ def _build_system_measure_request(
     false_reference_content, false_reference_count = _build_false_measure_reference_content()
     content.extend(false_reference_content)
     reference_examples_attached = int(false_reference_count)
+    music_reference_content, music_reference_count = _build_music_content_reference_content()
+    content.extend(music_reference_content)
+    reference_examples_attached += int(music_reference_count)
     if normalized_score_type in ("single", "grand"):
         rest_reference_content, rest_reference_count = _build_multi_rest_reference_content()
         content.extend(rest_reference_content)

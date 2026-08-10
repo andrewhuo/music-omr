@@ -2355,6 +2355,17 @@ class BrowserReadyApiTests(unittest.TestCase):
             [reference["caption"] for reference in WORKER.AI_FALSE_MEASURE_REFERENCE_EXAMPLES],
         )
 
+    def test_music_content_reference_catalog_loads_both_captioned_images(self):
+        content, count = WORKER._build_music_content_reference_content()
+        self.assertEqual(count, 2)
+        self.assertEqual(sum(1 for row in content if row.get("type") == "image"), 2)
+        captions = [row.get("text") for row in content if row.get("type") == "text"]
+        self.assertIn("The next 2 images teach music-content recognition.", captions[0])
+        self.assertEqual(
+            captions[1:],
+            [reference["caption"] for reference in WORKER.AI_MUSIC_CONTENT_REFERENCE_EXAMPLES],
+        )
+
     def test_ending_crop_adds_capped_horizontal_context_at_page_edges(self):
         page = _FakeRect(0, 0, 200, 300)
         measure = {
@@ -2872,10 +2883,10 @@ class BrowserReadyApiTests(unittest.TestCase):
             (((body.get("ai_suggest_run") or {}).get("last_time_signature_update") or {}).get("measure_id")),
             "m0",
         )
-        self.assertEqual(body.get("reference_examples_attached"), 3)
+        self.assertEqual(body.get("reference_examples_attached"), 5)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
         self.assertEqual(((body.get("debug_crops") or {}).get("pdf_source")), "corrected")
-        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 3)
+        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 5)
         warnings = ((body.get("ai_suggestions") or {}).get("warnings")) or []
         warnings_text = "\n".join(str((row or {}).get("message") or "") for row in warnings)
         self.assertIn("remembered_time_signature_out", warnings_text)
@@ -3761,6 +3772,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                 {
                     "measure_id": "m0",
                     "label": "false_measure",
+                    "contains_time_consuming_music": False,
                     "measure_completeness": "full",
                     "unclear_reason": None,
                     "rest_count": None,
@@ -3775,6 +3787,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         entry = (normalized.get("by_measure_id") or {}).get("m0") or {}
         self.assertEqual(entry.get("label"), "false_measure")
+        self.assertIs(entry.get("contains_time_consuming_music"), False)
         self.assertIsNone(entry.get("rest_count"))
         self.assertNotIn("decision_debug", entry)
         self.assertEqual(
@@ -3797,6 +3810,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                 {
                     "measure_id": "m0",
                     "label": "false_measure",
+                    "contains_time_consuming_music": False,
                     "measure_completeness": "unclear",
                     "unclear_reason": "split_may_be_wrong",
                     "rest_count": 4,
@@ -3818,6 +3832,110 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertNotIn("maybe_rest_count", entry)
         warnings = normalized.get("warnings") or []
         self.assertTrue(any("extra fields on false_measure" in str(row.get("message") or "") for row in warnings))
+
+    def test_normalize_ai_suggestions_result_rejects_false_measure_when_music_is_present(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [{"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 1}],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [{
+                "measure_id": "m0",
+                "label": "false_measure",
+                "contains_time_consuming_music": True,
+                "measure_completeness": "not_applicable",
+                "rest_count": None,
+                "confidence": "high",
+            }],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertEqual(normalized.get("by_measure_id"), {})
+        self.assertEqual(
+            normalized.get("music_content_by_measure_id"),
+            {"m0": {"contains_time_consuming_music": True}},
+        )
+        self.assertEqual(
+            normalized.get("measure_completeness_by_measure_id"),
+            {"m0": {"measure_completeness": "full", "measure_completeness_source": "ai"}},
+        )
+        self.assertTrue(any("because music was present" in str(row.get("message") or "") for row in normalized.get("warnings") or []))
+
+    def test_normalize_ai_suggestions_result_promotes_setup_only_normal_to_false_measure(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [{"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 1}],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [{
+                "measure_id": "m0",
+                "label": "normal",
+                "contains_time_consuming_music": False,
+                "measure_completeness": "full",
+                "rest_count": None,
+                "confidence": "medium",
+            }],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        entry = (normalized.get("by_measure_id") or {}).get("m0") or {}
+        self.assertEqual(entry.get("label"), "false_measure")
+        self.assertIs(entry.get("contains_time_consuming_music"), False)
+        self.assertEqual(entry.get("measure_completeness"), "not_applicable")
+
+    def test_normalize_ai_suggestions_result_preserves_specific_music_label_over_false_flag(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [{"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 1}],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [{
+                "measure_id": "m0",
+                "label": "multi_measure_rest",
+                "contains_time_consuming_music": False,
+                "measure_completeness": "full",
+                "rest_count": 8,
+                "confidence": "high",
+            }],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        entry = (normalized.get("by_measure_id") or {}).get("m0") or {}
+        self.assertEqual(entry.get("label"), "multi_measure_rest")
+        self.assertEqual(entry.get("rest_count"), 8)
+        self.assertIs(entry.get("contains_time_consuming_music"), True)
+
+    def test_normalize_ai_suggestions_result_downgrades_unconfirmed_false_measure(self):
+        editable_state = {
+            "systems": [{"system_id": "p1_s0", "page": 1, "system_index": 0}],
+            "measures": [{"measure_id": "m0", "system_id": "p1_s0", "measure_local_index": 0, "global_index": 1}],
+        }
+        raw_result = {
+            "provider": "claude",
+            "suggestions": [{
+                "measure_id": "m0",
+                "label": "false_measure",
+                "measure_completeness": "not_applicable",
+                "rest_count": None,
+                "confidence": "high",
+            }],
+            "warnings": [],
+        }
+
+        normalized = WORKER._normalize_ai_suggestions_result(raw_result, editable_state, 111, "test-state")
+
+        self.assertEqual(normalized.get("by_measure_id"), {})
+        self.assertEqual(normalized.get("music_content_by_measure_id"), {})
+        self.assertTrue(any("music presence was not confirmed" in str(row.get("message") or "") for row in normalized.get("warnings") or []))
 
     def test_normalize_ai_suggestions_result_keeps_first_measure_decision_debug_on_pickup(self):
         editable_state = {
@@ -4454,8 +4572,9 @@ class BrowserReadyApiTests(unittest.TestCase):
             )
 
         _, expected_false_references = WORKER._build_false_measure_reference_content()
+        _, expected_music_references = WORKER._build_music_content_reference_content()
         _, expected_rest_references = WORKER._build_multi_rest_reference_content()
-        expected_for_score_type = expected_false_references
+        expected_for_score_type = expected_false_references + expected_music_references
         if score_type in ("single", "grand"):
             expected_for_score_type += expected_rest_references
         self.assertEqual(reference_examples_attached, expected_for_score_type)
@@ -4475,6 +4594,12 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertIn("Do not remember, inherit, carry, or track time signatures across measures.", rules_text)
         self.assertIn("Single-staff pickup rules:", rules_text)
         self.assertIn("False-measure check - perform this before every other classification:", rules_text)
+        self.assertIn("First decide whether the target candidate contains any music that consumes time.", rules_text)
+        self.assertIn("A note still counts when its notehead is clipped", rules_text)
+        self.assertIn("Short ledger lines crossed by a note stem are not staff lines or barlines.", rules_text)
+        self.assertIn("Ordinary whole and half rests may look like small rectangles", rules_text)
+        self.assertIn("If contains_time_consuming_music is true, false_measure is forbidden.", rules_text)
+        self.assertIn("A separately boxed courtesy key or time signature at the right edge", rules_text)
         self.assertIn("A target box containing only those setup symbols is false_measure.", rules_text)
         self.assertIn("If any staff inside the target box contains a note, chord, ordinary rest", rules_text)
         self.assertIn("Setup symbols may appear alone or in any combination. A clef is not required.", rules_text)
@@ -4523,6 +4648,7 @@ class BrowserReadyApiTests(unittest.TestCase):
             suggestion_shape.get("label"),
             "normal|pickup|multi_measure_rest|false_measure|ending_1|ending_2",
         )
+        self.assertEqual(suggestion_shape.get("contains_time_consuming_music"), "boolean")
         self.assertNotIn("maybe_label", suggestion_shape)
         self.assertNotIn("maybe_rest_count", suggestion_shape)
         self.assertEqual(suggestion_shape.get("measure_completeness"), "full|incomplete|unclear|not_applicable")
@@ -5044,6 +5170,8 @@ class BrowserReadyApiTests(unittest.TestCase):
         ending_text = "\n".join(str(row.get("text") or "") for row in ending_content if row.get("type") == "text")
         for reference in WORKER.AI_FALSE_MEASURE_REFERENCE_EXAMPLES:
             self.assertNotIn(reference["caption"], ending_text)
+        for reference in WORKER.AI_MUSIC_CONTENT_REFERENCE_EXAMPLES:
+            self.assertNotIn(reference["caption"], ending_text)
 
     def test_build_system_measure_request_includes_reference_examples_before_real_measures(self):
         mapping_summary = self._sample_mapping_summary()
@@ -5057,6 +5185,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             (tmp_path / "false_measure_6_8_only.png").write_bytes(b"false-six-eight-reference")
             (tmp_path / "false_measure_common_time_only.png").write_bytes(b"false-common-time-reference")
             (tmp_path / "false_measure_key_and_6_8_only.png").write_bytes(b"false-key-and-six-eight-reference")
+            (tmp_path / "normal_6_8_clipped_high_note_and_rests.png").write_bytes(b"normal-clipped-note-reference")
+            (tmp_path / "note_and_rest_catalog.png").write_bytes(b"note-rest-catalog-reference")
             (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
             (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
             (tmp_path / "modern_rest_positive_8.png").write_bytes(b"modern-reference")
@@ -5076,7 +5206,7 @@ class BrowserReadyApiTests(unittest.TestCase):
                     score_type="single",
                 )
 
-        self.assertEqual(reference_examples_attached, 7)
+        self.assertEqual(reference_examples_attached, 9)
         self.assertNotIn("reference_examples_attached", payload)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         self.assertEqual((content[0] or {}).get("type"), "text")
@@ -5087,16 +5217,21 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual((content[5] or {}).get("type"), "image")
         self.assertIn("No clef is visible inside the box", (content[6] or {}).get("text") or "")
         self.assertEqual((content[7] or {}).get("type"), "image")
-        self.assertIn("Reference examples for multi-measure rest recognition.", (content[8] or {}).get("text") or "")
-        self.assertIn("printed count is 1", (content[9] or {}).get("text") or "")
+        self.assertIn("teach music-content recognition", (content[8] or {}).get("text") or "")
+        self.assertIn("high note is partially clipped", (content[9] or {}).get("text") or "")
         self.assertEqual((content[10] or {}).get("type"), "image")
-        self.assertIn("printed count is 3", (content[11] or {}).get("text") or "")
+        self.assertIn("Music-symbol catalog", (content[11] or {}).get("text") or "")
         self.assertEqual((content[12] or {}).get("type"), "image")
-        self.assertIn("printed count is 8", (content[13] or {}).get("text") or "")
-        self.assertEqual((content[14] or {}).get("type"), "image")
-        self.assertIn("printed count is 16", (content[15] or {}).get("text") or "")
-        self.assertEqual((content[16] or {}).get("type"), "image")
-        self.assertEqual(json.loads((content[17] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
+        self.assertIn("Reference examples for multi-measure rest recognition.", (content[13] or {}).get("text") or "")
+        self.assertIn("printed count is 1", (content[14] or {}).get("text") or "")
+        self.assertEqual((content[15] or {}).get("type"), "image")
+        self.assertIn("printed count is 3", (content[16] or {}).get("text") or "")
+        self.assertEqual((content[17] or {}).get("type"), "image")
+        self.assertIn("printed count is 8", (content[18] or {}).get("text") or "")
+        self.assertEqual((content[19] or {}).get("type"), "image")
+        self.assertIn("printed count is 16", (content[20] or {}).get("text") or "")
+        self.assertEqual((content[21] or {}).get("type"), "image")
+        self.assertEqual(json.loads((content[22] or {}).get("text") or "{}").get("measure_id"), "p1_s0_m0")
 
     def test_build_system_measure_request_skips_missing_reference_examples(self):
         mapping_summary = self._sample_mapping_summary()
@@ -5140,6 +5275,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             (tmp_path / "false_measure_6_8_only.png").write_bytes(b"false-six-eight-reference")
             (tmp_path / "false_measure_common_time_only.png").write_bytes(b"false-common-time-reference")
             (tmp_path / "false_measure_key_and_6_8_only.png").write_bytes(b"false-key-and-six-eight-reference")
+            (tmp_path / "normal_6_8_clipped_high_note_and_rests.png").write_bytes(b"normal-clipped-note-reference")
+            (tmp_path / "note_and_rest_catalog.png").write_bytes(b"note-rest-catalog-reference")
             with (
                 patch.object(WORKER, "AI_REFERENCE_EXAMPLES_DIR", tmp_path),
                 patch.object(WORKER, "_render_measure_crop_png", return_value=b"png-bytes"),
@@ -5155,10 +5292,11 @@ class BrowserReadyApiTests(unittest.TestCase):
                     score_type="score",
                 )
 
-        self.assertEqual(reference_examples_attached, 3)
+        self.assertEqual(reference_examples_attached, 5)
         content = (((payload.get("messages") or [])[0] or {}).get("content")) or []
         text_content = "\n".join(str(row.get("text") or "") for row in content if row.get("type") == "text")
         self.assertIn("false-measure references", text_content)
+        self.assertIn("music-content recognition", text_content)
         self.assertNotIn("multi-measure rest recognition", text_content)
 
     def test_generate_ai_suggestions_system_batch_does_not_send_local_debug_field_to_provider(self):
@@ -5199,6 +5337,8 @@ class BrowserReadyApiTests(unittest.TestCase):
             (tmp_path / "false_measure_6_8_only.png").write_bytes(b"false-six-eight-reference")
             (tmp_path / "false_measure_common_time_only.png").write_bytes(b"false-common-time-reference")
             (tmp_path / "false_measure_key_and_6_8_only.png").write_bytes(b"false-key-and-six-eight-reference")
+            (tmp_path / "normal_6_8_clipped_high_note_and_rests.png").write_bytes(b"normal-clipped-note-reference")
+            (tmp_path / "note_and_rest_catalog.png").write_bytes(b"note-rest-catalog-reference")
             (tmp_path / "old_style_rest_negative_1.png").write_bytes(b"negative-reference")
             (tmp_path / "old_style_rest_positive_3.png").write_bytes(b"positive-reference")
             (tmp_path / "modern_rest_positive_8.png").write_bytes(b"modern-reference")
@@ -5224,7 +5364,7 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(len(captured_payloads), 1)
         self.assertNotIn("reference_examples_attached", captured_payloads[0])
-        self.assertEqual(result.get("reference_examples_attached"), 7)
+        self.assertEqual(result.get("reference_examples_attached"), 9)
 
     def test_profile_system_layouts_flags_short_partial_staff(self):
         systems = [
