@@ -252,8 +252,8 @@ AI_ENDING_REFERENCE_EXAMPLES = (
         "caption": "Ending reference G: An already-active ending stops here without a downward hook. The horizontal line simply ends; this is an open stop, not continuation through the score.",
     },
 )
-AI_ENDING_START_VALUES = {"none", "ending_1", "ending_2", "unsupported", "uncertain"}
-AI_ENDING_BOUNDARY_VALUES = {"none", "continues", "closed_stop", "open_stop", "system_edge", "uncertain"}
+AI_ENDING_START_VALUES = {"none", "ending_1", "ending_2", "unsupported"}
+AI_ENDING_BOUNDARY_VALUES = {"none", "continues", "closed_stop", "open_stop", "system_edge"}
 
 # In-memory correlation for workflow dispatches that do not return run_id directly.
 _PENDING_DISPATCHES: dict[str, dict] = {}
@@ -6583,15 +6583,16 @@ def _build_ending_system_request(
                 "A continuing horizontal line without a number is not a new start.",
                 "Do not treat fingering, rehearsal numbers, measure numbers, lyrics, repeat dots, slurs, ties, beams, hairpins, staff lines, or ordinary barlines as ending brackets.",
                 "If a visible numbered bracket is neither Ending 1 nor Ending 2, use unsupported.",
-                "Use uncertain instead of guessing when the bracket structure cannot be read.",
+                "Make the best supported structural choice when the bracket is hard to read, and use low confidence when unsure.",
+                "Use none only when no ending start or right boundary is visible in the target measure.",
                 "Return JSON only.",
             ],
             "output_shape": {
                 "ending_measures": [
                     {
                         "measure_id": "string",
-                        "start": "none|ending_1|ending_2|unsupported|uncertain",
-                        "right_boundary": "none|continues|closed_stop|open_stop|system_edge|uncertain",
+                        "start": "none|ending_1|ending_2|unsupported",
+                        "right_boundary": "none|continues|closed_stop|open_stop|system_edge",
                         "confidence": "low|medium|high",
                         "evidence": "short visual description, maximum 20 words",
                     }

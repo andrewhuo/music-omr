@@ -2380,6 +2380,80 @@ class BrowserReadyApiTests(unittest.TestCase):
         with self.assertRaises(WORKER.AiSuggestError):
             WORKER._normalize_ending_system_response(invalid, measures)
 
+    def test_new_ending_response_rejects_uncertain_but_accepts_low_confidence_and_unsupported(self):
+        measures = [{"measure_id": "m1"}, {"measure_id": "m2"}]
+        valid = {
+            "ending_measures": [
+                {"measure_id": "m1", "start": "ending_1", "right_boundary": "continues", "confidence": "low", "evidence": "faint numbered bracket"},
+                {"measure_id": "m2", "start": "unsupported", "right_boundary": "open_stop", "confidence": "low", "evidence": "third ending bracket"},
+            ]
+        }
+        normalized = WORKER._normalize_ending_system_response(valid, measures)
+        self.assertEqual(normalized[0]["confidence"], "low")
+        self.assertEqual(normalized[1]["start"], "unsupported")
+
+        for field in ("start", "right_boundary"):
+            invalid = deepcopy(valid)
+            invalid["ending_measures"][0][field] = "uncertain"
+            with self.assertRaises(WORKER.AiSuggestError):
+                WORKER._normalize_ending_system_response(invalid, measures)
+
+    def test_old_saved_uncertain_ending_events_remain_harmless(self):
+        suggestions = WORKER._empty_ai_suggestions_state(111, "state", 2)
+        suggestions["ending_events_by_measure_id"] = {
+            "m1": {"start": "uncertain", "right_boundary": "uncertain", "confidence": "low"},
+            "m2": {"start": "ending_2", "right_boundary": "open_stop", "confidence": "medium"},
+        }
+        measures = [
+            {"measure_id": "m1", "page": 1, "system_index": 0, "measure_local_index": 0},
+            {"measure_id": "m2", "page": 1, "system_index": 0, "measure_local_index": 1},
+        ]
+
+        pairs = WORKER._rebuild_ai_ending_pairs(suggestions, measures, all_systems_completed=True)
+
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(next(iter(pairs.values()))["review_anchor_measure_ids"], ["m2"])
+
+    def test_new_uncertain_ending_answer_retries_once(self):
+        system_row = {"system_id": "p1_s0", "page": 1}
+        measures = [{"measure_id": "m1", "page": 1, "system_id": "p1_s0", "measure_local_index": 0}]
+        uncertain_message = {
+            "content": [{"type": "text", "text": json.dumps({
+                "ending_measures": [
+                    {"measure_id": "m1", "start": "uncertain", "right_boundary": "uncertain", "confidence": "low", "evidence": "faint bracket"}
+                ]
+            })}],
+        }
+        valid_message = {
+            "content": [{"type": "text", "text": json.dumps({
+                "ending_measures": [
+                    {"measure_id": "m1", "start": "ending_1", "right_boundary": "continues", "confidence": "low", "evidence": "faint numbered bracket"}
+                ]
+            })}],
+        }
+        fake_doc = _FakeDoc([_FakePage(_FakeRect(0, 0, 200, 160))])
+
+        with (
+            patch.object(WORKER, "_resolve_ai_crop_pdf_source", return_value=(Path("/tmp/input.pdf"), "corrected")),
+            patch.object(WORKER, "_build_ending_system_request", return_value=({"messages": []}, 7)),
+            patch.object(WORKER, "_ai_messages_create", side_effect=[uncertain_message, valid_message]) as create,
+            patch.object(WORKER.fitz, "open", return_value=fake_doc),
+        ):
+            result = WORKER._generate_ai_endings_for_system_batch(
+                "job",
+                111,
+                [system_row],
+                system_row,
+                measures,
+                {"corrected_pdf": "gs://bucket/file.pdf"},
+                active_ending_in=None,
+                score_type="single",
+            )
+
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(result["retry_attempts"], 2)
+        self.assertEqual(result["events"][0]["start"], "ending_1")
+
     def test_ending_pair_builder_creates_three_boundary_candidate(self):
         suggestions = WORKER._empty_ai_suggestions_state(111, "state", 4)
         suggestions["ending_events_by_measure_id"] = {
@@ -4981,6 +5055,17 @@ class BrowserReadyApiTests(unittest.TestCase):
 
         self.assertEqual(general_payload.get("max_tokens"), 5000)
         self.assertEqual(ending_payload.get("max_tokens"), 5000)
+
+        content = (((ending_payload.get("messages") or [])[0] or {}).get("content")) or []
+        intro = json.loads((content[0] or {}).get("text") or "{}")
+        instructions = intro.get("instructions") or {}
+        rules_text = "\n".join(str(row) for row in instructions.get("rules") or [])
+        output_text = json.dumps(instructions.get("output_shape") or {})
+        self.assertNotIn("uncertain", rules_text)
+        self.assertNotIn("uncertain", output_text)
+        self.assertIn("best supported structural choice", rules_text)
+        self.assertIn("use low confidence", rules_text)
+        self.assertIn("Use none only when no ending start or right boundary is visible", rules_text)
 
     def test_build_system_measure_request_includes_reference_examples_before_real_measures(self):
         mapping_summary = self._sample_mapping_summary()
