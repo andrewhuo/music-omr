@@ -126,9 +126,6 @@ AI_MEASURE_CROP_SYSTEM_GAP_CLAMP_RATIO = max(
     min(1.0, float(os.environ.get("AI_MEASURE_CROP_SYSTEM_GAP_CLAMP_RATIO", "0.75") or "0.75")),
 )
 SUSPICIOUS_PARTIAL_STAFF_HEIGHT_RATIO = 0.65
-AI_SUGGEST_SAVE_DEBUG_CROPS = (
-    str(os.environ.get("AI_SUGGEST_SAVE_DEBUG_CROPS", "0")).strip().lower() not in ("0", "false", "no", "")
-)
 
 MEASURE_TEXT_COLOR = (0, 0, 0)
 MEASURE_TEXT_SIZE = 10.0
@@ -300,7 +297,6 @@ class AiSuggestError(RuntimeError):
         retryable: bool = True,
         provider_status: int = 502,
         detail: str = "",
-        debug_crops: dict | None = None,
     ):
         super().__init__(message)
         self.message = str(message or "Claude suggestion request failed.")
@@ -308,7 +304,6 @@ class AiSuggestError(RuntimeError):
         self.retryable = bool(retryable)
         self.provider_status = int(provider_status)
         self.detail = str(detail or "")
-        self.debug_crops = dict(debug_crops) if isinstance(debug_crops, dict) else None
 
 
 class FriendAccessError(RuntimeError):
@@ -5419,122 +5414,6 @@ def _ai_message_text_parts(message: dict | None) -> list[str]:
     ]
 
 
-def _ai_general_response_diagnostics(
-    message: dict | None,
-    *,
-    system_id: str,
-    measure_count: int,
-    reference_count: int,
-    model: str,
-) -> dict:
-    row = message if isinstance(message, dict) else {}
-    content = row.get("content") if isinstance(row.get("content"), list) else []
-    text_parts = _ai_message_text_parts(row)
-    text = "\n".join(text_parts)
-    stripped = _strip_json_fences(text).strip()
-    usage = row.get("usage") if isinstance(row.get("usage"), dict) else {}
-    output_tokens = max(0, _safe_int(usage.get("output_tokens"), 0))
-    raw_stop_reason = str(row.get("stop_reason") or "unknown").strip().lower()
-    stop_reason = raw_stop_reason if raw_stop_reason in {"end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn"} else "other"
-    block_types: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
-            block_type = "invalid"
-        else:
-            raw_type = str(block.get("type") or "").strip().lower()
-            block_type = raw_type if raw_type in {"text", "tool_use", "thinking", "redacted_thinking"} else "other"
-        if block_type not in block_types:
-            block_types.append(block_type)
-    return {
-        "model": str(model or "unknown"),
-        "system_id": str(system_id or "unknown"),
-        "measure_count": max(0, int(measure_count)),
-        "reference_count": max(0, int(reference_count)),
-        "max_tokens": int(ANTHROPIC_MAX_TOKENS),
-        "stop_reason": stop_reason,
-        "input_tokens": max(0, _safe_int(usage.get("input_tokens"), 0)),
-        "output_tokens": output_tokens,
-        "content_blocks": len(content),
-        "block_types": ",".join(block_types) if block_types else "none",
-        "text_blocks": len(text_parts),
-        "text_chars": len(text),
-        "starts_object": stripped.startswith("{"),
-        "ends_object": stripped.endswith("}"),
-        "open_braces": text.count("{"),
-        "close_braces": text.count("}"),
-        "open_brackets": text.count("["),
-        "close_brackets": text.count("]"),
-        "provider_attempts": max(1, _safe_int(row.get("_internal_bedrock_attempts"), 1)),
-        "output_limit_reached": stop_reason == "max_tokens" or output_tokens >= int(ANTHROPIC_MAX_TOKENS),
-    }
-
-
-def _ai_general_failure_diagnostics(exc: Exception, response_diagnostics: dict | None) -> dict:
-    detail = str(getattr(exc, "detail", "") or "").lower()
-    if "no text content" in detail or "content missing" in detail:
-        category = "missing_text"
-    elif "missing json object" in detail:
-        category = "missing_object"
-    elif "invalid json" in detail:
-        category = "invalid_json"
-    elif "duplicate measure_id" in detail:
-        category = "duplicate_measures"
-    elif "unknown measure_id" in detail:
-        category = "unknown_measures"
-    elif "suggestions missing" in detail or "missing_measure_ids" in detail:
-        category = "missing_measures"
-    else:
-        category = "malformed_response"
-    position = re.search(r"line\s+(\d+)\s+column\s+(\d+)\s+\(char\s+(\d+)\)", detail)
-    diagnostics = dict(response_diagnostics or {})
-    diagnostics.update(
-        {
-            "category": category,
-            "error_line": int(position.group(1)) if position else 0,
-            "error_column": int(position.group(2)) if position else 0,
-            "error_char": int(position.group(3)) if position else 0,
-        }
-    )
-    return diagnostics
-
-
-def _log_ai_general_response_debug(diagnostics: dict) -> None:
-    if not _ai_suggest_debug_enabled():
-        return
-    logger.info(
-        "AI_GENERAL_RESPONSE_DEBUG model=%s system=%s measures=%s references=%s max_tokens=%s "
-        "stop_reason=%s input_tokens=%s output_tokens=%s content_blocks=%s block_types=%s "
-        "text_blocks=%s text_chars=%s starts_object=%s ends_object=%s open_braces=%s "
-        "close_braces=%s open_brackets=%s close_brackets=%s provider_attempts=%s output_limit_reached=%s",
-        diagnostics.get("model"), diagnostics.get("system_id"), diagnostics.get("measure_count"),
-        diagnostics.get("reference_count"), diagnostics.get("max_tokens"), diagnostics.get("stop_reason"),
-        diagnostics.get("input_tokens"), diagnostics.get("output_tokens"), diagnostics.get("content_blocks"),
-        diagnostics.get("block_types"), diagnostics.get("text_blocks"), diagnostics.get("text_chars"),
-        diagnostics.get("starts_object"), diagnostics.get("ends_object"), diagnostics.get("open_braces"),
-        diagnostics.get("close_braces"), diagnostics.get("open_brackets"), diagnostics.get("close_brackets"),
-        diagnostics.get("provider_attempts"), diagnostics.get("output_limit_reached"),
-    )
-
-
-def _log_ai_general_parse_failed(diagnostics: dict) -> None:
-    if not _ai_suggest_debug_enabled():
-        return
-    logger.warning(
-        "AI_GENERAL_PARSE_FAILED category=%s model=%s system=%s measures=%s references=%s max_tokens=%s "
-        "stop_reason=%s input_tokens=%s output_tokens=%s text_blocks=%s text_chars=%s "
-        "starts_object=%s ends_object=%s open_braces=%s close_braces=%s open_brackets=%s "
-        "close_brackets=%s provider_attempts=%s output_limit_reached=%s error_line=%s error_column=%s error_char=%s",
-        diagnostics.get("category"), diagnostics.get("model"), diagnostics.get("system_id"),
-        diagnostics.get("measure_count"), diagnostics.get("reference_count"), diagnostics.get("max_tokens"),
-        diagnostics.get("stop_reason"), diagnostics.get("input_tokens"), diagnostics.get("output_tokens"),
-        diagnostics.get("text_blocks"), diagnostics.get("text_chars"), diagnostics.get("starts_object"),
-        diagnostics.get("ends_object"), diagnostics.get("open_braces"), diagnostics.get("close_braces"),
-        diagnostics.get("open_brackets"), diagnostics.get("close_brackets"), diagnostics.get("provider_attempts"),
-        diagnostics.get("output_limit_reached"), diagnostics.get("error_line"), diagnostics.get("error_column"),
-        diagnostics.get("error_char"),
-    )
-
-
 def _parse_anthropic_suggestions_message(message: dict) -> dict:
     if not isinstance(message, dict):
         raise AiSuggestError(detail="malformed_provider_response")
@@ -5555,33 +5434,6 @@ def _parse_anthropic_suggestions_message(message: dict) -> dict:
     return parsed
 
 
-def _ai_suggest_debug_enabled() -> bool:
-    return bool(AI_SUGGEST_SAVE_DEBUG_CROPS)
-
-
-def _ai_debug_crops_prefix(artifacts: dict) -> str:
-    mapping_uri = str((artifacts or {}).get("mapping_summary") or "").strip()
-    if not mapping_uri:
-        raise ValueError("mapping_summary artifact missing")
-    bucket_name, blob_name = _parse_gs_uri(mapping_uri)
-    base_dir = blob_name.rsplit("/", 1)[0].rstrip("/")
-    return f"gs://{bucket_name}/{base_dir}/ai_debug_crops"
-
-
-def _ai_debug_crop_manifest_uri(artifacts: dict) -> str:
-    return f"{_ai_debug_crops_prefix(artifacts)}/manifest.json"
-
-
-def _ai_debug_batch_trace_uri(artifacts: dict) -> str:
-    return f"{_ai_debug_crops_prefix(artifacts)}/ai_batch_trace.json"
-
-
-def _ai_debug_crop_measure_uri(artifacts: dict, system_id: str, measure_id: str) -> str:
-    safe_system = _normalize_artifact_key(system_id) or "system"
-    safe_measure = _normalize_artifact_key(measure_id) or "measure"
-    return f"{_ai_debug_crops_prefix(artifacts)}/{safe_system}/{safe_measure}.png"
-
-
 def _resolve_ai_crop_pdf_source(artifacts: dict, tmpdir: Path) -> tuple[Path, str]:
     corrected_pdf_uri = str((artifacts or {}).get("audiveris_out_corrected_pdf") or "").strip()
     baseline_pdf_uri = str((artifacts or {}).get("audiveris_out_pdf") or "").strip()
@@ -5599,13 +5451,6 @@ def _resolve_ai_crop_pdf_source(artifacts: dict, tmpdir: Path) -> tuple[Path, st
     baseline_pdf = tmpdir / "audiveris_out.pdf"
     _download_gcs_to_file(baseline_pdf_uri, baseline_pdf)
     return baseline_pdf, "baseline"
-
-
-def _current_ai_crop_pdf_source_label(artifacts: dict) -> str:
-    corrected_pdf_uri = str((artifacts or {}).get("audiveris_out_corrected_pdf") or "").strip()
-    if corrected_pdf_uri and _gcs_uri_exists(corrected_pdf_uri):
-        return "corrected"
-    return "baseline"
 
 
 def _system_anchor_bounds(system_row: dict | None) -> tuple[float | None, float | None]:
@@ -5770,241 +5615,6 @@ def _ending_measure_crop_spec(
 def _render_measure_crop_png(page, clip: fitz.Rect) -> bytes:
     pix = page.get_pixmap(matrix=fitz.Matrix(AI_MEASURE_CROP_SCALE, AI_MEASURE_CROP_SCALE), clip=clip, alpha=False)
     return bytes(pix.tobytes("png"))
-
-
-def _build_ai_debug_crops_manifest(
-    job_id: str,
-    run_id: int,
-    artifacts: dict,
-    crop_rows: list[dict],
-    pdf_source: str | None = None,
-) -> dict:
-    manifest_uri = _ai_debug_crop_manifest_uri(artifacts)
-    payload = {
-        "version": "ai_debug_crops_v1",
-        "enabled": True,
-        "job_id": str(job_id),
-        "run_id": int(run_id),
-        "pdf_source": str(pdf_source or "baseline"),
-        "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
-        "count": len(crop_rows),
-        "crops": crop_rows,
-    }
-    _upload_json_to_gcs(payload, manifest_uri)
-    return {
-        "enabled": True,
-        "manifest_uri": manifest_uri,
-        "manifest_http": _signed_http_url_for_gs(manifest_uri),
-        "pdf_source": str(pdf_source or "baseline"),
-        "count": len(crop_rows),
-    }
-
-
-def _ai_batch_trace_before_snapshot(measures: list[dict] | None) -> list[dict | None]:
-    snapshot: list[dict | None] = []
-    for row in measures or []:
-        if not isinstance(row, dict):
-            snapshot.append(None)
-            continue
-        snapshot.append(
-            {
-                "system_id_before_reassign": str(row.get("system_id") or "").strip(),
-                "system_index_before_reassign": _safe_int(row.get("system_index"), 0),
-            }
-        )
-    return snapshot
-
-
-def _debug_display_system_number(system_index: object) -> int:
-    return max(1, _safe_int(system_index, 0) + 1)
-
-
-def _debug_display_measure_number(measure_local_index: object) -> int:
-    return max(1, _safe_int(measure_local_index, 0) + 1)
-
-
-def _build_ai_batch_trace_payload(
-    job_id: str,
-    run_id: int,
-    systems: list[dict] | None,
-    measures: list[dict] | None,
-    system_batches: list[tuple[dict, list[dict]]] | None,
-    before_snapshot: list[dict | None] | None = None,
-    processed_system_ids: list[str] | None = None,
-    pdf_source: str | None = None,
-) -> dict:
-    ordered_systems = _sorted_system_rows(systems or [])
-    ordered_measures = list(measures or [])
-    before_rows = list(before_snapshot or [])
-    valid_system_ids = {
-        str(row.get("system_id") or "").strip()
-        for row in ordered_systems
-        if isinstance(row, dict) and str(row.get("system_id") or "").strip()
-    }
-
-    batched_measure_to_system: dict[str, str] = {}
-    system_summaries: list[dict] = []
-    processed_lookup = {
-        str(system_id or "").strip()
-        for system_id in (processed_system_ids or [])
-        if str(system_id or "").strip()
-    }
-
-    for system_row, system_measures in system_batches or []:
-        if not isinstance(system_row, dict):
-            continue
-        system_id = str(system_row.get("system_id") or "").strip()
-        if not system_id:
-            continue
-        measure_ids_batched: list[str] = []
-        for row in system_measures or []:
-            if not isinstance(row, dict):
-                continue
-            measure_id = str(row.get("measure_id") or "").strip()
-            if not measure_id:
-                continue
-            batched_measure_to_system[measure_id] = system_id
-            measure_ids_batched.append(measure_id)
-        system_summaries.append(
-            {
-                "system_id": system_id,
-                "page": _safe_int(system_row.get("page"), 0),
-                "display_system_number": _debug_display_system_number(system_row.get("system_index")),
-                "display_location": f"Page {_safe_int(system_row.get('page'), 0)}, Staff {_debug_display_system_number(system_row.get('system_index'))}",
-                "measure_ids_batched": measure_ids_batched,
-                "count": len(measure_ids_batched),
-                "processed": system_id in processed_lookup,
-            }
-        )
-
-    trace_rows: list[dict] = []
-    batched_count = 0
-    skipped_count = 0
-
-    for index, row in enumerate(ordered_measures):
-        if not isinstance(row, dict):
-            continue
-        before_row = before_rows[index] if index < len(before_rows) else None
-        before_system_id = str((before_row or {}).get("system_id_before_reassign") or str(row.get("system_id") or "")).strip()
-        before_system_index = _safe_int((before_row or {}).get("system_index_before_reassign"), _safe_int(row.get("system_index"), 0))
-        measure_id = str(row.get("measure_id") or "").strip()
-        after_system_id = str(row.get("system_id") or "").strip()
-        after_system_index = _safe_int(row.get("system_index"), 0)
-        display_system_number = _debug_display_system_number(after_system_index)
-        display_measure_number = _debug_display_measure_number(row.get("measure_local_index"))
-        batch_system_id = str(batched_measure_to_system.get(measure_id) or "").strip() or None
-        changed = before_system_id != after_system_id or before_system_index != after_system_index
-
-        if batch_system_id:
-            status = "reassigned_and_batched" if changed else "batched"
-            batched_count += 1
-        elif not after_system_id:
-            status = "skipped_missing_system_id"
-            skipped_count += 1
-        elif after_system_id not in valid_system_ids:
-            status = "reassigned_but_unbatched" if changed else "skipped_no_matching_system"
-            skipped_count += 1
-        else:
-            status = "reassigned_but_unbatched" if changed else "skipped_no_matching_system"
-            skipped_count += 1
-
-        trace_rows.append(
-            {
-                "measure_id": measure_id,
-                "page": _safe_int(row.get("page"), 0),
-                "display_system_number": display_system_number,
-                "display_measure_number": display_measure_number,
-                "display_location": f"Page {_safe_int(row.get('page'), 0)}, Staff {display_system_number}, Measure {display_measure_number}",
-                "system_id_before_reassign": before_system_id or None,
-                "system_index_before_reassign": before_system_index,
-                "system_id_after_reassign": after_system_id or None,
-                "system_index_after_reassign": after_system_index,
-                "measure_local_index": _safe_int(row.get("measure_local_index"), 0),
-                "x_left": float(row.get("x_left") or 0.0),
-                "y_top": float(row.get("y_top") or 0.0),
-                "y_bottom": float(row.get("y_bottom") or 0.0),
-                "batch_system_id": batch_system_id,
-                "status": status,
-                "processed": bool(batch_system_id and batch_system_id in processed_lookup),
-            }
-        )
-
-    return {
-        "version": "ai_batch_trace_v1",
-        "enabled": True,
-        "job_id": str(job_id),
-        "run_id": int(run_id),
-        "pdf_source": str(pdf_source or "baseline"),
-        "generated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
-        "updated_at_utc": _utc_now().isoformat().replace("+00:00", "Z"),
-        "measure_count": len(trace_rows),
-        "batched_count": batched_count,
-        "skipped_count": skipped_count,
-        "processed_system_ids": sorted(processed_lookup),
-        "systems": system_summaries,
-        "measures": trace_rows,
-    }
-
-
-def _mark_ai_batch_trace_processed(
-    payload: dict,
-    system_row: dict | None,
-    system_measures: list[dict] | None,
-) -> dict:
-    if not isinstance(payload, dict):
-        return {}
-    updated = json.loads(json.dumps(payload))
-    system_id = str((system_row or {}).get("system_id") or "").strip()
-    if not system_id:
-        return updated
-    processed_ids = [
-        str(item or "").strip()
-        for item in updated.get("processed_system_ids") or []
-        if str(item or "").strip()
-    ]
-    if system_id not in processed_ids:
-        processed_ids.append(system_id)
-    updated["processed_system_ids"] = processed_ids
-
-    for summary in updated.get("systems") or []:
-        if isinstance(summary, dict) and str(summary.get("system_id") or "").strip() == system_id:
-            summary["processed"] = True
-
-    target_measure_ids = {
-        str(row.get("measure_id") or "").strip()
-        for row in system_measures or []
-        if isinstance(row, dict) and str(row.get("measure_id") or "").strip()
-    }
-    for row in updated.get("measures") or []:
-        if not isinstance(row, dict):
-            continue
-        if str(row.get("measure_id") or "").strip() in target_measure_ids:
-            row["processed"] = True
-
-    updated["updated_at_utc"] = _utc_now().isoformat().replace("+00:00", "Z")
-    return updated
-
-
-def _write_ai_debug_batch_trace(payload: dict, artifacts: dict) -> dict:
-    trace_uri = _ai_debug_batch_trace_uri(artifacts)
-    _upload_json_to_gcs(payload, trace_uri)
-    return {
-        "enabled": True,
-        "trace_uri": trace_uri,
-        "trace_http": _signed_http_url_for_gs(trace_uri),
-        "pdf_source": str(payload.get("pdf_source") or "baseline"),
-        "measure_count": max(0, _safe_int(payload.get("measure_count"), 0)),
-        "batched_count": max(0, _safe_int(payload.get("batched_count"), 0)),
-        "skipped_count": max(0, _safe_int(payload.get("skipped_count"), 0)),
-    }
-
-
-def _load_ai_debug_batch_trace(artifacts: dict) -> dict | None:
-    trace_uri = _ai_debug_batch_trace_uri(artifacts)
-    if not _gcs_uri_exists(trace_uri):
-        return None
-    payload = _download_gcs_json(trace_uri)
-    return payload if isinstance(payload, dict) else None
 
 
 def _build_multi_rest_reference_content() -> tuple[list[dict], int]:
@@ -6407,8 +6017,6 @@ def _build_system_measure_request(
     pdf_source: str = "baseline",
     prev_system_row: dict | None = None,
     next_system_row: dict | None = None,
-    artifacts: dict | None = None,
-    debug_crop_rows: list[dict] | None = None,
     remembered_time_signature_in: str | None = None,
     score_type: str | None = None,
 ) -> tuple[dict, int]:
@@ -6477,36 +6085,6 @@ def _build_system_measure_request(
         crop_spec = _measure_crop_spec(page.rect, row, next_row, system_row, prev_system_row, next_system_row)
         clip = crop_spec["clip"]
         image_bytes = _render_measure_crop_png(page, clip)
-        if artifacts is not None and debug_crop_rows is not None:
-            measure_id = str(row.get("measure_id") or "").strip()
-            crop_uri = _ai_debug_crop_measure_uri(artifacts, system_id, measure_id)
-            _upload_bytes_to_gcs(image_bytes, crop_uri, content_type="image/png")
-            debug_crop_rows.append(
-                {
-                    "measure_id": measure_id,
-                    "system_id": system_id,
-                    "page_number": int(page_number),
-                    "pdf_source": pdf_source,
-                    "display_system_number": _debug_display_system_number(system_row.get("system_index")),
-                    "display_measure_number": _debug_display_measure_number(row.get("measure_local_index")),
-                    "display_location": (
-                        f"Page {int(page_number)}, "
-                        f"Staff {_debug_display_system_number(system_row.get('system_index'))}, "
-                        f"Measure {_debug_display_measure_number(row.get('measure_local_index'))}"
-                    ),
-                    "order_index_in_system": _safe_int(row.get("measure_local_index"), idx),
-                    "crop_uri": crop_uri,
-                    "clip_rect": {
-                        "x0": float(clip.x0),
-                        "y0": float(clip.y0),
-                        "x1": float(clip.x1),
-                        "y1": float(clip.y1),
-                    },
-                    "measure_bounds": crop_spec["measure_bounds"],
-                    "padding": crop_spec["padding"],
-                    "system_bounds": crop_spec["system_bounds"],
-                }
-            )
         content.append(
             {
                 "type": "text",
@@ -6775,18 +6353,8 @@ def _generate_ai_suggestions_for_system_batch(
     if not model_name or model_name == "unknown":
         raise AiSuggestError(provider_status=503, detail="provider_not_configured")
 
-    debug_enabled = _ai_suggest_debug_enabled()
-    debug_crop_rows: list[dict] = []
     pdf_source = "baseline"
     reference_examples_attached = 0
-    response_diagnostics: dict | None = None
-
-    def _finalize_debug_crops() -> dict | None:
-        if not debug_enabled or not debug_crop_rows:
-            return None
-        payload = _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows, pdf_source=pdf_source)
-        payload["reference_examples_attached"] = int(reference_examples_attached)
-        return payload
 
     with TemporaryDirectory(prefix="omr-ai-suggest-step-") as tmp:
         tmpdir = Path(tmp)
@@ -6809,20 +6377,10 @@ def _generate_ai_suggestions_for_system_batch(
                 pdf_source=pdf_source,
                 prev_system_row=prev_system_row,
                 next_system_row=next_system_row,
-                artifacts=artifacts if debug_enabled else None,
-                debug_crop_rows=debug_crop_rows if debug_enabled else None,
                 remembered_time_signature_in=remembered_time_signature_in,
                 score_type=score_type,
             )
             message = _ai_messages_create(payload)
-            response_diagnostics = _ai_general_response_diagnostics(
-                message,
-                system_id=str(system_row.get("system_id") or ""),
-                measure_count=len(system_measures),
-                reference_count=reference_examples_attached,
-                model=model_name,
-            )
-            _log_ai_general_response_debug(response_diagnostics)
             parsed = _parse_anthropic_suggestions_message(message)
             system_suggestions = parsed.get("suggestions")
             if not isinstance(system_suggestions, list):
@@ -6852,20 +6410,11 @@ def _generate_ai_suggestions_for_system_batch(
             normalized["pdf_source"] = pdf_source
             normalized["reference_examples_attached"] = int(reference_examples_attached)
             normalized["_internal_ai_usage"] = _ai_usage_from_message(message)
-            debug_crops = _finalize_debug_crops()
-            if debug_crops is not None:
-                normalized["debug_crops"] = debug_crops
             return normalized
-        except AiSuggestError as exc:
-            if response_diagnostics is not None:
-                _log_ai_general_parse_failed(_ai_general_failure_diagnostics(exc, response_diagnostics))
-            debug_crops = _finalize_debug_crops()
-            if debug_crops is not None:
-                exc.debug_crops = debug_crops
+        except AiSuggestError:
             raise
         except Exception as exc:
-            debug_crops = _finalize_debug_crops()
-            raise AiSuggestError(provider_status=500, detail=_safe_error_text(exc), debug_crops=debug_crops) from exc
+            raise AiSuggestError(provider_status=500, detail=_safe_error_text(exc)) from exc
         finally:
             doc.close()
 
@@ -6893,17 +6442,8 @@ def _generate_ai_suggestions_for_job(
 
     warnings: list[dict] = []
     suggestions: list[dict] = []
-    debug_enabled = _ai_suggest_debug_enabled()
-    debug_crop_rows: list[dict] = []
     pdf_source = "baseline"
     reference_examples_attached = 0
-
-    def _finalize_debug_crops() -> dict | None:
-        if not debug_enabled or not debug_crop_rows:
-            return None
-        payload = _build_ai_debug_crops_manifest(job_id, int(run_id), artifacts, debug_crop_rows, pdf_source=pdf_source)
-        payload["reference_examples_attached"] = int(reference_examples_attached)
-        return payload
 
     with TemporaryDirectory(prefix="omr-ai-suggest-") as tmp:
         tmpdir = Path(tmp)
@@ -6930,8 +6470,6 @@ def _generate_ai_suggestions_for_job(
                     pdf_source=pdf_source,
                     prev_system_row=prev_system_row,
                     next_system_row=next_system_row,
-                    artifacts=artifacts if debug_enabled else None,
-                    debug_crop_rows=debug_crop_rows if debug_enabled else None,
                     score_type=score_type,
                 )
                 reference_examples_attached = max(
@@ -6971,14 +6509,10 @@ def _generate_ai_suggestions_for_job(
                             warning = dict(warning)
                             warning["system_index"] = _safe_int(system_row.get("system_index"), 0)
                         warnings.append(warning)
-        except AiSuggestError as exc:
-            debug_crops = _finalize_debug_crops()
-            if debug_crops is not None:
-                exc.debug_crops = debug_crops
+        except AiSuggestError:
             raise
         except Exception as exc:
-            debug_crops = _finalize_debug_crops()
-            raise AiSuggestError(provider_status=500, detail=_safe_error_text(exc), debug_crops=debug_crops) from exc
+            raise AiSuggestError(provider_status=500, detail=_safe_error_text(exc)) from exc
         finally:
             doc.close()
 
@@ -6990,9 +6524,6 @@ def _generate_ai_suggestions_for_job(
         "pdf_source": pdf_source,
         "reference_examples_attached": int(reference_examples_attached),
     }
-    debug_crops = _finalize_debug_crops()
-    if debug_crops is not None:
-        result["debug_crops"] = debug_crops
     return result
 
 
@@ -7469,8 +7000,6 @@ def _refresh_editable_state_qa(
 
 def _refresh_editable_state_systems_and_measures(
     editable_state: dict,
-    *,
-    ending_debug_ctx: dict | None = None,
 ) -> tuple[list[dict], list[dict], int, dict]:
     systems, measures = _merge_manual_rows_into_state(editable_state)
 
@@ -7483,12 +7012,7 @@ def _refresh_editable_state_systems_and_measures(
         skip_pages=authoritative_pages,
     )
     systems, measures = _reindex_system_and_measure_order(systems, measures)
-    systems, measures, _, _ = _recompute_measure_numbering(
-        systems,
-        measures,
-        editable_state,
-        ending_debug_ctx=ending_debug_ctx,
-    )
+    systems, measures, _, _ = _recompute_measure_numbering(systems, measures, editable_state)
     editable_state["systems"] = systems
     editable_state["measures"] = measures
     editable_state["staff_boxes"] = []
@@ -7562,33 +7086,7 @@ def _pickup_active_for_measure(measure_id: str, pickup_measures: dict[str, bool]
     return bool(pickup_measures.get(measure_id)) if measure_id else False
 
 
-def _relabel_has_ending_debug(editable_state: dict | None, edits: list[dict] | None) -> bool:
-    for raw_edit in edits or []:
-        if isinstance(raw_edit, dict) and str(raw_edit.get("type") or "").strip() == "set_ending":
-            return True
-    endings_map = (editable_state or {}).get("endings")
-    return bool(endings_map) if isinstance(endings_map, dict) else False
-
-
-def _log_relabel_ending_debug(
-    trace_id: str,
-    job_id: str,
-    run_id: int,
-    stage: str,
-    payload: dict | None = None,
-) -> None:
-    row = {
-        "trace_id": trace_id,
-        "job_id": job_id,
-        "run_id": int(run_id),
-        "stage": str(stage or "").strip(),
-    }
-    if isinstance(payload, dict):
-        row.update(payload)
-    print(f"RELABEL_ENDING_DEBUG {json.dumps(row, separators=(',', ':'), sort_keys=True, default=str)}")
-
-
-def _build_ending_group_debug_snapshot(
+def _build_ending_group_snapshot(
     ordered_measures: list[dict],
     endings_map: dict[str, str],
     pickup_measures: dict[str, bool],
@@ -7702,7 +7200,7 @@ def _ending_group_entries_by_measure_id(
     endings_map: dict[str, str],
     pickup_measures: dict[str, bool],
 ) -> dict[str, dict]:
-    snapshot = _build_ending_group_debug_snapshot(ordered_measures, endings_map, pickup_measures)
+    snapshot = _build_ending_group_snapshot(ordered_measures, endings_map, pickup_measures)
     return snapshot.get("entries") or {}
 
 
@@ -7921,7 +7419,6 @@ def _recompute_measure_numbering(
     systems: list[dict] | None,
     measures: list[dict] | None,
     editable_state: dict | None = None,
-    ending_debug_ctx: dict | None = None,
 ) -> tuple[list[dict], list[dict], dict[str, str], dict[str, int]]:
     editable_state = editable_state or {}
     sorted_systems = _sorted_system_rows(systems)
@@ -7943,22 +7440,8 @@ def _recompute_measure_numbering(
     rest_measures = _editable_rest_measures(editable_state)
     pickup_measures = _editable_pickup_measures(editable_state)
     measure_overrides = _measure_number_overrides(editable_state)
-    ending_snapshot = _build_ending_group_debug_snapshot(ordered_measures, endings_map, pickup_measures)
+    ending_snapshot = _build_ending_group_snapshot(ordered_measures, endings_map, pickup_measures)
     ending_entries = ending_snapshot.get("entries") or {}
-
-    if isinstance(ending_debug_ctx, dict):
-        _log_relabel_ending_debug(
-            str(ending_debug_ctx.get("trace_id") or ""),
-            str(ending_debug_ctx.get("job_id") or ""),
-            _safe_int(ending_debug_ctx.get("run_id"), 0),
-            "groups",
-            {
-                "saved_endings": dict(sorted(endings_map.items())),
-                "ordered_measures": ending_snapshot.get("raw_rows") or [],
-                "groups": ending_snapshot.get("groups") or [],
-                "ignored": ending_snapshot.get("ignored_rows") or [],
-            },
-        )
 
     exact_rest_system_ids: set[str] = set()
     for measure in ordered_measures:
@@ -7999,23 +7482,7 @@ def _recompute_measure_numbering(
         ending_group_id = _safe_int(ending_entry.get("group_id"), -1) if ending_entry else None
 
         if active_ending_group_id is not None and ending_group_id != active_ending_group_id:
-            close_state = dict(active_ending_group_state or {})
             resumed_value = _close_numbering_ending_group(current_value, active_ending_group_state)
-            if isinstance(ending_debug_ctx, dict):
-                _log_relabel_ending_debug(
-                    str(ending_debug_ctx.get("trace_id") or ""),
-                    str(ending_debug_ctx.get("job_id") or ""),
-                    _safe_int(ending_debug_ctx.get("run_id"), 0),
-                    "close",
-                    {
-                        "group_id": int(active_ending_group_id),
-                        "next_measure_id": measure_id,
-                        "resume_value": int(resumed_value),
-                        "first_next_value": _safe_int(close_state.get("first_next_value"), 0) if close_state.get("first_next_value") is not None else None,
-                        "second_next_value": _safe_int(close_state.get("second_next_value"), 0) if close_state.get("second_next_value") is not None else None,
-                        "start_value": _safe_int(close_state.get("start_value"), 0) if close_state.get("start_value") is not None else None,
-                    },
-                )
             current_value = resumed_value
             active_ending_group_id = None
             active_ending_group_state = None
@@ -8068,8 +7535,6 @@ def _recompute_measure_numbering(
 
         # Stage 4: compute the local numbering anchor for this counted measure.
         measure_override_value = _measure_override_value(measure_id, measure_overrides)
-        current_value_before_label = int(current_value)
-
         # Stage 5: resolve the final local label for this counted measure.
         ending_type = str(ending_entry.get("kind") or "").strip() if ending_entry else ""
         if ending_entry:
@@ -8122,45 +7587,8 @@ def _recompute_measure_numbering(
                 rest_measures,
             )
 
-        if ending_entry and isinstance(ending_debug_ctx, dict):
-            _log_relabel_ending_debug(
-                str(ending_debug_ctx.get("trace_id") or ""),
-                str(ending_debug_ctx.get("job_id") or ""),
-                _safe_int(ending_debug_ctx.get("run_id"), 0),
-                "numbering",
-                {
-                    "group_id": int(ending_group_id),
-                    "measure_id": measure_id,
-                    "kind": ending_type,
-                    "branch_index": _safe_int(ending_entry.get("branch_index"), 0),
-                    "current_value_before": int(current_value_before_label),
-                    "override_value": int(measure_override_value) if measure_override_value is not None else None,
-                    "group_start_value": _safe_int(active_ending_group_state.get("start_value"), 0) if active_ending_group_state and active_ending_group_state.get("start_value") is not None else None,
-                    "assigned_label": int(label_value),
-                    "first_next_value": _safe_int(active_ending_group_state.get("first_next_value"), 0) if active_ending_group_state and active_ending_group_state.get("first_next_value") is not None else None,
-                    "second_next_value": _safe_int(active_ending_group_state.get("second_next_value"), 0) if active_ending_group_state and active_ending_group_state.get("second_next_value") is not None else None,
-                    "current_value_after": int(current_value),
-                },
-            )
-
     if active_ending_group_id is not None:
-        close_state = dict(active_ending_group_state or {})
         resumed_value = _close_numbering_ending_group(current_value, active_ending_group_state)
-        if isinstance(ending_debug_ctx, dict):
-            _log_relabel_ending_debug(
-                str(ending_debug_ctx.get("trace_id") or ""),
-                str(ending_debug_ctx.get("job_id") or ""),
-                _safe_int(ending_debug_ctx.get("run_id"), 0),
-                "close",
-                {
-                    "group_id": int(active_ending_group_id),
-                    "next_measure_id": "",
-                    "resume_value": int(resumed_value),
-                    "first_next_value": _safe_int(close_state.get("first_next_value"), 0) if close_state.get("first_next_value") is not None else None,
-                    "second_next_value": _safe_int(close_state.get("second_next_value"), 0) if close_state.get("second_next_value") is not None else None,
-                    "start_value": _safe_int(close_state.get("start_value"), 0) if close_state.get("start_value") is not None else None,
-                },
-            )
         current_value = resumed_value
 
     for system in sorted_systems:
@@ -8372,12 +7800,6 @@ def _apply_legacy_rest_staff_edit(
     else:
         rest_systems[system_id] = measure_count
 
-    diff = measure_count - prev_rest
-    import sys
-
-    msg1 = f"REST_DEBUG system_id={system_id} measure_count={measure_count} prev_rest={prev_rest} diff={diff}"
-    logger.warning(msg1)
-    print(msg1, file=sys.stderr, flush=True)
     applied.append({"type": "set_rest_staff", "system_id": system_id, "value": measure_count})
 
 
@@ -8704,7 +8126,6 @@ def _apply_move_label_edit(
 def _apply_relabel_edits(
     editable_state: dict,
     edits: list[dict],
-    ending_debug_ctx: dict | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], int]:
     systems = _sorted_system_rows(editable_state.get("systems") or [])
     if not systems:
@@ -8814,10 +8235,7 @@ def _apply_relabel_edits(
     _editable_hidden_label_ids(editable_state)
     _editable_forced_label_ids(editable_state)
     _editable_label_positions(editable_state)
-    systems, measures, _, _ = _refresh_editable_state_systems_and_measures(
-        editable_state,
-        ending_debug_ctx=ending_debug_ctx,
-    )
+    systems, measures, _, _ = _refresh_editable_state_systems_and_measures(editable_state)
     return systems, applied, rejected, len(systems)
 
 
@@ -9357,8 +8775,6 @@ def get_job_state(job_id: str):
         qa = {}
 
     systems, measures, reassign_count, qa = _refresh_editable_state_systems_and_measures(editable_state)
-    if reassign_count > 0:
-        print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
 
     response = {
         "job_id": job_id,
@@ -9759,10 +9175,7 @@ def ai_suggest_job(job_id: str):
     measures = editable_state.get("measures")
     if not isinstance(measures, list):
         measures = []
-    batch_trace_before_rows = _ai_batch_trace_before_snapshot(measures) if _ai_suggest_debug_enabled() else None
     systems, measures, reassign_count, _ = _refresh_editable_state_systems_and_measures(editable_state)
-    if reassign_count > 0:
-        print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
 
     source_state_version = _editable_state_version(editable_state)
     mapping_summary["editable_state"] = editable_state
@@ -9936,7 +9349,6 @@ def ai_suggest_job(job_id: str):
         source_state_version,
         len(_ai_suggest_candidate_measures(editable_state)),
     )
-    debug_batch_trace = None
     run_status = AI_SUGGEST_RUN_STATUS_RUNNING if system_batches else AI_SUGGEST_RUN_STATUS_COMPLETED
     mapping_summary["ai_suggest_run"] = _new_ai_suggest_run_state(
         int(artifact_run_id),
@@ -9972,21 +9384,6 @@ def ai_suggest_job(job_id: str):
             500,
         )
 
-    if _ai_suggest_debug_enabled():
-        try:
-            payload = _build_ai_batch_trace_payload(
-                job_id,
-                int(artifact_run_id),
-                systems,
-                measures,
-                system_batches,
-                before_snapshot=batch_trace_before_rows,
-                pdf_source=_current_ai_crop_pdf_source_label(artifacts),
-            )
-            debug_batch_trace = _write_ai_debug_batch_trace(payload, artifacts)
-        except Exception as exc:
-            logger.warning("AI_BATCH_TRACE_START_WARN job_id=%s detail=%s", job_id, _safe_error_text(exc))
-
     response = {
         "job_id": job_id,
         "run_id": int(artifact_run_id),
@@ -9998,8 +9395,6 @@ def ai_suggest_job(job_id: str):
         "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
         "duration_ms": int((time.time() - started) * 1000),
     }
-    if isinstance(debug_batch_trace, dict):
-        response["debug_batch_trace"] = debug_batch_trace
     if rec and isinstance(rec, dict) and rec.get("pdf_gcs_uri"):
         response["pdf_gcs_uri"] = rec.get("pdf_gcs_uri")
     return jsonify(response), 200
@@ -10164,7 +9559,6 @@ def _step_ai_suggest_two_system_credit_v1(
 
     score_type = _normalize_ai_score_type(ai_suggest_run.get("score_type"))
     remembered_time_signature_in = _normalize_ai_time_signature_value(ai_suggest_run.get("remembered_time_signature"))
-    debug_crops = None
     reference_examples_attached = 0
 
     if pass_state.get("general") != "completed":
@@ -10180,7 +9574,6 @@ def _step_ai_suggest_two_system_credit_v1(
                 remembered_time_signature_in=remembered_time_signature_in,
                 score_type=score_type,
             )
-            debug_crops = system_result.pop("debug_crops", None)
             reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
             usage = system_result.pop("_internal_ai_usage", None)
             system_result.pop("remembered_time_signature_out", None)
@@ -10329,8 +9722,6 @@ def _step_ai_suggest_two_system_credit_v1(
         "artifacts_http": _artifact_http_uris_for_run(artifact_run_id, artifacts),
         "duration_ms": int((time.time() - started) * 1000),
     }
-    if isinstance(debug_crops, dict):
-        response["debug_crops"] = debug_crops
     return jsonify(response), 200
 
 
@@ -10511,7 +9902,6 @@ def _step_ai_suggest_split_credit_v2(
 
     score_type = _normalize_ai_score_type(ai_suggest_run.get("score_type"))
     remembered_time_signature_in = _normalize_ai_time_signature_value(ai_suggest_run.get("remembered_time_signature"))
-    debug_crops = None
     reference_examples_attached = 0
 
     if pass_state.get("general") != "completed":
@@ -10527,7 +9917,6 @@ def _step_ai_suggest_split_credit_v2(
                 remembered_time_signature_in=remembered_time_signature_in,
                 score_type=score_type,
             )
-            debug_crops = system_result.pop("debug_crops", None)
             reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
             usage = system_result.pop("_internal_ai_usage", None)
             system_result.pop("remembered_time_signature_out", None)
@@ -10664,8 +10053,6 @@ def _step_ai_suggest_split_credit_v2(
         "artifacts_http": _artifact_http_uris_for_run(artifact_run_id, artifacts),
         "duration_ms": int((time.time() - started) * 1000),
     }
-    if isinstance(debug_crops, dict):
-        response["debug_crops"] = debug_crops
     return jsonify(response), 200
 
 
@@ -10764,10 +10151,7 @@ def ai_suggest_job_step(job_id: str):
     measures = editable_state.get("measures")
     if not isinstance(measures, list):
         measures = []
-    batch_trace_before_rows = _ai_batch_trace_before_snapshot(measures) if _ai_suggest_debug_enabled() else None
     systems, measures, reassign_count, _ = _refresh_editable_state_systems_and_measures(editable_state)
-    if reassign_count > 0:
-        print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
 
     source_state_version = _editable_state_version(editable_state)
     mapping_summary["editable_state"] = editable_state
@@ -10783,25 +10167,6 @@ def ai_suggest_job_step(job_id: str):
     system_batches = _ai_suggest_system_batches(editable_state)
     systems_total = len(system_batches)
     ai_suggest_run["systems_total"] = systems_total
-    debug_batch_trace = None
-    debug_batch_trace_payload = None
-    if _ai_suggest_debug_enabled():
-        try:
-            debug_batch_trace_payload = _load_ai_debug_batch_trace(artifacts)
-            if not isinstance(debug_batch_trace_payload, dict):
-                debug_batch_trace_payload = _build_ai_batch_trace_payload(
-                    job_id,
-                    int(artifact_run_id),
-                    systems,
-                    measures,
-                    system_batches,
-                    before_snapshot=batch_trace_before_rows,
-                    pdf_source=_current_ai_crop_pdf_source_label(artifacts),
-                )
-            debug_batch_trace = _write_ai_debug_batch_trace(debug_batch_trace_payload, artifacts)
-        except Exception as exc:
-            logger.warning("AI_BATCH_TRACE_STEP_WARN job_id=%s detail=%s", job_id, _safe_error_text(exc))
-
     if ai_suggest_run.get("status") == AI_SUGGEST_RUN_STATUS_IDLE:
         response = {
             "job_id": job_id,
@@ -10817,8 +10182,6 @@ def ai_suggest_job_step(job_id: str):
                 "detail": "ai_suggest_not_started",
             },
         }
-        if isinstance(debug_batch_trace, dict):
-            response["debug_batch_trace"] = debug_batch_trace
         return jsonify(response), 409
 
     if ai_suggest_run.get("status") in {AI_SUGGEST_RUN_STATUS_COMPLETED, AI_SUGGEST_RUN_STATUS_FAILED, AI_SUGGEST_RUN_STATUS_CANCELLED}:
@@ -10833,8 +10196,6 @@ def ai_suggest_job_step(job_id: str):
             "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
             "duration_ms": int((time.time() - started) * 1000),
         }
-        if isinstance(debug_batch_trace, dict):
-            response["debug_batch_trace"] = debug_batch_trace
         if isinstance(ai_suggest_run.get("last_error"), dict):
             response["error"] = ai_suggest_run.get("last_error")
         return jsonify(response), 200
@@ -10862,7 +10223,6 @@ def ai_suggest_job_step(job_id: str):
                     "artifacts": artifacts,
                     "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
                     "duration_ms": int((time.time() - started) * 1000),
-                    **({"debug_batch_trace": debug_batch_trace} if isinstance(debug_batch_trace, dict) else {}),
                 }
             ),
             200,
@@ -10896,7 +10256,6 @@ def ai_suggest_job_step(job_id: str):
     except PaidAccessError as exc:
         return _paid_error_response(exc)
 
-    debug_crops = None
     reference_examples_attached = 0
     internal_ai_usage = None
     remembered_time_signature_in = _normalize_ai_time_signature_value(ai_suggest_run.get("remembered_time_signature"))
@@ -10914,7 +10273,6 @@ def ai_suggest_job_step(job_id: str):
             score_type=score_type,
         )
         if isinstance(system_result, dict):
-            debug_crops = system_result.pop("debug_crops", None)
             reference_examples_attached = _safe_int(system_result.pop("reference_examples_attached", 0), 0)
             internal_ai_usage = system_result.pop("_internal_ai_usage", None)
             current_system_id = str(system_row.get("system_id") or "").strip() or None
@@ -10962,16 +10320,6 @@ def ai_suggest_job_step(job_id: str):
             latest_cost.get("retry_attempts"),
             latest_cost.get("usage_available"),
         )
-        if isinstance(debug_batch_trace_payload, dict):
-            try:
-                debug_batch_trace_payload = _mark_ai_batch_trace_processed(
-                    debug_batch_trace_payload,
-                    system_row,
-                    system_measures,
-                )
-                debug_batch_trace = _write_ai_debug_batch_trace(debug_batch_trace_payload, artifacts)
-            except Exception as exc:
-                logger.warning("AI_BATCH_TRACE_MARK_WARN job_id=%s detail=%s", job_id, _safe_error_text(exc))
         now_txt = _utc_now().isoformat().replace("+00:00", "Z")
         completed_count = min(systems_total, next_system_index + 1)
         ai_suggest_run["status"] = AI_SUGGEST_RUN_STATUS_COMPLETED if completed_count >= systems_total else AI_SUGGEST_RUN_STATUS_RUNNING
@@ -10998,10 +10346,6 @@ def ai_suggest_job_step(job_id: str):
             "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
             "duration_ms": int((time.time() - started) * 1000),
         }
-        if isinstance(debug_crops, dict):
-            response["debug_crops"] = debug_crops
-        if isinstance(debug_batch_trace, dict):
-            response["debug_batch_trace"] = debug_batch_trace
         return jsonify(response), 200
     except Exception as exc:
         _finish_ai_access(ai_access, spent=False)
@@ -11049,10 +10393,6 @@ def ai_suggest_job_step(job_id: str):
             "artifacts_http": _artifact_http_uris_for_run(int(artifact_run_id), artifacts),
             "duration_ms": int((time.time() - started) * 1000),
         }
-        if isinstance(getattr(exc, "debug_crops", None), dict):
-            response["debug_crops"] = getattr(exc, "debug_crops")
-        if isinstance(debug_batch_trace, dict):
-            response["debug_batch_trace"] = debug_batch_trace
         return jsonify(response), 200
 
 
@@ -11255,8 +10595,6 @@ def relabel_job(job_id: str):
     editable_state["systems"] = systems_before
     editable_state["measures"] = measures_before
     systems_before, measures_before, reassign_count, _ = _refresh_editable_state_systems_and_measures(editable_state)
-    if reassign_count > 0:
-        print(f"MEASURE_REASSIGN_SUMMARY job_id={job_id} reassigned={reassign_count}")
 
     if not isinstance(edits, list) or len(edits) == 0:
         trace = {
@@ -11339,36 +10677,6 @@ def relabel_job(job_id: str):
             ),
             409,
         )
-    ending_debug_ctx: dict | None = None
-    if _relabel_has_ending_debug(editable_state, edits if isinstance(edits, list) else []):
-        ending_debug_ctx = {
-            "trace_id": trace_id,
-            "job_id": job_id,
-            "run_id": int(run_id),
-        }
-        _log_relabel_ending_debug(
-            trace_id,
-            job_id,
-            int(run_id),
-            "input",
-            {
-                "saved_endings_count": len(editable_state.get("endings") or {}) if isinstance(editable_state.get("endings"), dict) else 0,
-                "all_edit_types": [
-                    str(raw_edit.get("type") or "").strip()
-                    for raw_edit in edits
-                    if isinstance(raw_edit, dict)
-                ],
-                "ending_edits": [
-                    {
-                        "measure_id": str(raw_edit.get("measure_id") or "").strip(),
-                        "value": str(raw_edit.get("value") or "").strip(),
-                    }
-                    for raw_edit in edits
-                    if isinstance(raw_edit, dict) and str(raw_edit.get("type") or "").strip() == "set_ending"
-                ],
-            },
-        )
-
     try:
         baseline_systems = list(editable_state.get("systems") or [])
         baseline_by_id = {
@@ -11376,11 +10684,7 @@ def relabel_job(job_id: str):
             for row in baseline_systems
             if isinstance(row, dict) and str(row.get("system_id") or "").strip()
         }
-        systems, applied, rejected, total_systems = _apply_relabel_edits(
-            editable_state,
-            edits,
-            ending_debug_ctx=ending_debug_ctx,
-        )
+        systems, applied, rejected, total_systems = _apply_relabel_edits(editable_state, edits)
     except ValueError as exc:
         reason = "invalid_payload"
         if "unknown_system_id" in str(exc):

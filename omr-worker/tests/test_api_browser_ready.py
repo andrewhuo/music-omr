@@ -1562,103 +1562,6 @@ class BrowserReadyApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(((body.get("error") or {}).get("code")), "invalid_score_type")
 
-    def test_build_ai_batch_trace_payload_records_statuses_and_order(self):
-        systems = [
-            {"system_id": "p1_s0", "page": 1, "system_index": 0},
-            {"system_id": "p1_s1", "page": 1, "system_index": 1},
-        ]
-        measures = [
-            {
-                "measure_id": "m0",
-                "page": 1,
-                "system_id": "p1_s0",
-                "system_index": 0,
-                "measure_local_index": 0,
-                "x_left": 10,
-                "y_top": 20,
-                "y_bottom": 40,
-            },
-            {
-                "measure_id": "m1",
-                "page": 1,
-                "system_id": "p1_s1",
-                "system_index": 1,
-                "measure_local_index": 0,
-                "x_left": 50,
-                "y_top": 20,
-                "y_bottom": 40,
-            },
-            {
-                "measure_id": "m2",
-                "page": 1,
-                "system_id": "",
-                "system_index": 0,
-                "measure_local_index": 0,
-                "x_left": 90,
-                "y_top": 20,
-                "y_bottom": 40,
-            },
-            {
-                "measure_id": "m3",
-                "page": 1,
-                "system_id": "missing_system",
-                "system_index": 9,
-                "measure_local_index": 0,
-                "x_left": 130,
-                "y_top": 20,
-                "y_bottom": 40,
-            },
-            {
-                "measure_id": "m4",
-                "page": 1,
-                "system_id": "missing_after_reassign",
-                "system_index": 9,
-                "measure_local_index": 0,
-                "x_left": 170,
-                "y_top": 20,
-                "y_bottom": 40,
-            },
-        ]
-        before_snapshot = [
-            {"system_id_before_reassign": "p1_s0", "system_index_before_reassign": 0},
-            {"system_id_before_reassign": "p1_s0", "system_index_before_reassign": 0},
-            {"system_id_before_reassign": "", "system_index_before_reassign": 0},
-            {"system_id_before_reassign": "missing_system", "system_index_before_reassign": 9},
-            {"system_id_before_reassign": "p1_s0", "system_index_before_reassign": 0},
-        ]
-        system_batches = [
-            (systems[0], [measures[0]]),
-            (systems[1], [measures[1]]),
-        ]
-
-        payload = WORKER._build_ai_batch_trace_payload(
-            "job-1",
-            111,
-            systems,
-            measures,
-            system_batches,
-            before_snapshot=before_snapshot,
-        )
-
-        rows = {str(row.get("measure_id")): row for row in (payload.get("measures") or [])}
-        self.assertEqual((rows.get("m0") or {}).get("status"), "batched")
-        self.assertEqual((rows.get("m0") or {}).get("display_system_number"), 1)
-        self.assertEqual((rows.get("m0") or {}).get("display_measure_number"), 1)
-        self.assertEqual((rows.get("m1") or {}).get("status"), "reassigned_and_batched")
-        self.assertEqual((rows.get("m1") or {}).get("display_system_number"), 2)
-        self.assertEqual((rows.get("m1") or {}).get("display_measure_number"), 1)
-        self.assertEqual((rows.get("m2") or {}).get("status"), "skipped_missing_system_id")
-        self.assertEqual((rows.get("m3") or {}).get("status"), "skipped_no_matching_system")
-        self.assertEqual((rows.get("m4") or {}).get("status"), "reassigned_but_unbatched")
-        self.assertEqual(payload.get("measure_count"), 5)
-        self.assertEqual(payload.get("batched_count"), 2)
-        self.assertEqual(payload.get("skipped_count"), 3)
-        systems_summary = {str(row.get("system_id")): row for row in (payload.get("systems") or [])}
-        self.assertEqual((systems_summary.get("p1_s0") or {}).get("measure_ids_batched"), ["m0"])
-        self.assertEqual((systems_summary.get("p1_s1") or {}).get("measure_ids_batched"), ["m1"])
-        self.assertEqual((systems_summary.get("p1_s0") or {}).get("display_system_number"), 1)
-        self.assertEqual((systems_summary.get("p1_s1") or {}).get("display_system_number"), 2)
-
     def test_ai_suggest_step_persists_one_system_and_advances_progress(self):
         artifacts = self._sample_artifacts()
         artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
@@ -2034,64 +1937,6 @@ class BrowserReadyApiTests(unittest.TestCase):
             ],
         )
 
-    def test_ai_suggest_step_returns_debug_batch_trace_when_enabled(self):
-        artifacts = self._sample_artifacts()
-        artifacts_http = {k: f"https://signed/{k}" for k in artifacts}
-        mapping_summary = self._sample_mapping_summary()
-        mapping_summary["ai_suggestions"] = WORKER._empty_ai_suggestions_state(111, "test-state", 3)
-        mapping_summary["ai_suggest_run"] = {
-            "status": "running",
-            "started_at_utc": "2026-05-05T00:00:00Z",
-            "updated_at_utc": "2026-05-05T00:00:00Z",
-            "completed_at_utc": None,
-            "failed_at_utc": None,
-            "systems_total": 2,
-            "systems_completed": 0,
-            "next_system_index": 0,
-            "source_run_id": 111,
-            "source_state_version": "test-state",
-            "last_error": None,
-            "remembered_time_signature": "3/4",
-            "last_time_signature_update": {"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"},
-            "time_signature_updates": [{"system_id": "p0", "measure_id": "m0", "new_time_signature": "3/4"}],
-        }
-        WORKER.request = SimpleNamespace(path="/api/omr/jobs/111/ai-suggest/step", method="POST", headers={}, files={}, json={})
-        with (
-            patch.object(WORKER, "_resolve_run_id_from_job_id", return_value=(111, {}, None)),
-            patch.object(WORKER, "_load_mapping_for_run", return_value=(artifacts, mapping_summary, 111)),
-            patch.object(WORKER, "_editable_state_version", return_value="test-state"),
-            patch.object(
-                WORKER,
-                "_generate_ai_suggestions_for_system_batch",
-                return_value={
-                    "version": "ai_suggestions_v1",
-                    "generated_at_utc": "2026-05-05T00:00:01Z",
-                    "provider": "claude",
-                    "model": "claude-test",
-                    "source_run_id": 111,
-                    "by_measure_id": {
-                        "p1_s0_m0": {"label": "pickup", "rest_count": None, "confidence": "medium"}
-                    },
-                    "warnings": [],
-                    "summary": {"systems_processed": 1, "measures_seen": 2, "suggestions_kept": 1, "normal_measures_omitted": 1},
-                },
-            ),
-            patch.object(WORKER, "_artifact_http_uris_for_run", return_value=artifacts_http),
-            patch.object(WORKER, "_upload_json_to_gcs", return_value=None),
-            patch.object(WORKER, "_signed_http_url_for_gs", return_value="https://signed/debug"),
-            patch.object(WORKER, "_gcs_uri_exists", return_value=False),
-            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=True),
-        ):
-            body, status = _unpack(WORKER.ai_suggest_job_step("111"))
-
-        self.assertEqual(status, 200)
-        debug_batch_trace = body.get("debug_batch_trace") or {}
-        self.assertEqual(debug_batch_trace.get("enabled"), True)
-        self.assertEqual(debug_batch_trace.get("measure_count"), 3)
-        self.assertEqual(debug_batch_trace.get("batched_count"), 3)
-        self.assertEqual(debug_batch_trace.get("skipped_count"), 0)
-        self.assertEqual(debug_batch_trace.get("trace_http"), "https://signed/debug")
-
     def test_resolve_ai_crop_pdf_source_prefers_corrected_pdf(self):
         artifacts = self._sample_artifacts()
         with TemporaryDirectory(prefix="ai-crop-source-test-") as tmp:
@@ -2134,108 +1979,6 @@ class BrowserReadyApiTests(unittest.TestCase):
             ],
         )
 
-    def test_ai_general_response_debug_logs_safe_complete_metrics(self):
-        private_sentinel = "PRIVATE_MUSIC_RESPONSE_MUST_NOT_BE_LOGGED"
-        message = {
-            "content": [{"type": "text", "text": json.dumps({"suggestions": [], "private": private_sentinel})}],
-            "usage": {"input_tokens": 1200, "output_tokens": 96},
-            "stop_reason": "end_turn",
-            "_internal_bedrock_attempts": 1,
-        }
-        diagnostics = WORKER._ai_general_response_diagnostics(
-            message,
-            system_id="p1_s4",
-            measure_count=11,
-            reference_count=4,
-            model="sonnet-test",
-        )
-
-        self.assertEqual(diagnostics.get("stop_reason"), "end_turn")
-        self.assertEqual(diagnostics.get("text_blocks"), 1)
-        self.assertTrue(diagnostics.get("starts_object"))
-        self.assertTrue(diagnostics.get("ends_object"))
-        self.assertFalse(diagnostics.get("output_limit_reached"))
-        self.assertNotIn(private_sentinel, json.dumps(diagnostics))
-
-        with (
-            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=True),
-            patch.object(WORKER.logger, "info") as info_log,
-        ):
-            WORKER._log_ai_general_response_debug(diagnostics)
-
-        logged = " ".join(str(value) for value in info_log.call_args.args)
-        self.assertIn("AI_GENERAL_RESPONSE_DEBUG", logged)
-        self.assertNotIn(private_sentinel, logged)
-
-    def test_ai_general_parse_failure_identifies_output_limit_without_logging_text(self):
-        private_sentinel = "PRIVATE_TRUNCATED_RESPONSE_MUST_NOT_BE_LOGGED"
-        message = {
-            "content": [{"type": "text", "text": '{"suggestions":[' + private_sentinel}],
-            "usage": {"input_tokens": 2200, "output_tokens": WORKER.ANTHROPIC_MAX_TOKENS},
-            "stop_reason": "max_tokens",
-            "_internal_bedrock_attempts": 2,
-        }
-        response = WORKER._ai_general_response_diagnostics(
-            message,
-            system_id="p1_s4",
-            measure_count=11,
-            reference_count=4,
-            model="sonnet-test",
-        )
-        exc = WORKER.AiSuggestError(
-            detail="malformed_response: invalid json Expecting ',' delimiter: line 157 column 6 (char 5288)"
-        )
-        failure = WORKER._ai_general_failure_diagnostics(exc, response)
-
-        self.assertEqual(failure.get("category"), "invalid_json")
-        self.assertEqual(failure.get("error_line"), 157)
-        self.assertEqual(failure.get("error_column"), 6)
-        self.assertEqual(failure.get("error_char"), 5288)
-        self.assertTrue(failure.get("output_limit_reached"))
-        self.assertNotIn(private_sentinel, json.dumps(failure))
-
-        with (
-            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=True),
-            patch.object(WORKER.logger, "warning") as warning_log,
-        ):
-            WORKER._log_ai_general_parse_failed(failure)
-
-        logged = " ".join(str(value) for value in warning_log.call_args.args)
-        self.assertIn("AI_GENERAL_PARSE_FAILED", logged)
-        self.assertNotIn(private_sentinel, logged)
-
-    def test_ai_general_failure_categories_cover_structural_errors(self):
-        cases = {
-            "malformed_response: no text content": "missing_text",
-            "malformed_response: missing json object": "missing_object",
-            "malformed_response: invalid json bad": "invalid_json",
-            "malformed_response: suggestions missing for p1_s4": "missing_measures",
-            "malformed_response: missing_measure_ids=p1_s4_m2": "missing_measures",
-            "malformed_response: duplicate measure_id p1_s4_m2": "duplicate_measures",
-            "malformed_response: unknown measure_id p1_s9_m0": "unknown_measures",
-        }
-        for detail, expected in cases.items():
-            with self.subTest(detail=detail):
-                diagnostics = WORKER._ai_general_failure_diagnostics(WORKER.AiSuggestError(detail=detail), {})
-                self.assertEqual(diagnostics.get("category"), expected)
-
-    def test_ai_general_diagnostic_logs_are_disabled_with_crop_debugging(self):
-        diagnostics = {
-            "category": "invalid_json",
-            "model": "sonnet-test",
-            "system_id": "p1_s4",
-        }
-        with (
-            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=False),
-            patch.object(WORKER.logger, "info") as info_log,
-            patch.object(WORKER.logger, "warning") as warning_log,
-        ):
-            WORKER._log_ai_general_response_debug(diagnostics)
-            WORKER._log_ai_general_parse_failed(diagnostics)
-
-        info_log.assert_not_called()
-        warning_log.assert_not_called()
-
     def test_ai_output_limit_allows_complete_response_larger_than_old_ceiling(self):
         provider_payload = {
             "suggestions": [],
@@ -2248,19 +1991,9 @@ class BrowserReadyApiTests(unittest.TestCase):
             "stop_reason": "end_turn",
         }
 
-        diagnostics = WORKER._ai_general_response_diagnostics(
-            message,
-            system_id="p1_s4",
-            measure_count=11,
-            reference_count=4,
-            model="sonnet-test",
-        )
         parsed = WORKER._parse_anthropic_suggestions_message(message)
 
         self.assertEqual(WORKER.ANTHROPIC_MAX_TOKENS, 5000)
-        self.assertEqual(diagnostics.get("max_tokens"), 5000)
-        self.assertEqual(diagnostics.get("output_tokens"), 2400)
-        self.assertFalse(diagnostics.get("output_limit_reached"))
         self.assertEqual(parsed.get("suggestions"), [])
 
     def test_generate_ai_suggestions_for_system_batch_uses_neighbor_systems_without_crashing(self):
@@ -2901,24 +2634,6 @@ class BrowserReadyApiTests(unittest.TestCase):
             patch.object(WORKER, "_ai_messages_create", return_value=message),
             patch.object(WORKER.fitz, "open", return_value=fake_doc),
             patch.object(WORKER.fitz, "Rect", _FakeRect),
-            patch.object(WORKER, "_ai_suggest_debug_enabled", return_value=True),
-            patch.object(WORKER, "_signed_http_url_for_gs", return_value="https://signed/debug"),
-            patch.object(WORKER, "_load_ai_debug_batch_trace", return_value=None),
-            patch.object(WORKER, "_current_ai_crop_pdf_source_label", return_value="corrected"),
-            patch.object(WORKER, "_upload_bytes_to_gcs", return_value=None),
-            patch.object(
-                WORKER,
-                "_write_ai_debug_batch_trace",
-                side_effect=lambda payload, _artifacts: {
-                    "enabled": True,
-                    "trace_uri": "gs://x/output/artifacts/ai_debug_crops/ai_batch_trace.json",
-                    "trace_http": "https://signed/debug-trace",
-                    "pdf_source": str(payload.get("pdf_source") or "baseline"),
-                    "measure_count": int(payload.get("measure_count") or 0),
-                    "batched_count": int(payload.get("batched_count") or 0),
-                    "skipped_count": int(payload.get("skipped_count") or 0),
-                },
-            ),
         ):
             body, status = _unpack(WORKER.ai_suggest_job_step("111"))
 
@@ -2937,8 +2652,6 @@ class BrowserReadyApiTests(unittest.TestCase):
         )
         self.assertEqual(body.get("reference_examples_attached"), 0)
         self.assertEqual(sorted(((body.get("ai_suggestions") or {}).get("by_measure_id") or {}).keys()), ["p1_s0_m0"])
-        self.assertEqual(((body.get("debug_crops") or {}).get("pdf_source")), "corrected")
-        self.assertEqual(((body.get("debug_crops") or {}).get("reference_examples_attached")), 0)
         warnings = ((body.get("ai_suggestions") or {}).get("warnings")) or []
         warnings_text = "\n".join(str((row or {}).get("message") or "") for row in warnings)
         self.assertIn("remembered_time_signature_out", warnings_text)
