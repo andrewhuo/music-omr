@@ -84,6 +84,16 @@ Recommended env vars:
 - `ARTIFACT_SIGNED_URL_TTL_SEC=1800`
 - `MAX_UPLOAD_MB=25`
 - `INPUT_UPLOAD_PREFIX=gs://music-omr-bucket-777135743132/input/user-input`
+- `APPLE_IAP_ENABLED=1`
+- `APPLE_APP_ID=<numeric Apple ID from App Store Connect's App Information page>`
+- `APPLE_BUNDLE_ID=pineapple.Sheet-Music-Labeler`
+- `APPLE_PRO_PRODUCT_ID=pineapple.sheetmusiclabeler.pro.monthly`
+- `APPLE_PACKS_ENABLED=0`
+
+`APPLE_APP_ID` is the app's numeric Apple ID. Do not use the Pro Monthly
+subscription Apple ID. Apple purchase verification intentionally defaults to off
+when `APPLE_IAP_ENABLED` is missing, so every production deployment must preserve
+these variables.
 
 Remove stale vars if present:
 
@@ -97,15 +107,25 @@ Notes:
 
 ### Deploy snippet (immutable image)
 
+First inspect and save the service's current environment. Routine deployments
+must use `--update-env-vars`; `--set-env-vars` replaces the complete environment
+and can silently disable purchase verification by deleting Apple variables.
+
 ```bash
 set -euo pipefail
 PROJECT="music-omr-backend"
 REGION="us-central1"
 SERVICE="omr-trigger"
 REPO="us-central1-docker.pkg.dev/${PROJECT}/omr-trigger-service/trigger"
+APPLE_APP_ID="<numeric app Apple ID from App Store Connect>"
 SHA="$(git rev-parse --short HEAD)"
 TS="$(date +%Y%m%d-%H%M%S)"
 IMAGE="${REPO}:${SHA}-${TS}"
+
+gcloud run services describe "${SERVICE}" \
+  --project "${PROJECT}" \
+  --region "${REGION}" \
+  --format='yaml(spec.template.spec.containers[0].env,status.latestReadyRevisionName,status.traffic)'
 
 gcloud builds submit ./omr-worker --tag "${IMAGE}" --project "${PROJECT}" --region "${REGION}"
 gcloud run deploy "${SERVICE}" \
@@ -113,9 +133,32 @@ gcloud run deploy "${SERVICE}" \
   --project "${PROJECT}" \
   --region "${REGION}" \
   --allow-unauthenticated \
-  --set-env-vars "CORS_ALLOW_ORIGINS=http://localhost:5173,https://measure-marker.created.app,ARTIFACT_SIGNED_URL_TTL_SEC=1800,MAX_UPLOAD_MB=25,INPUT_UPLOAD_PREFIX=gs://music-omr-bucket-777135743132/input/user-input" \
+  --update-env-vars "^|^CORS_ALLOW_ORIGINS=http://localhost:5173,https://measure-marker.created.app|ARTIFACT_SIGNED_URL_TTL_SEC=1800|MAX_UPLOAD_MB=25|INPUT_UPLOAD_PREFIX=gs://music-omr-bucket-777135743132/input/user-input|APPLE_IAP_ENABLED=1|APPLE_APP_ID=${APPLE_APP_ID}|APPLE_BUNDLE_ID=pineapple.Sheet-Music-Labeler|APPLE_PRO_PRODUCT_ID=pineapple.sheetmusiclabeler.pro.monthly|APPLE_PACKS_ENABLED=0" \
   --remove-env-vars "INVITE_CODE,UPLOAD_GCS_PREFIX"
+
+gcloud run services update-traffic "${SERVICE}" \
+  --project "${PROJECT}" \
+  --region "${REGION}" \
+  --to-latest
 ```
+
+### Post-deployment purchase verification
+
+Run both checks after every production deployment:
+
+```bash
+curl -sS -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{}' \
+  'https://omr-trigger-777135743132.us-central1.run.app/api/access/paid/verify'
+
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  'https://omr-trigger-777135743132.us-central1.run.app/privacy'
+```
+
+The empty purchase request must return `apple_purchase_invalid`. If it returns
+`apple_purchase_not_enabled`, stop: the live Apple environment is incomplete.
+The privacy check must print `200`.
 
 ### Per-run lifecycle policy (1 day fallback cleanup)
 
